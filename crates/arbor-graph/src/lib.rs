@@ -36,5 +36,5 @@ mod ranking;
 pub use builder::GraphBuilder;
 pub use edge::EdgeKind;
 pub use graph::ArborGraph;
-pub use query::{ImpactResult, QueryResult};
-pub use ranking::CentralityScores;
+pub use query::{DependentInfo, ImpactResult, NodeInfo, QueryResult};
+pub use ranking::{compute_centrality, CentralityScores};
