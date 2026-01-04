@@ -34,7 +34,7 @@ mod query;
 mod ranking;
 
 pub use builder::GraphBuilder;
-pub use edge::EdgeKind;
+pub use edge::{Edge, EdgeKind};
 pub use graph::ArborGraph;
 pub use query::{DependentInfo, ImpactResult, NodeInfo, QueryResult};
 pub use ranking::{compute_centrality, CentralityScores};
