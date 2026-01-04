@@ -20,8 +20,10 @@ pub mod error;
 pub mod languages;
 pub mod node;
 pub mod parser;
+pub mod parser_v2;
 
 pub use error::{ParseError, Result};
 pub use languages::LanguageParser;
 pub use node::{CodeNode, NodeKind, Visibility};
 pub use parser::{detect_language, parse_file, parse_source};
+pub use parser_v2::{ArborParser, ParseResult, RelationType, SymbolRelation};

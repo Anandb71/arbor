@@ -29,6 +29,11 @@ pub enum ParseError {
     #[error("parser error: {0}")]
     ParserError(String),
 
+    /// Tree-sitter query compilation failed. Usually means
+    /// the query pattern is invalid for the language grammar.
+    #[error("query error: {0}")]
+    QueryError(String),
+
     /// The file exists but is empty. Not really an error,
     /// but we surface it so callers can handle it gracefully.
     #[error("file is empty: '{0}'")]
