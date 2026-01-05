@@ -1,25 +1,6 @@
 {
     "$schema": "https://glama.ai/mcp/schemas/server.json",
-    "name": "Arbor",
-    "description": "Graph-native intelligence layer for deterministic code analysis and logic mapping.",
     "maintainers": [
-        {
-            "name": "Anandb71",
-            "github": "Anandb71"
-        }
-    ],
-    "categories": [
-        "Developer Tools",
-        "Analysis"
-    ],
-    "tools": [
-        {
-            "name": "get_logic_path",
-            "description": "Traverses the AST graph to find the logical execution path between two nodes."
-        },
-        {
-            "name": "analyze_impact",
-            "description": "Determines which files and functions are logically affected by a change in a specific node."
-        }
+        "Anandb71"
     ]
 }
