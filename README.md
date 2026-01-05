@@ -102,6 +102,20 @@ The optional desktop app renders your codebase as an interactive force-directed 
 - **Low GPU Mode**: Disable effects for better performance on older hardware
 - **Real-time Sync**: Graph updates as you edit code
 
+<p align="center">
+  <img src="docs/assets/visualizer-screenshot.png" alt="Arbor Visualizer" width="800" />
+  <br>
+  <em>The Logic Forest Visualizer rendering 27,676 nodes with bloom effects</em>
+</p>
+
+### 🔧 Health Check
+
+Verify your environment with a single command:
+
+<p align="center">
+  <img src="docs/assets/cli-health-check.png" alt="Arbor Health Check" width="500" />
+</p>
+
 ## Architecture
 
 ```
