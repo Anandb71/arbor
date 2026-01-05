@@ -2,10 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
-use arbor_graph::ArborGraph;
 use arbor_server::{SharedGraph, SyncServerHandle};
 
 #[derive(Serialize, Deserialize, Debug)]

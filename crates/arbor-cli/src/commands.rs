@@ -395,8 +395,19 @@ pub async fn check_health() -> Result<()> {
 
     let mut all_ok = true;
 
+    // Detect workspace root (if we're in crates/, go up one level)
+    let workspace_root = if Path::new("Cargo.toml").exists() && Path::new("../visualizer").exists()
+    {
+        Path::new("..").to_path_buf()
+    } else if Path::new("crates").exists() {
+        Path::new(".").to_path_buf()
+    } else {
+        Path::new(".").to_path_buf()
+    };
+
     // 1. Check Cargo.toml presence (Rust workspace)
-    let cargo_exists = Path::new("Cargo.toml").exists();
+    let cargo_exists =
+        Path::new("Cargo.toml").exists() || workspace_root.join("crates/Cargo.toml").exists();
     if cargo_exists {
         println!("{} Rust workspace detected", "✓".green());
     } else {
@@ -420,27 +431,30 @@ pub async fn check_health() -> Result<()> {
     }
 
     // 3. Check visualizer directory
-    let viz_exists = Path::new("visualizer").exists();
-    if viz_exists {
+    let viz_path = workspace_root.join("visualizer");
+    if viz_path.exists() {
         println!("{} Visualizer directory found", "✓".green());
     } else {
-        println!("{} Visualizer not found in current directory", "⚠".yellow());
+        println!("{} Visualizer not found", "⚠".yellow());
     }
 
     // 4. Check VS Code extension
-    let ext_exists = Path::new("extensions/arbor-vscode").exists();
-    if ext_exists {
+    let ext_path = workspace_root.join("extensions/arbor-vscode");
+    if ext_path.exists() {
         println!("{} VS Code extension found", "✓".green());
     } else {
         println!("{} VS Code extension not found", "⚠".yellow());
     }
 
     // 5. Check .arbor directory
-    let arbor_init = Path::new(".arbor").exists();
-    if arbor_init {
+    let arbor_path = workspace_root.join(".arbor");
+    if arbor_path.exists() {
         println!("{} Arbor initialized (.arbor/ exists)", "✓".green());
     } else {
-        println!("{} Arbor not initialized (run 'arbor init')", "⚠".yellow());
+        println!(
+            "{} Arbor not initialized (run 'cargo run -- init' in workspace root)",
+            "⚠".yellow()
+        );
         all_ok = false;
     }
 
