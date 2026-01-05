@@ -78,29 +78,43 @@ That's it. Your IDE or AI agent can now connect to `ws://localhost:7433` and que
 
 ## Features
 
-### 🌲 AST-Graph Intelligence
+### AST-Graph Intelligence
 
 Every code entity becomes a queryable node. Arbor understands scope, shadowing, and namespace isolation — so when you ask for context, you get the exact logical block, not keyword-matched noise.
 
-### ⚡ Sub-100ms Incremental Sync
+### Sub-100ms Incremental Sync
 
 Arbor watches your files and re-parses only the changed AST nodes. In a 100k-line monorepo, saving a file triggers a ~15ms update. You'll never notice it running.
 
-### 🔍 Blast Radius Analysis
+### Blast Radius Analysis
 
 Refactoring a function? Arbor traces every caller, every consumer, every downstream dependency. See the full impact before you break production.
 
-### 📊 Semantic Ranking
+### Semantic Ranking
 
 Not all code is equal. Arbor ranks nodes by "centrality" — a function called by 50 others is more architecturally significant than a one-off utility. Context windows get the important stuff first.
 
-### 🎨 Logic Forest Visualizer
+### Logic Forest Visualizer
 
 The optional desktop app renders your codebase as an interactive force-directed graph. Custom shaders create bloom and glow effects as you navigate. Features include:
 
 - **Follow Mode**: Camera automatically tracks the node the AI is focusing on
 - **Low GPU Mode**: Disable effects for better performance on older hardware
 - **Real-time Sync**: Graph updates as you edit code
+
+<p align="center">
+  <img src="docs/assets/visualizer-screenshot.png" alt="Arbor Visualizer" width="800" />
+  <br>
+  <em>The Logic Forest Visualizer rendering 27,676 nodes with bloom effects</em>
+</p>
+
+### Health Check
+
+Verify your environment with a single command:
+
+<p align="center">
+  <img src="docs/assets/cli-health-check.png" alt="Arbor Health Check" width="500" />
+</p>
 
 ## Architecture
 
