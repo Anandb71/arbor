@@ -1,10 +1,17 @@
 # Stage 1: Build
 FROM rust:1.75-slim as builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY crates/ ./crates/
-COPY Cargo.toml ./Cargo.toml
+
 WORKDIR /app/crates
-RUN cargo build --release
+RUN cargo build --release --bin arbor-cli
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
@@ -12,12 +19,11 @@ WORKDIR /app
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
-    libssl-dev \
+    libssl3 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/crates/target/release/arbor /usr/local/bin/arbor
 
-# The inspector needs to talk to the server via stdio
-ENTRYPOINT ["arbor"]
-CMD ["bridge"]
+# MCP servers communicate via stdio
+ENTRYPOINT ["arbor", "bridge"]
