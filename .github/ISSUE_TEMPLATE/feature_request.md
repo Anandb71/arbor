@@ -1,27 +1,33 @@
 ---
 name: Feature Request
-about: Suggest an idea for Arbor
-title: "[FEATURE] "
+about: Suggest a new feature or enhancement
+title: '[FEATURE] '
 labels: enhancement
 assignees: ''
 ---
 
 ## Problem Statement
 
-A clear description of the problem you're trying to solve. Ex: "I'm always frustrated when..."
+What problem does this feature solve? What's the use case?
 
 ## Proposed Solution
 
-Describe what you'd like to happen. Be as specific as possible about the behavior you're imagining.
+Describe the feature you'd like.
 
 ## Alternatives Considered
 
-Have you thought about other ways to solve this problem? What are the trade-offs?
+Any alternative solutions or features you've considered.
 
-## Use Case
+## Implementation Ideas
 
-Describe the scenario where this feature would be useful. Who benefits and how?
+If you have thoughts on how this could be implemented:
+
+- [ ] Changes to CLI
+- [ ] Changes to visualizer
+- [ ] Changes to MCP bridge
+- [ ] New language parser
+- [ ] Documentation update
 
 ## Additional Context
 
-Add any other context, mockups, or examples here.
+Any other context, screenshots, or mockups.
