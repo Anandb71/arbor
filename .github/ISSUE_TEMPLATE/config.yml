@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Discussions
+    url: https://github.com/Anandb71/arbor/discussions
+    about: Use GitHub Discussions for general questions and community chat
+  - name: Documentation
+    url: https://github.com/Anandb71/arbor/tree/main/docs
+    about: Check the docs before opening an issue

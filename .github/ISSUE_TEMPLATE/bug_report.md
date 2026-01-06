@@ -1,37 +1,43 @@
 ---
 name: Bug Report
-about: Something isn't working as expected
-title: "[BUG] "
+about: Report a bug or unexpected behavior
+title: '[BUG] '
 labels: bug
 assignees: ''
 ---
 
-## Description
+## Bug Description
 
-A clear description of what the bug is. What did you expect to happen, and what actually happened?
+A clear and concise description of the bug.
 
 ## Steps to Reproduce
 
 1. Run `arbor ...`
-2. Open the visualizer
-3. Click on '...'
-4. See error
+2. ...
+3. See error
+
+## Expected Behavior
+
+What you expected to happen.
+
+## Actual Behavior
+
+What actually happened.
 
 ## Environment
 
 - **OS**: [e.g., Windows 11, macOS 14, Ubuntu 22.04]
-- **Arbor version**: [e.g., 0.1.0]
-- **Rust version**: [output of `rustc --version`]
-- **Flutter version**: [output of `flutter --version`, if using visualizer]
+- **Arbor Version**: [e.g., 0.1.0]
+- **Rust Version** (if building from source): [e.g., 1.75]
 
-## Logs
+## Logs/Screenshots
 
-If applicable, paste any error output or logs here:
+If applicable, add logs or screenshots.
 
 ```
-paste logs here
+Paste error logs here
 ```
 
 ## Additional Context
 
-Add any other context about the problem here. Screenshots are helpful for visualizer issues.
+Any other context about the problem.
