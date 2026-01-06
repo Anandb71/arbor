@@ -1,0 +1,43 @@
+name: Set Repository Topics
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  set-topics:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set repository topics
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.repos.replaceAllTopics({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              names: [
+                'code-analysis',
+                'ast',
+                'tree-sitter',
+                'developer-tools',
+                'rust',
+                'flutter',
+                'mcp',
+                'model-context-protocol',
+                'visualization',
+                'graph',
+                'ai-tools',
+                'static-analysis',
+                'code-intelligence',
+                'code-navigation',
+                'vscode',
+                'websocket',
+                'json-rpc',
+                'cli',
+                'tree-visualization'
+              ]
+            });
+            console.log('Topics updated successfully!');

@@ -4,6 +4,10 @@
 //! the LanguageParser trait. This keeps language-specific quirks
 //! isolated and makes it straightforward to add new languages.
 
+mod c;
+mod cpp;
+mod go;
+mod java;
 mod python;
 mod rust;
 mod typescript;
@@ -49,6 +53,18 @@ pub fn get_parser(extension: &str) -> Option<Box<dyn LanguageParser>> {
         // Python
         "py" | "pyi" => Some(Box::new(python::PythonParser)),
 
+        // Go
+        "go" => Some(Box::new(go::GoParser)),
+
+        // Java
+        "java" => Some(Box::new(java::JavaParser)),
+
+        // C
+        "c" | "h" => Some(Box::new(c::CParser)),
+
+        // C++
+        "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx" => Some(Box::new(cpp::CppParser)),
+
         _ => None,
     }
 }
@@ -59,7 +75,11 @@ pub fn supported_extensions() -> &'static [&'static str] {
         "ts", "tsx", "mts", "cts", // TypeScript
         "js", "jsx", "mjs", "cjs", // JavaScript
         "rs",  // Rust
-        "py", "pyi", // Python
+        "py", "pyi",  // Python
+        "go",   // Go
+        "java", // Java
+        "c", "h", // C
+        "cpp", "hpp", "cc", "hh", "cxx", "hxx", // C++
     ]
 }
 

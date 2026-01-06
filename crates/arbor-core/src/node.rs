@@ -39,6 +39,10 @@ pub enum NodeKind {
     Import,
     /// An export declaration.
     Export,
+    /// A constructor (Java, TypeScript class constructors).
+    Constructor,
+    /// A class field.
+    Field,
 }
 
 impl std::fmt::Display for NodeKind {
@@ -56,6 +60,8 @@ impl std::fmt::Display for NodeKind {
             Self::Module => "module",
             Self::Import => "import",
             Self::Export => "export",
+            Self::Constructor => "constructor",
+            Self::Field => "field",
         };
         write!(f, "{}", s)
     }
