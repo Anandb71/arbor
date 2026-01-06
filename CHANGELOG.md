@@ -13,7 +13,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Java language support** - Classes, interfaces, methods, constructors, fields
 - **C language support** - Functions, structs, enums, typedefs, includes
 - **C++ language support** - Classes, namespaces, structs, functions, templates
-- **Dart language support** - Classes, mixins, extensions, methods, enums
 - `Constructor` and `Field` node kinds for Java/OOP languages
 - Updated set-topics workflow with 19 repository topics
 
