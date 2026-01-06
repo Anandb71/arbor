@@ -199,7 +199,7 @@ See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the full specification.
 | Java       | ✅     | tree-sitter-java |
 | C          | ✅     | tree-sitter-c |
 | C++        | ✅     | tree-sitter-cpp |
-| Dart       | 🚧     | Coming soon |
+| Dart       | ✅     | tree-sitter-dart |
 
 Adding a new language? See our [language contribution guide](docs/ADDING_LANGUAGES.md).
 

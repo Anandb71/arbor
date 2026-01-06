@@ -19,6 +19,7 @@ tree-sitter-go.workspace = true
 tree-sitter-java.workspace = true
 tree-sitter-c.workspace = true
 tree-sitter-cpp.workspace = true
+tree-sitter-dart.workspace = true
 
 [dev-dependencies]
 tempfile = "3.0"
