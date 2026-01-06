@@ -195,7 +195,7 @@ See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the full specification.
 | JavaScript | ✅     | tree-sitter-typescript |
 | Rust       | ✅     | tree-sitter-rust |
 | Python     | ✅     | tree-sitter-python |
-| Go         | 🚧     | Coming soon |
+| Go         | ✅     | tree-sitter-go |
 | Java       | 🚧     | Coming soon |
 
 Adding a new language? See our [language contribution guide](docs/ADDING_LANGUAGES.md).

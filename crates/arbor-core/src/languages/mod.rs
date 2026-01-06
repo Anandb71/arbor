@@ -4,6 +4,7 @@
 //! the LanguageParser trait. This keeps language-specific quirks
 //! isolated and makes it straightforward to add new languages.
 
+mod go;
 mod python;
 mod rust;
 mod typescript;
@@ -49,6 +50,9 @@ pub fn get_parser(extension: &str) -> Option<Box<dyn LanguageParser>> {
         // Python
         "py" | "pyi" => Some(Box::new(python::PythonParser)),
 
+        // Go
+        "go" => Some(Box::new(go::GoParser)),
+
         _ => None,
     }
 }
@@ -60,6 +64,7 @@ pub fn supported_extensions() -> &'static [&'static str] {
         "js", "jsx", "mjs", "cjs", // JavaScript
         "rs",  // Rust
         "py", "pyi", // Python
+        "go", // Go
     ]
 }
 
