@@ -106,6 +106,8 @@ The Flutter-based desktop app renders your codebase as a stunning Force-Directed
 - **Velocity LOD**: Dynamically simplifies rendering during rapid panning/zooming to maintain 60 FPS.
 - **Interactive**: Drag nodes, hover for details, and watch the camera automatically follow AI context.
 
+![Arbor Visualizer](docs/assets/visualizer-screenshot.png)
+
 ### ⚡ Performance
 
 - **Sub-100ms Incremental Sync**: Parsing happens in milliseconds.
