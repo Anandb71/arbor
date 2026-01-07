@@ -15,6 +15,7 @@ class GraphPainter extends CustomPainter {
   final Offset offset;
   final double scale;
   final bool isLowGpuMode;
+  final double interactionSpeed;
 
   GraphPainter({
     required this.nodes,
@@ -24,6 +25,7 @@ class GraphPainter extends CustomPainter {
     this.offset = Offset.zero,
     this.scale = 1.0,
     this.isLowGpuMode = false,
+    this.interactionSpeed = 0.0,
   });
 
   @override
@@ -136,8 +138,9 @@ class GraphPainter extends CustomPainter {
     final baseRadius = 8 + node.centrality * 16;
     final radius = isHovered ? baseRadius * 1.2 : baseRadius;
     
-    // LOD: Skip fancy effects for very small nodes at low zoom
-    final isLOD = scale < 0.3 && radius * scale < 4;
+    // LOD: Skip fancy effects for very small nodes at low zoom OR high speed
+    // If interactionSpeed > 100, we consider it "rapid movement"
+    final isLOD = (scale < 0.3 && radius * scale < 4) || (interactionSpeed > 30.0);
 
     final color = ArborTheme.colorForKind(node.kind);
     
@@ -235,6 +238,7 @@ class GraphPainter extends CustomPainter {
         hoveredNodeId != oldDelegate.hoveredNodeId ||
         offset != oldDelegate.offset ||
         scale != oldDelegate.scale ||
-        isLowGpuMode != oldDelegate.isLowGpuMode;
+        isLowGpuMode != oldDelegate.isLowGpuMode ||
+        interactionSpeed != oldDelegate.interactionSpeed;
   }
 }

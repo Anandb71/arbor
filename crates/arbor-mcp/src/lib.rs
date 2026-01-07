@@ -176,6 +176,18 @@ impl McpServer {
                         },
                         "required": ["node_id"]
                     }
+                },
+                {
+                    "name": "find_path",
+                    "description": "Finds the shortest path between two nodes.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "start_node": { "type": "string", "description": "Name or ID of the start node" },
+                            "end_node": { "type": "string", "description": "Name or ID of the end node" }
+                        },
+                        "required": ["start_node", "end_node"]
+                    }
                 }
             ]
         }))
@@ -231,6 +243,55 @@ impl McpServer {
                         }
                     ]
                 }))
+            }
+            "find_path" => {
+                let start_node = arguments
+                    .get("start_node")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let end_node = arguments
+                    .get("end_node")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let graph = self.graph.read().await;
+
+                let start_idx = graph.get_index(start_node).or_else(|| {
+                    graph
+                        .find_by_name(start_node)
+                        .first()
+                        .map(|n| graph.get_index(&n.id).unwrap())
+                });
+                let end_idx = graph.get_index(end_node).or_else(|| {
+                    graph
+                        .find_by_name(end_node)
+                        .first()
+                        .map(|n| graph.get_index(&n.id).unwrap())
+                });
+
+                match (start_idx, end_idx) {
+                    (Some(u), Some(v)) => {
+                        if let Some(path) = graph.find_path(u, v) {
+                            let path_str = path
+                                .iter()
+                                .map(|n| format!("`{}` ({})", n.name, n.kind))
+                                .collect::<Vec<_>>()
+                                .join(" -> ");
+                            Ok(json!({
+                                "content": [{ "type": "text", "text": format!("Found path:\n\n{}", path_str) }]
+                            }))
+                        } else {
+                            Ok(json!({
+                                "content": [{ "type": "text", "text": "No path found between these nodes." }]
+                            }))
+                        }
+                    }
+                    _ => Err(JsonRpcError {
+                        code: -32602,
+                        message: "Could not resolve start or end node.".to_string(),
+                        data: None,
+                    }),
+                }
             }
             _ => Err(JsonRpcError {
                 code: -32601,

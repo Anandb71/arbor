@@ -2,7 +2,7 @@
   <img src="docs/assets/arbor-logo.svg" alt="Arbor" width="120" height="120" />
 </p>
 
-<h1 align="center">Arbor</h1>
+<h1 align="center">Arbor v1.0.0</h1>
 
 <p align="center">
   <strong>The Graph-Native Intelligence Layer for Code</strong><br>
@@ -20,7 +20,7 @@
 
 <p align="center">
   <a href="https://github.com/Anandb71/arbor/actions"><img src="https://img.shields.io/github/actions/workflow/status/Anandb71/arbor/rust.yml?style=flat-square&label=CI" alt="CI" /></a>
-  <img src="https://img.shields.io/badge/release-v0.1.0-blue?style=flat-square" alt="Release" />
+  <img src="https://img.shields.io/badge/release-v1.0.0-blue?style=flat-square" alt="Release" />
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" />
   <img src="https://img.shields.io/badge/rust-1.70+-orange?style=flat-square" alt="Rust" />
   <img src="https://img.shields.io/badge/flutter-3.0+-blue?style=flat-square" alt="Flutter" />
@@ -51,7 +51,7 @@ Traditional RAG:         Arbor:
 
 ### Option 1: Download Pre-built Binary (Recommended)
 
-Download `arbor-windows-v0.1.0.zip` from the [Releases](https://github.com/Anandb71/arbor/releases) page.
+Download `arbor-windows-v1.0.0.zip` from the [Releases](https://github.com/Anandb71/arbor/releases) page.
 
 ```bash
 # Unzip and add to PATH, then:
@@ -74,134 +74,58 @@ cd ../visualizer
 flutter build windows
 ```
 
-That's it. Your IDE or AI agent can now connect to `ws://localhost:7433` and query the graph.
+That's it. Your IDE or AI agent can now connect to `ws://localhost:7433` and query the graph, or use the MCP protocol over stdio.
 
 ## Features
 
-### AST-Graph Intelligence
+### 🧠 ArborQL & AI Bridge (MCP)
 
-Every code entity becomes a queryable node. Arbor understands scope, shadowing, and namespace isolation — so when you ask for context, you get the exact logical block, not keyword-matched noise.
+Arbor enables Claude and other LLMs to "walk" your code graph. Using the Model Context Protocol (MCP), agents can run:
 
-### Sub-100ms Incremental Sync
+- `find_path(start, end)`: Discover the logic flow between two distant components (A* algorithm).
+- `analyze_impact(node)`: Determine the blast radius of a change before it happens.
+- `get_context(node)`: Retrieve semantically relevant code, not just keyword matches.
 
-Arbor watches your files and re-parses only the changed AST nodes. In a 100k-line monorepo, saving a file triggers a ~15ms update. You'll never notice it running.
+### 🔗 World Edges (Cross-File Resolution)
 
-### Blast Radius Analysis
+Arbor understands that code doesn't live in isolation. It resolves **imports**, **calls**, and **inheritances** across file boundaries using a Global Symbol Table. It knows that `User` in `auth.ts` is the same as `User` imported in `profile.ts`.
 
-Refactoring a function? Arbor traces every caller, every consumer, every downstream dependency. See the full impact before you break production.
+### 💾 Incremental Persistence
 
-### Semantic Ranking
+Powered by **Sled**, Arbor's graph persistence layer is atomicity-compliant and lightning fast.
 
-Not all code is equal. Arbor ranks nodes by "centrality" — a function called by 50 others is more architecturally significant than a one-off utility. Context windows get the important stuff first.
+- **Granular Updates**: Only "dirty" nodes are re-written to disk. Saving a file in a 100k LOC repo triggers minimal I/O.
+- **Instant Load**: The graph state loads instantly on startup, no re-indexing required.
 
-### Logic Forest Visualizer
+### 🌲 Logic Forest Visualizer 2.0
 
-The optional desktop app renders your codebase as an interactive force-directed graph. Custom shaders create bloom and glow effects as you navigate. Features include:
+The Flutter-based desktop app renders your codebase as a stunning Force-Directed Graph.
 
-- **Follow Mode**: Camera automatically tracks the node the AI is focusing on
-- **Low GPU Mode**: Disable effects for better performance on older hardware
-- **Real-time Sync**: Graph updates as you edit code
+- **Cinematic Rendering**: Bloom, glow, and depth effects.
+- **100k+ Node Support**: Optimized with Barnes-Hut QuadTrees and viewport culling.
+- **Velocity LOD**: Dynamically simplifies rendering during rapid panning/zooming to maintain 60 FPS.
+- **Interactive**: Drag nodes, hover for details, and watch the camera automatically follow AI context.
 
-<p align="center">
-  <img src="docs/assets/visualizer-screenshot.png" alt="Arbor Visualizer" width="800" />
-  <br>
-  <em>The Logic Forest Visualizer rendering 27,676 nodes with bloom effects</em>
-</p>
+### ⚡ Performance
 
-### Health Check
-
-Verify your environment with a single command:
-
-<p align="center">
-  <img src="docs/assets/cli-health-check.png" alt="Arbor Health Check" width="500" />
-</p>
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Your IDE / AI Agent                      │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                │ WebSocket (Arbor Protocol)
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        Context Sidecar                           │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
-│  │   Protocol   │  │   Ranking    │  │      Discovery       │   │
-│  │   Handler    │  │   Engine     │  │      Engine          │   │
-│  └──────────────┘  └──────────────┘  └──────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                         Arbor Graph                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
-│  │    Nodes     │  │    Edges     │  │     Relationships    │   │
-│  │  (Entities)  │  │   (Links)    │  │    (Semantic)        │   │
-│  └──────────────┘  └──────────────┘  └──────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        Pulse Indexer                             │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
-│  │  Tree-sitter │  │    Watcher   │  │    Delta Sync        │   │
-│  │    Parser    │  │   (notify)   │  │    Engine            │   │
-│  └──────────────┘  └──────────────┘  └──────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        Your Codebase                             │
-│                     TypeScript • Rust • Python                   │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-## The Protocol
-
-The Arbor Protocol is a simple JSON-RPC interface over WebSocket. Here's what your AI agent can ask:
-
-```json
-// Find the architectural root for a concept
-{
-  "method": "discover",
-  "params": { "query": "user authentication" }
-}
-
-// Get the blast radius for a function
-{
-  "method": "impact",
-  "params": { "node": "UserService.validateToken" }
-}
-
-// Retrieve ranked context for a task
-{
-  "method": "context",
-  "params": { 
-    "task": "refactor the payment flow",
-    "maxTokens": 8000
-  }
-}
-```
-
-See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the full specification.
+- **Sub-100ms Incremental Sync**: Parsing happens in milliseconds.
+- **Binary Serialization**: Graph state uses efficient `bincode` encoding.
+- **Rust Core**: Built on the safety and speed of Rust.
 
 ## Supported Languages
 
-| Language   | Status | Parser          |
-|------------|--------|-----------------|
-| TypeScript | ✅     | tree-sitter-typescript |
-| JavaScript | ✅     | tree-sitter-typescript |
-| Rust       | ✅     | tree-sitter-rust |
-| Python     | ✅     | tree-sitter-python |
-| Go         | ✅     | tree-sitter-go |
-| Java       | ✅     | tree-sitter-java |
-| C          | ✅     | tree-sitter-c |
-| C++        | ✅     | tree-sitter-cpp |
-| Dart       | ✅     | tree-sitter-dart |
-
-Adding a new language? See our [language contribution guide](docs/ADDING_LANGUAGES.md).
+| Language   | Status | Parser Entity Coverage |
+|------------|--------|------------------------|
+| **Rust**       | ✅     | Functions, Structs, Impls, Traits, Macros |
+| **TypeScript** | ✅     | Classes, Interfaces, Types, Imports, JSX |
+| **JavaScript** | ✅     | Functions, Classes, Vars, Imports |
+| **Python**     | ✅     | Classes, Functions, Imports, Decorators |
+| **Go**         | ✅     | Structs, Interfaces, Funcs, Methods |
+| **Java**       | ✅     | Classes, Interfaces, Methods, Fields, Connectors |
+| **C**          | ✅     | Structs, Functions, Enums, Typedefs |
+| **C++**        | ✅     | Classes, Namespaces, Templates, Impls |
+| **C#**         | ✅     | Classes, Methods, Properties, Interfaces, Structs |
+| **Dart**       | ✅     | Classes, Mixins, Methods, Widgets |
 
 ## Project Structure
 
@@ -209,74 +133,54 @@ Adding a new language? See our [language contribution guide](docs/ADDING_LANGUAG
 arbor/
 ├── crates/                 # Rust workspace
 │   ├── arbor-core/         # AST parsing, Tree-sitter integration
-│   ├── arbor-graph/        # Graph schema, relationships, ranking
+│   ├── arbor-graph/        # Graph schema, Sled Store, Symbol Table
 │   ├── arbor-watcher/      # File watching, incremental sync
 │   ├── arbor-server/       # WebSocket server, protocol handler
+│   ├── arbor-mcp/          # Model Context Protocol bridge
 │   └── arbor-cli/          # Command-line interface
 ├── visualizer/             # Flutter desktop app
 │   ├── lib/
 │   │   ├── core/           # Theme, state management
-│   │   ├── graph/          # Force-directed layout
+│   │   ├── graph/          # Force-directed layout, LOD logic
 │   │   └── shaders/        # GLSL bloom/glow effects
 │   └── shaders/            # Raw GLSL files
 └── docs/                   # Extended documentation
 ```
 
-## Performance
-
-We obsess over speed because slow tools don't get used.
-
-| Metric | Target | Actual |
-|--------|--------|--------|
-| Initial index (10k files) | < 5s | ~2.3s |
-| Incremental update | < 100ms | ~15ms |
-| Query response | < 50ms | ~8ms |
-| Memory (100k LOC) | < 200MB | ~120MB |
-
-Benchmarks run on M1 MacBook Pro. Your mileage may vary, but not by much.
-
-## Contributing
-
-We love contributors. Whether you're fixing a typo, adding a language parser, or building something entirely new — you're welcome here.
-
-1. Read [CONTRIBUTING.md](CONTRIBUTING.md)
-2. Check the [good first issues](https://github.com/Anandb71/arbor/labels/good%20first%20issue)
-3. Join the discussion in [GitHub Discussions](https://github.com/Anandb71/arbor/discussions)
-
-## Roadmap
+## Roadmap (v1.0.0 Completed)
 
 - [x] **Phase 1**: Core indexer and CLI
-- [x] **Phase 2**: Logic Forest visualizer ✅
-- [x] **Phase 3**: VS Code extension ✅
-- [x] **Phase 4**: Agentic Bridge (MCP) ✅
-- [x] **Phase 5**: Linux ARM64/AMD64 + macOS ARM64 CI/CD ✅
-- [ ] **Phase 6**: Language server protocol support
+- [x] **Phase 2**: Logic Forest visualizer (LOD, Bloom)
+- [x] **Phase 3**: VS Code extension
+- [x] **Phase 4**: Agentic Bridge (MCP)
+- [x] **Phase 5**: Linux ARM64/AMD64 + macOS ARM64 CI/CD
+- [x] **Phase 6**: Language server protocol support
 - [x] **Phase 7**: Go and Java parser support
 - [x] **Phase 8**: C/C++ parser support
 - [x] **Phase 9**: Dart/Flutter parser support
-- [ ] **Phase 10**: The Brain Upgrade (CFG & Data Flow)
-- [ ] **Phase 11**: Expanded Support (C# Parser, Web-Based Visualizer)
+- [x] **Phase 10**: The Brain Upgrade (Control Flow & Data Flow)
+- [x] **Phase 11**: Expanded Support (C# Parser, Graph Persistence)
 
 ## Security
 
-Arbor is designed with security in mind:
+Arbor is designed with a **Local-First** security model:
 
-- **No data exfiltration**: All indexing happens locally; no code leaves your machine
-- **No API keys required**: Works entirely offline
-- **No telemetry**: Zero phone-home behavior
-- **Open source**: Full source code available for audit
+- **No data exfiltration**: All indexing and querying happens 100% locally. No code leaves your machine.
+- **No API keys required**: Works entirely offline.
+- **No telemetry**: Zero phone-home behavior.
+- **Open source**: Full source code available for audit.
 
 ## The Unified Nervous System
 
-Arbor v0.1.0 is **feature-complete**. The entire stack is now synchronized:
+Arbor v1.0.0 represents the complete "Nervous System" for your code:
 
 ```
      Claude asks about AuthController
            │
            ▼
     ┌─────────────────┐
-    │   Arbor Bridge  │  ← MCP Server (stdio)
-    │   (arbor-mcp)   │
+    │   Arbor Bridge  │  ← MCP Server (ArborQL)
+    │   (arbor-mcp)   │     "find_path(Auth, DB)"
     └────────┬────────┘
              │ trigger_spotlight()
              ▼
@@ -295,8 +199,6 @@ Arbor v0.1.0 is **feature-complete**. The entire stack is now synchronized:
 │ #FFD700 │    │ 600ms   │
 └─────────┘    └─────────┘
 ```
-
-**Experience:** Ask Claude, "How does auth work?" → Watch your IDE highlight the file → Watch the Visualizer fly to the node.
 
 ## CLI Commands
 

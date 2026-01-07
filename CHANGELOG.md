@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **World Edges (Cross-File Resolution)** - Implemented `SymbolTable` and FQN-based linking for robust cross-file references.
+- **Persistence Layer** - Integrated `sled` database for local graph storage (`GraphStore`).
+- **ArborQL (MCP)** - Added `find_path` tool for finding shortest paths between nodes.
 - **C# language support** - Methods, classes, interfaces, structs, constructors, properties
 - **Control Flow edges** - `FlowsTo` edge kind for CFG (Control Flow Graph) analysis
 - **Data Flow edges** - `DataDependency` edge kind for DFA (Data Flow Analysis)

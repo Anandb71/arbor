@@ -17,7 +17,7 @@ pub type NodeId = NodeIndex;
 ///
 /// This is the heart of Arbor. It stores all code entities as nodes
 /// and their relationships as edges, with indexes for fast access.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ArborGraph {
     /// The underlying petgraph graph.
     graph: DiGraph<CodeNode, Edge>,
@@ -262,6 +262,25 @@ impl ArborGraph {
     /// Iterates over all node indexes.
     pub fn node_indexes(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.graph.node_indices()
+    }
+
+    /// Finds the shortest path between two nodes.
+    pub fn find_path(&self, from: NodeId, to: NodeId) -> Option<Vec<&CodeNode>> {
+        let path_indices = petgraph::algo::astar(
+            &self.graph,
+            from,
+            |finish| finish == to,
+            |_| 1, // weight of 1 for all edges (BFS-like)
+            |_| 0, // heuristic
+        )?;
+
+        Some(
+            path_indices
+                .1
+                .into_iter()
+                .filter_map(|idx| self.graph.node_weight(idx))
+                .collect(),
+        )
     }
 
     /// Gets the node index for a string ID.

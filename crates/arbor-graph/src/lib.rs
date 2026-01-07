@@ -33,8 +33,13 @@ mod graph;
 mod query;
 mod ranking;
 
+pub mod store;
+pub mod symbol_table;
+
 pub use builder::GraphBuilder;
 pub use edge::{Edge, EdgeKind, GraphEdge};
-pub use graph::ArborGraph;
+pub use graph::{ArborGraph, NodeId};
 pub use query::{DependentInfo, ImpactResult, NodeInfo, QueryResult};
 pub use ranking::{compute_centrality, CentralityScores};
+pub use store::{GraphStore, StoreError};
+pub use symbol_table::SymbolTable;

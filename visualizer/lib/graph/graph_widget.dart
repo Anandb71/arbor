@@ -29,6 +29,7 @@ class _GraphWidgetState extends ConsumerState<GraphWidget>
   Offset _offset = Offset.zero;
   double _scale = 1.0;
   double _baseScale = 1.0;
+  double _interactionSpeed = 0.0;
   
   // Interaction
   String? _hoveredNodeId;
@@ -136,11 +137,20 @@ class _GraphWidgetState extends ConsumerState<GraphWidget>
                 // Viewport Pan & Zoom
                 _offset += details.focalPointDelta;
                 _scale = (_baseScale * details.scale).clamp(0.1, 5.0);
+                
+                // Calculate interaction speed for LOD
+                // We use the focal point movement as a proxy for speed.
+                // For pure zooming, we might want to consider scale delta too, 
+                // but usually zooming involves some focal shift or we can just rely on pan.
+                _interactionSpeed = details.focalPointDelta.distance;
               }
             });
           },
           onScaleEnd: (details) {
             _draggedNode = null;
+            setState(() {
+              _interactionSpeed = 0.0;
+            });
           },
           onTapUp: (details) => _handleTap(details, state),
           child: MouseRegion(
@@ -155,6 +165,7 @@ class _GraphWidgetState extends ConsumerState<GraphWidget>
                 offset: _offset,
                 scale: _scale,
                 isLowGpuMode: state.isLowGpuMode,
+                interactionSpeed: _interactionSpeed,
               ),
             ),
           ),
