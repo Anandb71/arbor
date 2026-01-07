@@ -64,3 +64,6 @@ arbor-windows-*/
 node_modules/
 extensions/*/node_modules/
 *.vsix
+
+# Personal Release Guides
+v1_release_checklist.md
