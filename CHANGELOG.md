@@ -5,6 +5,29 @@ All notable changes to Arbor will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-01-07
+
+### Added
+
+- **C# language support** - Methods, classes, interfaces, structs, constructors, properties
+- **Control Flow edges** - `FlowsTo` edge kind for CFG (Control Flow Graph) analysis
+- **Data Flow edges** - `DataDependency` edge kind for DFA (Data Flow Analysis)
+- **Barnes-Hut QuadTree** - O(n log n) force simulation for visualizer scalability
+- **Viewport culling** - Only render visible nodes/edges for 100k+ node support
+- **LOD rendering** - Simplified node rendering at low zoom levels
+- **Headless mode** - `--headless` CLI flag for remote/Docker/WSL deployment
+- **Binary serialization** - `bincode` dependency for future binary wire protocol
+
+### Changed
+
+- Consolidated language parsers into query-based `parser_v2.rs`
+- Upgraded supported languages to 10 (TypeScript, JavaScript, Rust, Python, Go, Java, C, C++, Dart, C#)
+- Improved graph rendering performance for large codebases
+
+### Fixed
+
+- None
+
 ## [0.1.1] - 2026-01-06
 
 ### Added

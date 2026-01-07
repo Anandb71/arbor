@@ -60,6 +60,10 @@ enum Commands {
         #[arg(short, long, default_value = "7432")]
         port: u16,
 
+        /// Headless mode: bind to 0.0.0.0 for remote access (WSL/Docker/Server)
+        #[arg(long)]
+        headless: bool,
+
         /// Path to index (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -125,7 +129,11 @@ async fn main() {
         Commands::Init { path } => commands::init(&path),
         Commands::Index { path, output } => commands::index(&path, output.as_deref()),
         Commands::Query { query, limit } => commands::query(&query, limit),
-        Commands::Serve { port, path } => commands::serve(port, &path).await,
+        Commands::Serve {
+            port,
+            headless,
+            path,
+        } => commands::serve(port, headless, &path).await,
         Commands::Export { output, path } => commands::export(&path, &output),
         Commands::Status { path } => commands::status(&path),
         Commands::Viz { path } => commands::viz(&path).await,

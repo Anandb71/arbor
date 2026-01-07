@@ -129,8 +129,14 @@ pub fn query(query: &str, limit: usize) -> Result<()> {
 }
 
 /// Start the Arbor server.
-pub async fn serve(port: u16, path: &Path) -> Result<()> {
-    println!("{}", "Starting Arbor server...".cyan());
+pub async fn serve(port: u16, headless: bool, path: &Path) -> Result<()> {
+    let bind_addr = if headless { "0.0.0.0" } else { "127.0.0.1" };
+
+    if headless {
+        println!("{}", "Starting Arbor server in headless mode...".cyan());
+    } else {
+        println!("{}", "Starting Arbor server...".cyan());
+    }
 
     // Index the codebase first
     let result = index_directory(path)?;
@@ -147,11 +153,14 @@ pub async fn serve(port: u16, path: &Path) -> Result<()> {
         result.nodes_extracted
     );
 
-    let addr = format!("127.0.0.1:{}", port).parse()?;
+    let addr = format!("{}:{}", bind_addr, port).parse()?;
     let config = ServerConfig { addr };
     let server = ArborServer::new(graph, config);
 
-    println!("{} Listening on ws://127.0.0.1:{}", "✓".green(), port);
+    println!("{} Listening on ws://{}:{}", "✓".green(), bind_addr, port);
+    if headless {
+        println!("  Headless mode: accepting connections from any host");
+    }
     println!("  Press {} to stop", "Ctrl+C".cyan());
 
     server.run().await.map_err(|e| e.to_string())?;

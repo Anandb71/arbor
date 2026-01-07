@@ -9,9 +9,29 @@ use tree_sitter::{Language, Node, Tree};
 
 pub struct DartParser;
 
+/// ABI Compatibility Shim for tree-sitter-dart
+///
+/// # Safety
+/// `tree-sitter-dart` v0.0.4 is built against tree-sitter 0.20 ABI, while
+/// Arbor uses tree-sitter 0.22. The ABI is compatible for our use case
+/// (parsing and node traversal), but the Rust types differ.
+///
+/// This transmute is safe because:
+/// 1. Both ABIs use the same C representation for TSLanguage
+/// 2. We only use the language for parsing/tree traversal (no query syntax)
+/// 3. This shim is isolated for easy removal when tree-sitter-dart updates
+///
+/// TODO: Remove this when tree-sitter-dart releases a 0.22+ compatible version.
+#[inline]
+fn dart_language_compat() -> Language {
+    // SAFETY: See module-level documentation above
+    unsafe { std::mem::transmute(tree_sitter_dart::language()) }
+}
+
 impl LanguageParser for DartParser {
     fn language(&self) -> Language {
-        unsafe { std::mem::transmute(tree_sitter_dart::language()) }
+        // Use the ABI compatibility shim for tree-sitter-dart 0.0.4
+        dart_language_compat()
     }
 
     fn extensions(&self) -> &[&str] {

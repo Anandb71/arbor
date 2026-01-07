@@ -254,6 +254,8 @@ We love contributors. Whether you're fixing a typo, adding a language parser, or
 - [x] **Phase 7**: Go and Java parser support
 - [x] **Phase 8**: C/C++ parser support
 - [x] **Phase 9**: Dart/Flutter parser support
+- [ ] **Phase 10**: The Brain Upgrade (CFG & Data Flow)
+- [ ] **Phase 11**: Expanded Support (C# Parser, Web-Based Visualizer)
 
 ## Security
 

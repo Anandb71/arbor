@@ -30,6 +30,14 @@ pub enum EdgeKind {
 
     /// Container relationship (class contains method).
     Contains,
+
+    /// Control flow: statement A flows to statement B.
+    /// Used for CFG (Control Flow Graph) edges.
+    FlowsTo,
+
+    /// Data dependency: variable use depends on definition.
+    /// Used for DFA (Data Flow Analysis) edges.
+    DataDependency,
 }
 
 impl std::fmt::Display for EdgeKind {
@@ -42,6 +50,8 @@ impl std::fmt::Display for EdgeKind {
             Self::UsesType => "uses_type",
             Self::References => "references",
             Self::Contains => "contains",
+            Self::FlowsTo => "flows_to",
+            Self::DataDependency => "data_dependency",
         };
         write!(f, "{}", s)
     }

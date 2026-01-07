@@ -1,5 +1,6 @@
 import 'dart:math';
 import '../core/providers.dart';
+import 'quad_tree.dart';
 
 /// Force-directed layout algorithm with file-based clustering.
 ///
@@ -56,35 +57,14 @@ class ForceLayout {
       }
     });
 
-    // 3. Repulsion (Nodes push apart)
-    // Optimization: Spatial hashing or Quadtree could be used here for O(N log N)
-    // For < 1000 nodes, O(N^2) is acceptable on desktop
-    for (var i = 0; i < nodes.length; i++) {
-        final a = nodes[i];
-      for (var j = i + 1; j < nodes.length; j++) {
-        final b = nodes[j];
-
-        var dx = a.x - b.x;
-        var dy = a.y - b.y;
-        var distSq = dx * dx + dy * dy;
-
-        // Prevent division by zero and extreme forces
-        if (distSq < 1) {
-            dx = (Random().nextDouble() - 0.5);
-            dy = (Random().nextDouble() - 0.5);
-            distSq = 1;
-        }
-
-        final force = repulsion / distSq;
-        final dist = sqrt(distSq);
-        final fx = (dx / dist) * force;
-        final fy = (dy / dist) * force;
-
-        a.vx += fx * dt;
-        a.vy += fy * dt;
-        b.vx -= fx * dt;
-        b.vy -= fy * dt;
-      }
+    // 3. Repulsion using Barnes-Hut approximation (O(n log n))
+    // Build QuadTree for spatial partitioning
+    final quadTree = QuadTree.build(nodes);
+    
+    for (final node in nodes) {
+      final (fx, fy) = quadTree.calculateForce(node, repulsion);
+      node.vx += fx * dt;
+      node.vy += fy * dt;
     }
 
     // 4. Edge Attraction (Springs)

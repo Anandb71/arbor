@@ -21,4 +21,5 @@ futures-util = "0.3"
 uuid = { version = "1.0", features = ["v4"] }
 chrono = "0.4"
 notify = "6.1"
+bincode = "1.3"
 
