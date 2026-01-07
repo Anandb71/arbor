@@ -30,21 +30,44 @@ class GraphPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     // Build node map for edge drawing
     final nodeMap = {for (var n in nodes) n.id: n};
+    
+    // Viewport culling bounds (with margin for nodes near edges)
+    const cullMargin = 100.0;
+    final cullRect = Rect.fromLTWH(
+      -cullMargin, 
+      -cullMargin, 
+      size.width + cullMargin * 2, 
+      size.height + cullMargin * 2,
+    );
+    
+    // Filter visible nodes for LOD/culling
+    final visibleNodes = nodes.where((node) {
+      final pos = _transformPoint(node.x, node.y);
+      return cullRect.contains(pos);
+    }).toList();
+    
+    // Create set of visible node IDs for edge culling
+    final visibleNodeIds = visibleNodes.map((n) => n.id).toSet();
 
-    // Draw edges first (below nodes)
-    _drawEdges(canvas, nodeMap, size);
+    // Draw edges first (below nodes) - only for visible nodes
+    _drawEdges(canvas, nodeMap, size, visibleNodeIds);
 
-    // Draw nodes
-    for (final node in nodes) {
-      _drawNode(canvas, node);
+    // Draw nodes with LOD based on scale
+    for (final node in visibleNodes) {
+      _drawNode(canvas, node, size);
     }
   }
 
-  void _drawEdges(Canvas canvas, Map<String, GraphNode> nodeMap, Size size) {
+  void _drawEdges(Canvas canvas, Map<String, GraphNode> nodeMap, Size size, Set<String> visibleNodeIds) {
     final screenCenter = size.center(Offset.zero);
     final maxDist = size.shortestSide * 0.8;
 
     for (final edge in edges) {
+      // Edge culling: skip if neither endpoint is visible
+      if (!visibleNodeIds.contains(edge.source) && !visibleNodeIds.contains(edge.target)) {
+        continue;
+      }
+      
       final from = nodeMap[edge.source];
       final to = nodeMap[edge.target];
       if (from == null || to == null) continue;
@@ -104,7 +127,7 @@ class GraphPainter extends CustomPainter {
     canvas.drawPath(path, paint..style = PaintingStyle.fill);
   }
 
-  void _drawNode(Canvas canvas, GraphNode node) {
+  void _drawNode(Canvas canvas, GraphNode node, Size size) {
     final center = _transformPoint(node.x, node.y);
     final isSelected = node.id == selectedNodeId;
     final isHovered = node.id == hoveredNodeId;
@@ -112,8 +135,18 @@ class GraphPainter extends CustomPainter {
     // Size based on centrality (more important = bigger)
     final baseRadius = 8 + node.centrality * 16;
     final radius = isHovered ? baseRadius * 1.2 : baseRadius;
+    
+    // LOD: Skip fancy effects for very small nodes at low zoom
+    final isLOD = scale < 0.3 && radius * scale < 4;
 
     final color = ArborTheme.colorForKind(node.kind);
+    
+    // Ultra-simplified rendering for LOD mode
+    if (isLOD && !isSelected && !isHovered) {
+      final simplePaint = Paint()..color = color;
+      canvas.drawCircle(center, max(2, radius * 0.5), simplePaint);
+      return;
+    }
 
     // Cinematic Bloom (Persistent for important nodes) - Disable in Low GPU Mode
     if (!isLowGpuMode && node.centrality > 0.3) {
