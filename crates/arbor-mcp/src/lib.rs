@@ -168,11 +168,12 @@ impl McpServer {
                 },
                 {
                     "name": "analyze_impact",
-                    "description": "Analyzes the impact (blast radius) of changing a specific node.",
+                    "description": "Analyzes the impact (blast radius) of changing a node. Returns structured data with upstream/downstream affected nodes.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "node_id": { "type": "string", "description": "ID or name of the node to analyze" }
+                            "node_id": { "type": "string", "description": "ID or name of the node to analyze" },
+                            "max_depth": { "type": "integer", "description": "Maximum hop distance (default: 5, 0 = unlimited)", "default": 5 }
                         },
                         "required": ["node_id"]
                     }
@@ -231,18 +232,87 @@ impl McpServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
+                let max_depth = arguments
+                    .get("max_depth")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(5) as usize;
+
                 // Trigger Spotlight
                 self.trigger_spotlight(node_id).await;
 
-                let context = self.generate_context(node_id).await;
-                Ok(json!({
-                    "content": [
-                        {
+                let graph = self.graph.read().await;
+
+                // Resolve node by name or ID
+                let node_index = graph.get_index(node_id).or_else(|| {
+                    graph
+                        .find_by_name(node_id)
+                        .first()
+                        .and_then(|n| graph.get_index(&n.id))
+                });
+
+                match node_index {
+                    Some(idx) => {
+                        let analysis = graph.analyze_impact(idx, max_depth);
+
+                        // Build structured response
+                        let upstream: Vec<Value> = analysis
+                            .upstream
+                            .iter()
+                            .map(|n| {
+                                json!({
+                                    "id": n.node_info.id,
+                                    "name": n.node_info.name,
+                                    "kind": n.node_info.kind,
+                                    "file": n.node_info.file,
+                                    "severity": n.severity.as_str(),
+                                    "hop_distance": n.hop_distance,
+                                    "entry_edge": n.entry_edge.to_string()
+                                })
+                            })
+                            .collect();
+
+                        let downstream: Vec<Value> = analysis
+                            .downstream
+                            .iter()
+                            .map(|n| {
+                                json!({
+                                    "id": n.node_info.id,
+                                    "name": n.node_info.name,
+                                    "kind": n.node_info.kind,
+                                    "file": n.node_info.file,
+                                    "severity": n.severity.as_str(),
+                                    "hop_distance": n.hop_distance,
+                                    "entry_edge": n.entry_edge.to_string()
+                                })
+                            })
+                            .collect();
+
+                        Ok(json!({
+                            "content": [{
+                                "type": "text",
+                                "text": serde_json::to_string_pretty(&json!({
+                                    "target": {
+                                        "id": analysis.target.id,
+                                        "name": analysis.target.name,
+                                        "kind": analysis.target.kind,
+                                        "file": analysis.target.file
+                                    },
+                                    "upstream": upstream,
+                                    "downstream": downstream,
+                                    "total_affected": analysis.total_affected,
+                                    "max_depth": analysis.max_depth,
+                                    "query_time_ms": analysis.query_time_ms
+                                })).unwrap_or_default()
+                            }]
+                        }))
+                    }
+                    None => Ok(json!({
+                        "content": [{
                             "type": "text",
-                            "text": format!("Impact analysis for {}:\n\n{}", node_id, context)
-                        }
-                    ]
-                }))
+                            "text": format!("Node '{}' not found in graph", node_id)
+                        }]
+                    })),
+                }
             }
             "find_path" => {
                 let start_node = arguments
