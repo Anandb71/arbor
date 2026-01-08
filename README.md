@@ -30,15 +30,17 @@
 
 ---
 
+> **If you've ever asked an AI to refactor code and it confidently broke half your system, Arbor is why that keeps happening — and how to fix it.**
+
 ## Why Arbor?
 
-> **The Vector RAG Problem:** Most AI coding assistants treat your codebase like a bag of text. They embed chunks into vectors and hope similarity search finds the right context. The result? Hallucinated connections, missing dependencies, and refactors that break everything downstream.
+**The Vector RAG Problem:** Most AI coding assistants treat your codebase like a bag of text. They embed chunks into vectors and hope similarity search finds the right context. The result? Hallucinated connections, missing dependencies, and refactors that break everything downstream.
 
-**Arbor thinks differently.**
+**Arbor is the ground truth layer between code and AI.**
 
 We parse your code into an Abstract Syntax Tree using [Tree-sitter](https://tree-sitter.github.io/), then build a living graph where every function, class, and variable is a **node**, and every import, call, and implementation is an **edge**. When an AI asks "where is authentication handled?", Arbor doesn't grep for "auth" — it traces the call graph to find the actual service that initiates the flow.
 
-```
+```text
 Traditional RAG:         Arbor:
                          
 "auth" → 47 results      "auth" → AuthController
@@ -88,7 +90,9 @@ Arbor enables Claude and other LLMs to "walk" your code graph. Using the Model C
 
 ### 🔗 World Edges (Cross-File Resolution)
 
-Arbor understands that code doesn't live in isolation. It resolves **imports**, **calls**, and **inheritances** across file boundaries using a Global Symbol Table. It knows that `User` in `auth.ts` is the same as `User` imported in `profile.ts`.
+Arbor understands that code doesn't live in isolation. It resolves **imports**, **calls**, and **inheritances** across file boundaries using a Global Symbol Table.
+
+**Concrete example:** When you import `User` in `profile.ts`, Arbor knows it's the same `User` class defined in `auth.ts`. If you rename `User.email` → `User.emailAddress`, Arbor can tell you which 7 files in `services/` will break — before you run the tests.
 
 ### 💾 Incremental Persistence
 
@@ -97,14 +101,14 @@ Powered by **Sled**, Arbor's graph persistence layer is atomicity-compliant and 
 - **Granular Updates**: Only "dirty" nodes are re-written to disk. Saving a file in a 100k LOC repo triggers minimal I/O.
 - **Instant Load**: The graph state loads instantly on startup, no re-indexing required.
 
-### 🌲 Logic Forest Visualizer 2.0
+### 🌲 Logic Forest Visualizer (Debugging & Trust)
 
-The Flutter-based desktop app renders your codebase as a stunning Force-Directed Graph.
+The visualizer exists to make AI reasoning **inspectable**. Every node an LLM touches can be seen, traced, and verified by a human.
 
-- **Cinematic Rendering**: Bloom, glow, and depth effects.
-- **100k+ Node Support**: Optimized with Barnes-Hut QuadTrees and viewport culling.
-- **Velocity LOD**: Dynamically simplifies rendering during rapid panning/zooming to maintain 60 FPS.
-- **Interactive**: Drag nodes, hover for details, and watch the camera automatically follow AI context.
+- **Force-Directed Graph**: 100k+ nodes with Barnes-Hut QuadTree optimization
+- **AI Spotlight**: Camera follows the node an AI agent is currently examining
+- **Impact Highlights**: See which nodes "vibrate" when you preview a change
+- **Interactive**: Drag nodes, hover for details, filter by file/type
 
 ![Arbor Visualizer](docs/assets/visualizer-screenshot.png)
 
