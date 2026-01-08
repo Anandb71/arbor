@@ -8,7 +8,7 @@
 
 - Context size reduced by 60%+ vs naive file RAG
 - Zero unrelated files injected into LLM context
-- Impact analysis correctly predicts 90%+ of downstream breaks
+- High-precision detection of graph-reachable downstream breaks
 
 ---
 
@@ -20,6 +20,19 @@ Arbor guarantees:
 - ✅ **No unrelated files** are injected into prompts
 - ✅ Every dependency is **traceable and inspectable**
 - ✅ All commands support `--why` for auditability
+
+---
+
+## Non-Goals
+
+Arbor does **not** aim to:
+
+- ❌ Generate code (that's the LLM's job)
+- ❌ Replace your IDE
+- ❌ Guess runtime behavior or dynamic dispatch
+- ❌ Provide fuzzy "maybe related" results
+
+Arbor exists to provide **correct structure**, not creativity.
 
 ---
 

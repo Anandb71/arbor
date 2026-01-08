@@ -189,6 +189,20 @@ Arbor is designed with a **Local-First** security model:
 - **No telemetry**: Zero phone-home behavior.
 - **Open source**: Full source code available for audit.
 
+## Who Arbor Is For
+
+**Arbor is for:**
+
+- Large or long-lived codebases
+- AI-assisted refactoring where correctness matters
+- Engineers who value precision over convenience
+
+**Arbor is not for:**
+
+- Small scripts or throwaway code
+- Prompt-only workflows without code context
+- People who just want autocomplete
+
 ## The Unified Nervous System
 
 Arbor v1.0.0 represents the complete "Nervous System" for your code:
