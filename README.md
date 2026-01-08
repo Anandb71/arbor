@@ -171,14 +171,27 @@ arbor/
 - [x] **Phase 10**: The Brain Upgrade (Control Flow & Data Flow)
 - [x] **Phase 11**: Expanded Support (C# Parser, Graph Persistence)
 
-### Coming in v1.1.0 "The Sentinel Update"
+### v1.1.0 "The Sentinel Update" ✅
 
-*Theme: "Predict breakage + give AI only the logic it needs"*
+> **Predict breakage. Give AI only the logic it needs.**
 
-- [ ] **Impact Radius Simulator**: `arbor refactor` with blast radius preview + `--why` flag
-- [ ] **Dynamic Context Slicing**: Token-bounded LLM context with node pinning
-- [ ] **Opinionated Workflows**: `arbor refactor` and `arbor explain` commands
-- [ ] **Docker + Cross-Platform**: One-command install on any platform
+- [x] **Impact Radius Simulator**: Bidirectional BFS blast radius analysis
+- [x] **Dynamic Context Slicing**: Token-bounded LLM context with pinning
+- [x] **CLI: `arbor refactor`** with `--why` and `--json` flags
+- [x] **CLI: `arbor explain`** for graph-backed code explanation
+
+```bash
+$ arbor refactor validate --why
+
+⚠️  Blast Radius
+Target: validate (Function)
+
+Total: 12 nodes (direct: 4, transitive: 6, distant: 2)
+
+Direct (1 hop):
+  • TokenMiddleware (Class) — Calls validate
+  • AuthController (Class) — Calls validate
+```
 
 📖 **Full roadmap**: [docs/ROADMAP.md](docs/ROADMAP.md)
 
