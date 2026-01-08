@@ -1,18 +1,35 @@
 # Changelog
 
-## [Unreleased] - v1.1.0 "The Sentinel Update"
+## [1.1.0] - 2026-01-08 "The Sentinel Update"
 
-### Planned
+> **Predict breakage. Give AI only the logic it needs.**
 
-- **Impact Radius Simulator**: Predict affected nodes before making changes
-- **Dynamic Context Slicing**: Token-optimized code retrieval for LLMs
-- **Shadow Indexing**: Structural git diffs (AST-level comparisons)
-- **Technical Debt Heatmaps**: Cyclomatic complexity overlays in visualizer
-- **Arbor Relay**: Real-time collaborative graph sessions
-- **Docker Distribution**: `docker pull ghcr.io/anandb71/arbor`
-- **What-If Sandbox**: Simulate refactors without file changes
-- **LSP Integration**: IDE hover/codelens for graph context
-- **Cross-Platform Binaries**: macOS (Intel + Apple Silicon), Linux (x64 + ARM64) via GitHub Actions
+### Added
+
+- **Impact Radius Simulator** (`impact.rs`) — Bidirectional BFS to predict all affected nodes before refactoring
+  - Severity classification: direct (1 hop), transitive (2-3), distant (4+)
+  - Entry edge tracking for explainability
+  - Stable ordering for reproducible output
+  - 8 unit tests including cycle detection
+- **Dynamic Context Slicing** (`slice.rs`) — Token-bounded context extraction for LLM prompts
+  - Pinning support for critical nodes
+  - Explicit truncation reasons (budget vs depth)
+  - 6 unit tests
+- **MCP `analyze_impact` Tool** — Structured JSON output for AI agents
+  - Input: `{ "node_id": "...", "max_depth": 5 }`
+  - Returns: target, upstream, downstream, severity, hop_distance, entry_edge
+- **CLI: `arbor refactor <target>`** — Preview blast radius before making changes
+  - `--why` flag shows reasoning for each affected node
+  - `--json` flag for scripting and CI integration
+  - `--depth N` controls search depth
+- **CLI: `arbor explain <target>`** — Graph-backed context for code explanations
+  - `--why` flag shows path traced
+  - `--json` flag for structured output
+  - `--tokens N` controls context budget
+
+### Changed
+
+- MCP `analyze_impact` now uses real graph traversal (was placeholder)
 
 ---
 
