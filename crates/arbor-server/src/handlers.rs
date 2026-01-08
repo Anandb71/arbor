@@ -240,7 +240,16 @@ pub async fn handle_node_get(
 
     match g.get_by_id(&params.id) {
         Some(node) => {
-            let idx = g.get_index(&node.id).unwrap();
+            let idx = match g.get_index(&node.id) {
+                Some(i) => i,
+                None => {
+                    return Response::error(
+                        id,
+                        -32603,
+                        format!("Internal error: Node index not found for {}", node.id),
+                    );
+                }
+            };
             let callers: Vec<_> = g.get_callers(idx).iter().map(|n| &n.id).collect();
             let callees: Vec<_> = g.get_callees(idx).iter().map(|n| &n.id).collect();
 
