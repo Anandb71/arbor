@@ -108,6 +108,42 @@ enum Commands {
     /// Check system health and environment
     #[command(hide = true)]
     CheckHealth,
+
+    /// Preview blast radius before refactoring a node
+    Refactor {
+        /// The node to analyze (function name, class name, or qualified path)
+        target: String,
+
+        /// Maximum depth to search (default: 5)
+        #[arg(short, long, default_value = "5")]
+        depth: usize,
+
+        /// Show detailed reasoning for each affected node
+        #[arg(long)]
+        why: bool,
+
+        /// Output as JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Explain code using graph-backed context
+    Explain {
+        /// The question or code path to explain
+        question: String,
+
+        /// Maximum tokens for context (default: 4000)
+        #[arg(short, long, default_value = "4000")]
+        tokens: usize,
+
+        /// Show detailed reasoning for context selection
+        #[arg(long)]
+        why: bool,
+
+        /// Output as JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -139,6 +175,18 @@ async fn main() {
         Commands::Viz { path } => commands::viz(&path).await,
         Commands::Bridge { path, viz } => commands::bridge(&path, viz).await,
         Commands::CheckHealth => commands::check_health().await,
+        Commands::Refactor {
+            target,
+            depth,
+            why,
+            json,
+        } => commands::refactor(&target, depth, why, json),
+        Commands::Explain {
+            question,
+            tokens,
+            why,
+            json,
+        } => commands::explain(&question, tokens, why, json),
     };
 
     if let Err(e) = result {

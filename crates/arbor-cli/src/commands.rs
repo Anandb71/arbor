@@ -506,3 +506,229 @@ pub async fn check_health() -> Result<()> {
 
     Ok(())
 }
+
+/// Preview blast radius before refactoring a node.
+pub fn refactor(target: &str, max_depth: usize, show_why: bool, json_output: bool) -> Result<()> {
+    // Load the graph by indexing current directory
+    let path = std::env::current_dir()?;
+    let result = index_directory(&path)?;
+    let graph = result.graph;
+
+    // Find the target node
+    let node_idx = graph.get_index(target).or_else(|| {
+        graph
+            .find_by_name(target)
+            .first()
+            .and_then(|n| graph.get_index(&n.id))
+    });
+
+    let node_idx = match node_idx {
+        Some(idx) => idx,
+        None => {
+            return Err(format!("Node '{}' not found in graph", target).into());
+        }
+    };
+
+    // Run impact analysis
+    let analysis = graph.analyze_impact(node_idx, max_depth);
+
+    if json_output {
+        // JSON output
+        let output = serde_json::json!({
+            "target": {
+                "id": analysis.target.id,
+                "name": analysis.target.name,
+                "kind": analysis.target.kind,
+                "file": analysis.target.file
+            },
+            "upstream": analysis.upstream.iter().map(|n| serde_json::json!({
+                "id": n.node_info.id,
+                "name": n.node_info.name,
+                "severity": n.severity.as_str(),
+                "hop_distance": n.hop_distance,
+                "entry_edge": n.entry_edge.to_string()
+            })).collect::<Vec<_>>(),
+            "downstream": analysis.downstream.iter().map(|n| serde_json::json!({
+                "id": n.node_info.id,
+                "name": n.node_info.name,
+                "severity": n.severity.as_str(),
+                "hop_distance": n.hop_distance,
+                "entry_edge": n.entry_edge.to_string()
+            })).collect::<Vec<_>>(),
+            "total_affected": analysis.total_affected,
+            "query_time_ms": analysis.query_time_ms
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        // Human-readable output
+        println!("{}", "⚠️  Blast Radius".yellow().bold());
+        println!(
+            "Target: {} ({})",
+            analysis.target.name.cyan(),
+            analysis.target.kind
+        );
+        println!();
+
+        // Count by severity
+        let direct: Vec<_> = analysis
+            .all_affected()
+            .into_iter()
+            .filter(|n| n.severity == arbor_graph::ImpactSeverity::Direct)
+            .collect();
+        let transitive: Vec<_> = analysis
+            .all_affected()
+            .into_iter()
+            .filter(|n| n.severity == arbor_graph::ImpactSeverity::Transitive)
+            .collect();
+        let distant: Vec<_> = analysis
+            .all_affected()
+            .into_iter()
+            .filter(|n| n.severity == arbor_graph::ImpactSeverity::Distant)
+            .collect();
+
+        println!(
+            "Total: {} nodes (direct: {}, transitive: {}, distant: {})",
+            analysis.total_affected.to_string().bold(),
+            direct.len().to_string().red(),
+            transitive.len().to_string().yellow(),
+            distant.len().to_string().dimmed()
+        );
+        println!();
+
+        if !direct.is_empty() {
+            println!("{}", "Direct (1 hop):".red());
+            for node in direct.iter().take(10) {
+                print!("  • {} ({})", node.node_info.name, node.node_info.kind);
+                if show_why {
+                    print!(
+                        " — {} {}",
+                        node.entry_edge.to_string().dimmed(),
+                        analysis.target.name
+                    );
+                }
+                println!();
+            }
+            if direct.len() > 10 {
+                println!("  ... and {} more", direct.len() - 10);
+            }
+            println!();
+        }
+
+        if !transitive.is_empty() {
+            println!("{}", "Transitive (2-3 hops):".yellow());
+            for node in transitive.iter().take(5) {
+                print!("  • {}", node.node_info.name);
+                if show_why {
+                    print!(
+                        " — {} hops via {}",
+                        node.hop_distance,
+                        node.entry_edge.to_string().dimmed()
+                    );
+                }
+                println!();
+            }
+            if transitive.len() > 5 {
+                println!("  ... and {} more", transitive.len() - 5);
+            }
+            println!();
+        }
+
+        if !distant.is_empty() {
+            println!("{}", "Distant (4+ hops):".dimmed());
+            println!("  {} nodes at depth 4+", distant.len());
+        }
+
+        println!();
+        println!("Query time: {}ms", analysis.query_time_ms);
+    }
+
+    Ok(())
+}
+
+/// Explain code using graph-backed context.
+pub fn explain(question: &str, max_tokens: usize, show_why: bool, json_output: bool) -> Result<()> {
+    // Load the graph by indexing current directory
+    let path = std::env::current_dir()?;
+    let result = index_directory(&path)?;
+    let graph = result.graph;
+
+    // Try to find a node matching the question (could be a function name)
+    let node_idx = graph.get_index(question).or_else(|| {
+        graph
+            .find_by_name(question)
+            .first()
+            .and_then(|n| graph.get_index(&n.id))
+    });
+
+    let node_idx = match node_idx {
+        Some(idx) => idx,
+        None => {
+            return Err(format!("Node '{}' not found in graph", question).into());
+        }
+    };
+
+    // Slice context around the node
+    let slice = graph.slice_context(node_idx, max_tokens, 2, &[]);
+
+    if json_output {
+        let output = serde_json::json!({
+            "target": {
+                "id": slice.target.id,
+                "name": slice.target.name,
+                "kind": slice.target.kind,
+                "file": slice.target.file
+            },
+            "context_nodes": slice.nodes.iter().map(|n| serde_json::json!({
+                "id": n.node_info.id,
+                "name": n.node_info.name,
+                "kind": n.node_info.kind,
+                "file": n.node_info.file,
+                "depth": n.depth,
+                "token_estimate": n.token_estimate,
+                "pinned": n.pinned
+            })).collect::<Vec<_>>(),
+            "total_tokens": slice.total_tokens,
+            "max_tokens": slice.max_tokens,
+            "truncation_reason": slice.truncation_reason.to_string()
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("{}", "📖 Graph-Backed Context".cyan().bold());
+        println!(
+            "Target: {} ({})",
+            slice.target.name.cyan(),
+            slice.target.kind
+        );
+        println!();
+
+        println!("{}", slice.summary());
+        println!();
+
+        if show_why {
+            println!("{}", "Path traced:".dimmed());
+            for node in slice.nodes.iter().take(10) {
+                let pinned_marker = if node.pinned { " [pinned]" } else { "" };
+                println!(
+                    "  {} {} ({}) — ~{} tokens{}",
+                    "→".dimmed(),
+                    node.node_info.name,
+                    node.node_info.kind,
+                    node.token_estimate,
+                    pinned_marker.cyan()
+                );
+            }
+            if slice.nodes.len() > 10 {
+                println!("  ... and {} more nodes", slice.nodes.len() - 10);
+            }
+            println!();
+        }
+
+        println!(
+            "Truncation: {} | Query time: {}ms",
+            slice.truncation_reason.to_string().yellow(),
+            slice.query_time_ms
+        );
+    }
+
+    Ok(())
+}
