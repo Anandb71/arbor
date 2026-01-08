@@ -30,6 +30,7 @@
 mod builder;
 mod edge;
 mod graph;
+mod impact;
 mod query;
 mod ranking;
 
@@ -39,6 +40,7 @@ pub mod symbol_table;
 pub use builder::GraphBuilder;
 pub use edge::{Edge, EdgeKind, GraphEdge};
 pub use graph::{ArborGraph, NodeId};
+pub use impact::{AffectedNode, ImpactAnalysis, ImpactDirection, ImpactSeverity};
 pub use query::{DependentInfo, ImpactResult, NodeInfo, QueryResult};
 pub use ranking::{compute_centrality, CentralityScores};
 pub use store::{GraphStore, StoreError};

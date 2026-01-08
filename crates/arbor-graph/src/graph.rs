@@ -20,7 +20,7 @@ pub type NodeId = NodeIndex;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ArborGraph {
     /// The underlying petgraph graph.
-    graph: DiGraph<CodeNode, Edge>,
+    pub(crate) graph: DiGraph<CodeNode, Edge>,
 
     /// Maps string IDs to graph node indexes.
     id_index: HashMap<String, NodeId>,
