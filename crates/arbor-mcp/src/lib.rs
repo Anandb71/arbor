@@ -260,13 +260,13 @@ impl McpServer {
                     graph
                         .find_by_name(start_node)
                         .first()
-                        .map(|n| graph.get_index(&n.id).unwrap())
+                        .and_then(|n| graph.get_index(&n.id))
                 });
                 let end_idx = graph.get_index(end_node).or_else(|| {
                     graph
                         .find_by_name(end_node)
                         .first()
-                        .map(|n| graph.get_index(&n.id).unwrap())
+                        .and_then(|n| graph.get_index(&n.id))
                 });
 
                 match (start_idx, end_idx) {
