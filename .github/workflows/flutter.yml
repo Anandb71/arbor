@@ -13,25 +13,25 @@ on:
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Setup Flutter
       uses: subosito/flutter-action@v2
       with:
         flutter-version: '3.16.0'
         channel: 'stable'
-    
+
     - name: Get dependencies
       working-directory: ./visualizer
       run: flutter pub get
-    
+
     - name: Analyze code
       working-directory: ./visualizer
       run: flutter analyze
       continue-on-error: true
-    
+
     - name: Run tests
       working-directory: ./visualizer
       run: flutter test
@@ -39,11 +39,20 @@ jobs:
 
   build:
     needs: analyze
-    runs-on: windows-latest
-    
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: macos-latest
+            platform: macos
+
+    runs-on: ${{ matrix.os }}
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Setup Flutter
       uses: subosito/flutter-action@v2
       with:
@@ -53,7 +62,7 @@ jobs:
     - name: Get dependencies
       working-directory: ./visualizer
       run: flutter pub get
-    
-    - name: Build Windows
+
+    - name: Build ${{ matrix.platform }}
       working-directory: ./visualizer
-      run: flutter build windows
+      run: flutter build ${{ matrix.platform }}

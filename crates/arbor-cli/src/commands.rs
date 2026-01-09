@@ -229,10 +229,21 @@ pub async fn viz(path: &Path) -> Result<()> {
     });
 
     // 4. Launch Visualizer
-    // Priority 1: Standalone bundled executable (relative to arbor.exe)
+    // Priority 1: Standalone bundled executable (relative to arbor binary)
     let current_exe = std::env::current_exe()?;
     let exe_dir = current_exe.parent().unwrap_or(path);
+
+    #[cfg(target_os = "windows")]
     let bundled_viz = exe_dir.join("arbor_visualizer").join("visualizer.exe");
+    #[cfg(target_os = "macos")]
+    let bundled_viz = exe_dir
+        .join("arbor_visualizer")
+        .join("arbor_visualizer.app")
+        .join("Contents")
+        .join("MacOS")
+        .join("arbor_visualizer");
+    #[cfg(target_os = "linux")]
+    let bundled_viz = exe_dir.join("arbor_visualizer").join("arbor_visualizer");
 
     if bundled_viz.exists() {
         println!("{} Launching bundled visualizer...", "🚀".cyan());
@@ -251,14 +262,16 @@ pub async fn viz(path: &Path) -> Result<()> {
             println!("{}", "Launching Flutter Visualizer (Dev Mode)...".cyan());
 
             #[cfg(target_os = "windows")]
-            let cmd = "flutter.bat";
-            #[cfg(not(target_os = "windows"))]
-            let cmd = "flutter";
+            let (cmd, device) = ("flutter.bat", "windows");
+            #[cfg(target_os = "macos")]
+            let (cmd, device) = ("flutter", "macos");
+            #[cfg(target_os = "linux")]
+            let (cmd, device) = ("flutter", "linux");
 
             let status = std::process::Command::new(cmd)
                 .arg("run")
                 .arg("-d")
-                .arg("windows")
+                .arg(device)
                 .current_dir(&viz_dir)
                 .status();
 
@@ -397,7 +410,6 @@ pub async fn bridge(path: &Path, launch_viz: bool) -> Result<()> {
     eprintln!("🔦 Spotlight mode active - Visualizer will track AI focus");
 
     // 3. Optionally launch the visualizer
-    // 3. Optionally launch the visualizer
     if launch_viz {
         // Try to find visualizer in target path or parent (workspace root)
         let viz_dir = if path.join("visualizer").exists() {
@@ -416,15 +428,17 @@ pub async fn bridge(path: &Path, launch_viz: bool) -> Result<()> {
             );
 
             #[cfg(target_os = "windows")]
-            let cmd = "flutter.bat";
-            #[cfg(not(target_os = "windows"))]
-            let cmd = "flutter";
+            let (cmd, device) = ("flutter.bat", "windows");
+            #[cfg(target_os = "macos")]
+            let (cmd, device) = ("flutter", "macos");
+            #[cfg(target_os = "linux")]
+            let (cmd, device) = ("flutter", "linux");
 
             // Spawn visualizer in background
             std::process::Command::new(cmd)
                 .arg("run")
                 .arg("-d")
-                .arg("windows")
+                .arg(device)
                 .current_dir(&dir)
                 .stdout(std::process::Stdio::null()) // Silence flutter output to keep MCP clean
                 .stderr(std::process::Stdio::null())
@@ -752,4 +766,98 @@ pub fn explain(question: &str, max_tokens: usize, show_why: bool, json_output: b
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    /// Returns the platform-specific bundled visualizer path relative to exe_dir.
+    fn get_bundled_visualizer_path(exe_dir: &std::path::Path) -> PathBuf {
+        #[cfg(target_os = "windows")]
+        {
+            exe_dir.join("arbor_visualizer").join("visualizer.exe")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            exe_dir
+                .join("arbor_visualizer")
+                .join("arbor_visualizer.app")
+                .join("Contents")
+                .join("MacOS")
+                .join("arbor_visualizer")
+        }
+        #[cfg(target_os = "linux")]
+        {
+            exe_dir.join("arbor_visualizer").join("arbor_visualizer")
+        }
+    }
+
+    /// Returns the platform-specific Flutter command and device target.
+    fn get_flutter_cmd_and_device() -> (&'static str, &'static str) {
+        #[cfg(target_os = "windows")]
+        {
+            ("flutter.bat", "windows")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            ("flutter", "macos")
+        }
+        #[cfg(target_os = "linux")]
+        {
+            ("flutter", "linux")
+        }
+    }
+
+    #[test]
+    fn test_bundled_visualizer_path_structure() {
+        let exe_dir = PathBuf::from("/usr/local/bin");
+        let viz_path = get_bundled_visualizer_path(&exe_dir);
+
+        #[cfg(target_os = "windows")]
+        assert!(viz_path.to_string_lossy().ends_with("visualizer.exe"));
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(viz_path.to_string_lossy().contains("arbor_visualizer.app"));
+            assert!(viz_path.to_string_lossy().contains("Contents/MacOS"));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(viz_path.to_string_lossy().ends_with("arbor_visualizer"));
+            assert!(!viz_path.to_string_lossy().contains(".exe"));
+            assert!(!viz_path.to_string_lossy().contains(".app"));
+        }
+    }
+
+    #[test]
+    fn test_flutter_device_target() {
+        let (cmd, device) = get_flutter_cmd_and_device();
+
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(cmd, "flutter.bat");
+            assert_eq!(device, "windows");
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(cmd, "flutter");
+            assert_eq!(device, "macos");
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(cmd, "flutter");
+            assert_eq!(device, "linux");
+        }
+    }
+
+    #[test]
+    fn test_bundled_visualizer_path_is_absolute_when_exe_dir_is_absolute() {
+        let exe_dir = PathBuf::from("/opt/arbor/bin");
+        let viz_path = get_bundled_visualizer_path(&exe_dir);
+        assert!(viz_path.is_absolute());
+    }
 }
