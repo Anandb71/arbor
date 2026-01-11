@@ -364,12 +364,13 @@ async fn handle_client(
     // 1. Send Hello (Metadata)
     let (node_count, edge_count, nodes, edges) = {
         let g = graph.read().await;
-        (
-            g.node_count(),
-            g.edge_count(),
-            g.nodes().cloned().collect::<Vec<_>>(),
-            g.export_edges(),
-        )
+        let mut nodes: Vec<_> = g.nodes().cloned().collect();
+        let edges_raw = g.export_edges();
+        // Sort for deterministic output (run twice = identical)
+        nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut edges = edges_raw;
+        edges.sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
+        (g.node_count(), g.edge_count(), nodes, edges)
     };
 
     let hello = BroadcastMessage::Hello(HelloPayload {

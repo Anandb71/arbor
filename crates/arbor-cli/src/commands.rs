@@ -61,6 +61,14 @@ pub fn index(path: &Path, output: Option<&Path>, follow_symlinks: bool) -> Resul
         result.duration_ms
     );
 
+    // Warn if graph is empty
+    if result.nodes_extracted == 0 {
+        eprintln!("\n{} No nodes extracted. Check:", "⚠ Warning:".yellow());
+        eprintln!("  - File extensions match supported languages (.rs, .ts, .py, .dart, .go)");
+        eprintln!("  - Path is not excluded by .gitignore");
+        eprintln!("  - Files contain parseable function/class definitions");
+    }
+
     // Show any errors
     if !result.errors.is_empty() {
         println!("\n{} files with parse errors:", "⚠".yellow());
@@ -314,12 +322,47 @@ pub fn status(path: &Path) -> Result<()> {
     // Quick index to get stats
     let result = index_directory(path, IndexOptions::default())?;
 
-    println!("{}", "Arbor Status".cyan().bold());
+    // Collect unique extensions from indexed files
+    let extensions: std::collections::HashSet<_> = result
+        .graph
+        .nodes()
+        .filter_map(|n| {
+            std::path::Path::new(&n.file)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    let ext_list: Vec<_> = extensions.iter().take(10).collect();
+
+    println!("{}", "📊 Arbor Status".cyan().bold());
     println!();
-    println!("  {} {}", "Files:".dimmed(), result.files_indexed);
+    println!("  {} {}", "Files indexed:".dimmed(), result.files_indexed);
     println!("  {} {}", "Nodes:".dimmed(), result.nodes_extracted);
     println!("  {} {}", "Edges:".dimmed(), result.graph.edge_count());
-    println!("  {} TypeScript, Rust, Python", "Languages:".dimmed());
+    println!(
+        "  {} {}",
+        "Extensions:".dimmed(),
+        if ext_list.is_empty() {
+            "(none)".to_string()
+        } else {
+            ext_list
+                .iter()
+                .map(|s| format!(".{}", s))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    );
+
+    // Show helpful tip if graph is empty
+    if result.nodes_extracted == 0 && result.files_indexed > 0 {
+        println!();
+        println!(
+            "{} Files were scanned but no code nodes extracted.",
+            "💡".yellow()
+        );
+        println!("   This may happen if files contain only comments or imports.");
+    }
 
     Ok(())
 }
@@ -571,6 +614,18 @@ pub fn refactor(target: &str, max_depth: usize, show_why: bool, json_output: boo
     // Run impact analysis
     let analysis = graph.analyze_impact(node_idx, max_depth);
 
+    // Warn if no affected nodes found
+    if analysis.total_affected == 0 {
+        eprintln!("\n{} No affected nodes found.", "⚠ Warning:".yellow());
+        eprintln!("Possible causes:");
+        eprintln!(
+            "  - Node '{}' has no dependents (nothing calls/imports it)",
+            target
+        );
+        eprintln!("  - Try increasing --depth (current: {})", max_depth);
+        eprintln!("  - Edges may be missing if source files weren't fully parsed");
+    }
+
     if json_output {
         // JSON output
         let output = serde_json::json!({
@@ -708,6 +763,18 @@ pub fn explain(question: &str, max_tokens: usize, show_why: bool, json_output: b
 
     // Slice context around the node
     let slice = graph.slice_context(node_idx, max_tokens, 2, &[]);
+
+    // Warn if context was truncated
+    if slice.truncation_reason != arbor_graph::TruncationReason::Complete {
+        eprintln!(
+            "\n{} Context truncated: {} (limit: {} tokens)",
+            "⚠".yellow(),
+            slice.truncation_reason,
+            max_tokens
+        );
+        eprintln!("  Some nodes were excluded to fit token budget.");
+        eprintln!("  Use --tokens to increase limit, or use pinning for critical nodes.");
+    }
 
     if json_output {
         let output = serde_json::json!({
@@ -860,8 +927,16 @@ mod tests {
 
     #[test]
     fn test_bundled_visualizer_path_is_absolute_when_exe_dir_is_absolute() {
+        #[cfg(target_os = "windows")]
+        let exe_dir = PathBuf::from("C:\\Program Files\\Arbor\\bin");
+        #[cfg(not(target_os = "windows"))]
         let exe_dir = PathBuf::from("/opt/arbor/bin");
+
         let viz_path = get_bundled_visualizer_path(&exe_dir);
-        assert!(viz_path.is_absolute());
+        assert!(
+            viz_path.is_absolute(),
+            "Expected absolute path, got: {:?}",
+            viz_path
+        );
     }
 }

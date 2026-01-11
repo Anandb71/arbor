@@ -265,6 +265,31 @@ Arbor v1.0.0 represents the complete "Nervous System" for your code:
 | ⭐ `arbor refactor` | Safe refactor with blast radius preview (v1.1.0) |
 | ⭐ `arbor explain` | Graph-backed code explanation (v1.1.0) |
 
+## Troubleshooting
+
+### Why does impact analysis return 0 nodes?
+
+- The target node may not exist in the graph. Run `arbor query "NodeName"` to verify.
+- The node may have no dependents (nothing calls or imports it).
+- Try increasing depth: `arbor refactor NodeName --depth 5`.
+
+### Why do Flutter widgets behave differently?
+
+- Flutter uses composition, not inheritance. Arbor tracks `contains` edges, not class hierarchies.
+- Use `arbor refactor WidgetName --depth 2` to see nested widgets.
+
+### When to use --follow-symlinks?
+
+- In monorepos with linked packages (pnpm, npm link).
+- When local dependencies are symlinked into `node_modules`.
+- Default is OFF to avoid infinite loops from circular links.
+
+### Graph is empty after indexing?
+
+- Check that your files use supported extensions: `.rs`, `.ts`, `.tsx`, `.py`, `.dart`, `.go`.
+- Ensure files are not excluded by `.gitignore`.
+- Run `arbor status` to see which extensions were detected.
+
 ## License
 
 MIT — use it however you want. See [LICENSE](LICENSE) for details.
