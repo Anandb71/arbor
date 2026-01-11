@@ -2,7 +2,7 @@
 
 use arbor_graph::compute_centrality;
 use arbor_server::{ArborServer, ServerConfig};
-use arbor_watcher::index_directory;
+use arbor_watcher::{index_directory, IndexOptions};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs;
@@ -39,7 +39,7 @@ pub fn init(path: &Path) -> Result<()> {
 }
 
 /// Index a directory and build the code graph.
-pub fn index(path: &Path, output: Option<&Path>) -> Result<()> {
+pub fn index(path: &Path, output: Option<&Path>, follow_symlinks: bool) -> Result<()> {
     println!("{}", "Indexing codebase...".cyan());
 
     let spinner = ProgressBar::new_spinner();
@@ -47,7 +47,8 @@ pub fn index(path: &Path, output: Option<&Path>) -> Result<()> {
     spinner.enable_steady_tick(Duration::from_millis(80));
     spinner.set_message("Scanning files...");
 
-    let result = index_directory(path)?;
+    let options = IndexOptions { follow_symlinks };
+    let result = index_directory(path, options)?;
 
     spinner.finish_and_clear();
 
@@ -102,7 +103,7 @@ pub fn query(query: &str, limit: usize) -> Result<()> {
     // For now, we need to re-index. In a real implementation,
     // we'd load from a persisted graph or connect to the server.
     let path = std::env::current_dir()?;
-    let result = index_directory(&path)?;
+    let result = index_directory(&path, IndexOptions::default())?;
 
     let matches: Vec<_> = result.graph.search(query).into_iter().take(limit).collect();
 
@@ -129,7 +130,7 @@ pub fn query(query: &str, limit: usize) -> Result<()> {
 }
 
 /// Start the Arbor server.
-pub async fn serve(port: u16, headless: bool, path: &Path) -> Result<()> {
+pub async fn serve(port: u16, headless: bool, path: &Path, follow_symlinks: bool) -> Result<()> {
     let bind_addr = if headless { "0.0.0.0" } else { "127.0.0.1" };
 
     if headless {
@@ -139,7 +140,8 @@ pub async fn serve(port: u16, headless: bool, path: &Path) -> Result<()> {
     }
 
     // Index the codebase first
-    let result = index_directory(path)?;
+    let options = IndexOptions { follow_symlinks };
+    let result = index_directory(path, options)?;
     let mut graph = result.graph;
 
     // Compute centrality
@@ -169,11 +171,12 @@ pub async fn serve(port: u16, headless: bool, path: &Path) -> Result<()> {
 }
 
 /// Start the Arbor Visualizer.
-pub async fn viz(path: &Path) -> Result<()> {
+pub async fn viz(path: &Path, follow_symlinks: bool) -> Result<()> {
     println!("{}", "Starting Arbor Visualizer stack...".cyan());
 
     // 1. Index Codebase
-    let result = index_directory(path)?;
+    let options = IndexOptions { follow_symlinks };
+    let result = index_directory(path, options)?;
     let mut graph = result.graph;
 
     // Compute centrality for better initial layout
@@ -293,7 +296,7 @@ pub async fn viz(path: &Path) -> Result<()> {
 
 /// Export the graph to JSON.
 pub fn export(path: &Path, output: &Path) -> Result<()> {
-    let result = index_directory(path)?;
+    let result = index_directory(path, IndexOptions::default())?;
     export_graph(&result.graph, output)?;
     Ok(())
 }
@@ -309,7 +312,7 @@ pub fn status(path: &Path) -> Result<()> {
     }
 
     // Quick index to get stats
-    let result = index_directory(path)?;
+    let result = index_directory(path, IndexOptions::default())?;
 
     println!("{}", "Arbor Status".cyan().bold());
     println!();
@@ -322,7 +325,7 @@ pub fn status(path: &Path) -> Result<()> {
 }
 
 /// Start the Agentic Bridge (MCP + Viz).
-pub async fn bridge(path: &Path, launch_viz: bool) -> Result<()> {
+pub async fn bridge(path: &Path, launch_viz: bool, follow_symlinks: bool) -> Result<()> {
     use arbor_mcp::McpServer;
 
     eprintln!("{} Arbor Bridge (MCP Mode)", "🔗".bold().cyan());
@@ -333,10 +336,11 @@ pub async fn bridge(path: &Path, launch_viz: bool) -> Result<()> {
 
     // 2. Run Initial Index (Blocking)
     let index_path = path.to_path_buf();
+    let options = IndexOptions { follow_symlinks };
     eprintln!("{} Starting initial index...", "⏳".yellow());
 
     // Run blocking indexer
-    let result = tokio::task::spawn_blocking(move || index_directory(&index_path)).await?;
+    let result = tokio::task::spawn_blocking(move || index_directory(&index_path, options)).await?;
 
     match result {
         Ok(index_result) => {
@@ -546,7 +550,7 @@ pub async fn check_health() -> Result<()> {
 pub fn refactor(target: &str, max_depth: usize, show_why: bool, json_output: bool) -> Result<()> {
     // Load the graph by indexing current directory
     let path = std::env::current_dir()?;
-    let result = index_directory(&path)?;
+    let result = index_directory(&path, IndexOptions::default())?;
     let graph = result.graph;
 
     // Find the target node
@@ -684,7 +688,7 @@ pub fn refactor(target: &str, max_depth: usize, show_why: bool, json_output: boo
 pub fn explain(question: &str, max_tokens: usize, show_why: bool, json_output: bool) -> Result<()> {
     // Load the graph by indexing current directory
     let path = std::env::current_dir()?;
-    let result = index_directory(&path)?;
+    let result = index_directory(&path, IndexOptions::default())?;
     let graph = result.graph;
 
     // Try to find a node matching the question (could be a function name)

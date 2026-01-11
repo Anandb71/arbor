@@ -42,6 +42,10 @@ enum Commands {
         /// Output file for the graph JSON
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Follow symbolic links when walking directories
+        #[arg(long)]
+        follow_symlinks: bool,
     },
 
     /// Search the code graph
@@ -67,6 +71,10 @@ enum Commands {
         /// Path to index (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Follow symbolic links when walking directories
+        #[arg(long)]
+        follow_symlinks: bool,
     },
 
     /// Export the graph to JSON
@@ -92,6 +100,10 @@ enum Commands {
         /// Path to visualize (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Follow symbolic links when walking directories
+        #[arg(long)]
+        follow_symlinks: bool,
     },
 
     /// Start the Agentic Bridge (MCP + Viz)
@@ -103,6 +115,10 @@ enum Commands {
         /// Also launch the Flutter visualizer
         #[arg(long)]
         viz: bool,
+
+        /// Follow symbolic links when walking directories
+        #[arg(long)]
+        follow_symlinks: bool,
     },
 
     /// Check system health and environment
@@ -163,17 +179,29 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Init { path } => commands::init(&path),
-        Commands::Index { path, output } => commands::index(&path, output.as_deref()),
+        Commands::Index {
+            path,
+            output,
+            follow_symlinks,
+        } => commands::index(&path, output.as_deref(), follow_symlinks),
         Commands::Query { query, limit } => commands::query(&query, limit),
         Commands::Serve {
             port,
             headless,
             path,
-        } => commands::serve(port, headless, &path).await,
+            follow_symlinks,
+        } => commands::serve(port, headless, &path, follow_symlinks).await,
         Commands::Export { output, path } => commands::export(&path, &output),
         Commands::Status { path } => commands::status(&path),
-        Commands::Viz { path } => commands::viz(&path).await,
-        Commands::Bridge { path, viz } => commands::bridge(&path, viz).await,
+        Commands::Viz {
+            path,
+            follow_symlinks,
+        } => commands::viz(&path, follow_symlinks).await,
+        Commands::Bridge {
+            path,
+            viz,
+            follow_symlinks,
+        } => commands::bridge(&path, viz, follow_symlinks).await,
         Commands::CheckHealth => commands::check_health().await,
         Commands::Refactor {
             target,
