@@ -135,6 +135,26 @@ The visualizer exists to make AI reasoning **inspectable**. Every node an LLM to
 | **C#**         | ✅     | Classes, Methods, Properties, Interfaces, Structs |
 | **Dart**       | ✅     | Classes, Mixins, Methods, Widgets |
 
+## Platform Support
+
+| Platform | CLI | Visualizer |
+|----------|-----|------------|
+| **Windows** | ✅ | ✅ |
+| **macOS** | ✅ | ✅ |
+| **Linux** | ✅ | ✅ |
+
+### Monorepo & Symlink Support
+
+For monorepos using `pnpm`, `npm link`, or symlinked local packages:
+
+```bash
+arbor index --follow-symlinks
+arbor viz --follow-symlinks
+arbor bridge --follow-symlinks
+```
+
+This ensures symlinked dependencies are indexed instead of skipped.
+
 ## Project Structure
 
 ```
