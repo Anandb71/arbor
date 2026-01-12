@@ -325,12 +325,12 @@ pub fn status(path: &Path, files: bool) -> Result<()> {
     // Collect unique extensions from indexed files
     let mut file_exts: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut ext_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    
+
     for node in result.graph.nodes() {
         if file_exts.insert(node.file.clone()) {
-             if let Some(ext) = std::path::Path::new(&node.file)
+            if let Some(ext) = std::path::Path::new(&node.file)
                 .extension()
-                .and_then(|e| e.to_str()) 
+                .and_then(|e| e.to_str())
             {
                 *ext_counts.entry(ext.to_string()).or_insert(0) += 1;
             }
@@ -346,21 +346,25 @@ pub fn status(path: &Path, files: bool) -> Result<()> {
     println!("  {} {}", "Files indexed:".dimmed(), result.files_indexed);
     println!("  {} {}", "Nodes:".dimmed(), result.nodes_extracted);
     println!("  {} {}", "Edges:".dimmed(), result.graph.edge_count());
-    
+
     if files {
         println!();
         println!("  {}", "Extensions (by file count):".yellow());
         if ext_list.is_empty() {
-             println!("    (none)");
+            println!("    (none)");
         } else {
             for (ext, count) in ext_list {
-                 println!("    .{}: {} files", ext, count);
+                println!("    .{}: {} files", ext, count);
             }
         }
     } else {
         // Compact view (top 5)
-        let top_exts: Vec<_> = ext_list.iter().take(5).map(|(e, _)| format!(".{}", e)).collect();
-         println!(
+        let top_exts: Vec<_> = ext_list
+            .iter()
+            .take(5)
+            .map(|(e, _)| format!(".{}", e))
+            .collect();
+        println!(
             "  {} {}",
             "Extensions:".dimmed(),
             if top_exts.is_empty() {
