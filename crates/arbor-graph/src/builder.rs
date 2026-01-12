@@ -9,6 +9,7 @@ use crate::symbol_table::SymbolTable;
 use arbor_core::CodeNode;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use tracing::warn;
 
 /// Builds an ArborGraph from parsed code nodes.
 ///
@@ -75,35 +76,38 @@ impl GraphBuilder {
         let node_indices: Vec<NodeId> = self.graph.node_indexes().collect();
 
         for from_idx in node_indices {
-            // Get references by cloning to release borrow on graph
-            let references = {
+            // Get references and file by cloning to release borrow on graph
+            let (references, from_file) = {
                 let node = self.graph.get(from_idx).unwrap();
-                node.references.clone()
+                (node.references.clone(), PathBuf::from(&node.file))
             };
 
             for reference in references {
-                let mut found = false;
-
-                // 1. Try resolving via Symbol Table (FQN)
+                // 1. Try exact FQN match
                 if let Some(to_idx) = self.symbol_table.resolve(&reference) {
                     if from_idx != to_idx {
                         edges_to_add.push((from_idx, to_idx, reference.clone()));
-                        found = true;
                     }
-                }
-
-                if found {
                     continue;
                 }
 
-                // 2. Fallback to legacy ID map
-                if let Some(to_id_str) = self.name_to_id.get(&reference) {
-                    if let Some(to_idx) = self.graph.get_index(to_id_str) {
-                        if from_idx != to_idx {
-                            edges_to_add.push((from_idx, to_idx, reference.clone()));
-                        }
+                // 2. Try context-aware resolution (suffix match with locality)
+                if let Some(to_idx) = self
+                    .symbol_table
+                    .resolve_with_context(&reference, &from_file)
+                {
+                    if from_idx != to_idx {
+                        edges_to_add.push((from_idx, to_idx, reference.clone()));
                     }
+                    continue;
                 }
+
+                // 3. Unresolved - warn
+                warn!(
+                    "Unresolved reference '{}' in {}",
+                    reference,
+                    from_file.display()
+                );
             }
         }
 
