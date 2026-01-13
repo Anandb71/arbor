@@ -53,6 +53,8 @@ Traditional RAG:         Arbor:
 
 ## Quick Start
 
+> 📖 **New to Arbor?** See the [5-minute Quickstart Guide](docs/QUICKSTART.md)
+
 ### Option 1: Download Pre-built Binary (Recommended)
 
 Download `arbor-windows-v1.0.0.zip` from the [Releases](https://github.com/Anandb71/arbor/releases) page.
