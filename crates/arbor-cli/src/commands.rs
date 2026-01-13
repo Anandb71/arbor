@@ -39,7 +39,12 @@ pub fn init(path: &Path) -> Result<()> {
 }
 
 /// Index a directory and build the code graph.
-pub fn index(path: &Path, output: Option<&Path>, follow_symlinks: bool) -> Result<()> {
+pub fn index(
+    path: &Path,
+    output: Option<&Path>,
+    follow_symlinks: bool,
+    no_cache: bool,
+) -> Result<()> {
     println!("{}", "Indexing codebase...".cyan());
 
     let spinner = ProgressBar::new_spinner();
@@ -47,16 +52,32 @@ pub fn index(path: &Path, output: Option<&Path>, follow_symlinks: bool) -> Resul
     spinner.enable_steady_tick(Duration::from_millis(80));
     spinner.set_message("Scanning files...");
 
-    let options = IndexOptions { follow_symlinks };
+    // Determine cache path
+    let cache_path = if no_cache {
+        None
+    } else {
+        Some(path.join(".arbor").join("cache"))
+    };
+
+    let options = IndexOptions {
+        follow_symlinks,
+        cache_path,
+    };
     let result = index_directory(path, options)?;
 
     spinner.finish_and_clear();
 
     // Print results
+    let cache_msg = if result.cache_hits > 0 {
+        format!(" ({} from cache)", result.cache_hits)
+    } else {
+        String::new()
+    };
     println!(
-        "{} Indexed {} files ({} nodes) in {}ms",
+        "{} Indexed {} files{} ({} nodes) in {}ms",
         "✓".green(),
         result.files_indexed.to_string().cyan(),
+        cache_msg.dimmed(),
         result.nodes_extracted.to_string().cyan(),
         result.duration_ms
     );
@@ -148,7 +169,10 @@ pub async fn serve(port: u16, headless: bool, path: &Path, follow_symlinks: bool
     }
 
     // Index the codebase first
-    let options = IndexOptions { follow_symlinks };
+    let options = IndexOptions {
+        follow_symlinks,
+        cache_path: None,
+    };
     let result = index_directory(path, options)?;
     let mut graph = result.graph;
 
@@ -183,7 +207,10 @@ pub async fn viz(path: &Path, follow_symlinks: bool) -> Result<()> {
     println!("{}", "Starting Arbor Visualizer stack...".cyan());
 
     // 1. Index Codebase
-    let options = IndexOptions { follow_symlinks };
+    let options = IndexOptions {
+        follow_symlinks,
+        cache_path: None,
+    };
     let result = index_directory(path, options)?;
     let mut graph = result.graph;
 
@@ -379,7 +406,10 @@ pub async fn bridge(path: &Path, launch_viz: bool, follow_symlinks: bool) -> Res
 
     // 2. Run Initial Index (Blocking)
     let index_path = path.to_path_buf();
-    let options = IndexOptions { follow_symlinks };
+    let options = IndexOptions {
+        follow_symlinks,
+        cache_path: Some(path.join(".arbor").join("cache")),
+    };
     eprintln!("{} Starting initial index...", "⏳".yellow());
 
     // Run blocking indexer

@@ -46,6 +46,10 @@ enum Commands {
         /// Follow symbolic links when walking directories
         #[arg(long)]
         follow_symlinks: bool,
+
+        /// Disable caching (force full re-index)
+        #[arg(long)]
+        no_cache: bool,
     },
 
     /// Search the code graph
@@ -183,7 +187,8 @@ async fn main() {
             path,
             output,
             follow_symlinks,
-        } => commands::index(&path, output.as_deref(), follow_symlinks),
+            no_cache,
+        } => commands::index(&path, output.as_deref(), follow_symlinks, no_cache),
         Commands::Query { query, limit } => commands::query(&query, limit),
         Commands::Serve {
             port,

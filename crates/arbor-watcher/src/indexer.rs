@@ -4,9 +4,10 @@
 //! the initial code graph.
 
 use arbor_core::{parse_file, CodeNode};
-use arbor_graph::{ArborGraph, GraphBuilder};
+use arbor_graph::{ArborGraph, GraphBuilder, GraphStore};
 use ignore::WalkBuilder;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -15,8 +16,11 @@ pub struct IndexResult {
     /// The built graph.
     pub graph: ArborGraph,
 
-    /// Number of files processed.
+    /// Number of files processed (parsed fresh).
     pub files_indexed: usize,
+
+    /// Number of files loaded from cache.
+    pub cache_hits: usize,
 
     /// Number of nodes extracted.
     pub nodes_extracted: usize,
@@ -33,12 +37,19 @@ pub struct IndexResult {
 pub struct IndexOptions {
     /// Follow symbolic links when walking directories.
     pub follow_symlinks: bool,
+
+    /// Path to cache directory (e.g., `.arbor/cache`).
+    /// If None, caching is disabled.
+    pub cache_path: Option<PathBuf>,
 }
 
 /// Indexes a directory and returns the code graph.
 ///
 /// This walks all source files, parses them, and builds the
 /// relationship graph. It respects .gitignore patterns.
+///
+/// If `options.cache_path` is set, files are cached with their mtimes.
+/// Only files with changed mtimes are re-parsed.
 ///
 /// # Example
 ///
@@ -53,10 +64,27 @@ pub fn index_directory(root: &Path, options: IndexOptions) -> Result<IndexResult
     let start = Instant::now();
     let mut builder = GraphBuilder::new();
     let mut files_indexed = 0;
+    let mut cache_hits = 0;
     let mut nodes_extracted = 0;
     let mut errors = Vec::new();
 
     info!("Starting index of {}", root.display());
+
+    // Open cache if configured
+    let store =
+        options
+            .cache_path
+            .as_ref()
+            .and_then(|path| match GraphStore::open_or_reset(path) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!("Failed to open cache: {}, proceeding without cache", e);
+                    None
+                }
+            });
+
+    // Track files we've seen (for detecting deleted files)
+    let mut seen_files: HashSet<String> = HashSet::new();
 
     // Walk the directory, respecting .gitignore
     let walker = WalkBuilder::new(root)
@@ -85,17 +113,80 @@ pub fn index_directory(root: &Path, options: IndexOptions) -> Result<IndexResult
             continue;
         }
 
-        debug!("Parsing {}", path.display());
+        let path_str = path.display().to_string();
+        seen_files.insert(path_str.clone());
 
-        match parse_file(path) {
-            Ok(nodes) => {
-                nodes_extracted += nodes.len();
-                files_indexed += 1;
-                builder.add_nodes(nodes);
+        // Check cache
+        if let Some(ref store) = store {
+            // Get file mtime
+            let current_mtime = match std::fs::metadata(path) {
+                Ok(meta) => meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                Err(_) => 0,
+            };
+
+            // Check cached mtime
+            if let Ok(Some(cached_mtime)) = store.get_mtime(&path_str) {
+                if cached_mtime == current_mtime {
+                    // File unchanged, load from cache
+                    if let Ok(Some(cached_nodes)) = store.get_file_nodes(&path_str) {
+                        debug!("Cache hit: {}", path.display());
+                        nodes_extracted += cached_nodes.len();
+                        cache_hits += 1;
+                        builder.add_nodes(cached_nodes);
+                        continue;
+                    }
+                }
             }
-            Err(e) => {
-                warn!("Failed to parse {}: {}", path.display(), e);
-                errors.push((path.display().to_string(), e.to_string()));
+
+            // Cache miss or stale, parse file
+            debug!("Parsing (cache miss): {}", path.display());
+            match parse_file(path) {
+                Ok(nodes) => {
+                    nodes_extracted += nodes.len();
+                    files_indexed += 1;
+                    // Update cache
+                    if let Err(e) = store.update_file(&path_str, &nodes, current_mtime) {
+                        warn!("Failed to update cache for {}: {}", path_str, e);
+                    }
+                    builder.add_nodes(nodes);
+                }
+                Err(e) => {
+                    warn!("Failed to parse {}: {}", path.display(), e);
+                    errors.push((path_str, e.to_string()));
+                }
+            }
+        } else {
+            // No cache, parse directly
+            debug!("Parsing {}", path.display());
+            match parse_file(path) {
+                Ok(nodes) => {
+                    nodes_extracted += nodes.len();
+                    files_indexed += 1;
+                    builder.add_nodes(nodes);
+                }
+                Err(e) => {
+                    warn!("Failed to parse {}: {}", path.display(), e);
+                    errors.push((path_str, e.to_string()));
+                }
+            }
+        }
+    }
+
+    // Handle deleted files: remove from cache any files that no longer exist
+    if let Some(ref store) = store {
+        if let Ok(cached_files) = store.list_cached_files() {
+            for cached_file in cached_files {
+                if !seen_files.contains(&cached_file) {
+                    debug!("Removing deleted file from cache: {}", cached_file);
+                    if let Err(e) = store.remove_file(&cached_file) {
+                        warn!("Failed to remove {} from cache: {}", cached_file, e);
+                    }
+                }
             }
         }
     }
@@ -104,13 +195,14 @@ pub fn index_directory(root: &Path, options: IndexOptions) -> Result<IndexResult
     let duration = start.elapsed();
 
     info!(
-        "Indexed {} files ({} nodes) in {:?}",
-        files_indexed, nodes_extracted, duration
+        "Indexed {} files, {} cache hits ({} nodes) in {:?}",
+        files_indexed, cache_hits, nodes_extracted, duration
     );
 
     Ok(IndexResult {
         graph,
         files_indexed,
+        cache_hits,
         nodes_extracted,
         duration_ms: duration.as_millis() as u64,
         errors,
@@ -214,6 +306,7 @@ mod tests {
         // Index with follow_symlinks enabled
         let options = IndexOptions {
             follow_symlinks: true,
+            cache_path: None,
         };
         let result = index_directory(dir.path(), options).unwrap();
         assert_eq!(result.files_indexed, 1);
