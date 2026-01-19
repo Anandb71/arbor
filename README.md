@@ -56,7 +56,7 @@ That's it. One command. Know what breaks before you break it.
 
 ```bash
 # Install
-cargo install arbor
+cargo install arbor-graph-cli
 
 # Run on any project
 cd your-project
