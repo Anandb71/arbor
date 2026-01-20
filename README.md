@@ -2,16 +2,16 @@
   <img src="docs/assets/arbor-logo.svg" alt="Arbor" width="120" height="120" />
 </p>
 
-<h1 align="center">Arbor v1.3.0</h1>
+<h1 align="center">Arbor v1.4.0</h1>
 
 <p align="center">
   <strong>The Graph-Native Intelligence Layer for Code</strong><br>
-  <em>Stop RAG-ing. Start navigating.</em>
+  <em>Know what breaks before you break it.</em>
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> •
-  <a href="#why-arbor">Why Arbor?</a> •
+  <a href="#gui">GUI</a> •
   <a href="#features">Features</a> •
   <a href="#the-unified-nervous-system">Architecture</a> •
   <a href="docs/PROTOCOL.md">Protocol</a> •
@@ -20,7 +20,7 @@
 
 <p align="center">
   <a href="https://github.com/Anandb71/arbor/actions"><img src="https://img.shields.io/github/actions/workflow/status/Anandb71/arbor/rust.yml?style=flat-square&label=CI" alt="CI" /></a>
-  <img src="https://img.shields.io/badge/release-v1.3.0-blue?style=flat-square" alt="Release" />
+  <img src="https://img.shields.io/badge/release-v1.4.0-blue?style=flat-square" alt="Release" />
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" />
   <img src="https://img.shields.io/badge/rust-1.70+-orange?style=flat-square" alt="Rust" />
   <img src="https://img.shields.io/badge/flutter-3.0+-blue?style=flat-square" alt="Flutter" />
@@ -33,24 +33,46 @@
 > **About to change code but afraid of breaking things?**
 
 ```bash
-$ arbor refactor parse_file
+$ arbor refactor detect_language
 
-🔍 Analyzing parse_file
+🔍 Analyzing detect_language
 
-This node sits in the middle of the graph.
-  15 callers, 3 dependencies.
+🟢  Confidence: High | Role: Core Logic
+   • 15 callers, 3 dependencies
+   • Well-connected with manageable impact
 
 ⚠️  18 nodes affected (4 direct, 14 transitive)
 
 Will break immediately:
-  • detect_language (function)
-  • parse_single_file (function)
-  • index_directory (function)
+  • parse_file (function)
+  • get_parser (function)
 
 → Proceed carefully. Test affected callers.
 ```
 
 That's it. One command. Know what breaks before you break it.
+
+---
+
+## GUI
+
+Arbor now includes a native graphical interface for impact analysis:
+
+```bash
+arbor gui
+```
+
+![Arbor GUI](docs/gui_screenshot.png)
+
+**Features:**
+- 🔍 **Symbol Search**: Enter any function, class, or method name
+- 📊 **Impact Display**: See direct callers, indirect callers, and dependencies
+- 🔒 **Privacy Spoilers**: File paths hidden by default (click to reveal)
+- 🌙 **Dark/Light Mode**: Toggle with one click
+- 📋 **Copy as Markdown**: Export analysis for PR descriptions
+- 📜 **Search History**: Quick access to recent searches
+
+---
 
 ## Quick Start
 
@@ -61,6 +83,9 @@ cargo install arbor
 # Run on any project
 cd your-project
 arbor refactor <function-name>
+
+# Or use the GUI
+arbor gui
 ```
 
 > 📖 **More commands?** See the [5-minute Quickstart Guide](docs/QUICKSTART.md)
@@ -98,6 +123,32 @@ flutter build windows
 That's it. Your IDE or AI agent can now connect to `ws://localhost:7433` and query the graph, or use the MCP protocol over stdio.
 
 ## Features
+
+### 🖥️ Native GUI (NEW in v1.4)
+
+A lightweight, egui-based interface for quick impact analysis:
+- Enter a symbol name, see what breaks
+- Privacy-first: file paths hidden behind spoilers
+- Copy results as Markdown for PR descriptions
+
+### 🔮 Confidence Scoring (NEW in v1.4)
+
+Every analysis now includes explainable confidence:
+
+| Level | Indicator | Meaning |
+|-------|-----------|---------|
+| 🟢 High | Green | Clear edges, well-connected |
+| 🟡 Medium | Yellow | Some uncertainty exists |
+| 🔴 Low | Red | Potential dynamic calls or isolation |
+
+### 🏷️ Node Roles (NEW in v1.4)
+
+Arbor classifies nodes by their structural role:
+- **Entry Point**: No internal callers (API endpoints, main functions)
+- **Utility**: Helper functions called by many
+- **Core Logic**: Central to the domain
+- **Adapter**: Bridges between layers
+- **Isolated**: No detected connections
 
 ### 🧠 ArborQL & AI Bridge (MCP)
 
@@ -154,11 +205,11 @@ The visualizer exists to make AI reasoning **inspectable**. Every node an LLM to
 
 ## Platform Support
 
-| Platform | CLI | Visualizer |
-|----------|-----|------------|
-| **Windows** | ✅ | ✅ |
-| **macOS** | ✅ | ✅ |
-| **Linux** | ✅ | ✅ |
+| Platform | CLI | GUI | Visualizer |
+|----------|-----|-----|------------|
+| **Windows** | ✅ | ✅ | ✅ |
+| **macOS** | ✅ | ✅ | ✅ |
+| **Linux** | ✅ | ✅ | ✅ |
 
 ### Monorepo & Symlink Support
 
@@ -182,7 +233,8 @@ arbor/
 │   ├── arbor-watcher/      # File watching, incremental sync
 │   ├── arbor-server/       # WebSocket server, protocol handler
 │   ├── arbor-mcp/          # Model Context Protocol bridge
-│   └── arbor-cli/          # Command-line interface (pkg: arbor-graph-cli)
+│   ├── arbor-cli/          # Command-line interface (pkg: arbor-graph-cli)
+│   └── arbor-gui/          # Native GUI (egui-based) ← NEW
 ├── visualizer/             # Flutter desktop app
 │   ├── lib/
 │   │   ├── core/           # Theme, state management
@@ -192,54 +244,77 @@ arbor/
 └── docs/                   # Extended documentation
 ```
 
+## CLI Commands
+
+| Command | Description |
+|---------|-------------|
+| `arbor init` | Creates `.arbor/` config directory |
+| `arbor index` | Full index of the codebase |
+| `arbor query <q>` | Search the graph |
+| `arbor serve` | Start the sidecar server |
+| `arbor export` | Export graph to JSON |
+| `arbor status` | Show index status |
+| `arbor status --files` | List all indexed files |
+| `arbor viz` | Launch the Logic Forest visualizer |
+| `arbor bridge` | Start MCP server for AI integration |
+| `arbor bridge --viz` | MCP + Visualizer together |
+| `arbor check-health` | System diagnostics and health check |
+| ⭐ `arbor refactor` | Safe refactor with blast radius preview |
+| ⭐ `arbor explain` | Graph-backed code explanation |
+| 🆕 `arbor gui` | Launch the native GUI |
+| 🆕 `arbor pr-summary` | Generate PR impact summary |
+| 🆕 `arbor watch` | Auto-refresh index on file changes |
+
 ## Roadmap
 
-### v1.0.0 (Completed)
+### v1.0.0 – v1.3.0 (Completed)
 
-- [x] **Phase 1**: Core indexer and CLI
-- [x] **Phase 2**: Logic Forest visualizer (LOD, Bloom)
-- [x] **Phase 3**: VS Code extension
-- [x] **Phase 4**: Agentic Bridge (MCP)
-- [x] **Phase 5**: Linux ARM64/AMD64 + macOS ARM64 CI/CD
-- [x] **Phase 6**: Language server protocol support
-- [x] **Phase 7**: Go and Java parser support
-- [x] **Phase 8**: C/C++ parser support
-- [x] **Phase 9**: Dart/Flutter parser support
-- [x] **Phase 10**: The Brain Upgrade (Control Flow & Data Flow)
-- [x] **Phase 11**: Expanded Support (C# Parser, Graph Persistence)
+- [x] Core indexer and CLI
+- [x] Logic Forest visualizer (LOD, Bloom)
+- [x] VS Code extension
+- [x] Agentic Bridge (MCP)
+- [x] Multi-language parsers (Rust, TS, Python, Go, Java, C/C++, C#, Dart)
+- [x] Impact Radius Simulator
+- [x] Context-Aware Edge Resolution
+- [x] Persistent Caching
 
-### v1.1.0 "The Sentinel Update" ✅
+### v1.4.0 "The Trust Update" ✅ (Current)
 
-> **Predict breakage. Give AI only the logic it needs.**
+> **See the impact. Trust the output.**
 
-- [x] **Impact Radius Simulator**: Bidirectional BFS blast radius analysis
-- [x] **Dynamic Context Slicing**: Token-bounded LLM context with pinning
-- [x] **CLI: `arbor refactor`** with `--why` and `--json` flags
-- [x] **CLI: `arbor explain`** for graph-backed code explanation
-
-```bash
-$ arbor refactor validate --why
-
-⚠️  Blast Radius
-Target: validate (Function)
-
-Total: 12 nodes (direct: 4, transitive: 6, distant: 2)
-
-Direct (1 hop):
-  • TokenMiddleware (Class) — Calls validate
-  • AuthController (Class) — Calls validate
-```
-
-### v1.3.0 "The Cache Update" ✅
-
-> **Faster indexing. Smarter resolution. Better docs.**
-
-- [x] **Context-Aware Edge Resolution**: FQN-based symbol lookup with locality preference
-- [x] **Persistent Caching**: Mtime-based incremental indexing with Sled
-- [x] **`--no-cache` Flag**: Force full re-index when needed
-- [x] **Quickstart Guide**: 5-minute getting started documentation
+- [x] **Native GUI**: Egui-based impact analysis interface
+- [x] **Confidence Scoring**: Explainable Low/Medium/High risk levels
+- [x] **Node Roles**: Entry Point, Utility, Core Logic, Adapter, Isolated
+- [x] **Privacy Spoilers**: File paths hidden until clicked
+- [x] **PR Summary Generator**: `arbor pr-summary`
+- [x] **Watch Mode**: `arbor watch` for auto-refresh
 
 📖 **Full roadmap**: [docs/ROADMAP.md](docs/ROADMAP.md)
+
+## Troubleshooting
+
+### Why does impact analysis return 0 nodes?
+
+- The target node may not exist in the graph. Run `arbor query "NodeName"` to verify.
+- The node may have no dependents (nothing calls or imports it).
+- Try increasing depth: `arbor refactor NodeName --depth 5`.
+
+### Why do Flutter widgets behave differently?
+
+- Flutter uses composition, not inheritance. Arbor tracks `contains` edges, not class hierarchies.
+- Use `arbor refactor WidgetName --depth 2` to see nested widgets.
+
+### When to use --follow-symlinks?
+
+- In monorepos with linked packages (pnpm, npm link).
+- When local dependencies are symlinked into `node_modules`.
+- Default is OFF to avoid infinite loops from circular links.
+
+### Graph is empty after indexing?
+
+- Check that your files use supported extensions: `.rs`, `.ts`, `.tsx`, `.py`, `.dart`, `.go`.
+- Ensure files are not excluded by `.gitignore`.
+- Run `arbor status` to see which extensions were detected.
 
 ## Security
 
@@ -266,7 +341,7 @@ Arbor is designed with a **Local-First** security model:
 
 ## The Unified Nervous System
 
-Arbor v1.0.0 represents the complete "Nervous System" for your code:
+Arbor represents the complete "Nervous System" for your code:
 
 ```
      Claude asks about AuthController
@@ -293,48 +368,6 @@ Arbor v1.0.0 represents the complete "Nervous System" for your code:
 │ #FFD700 │    │ 600ms   │
 └─────────┘    └─────────┘
 ```
-
-## CLI Commands
-
-| Command | Description |
-|---------|-------------|
-| `arbor init` | Creates `.arbor/` config directory |
-| `arbor index` | Full index of the codebase |
-| `arbor query <q>` | Search the graph |
-| `arbor serve` | Start the sidecar server |
-| `arbor export` | Export graph to JSON |
-| `arbor status` | Show index status |
-| `arbor viz` | Launch the Logic Forest visualizer |
-| `arbor bridge` | Start MCP server for AI integration |
-| `arbor bridge --viz` | MCP + Visualizer together |
-| `arbor check-health` | System diagnostics and health check |
-| ⭐ `arbor refactor` | Safe refactor with blast radius preview (v1.1.0) |
-| ⭐ `arbor explain` | Graph-backed code explanation (v1.1.0) |
-
-## Troubleshooting
-
-### Why does impact analysis return 0 nodes?
-
-- The target node may not exist in the graph. Run `arbor query "NodeName"` to verify.
-- The node may have no dependents (nothing calls or imports it).
-- Try increasing depth: `arbor refactor NodeName --depth 5`.
-
-### Why do Flutter widgets behave differently?
-
-- Flutter uses composition, not inheritance. Arbor tracks `contains` edges, not class hierarchies.
-- Use `arbor refactor WidgetName --depth 2` to see nested widgets.
-
-### When to use --follow-symlinks?
-
-- In monorepos with linked packages (pnpm, npm link).
-- When local dependencies are symlinked into `node_modules`.
-- Default is OFF to avoid infinite loops from circular links.
-
-### Graph is empty after indexing?
-
-- Check that your files use supported extensions: `.rs`, `.ts`, `.tsx`, `.py`, `.dart`, `.go`.
-- Ensure files are not excluded by `.gitignore`.
-- Run `arbor status` to see which extensions were detected.
 
 ## License
 
