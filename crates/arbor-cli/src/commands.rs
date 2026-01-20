@@ -357,36 +357,57 @@ pub fn status(path: &Path, show_files: bool) -> Result<()> {
         .collect();
 
     // Collect unique extensions from indexed files
-    let extensions: std::collections::HashSet<_> = result
-        .graph
-        .nodes()
-        .filter_map(|n| {
-            std::path::Path::new(&n.file)
+    let mut file_exts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ext_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for node in result.graph.nodes() {
+        if file_exts.insert(node.file.clone()) {
+            if let Some(ext) = std::path::Path::new(&node.file)
                 .extension()
                 .and_then(|e| e.to_str())
-                .map(|s| s.to_string())
-        })
-        .collect();
-    let ext_list: Vec<_> = extensions.iter().take(10).collect();
+            {
+                *ext_counts.entry(ext.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut ext_list: Vec<_> = ext_counts.iter().collect();
+    // Sort by count descending
+    ext_list.sort_by(|a, b| b.1.cmp(a.1));
 
     println!("{}", "📊 Arbor Status".cyan().bold());
     println!();
     println!("  {} {}", "Files indexed:".dimmed(), result.files_indexed);
     println!("  {} {}", "Nodes:".dimmed(), result.nodes_extracted);
     println!("  {} {}", "Edges:".dimmed(), result.graph.edge_count());
-    println!(
-        "  {} {}",
-        "Extensions:".dimmed(),
+
+    if show_files {
+        println!();
+        println!("  {}", "Extensions (by file count):".yellow());
         if ext_list.is_empty() {
-            "(none)".to_string()
+            println!("    (none)");
         } else {
-            ext_list
-                .iter()
-                .map(|s| format!(".{}", s))
-                .collect::<Vec<_>>()
-                .join(", ")
+            for (ext, count) in ext_list {
+                println!("    .{}: {} files", ext, count);
+            }
         }
-    );
+    } else {
+        // Compact view (top 5)
+        let top_exts: Vec<_> = ext_list
+            .iter()
+            .take(5)
+            .map(|(e, _)| format!(".{}", e))
+            .collect();
+        println!(
+            "  {} {}",
+            "Extensions:".dimmed(),
+            if top_exts.is_empty() {
+                "(none)".to_string()
+            } else {
+                top_exts.join(", ")
+            }
+        );
+    }
 
     // Show files list if requested
     if show_files {
