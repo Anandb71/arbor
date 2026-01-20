@@ -40,7 +40,11 @@ fn load_icon() -> std::sync::Arc<egui::IconData> {
     let height = size.height().ceil() as u32;
 
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).expect("Failed to create pixmap");
-    resvg::render(&tree, resvg::tiny_skia::Transform::identity(), &mut pixmap.as_mut());
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::identity(),
+        &mut pixmap.as_mut(),
+    );
 
     std::sync::Arc::new(egui::IconData {
         rgba: pixmap.take(),
