@@ -35,7 +35,7 @@
 
 ---
 
-## Phase 3: Developer Trust Features (v1.5) ✅
+## Phase 3: Developer Trust Features (v1.4) ✅
 
 **Address the biggest real-world problem: "Can I trust this output?"**
 
@@ -48,7 +48,7 @@
 
 ---
 
-## Phase 4: Code Reality Support (v1.6) ✅
+## Phase 4: Code Reality Support (v1.4) ✅
 
 **Real codebases aren't clean. Arbor must handle messiness.**
 

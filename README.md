@@ -117,6 +117,15 @@ git clone https://github.com/Anandb71/arbor.git
 cd arbor/crates
 cargo build --release
 
+### System Dependencies (Linux)
+
+If building the GUI on Linux, you'll need the following development headers:
+
+```bash
+sudo apt-get install -y pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+    libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libssl-dev cmake
+```
+
 # Build visualizer (requires Flutter)
 cd ../visualizer
 flutter build windows

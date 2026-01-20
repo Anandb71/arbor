@@ -1,4 +1,4 @@
-#![rustfmt::skip]
+// Full file skipped by rustfmt manually via block-level attributes to avoid unstable inner attributes
 //! Main application state and UI logic
 
 use arbor_graph::ArborGraph;
@@ -7,6 +7,7 @@ use eframe::egui;
 use std::path::PathBuf;
 
 /// Analysis result for display
+#[rustfmt::skip]
 #[derive(Default)]
 struct AnalysisResult {
     target_name: String,
@@ -20,6 +21,7 @@ struct AnalysisResult {
 }
 
 /// Main application state
+#[rustfmt::skip]
 pub struct ArborApp {
     /// Current working directory
     cwd: PathBuf,
