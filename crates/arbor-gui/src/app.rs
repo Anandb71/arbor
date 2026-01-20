@@ -40,6 +40,15 @@ pub struct ArborApp {
 
     /// Dark mode toggle
     dark_mode: bool,
+
+    /// Search history
+    search_history: Vec<String>,
+
+    /// Show call tree (collapsible)
+    show_call_tree: bool,
+
+    /// Show dependencies (collapsible)
+    show_dependencies: bool,
 }
 
 impl ArborApp {
@@ -52,6 +61,9 @@ impl ArborApp {
             status: "Ready. Enter a symbol name to analyze.".to_string(),
             loading: false,
             dark_mode: true,
+            search_history: Vec::new(),
+            show_call_tree: true,
+            show_dependencies: true,
         }
     }
 
@@ -140,6 +152,15 @@ impl ArborApp {
                     });
 
                     self.status = format!("Analyzed '{}'", target);
+
+                    // Add to search history
+                    let query = target.to_string();
+                    if !self.search_history.contains(&query) {
+                        self.search_history.insert(0, query);
+                        if self.search_history.len() > 10 {
+                            self.search_history.pop();
+                        }
+                    }
                 }
                 None => {
                     self.result = None;
@@ -213,6 +234,23 @@ impl eframe::App for ArborApp {
                     self.analyze();
                 }
             });
+
+            // Search history
+            let mut clicked_query: Option<String> = None;
+            if !self.search_history.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("History:").small().weak());
+                    for query in self.search_history.iter().take(5) {
+                        if ui.small_button(query).clicked() {
+                            clicked_query = Some(query.clone());
+                        }
+                    }
+                });
+            }
+            if let Some(query) = clicked_query {
+                self.symbol_input = query;
+                self.analyze();
+            }
 
             ui.label(egui::RichText::new(&self.status).small().weak());
 
