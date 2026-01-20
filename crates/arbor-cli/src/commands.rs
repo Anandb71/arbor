@@ -337,7 +337,7 @@ pub fn export(path: &Path, output: &Path) -> Result<()> {
 }
 
 /// Show index status.
-pub fn status(path: &Path) -> Result<()> {
+pub fn status(path: &Path, show_files: bool) -> Result<()> {
     let arbor_dir = path.join(".arbor");
 
     if !arbor_dir.exists() {
@@ -348,6 +348,13 @@ pub fn status(path: &Path) -> Result<()> {
 
     // Quick index to get stats
     let result = index_directory(path, IndexOptions::default())?;
+
+    // Collect unique files from indexed nodes
+    let files: std::collections::HashSet<_> = result
+        .graph
+        .nodes()
+        .map(|n| n.file.clone())
+        .collect();
 
     // Collect unique extensions from indexed files
     let extensions: std::collections::HashSet<_> = result
@@ -380,6 +387,20 @@ pub fn status(path: &Path) -> Result<()> {
                 .join(", ")
         }
     );
+
+    // Show files list if requested
+    if show_files {
+        println!();
+        println!("{}", "📁 Indexed Files".cyan().bold());
+        let mut sorted_files: Vec<_> = files.iter().collect();
+        sorted_files.sort();
+        for file in sorted_files.iter().take(50) {
+            println!("  {}", file.dimmed());
+        }
+        if files.len() > 50 {
+            println!("  {} ... and {} more", "".dimmed(), files.len() - 50);
+        }
+    }
 
     // Show helpful tip if graph is empty
     if result.nodes_extracted == 0 && result.files_indexed > 0 {
@@ -847,32 +868,44 @@ fn suggest_similar_symbols(graph: &arbor_graph::ArborGraph, target: &str) -> Res
     println!("{} Couldn't find \"{}\"", "🔍".yellow(), target.cyan());
     println!();
 
-    // Find symbols that contain the target or end with it
+    // Find symbols with relevance scoring
     let target_lower = target.to_lowercase();
-    let mut suggestions: Vec<(&arbor_core::CodeNode, usize)> = Vec::new();
+    
+    // (node, relevance_score, caller_count)
+    // Relevance: 100 = exact name, 80 = exact suffix, 60 = starts with, 40 = contains
+    let mut suggestions: Vec<(&arbor_core::CodeNode, u32, usize)> = Vec::new();
 
     for node in graph.nodes() {
         let name_lower = node.name.to_lowercase();
         let id_lower = node.id.to_lowercase();
 
-        // Match by suffix, contains, or starts with
-        if name_lower == target_lower
-            || id_lower.ends_with(&format!("::{}", target_lower))
+        let relevance = if name_lower == target_lower {
+            100 // Exact name match
+        } else if id_lower.ends_with(&format!("::{}", target_lower))
             || id_lower.ends_with(&format!(".{}", target_lower))
-            || name_lower.contains(&target_lower)
         {
-            // Count callers for this node
-            let caller_count = if let Some(idx) = graph.get_index(&node.id) {
-                graph.analyze_impact(idx, 1).upstream.len()
-            } else {
-                0
-            };
-            suggestions.push((node, caller_count));
-        }
+            80 // Exact suffix match (e.g., "auth" matches "module::auth")
+        } else if name_lower.starts_with(&target_lower) {
+            60 // Starts with (e.g., "auth" matches "authenticate")
+        } else if name_lower.contains(&target_lower) {
+            40 // Contains (e.g., "auth" matches "user_auth_handler")
+        } else {
+            continue; // No match
+        };
+
+        // Count callers for this node
+        let caller_count = if let Some(idx) = graph.get_index(&node.id) {
+            graph.analyze_impact(idx, 1).upstream.len()
+        } else {
+            0
+        };
+        suggestions.push((node, relevance, caller_count));
     }
 
-    // Sort by caller count (most callers first)
-    suggestions.sort_by(|a, b| b.1.cmp(&a.1));
+    // Sort by relevance first, then by caller count
+    suggestions.sort_by(|a, b| {
+        b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2))
+    });
 
     if suggestions.is_empty() {
         println!("No similar symbols found in the codebase.");
@@ -885,7 +918,7 @@ fn suggest_similar_symbols(graph: &arbor_graph::ArborGraph, target: &str) -> Res
     }
 
     println!("{}", "Did you mean:".green());
-    for (i, (node, caller_count)) in suggestions.iter().take(3).enumerate() {
+    for (i, (node, _relevance, caller_count)) in suggestions.iter().take(3).enumerate() {
         let suffix = if *caller_count == 0 {
             "entry point".dimmed().to_string()
         } else {

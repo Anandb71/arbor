@@ -97,6 +97,10 @@ enum Commands {
         /// Path to check (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// List all indexed files
+        #[arg(long)]
+        files: bool,
     },
 
     /// Start the Arbor Visualizer
@@ -197,7 +201,7 @@ async fn main() {
             follow_symlinks,
         } => commands::serve(port, headless, &path, follow_symlinks).await,
         Commands::Export { output, path } => commands::export(&path, &output),
-        Commands::Status { path } => commands::status(&path),
+        Commands::Status { path, files } => commands::status(&path, files),
         Commands::Viz {
             path,
             follow_symlinks,
