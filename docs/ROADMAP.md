@@ -1,88 +1,145 @@
-# Arbor Roadmap: Path to v2.0
+# Arbor Roadmap: v1.3 → v2.0
+
+> **Goal:** Arbor becomes the default pre-refactor safety tool for any developer, with a simple, intuitive GUI and zero guesswork.
+
+---
+
+## Phase 1: Hero Command Perfection (v1.3.x)
+
+**Arbor must feel emotionally safe before adding new features.**
+
+### ✅ Completed
+- [x] Smart edge resolution
+- [x] Persistent caching
+- [x] Warm refactor output
+- [x] Fallback suggestions
+- [x] Quickstart guide
+
+### 🔜 To Finish
+- [ ] Tighten refactor output wording
+- [ ] Improve fallback ranking
+- [ ] More examples in README
+- [ ] Add `arbor status --files` listing
+
+**Outcome:** `arbor refactor <target>` becomes reliable, predictable, and friendly.
+
+---
+
+## Phase 2: GUI v1 — Minimal, Impact-First (v1.4)
+
+**The GUI should ONLY exist to make the "What breaks if I change this?" moment obvious.**
+
+### 🎯 Scope
+- [ ] Add `arbor gui` mode
+- [ ] Egui-based window (Rust native)
+- [ ] Text box: "Enter symbol"
+- [ ] Button: Analyze Impact
+- [ ] Clean results panel:
+  - Direct callers
+  - Indirect callers
+  - Downstream dependencies
+- [ ] Copy-as-markdown button
+- [ ] Light/Dark theme (egui built-in)
+
+### ❌ Not in v1 GUI
+- No graph
+- No sidebar
+- No settings
+- No file explorer
+
+**Outcome:** A single-window safety console any dev can understand in 10 seconds.
+
+---
+
+## Phase 3: Developer Trust Features (v1.5)
+
+**Address the biggest real-world problem: "Can I trust this output?"**
+
+- [ ] **Confidence Signal**: Low / Medium / High
+- [ ] Explain WHY confidence is low (e.g., dynamic calls, missing edges)
+- [ ] **Node Roles**:
+  - Entry point
+  - Utility
+  - Core logic
+  - Isolated
+- [ ] Highlight missing edges as "Uncertain Areas"
+
+**Outcome:** Arbor becomes transparent, not mysterious.
+
+---
+
+## Phase 4: Code Reality Support (v1.6)
+
+**Real codebases aren't clean. Arbor must handle messiness.**
+
+- [ ] Dynamic call heuristics
+- [ ] Widget-tree heuristics for Flutter/Dart
+- [ ] "Possible runtime edge" hints
+- [ ] Smarter import resolution for JS/TS/Python
+- [ ] Support for larger monorepos without noise
+
+**Outcome:** Arbor works on ugly, real-world code — not just pretty examples.
+
+---
+
+## Phase 5: GUI v2 — Visual + Structured (v1.7)
+
+**Now that trust is solid, add carefully scoped visual features.**
+
+- [ ] Optional graph panel (not default view)
+- [ ] Collapsible call tree
+- [ ] File path → click to open in editor
+- [ ] "Suggested safe refactors" section
+- [ ] Search history list
+
+**Outcome:** GUI becomes a real productivity tool, not a gimmick.
+
+---
+
+## Phase 6: Workflow Integration (v1.8–v1.9)
+
+**Fit Arbor into developers' daily routines.**
+
+- [ ] PR summary generator (markdown)
+- [ ] AI-friendly JSON output modes
+- [ ] Editor integrations:
+  - Cursor
+  - VS Code (simple extension)
+- [ ] `arbor watch` mode: auto-refresh index on file save
+- [ ] Configurable ignore patterns
+
+**Outcome:** Arbor becomes something people use 5× per day, not once per week.
+
+---
+
+## Phase 7: v2.0 Identity Lock-In
+
+**Promise:** *"If Arbor says a change is safe, you understand why."*
+
+### Requirements
+- [ ] GUI mature
+- [ ] CLI output consistent and human-friendly
+- [ ] Clear confidence/uncertainty signals
+- [ ] Supports common real-world patterns (frameworks, widgets, async)
+- [ ] Caching stable for large repos
+- [ ] No empty or useless outputs
+- [ ] Zero confusion around installation or crate name
+
+**Outcome:** Arbor reaches **trusted tool status**.  
+Not a toy. Not an experiment. Something developers depend on.
+
+---
+
+## Phase X: Optional Long-Term (Post-2.0)
+
+*Only after adoption is strong.*
+
+- [ ] Full-blown logic visualizer (rebuilt properly)
+- [ ] Architecture smell detection
+- [ ] Automated refactor suggestions
+- [ ] LSP server
+- [ ] Multi-project tagging (concepts from issue #32)
+
+---
 
 > **North Star:** Arbor is the tool you run *before* refactoring, not after something breaks.
-
-## Theme
-**From "useful tool" to "default pre-refactor safety net".**
-
----
-
-## Phase 0: Stabilize the Hero (Now → v1.3.x) 🔒
-**Goal:** Make `arbor refactor` boringly reliable.
-
-- [x] **v1.3.0 The Cache Update**: Faster indexing, smarter resolution.
-- [ ] **Output Polishing**: Refine wording based on confusion reports.
-- [ ] **Better Fallbacks**: Improve suggestions if target not found.
-- [ ] **Clarity**: Make "why this is safe/risky" explicit.
-
-*Rule: No new commands. No architecture changes.*
-
----
-
-## Phase 1: Confidence Signals (v1.4)
-**Theme:** "Can I trust this?"
-
-Responding to: *"I rely on tests / types / compiler."*
-
-- [ ] **Confidence Signal**: Explainable risk level (Low/Medium/High), derived from visible factors.
-- [ ] **Explainer**: "This looks safe structurally. Tests still recommended for behavior."
-- [ ] **Better Role Detection**: Explicitly identify Core Domain vs Adapters vs Utilities.
-
-*Outcome: Arbor feels like a pre-flight checklist, not a judge.*
-
----
-
-## Phase 2: Reality Tolerance (v1.5)
-**Theme:** "Real code isn't perfect."
-
-- [ ] **Dynamic Edge Awareness**: Best-effort heuristics for callbacks, framework hooks (e.g., Flutter widgets).
-- [ ] **Uncertainty Surfacing**: "This dependency *may* exist at runtime."
-- [ ] **Dead/Suspicious Node Detection**: Framed as investigation ("No callers found"), not accusation.
-
-*Outcome: Arbor feels honest about limitations — building trust.*
-
----
-
-## Phase 3: Workflow Fit (v1.6–1.7)
-**Theme:** "Fits how people actually work."
-
-- [ ] **Pre-Refactor Mode**: `arbor refactor auth --mode cautious` (Verbose, conservative).
-- [ ] **Refactor Notes**: Generate markdown summaries pasteable into PR descriptions.
-- [ ] **IDE QoL**: Jump-to-file, line numbers, copyable paths in CLI output.
-
-*Outcome: Arbor becomes part of the ritual, not a one-off tool.*
-
----
-
-## Phase 4: Teaching the Mental Model (v1.8)
-**Theme:** "Explain the system, not just the change."
-
-- [ ] **Call Path Narratives**: "Request enters here → flows through layers → exits here."
-- [ ] **Layer Detection**: Controller, Service, Domain, Infrastructure.
-- [ ] **Architecture Smells**: Gentle observations ("This function has unrelated callers").
-
-*Outcome: Arbor teaches people how their code works.*
-
----
-
-## Phase 5: The Contract (v2.0)
-**Theme:** "I trust this before I touch code."
-
-v2.0 isn't about more features. It's a promise: **"If Arbor says this is safe, you understand why."**
-
-**Criteria:**
-- 1. `arbor refactor` never feels empty.
-- 2. Output always explains reasoning.
-- 3. Uncertainty is explicit.
-- 4. Works on ugly real-world code.
-- 5. Helps even when tests/types exist.
-
----
-
-## What is NOT on the Roadmap (Yet)
-*To keep focus, these stay out until after v2:*
-> These are intentionally excluded to keep Arbor focused on confidence, not complexity.
-- Fancy visualizer overhauls
-- LSP parity with IDEs
-- AI automated refactoring
-- Full runtime analysis
