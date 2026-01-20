@@ -23,7 +23,7 @@
   <img src="https://img.shields.io/badge/release-v1.4.0-blue?style=flat-square" alt="Release" />
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" />
   <img src="https://img.shields.io/badge/rust-1.70+-orange?style=flat-square" alt="Rust" />
-  <img src="https://img.shields.io/badge/flutter-3.0+-blue?style=flat-square" alt="Flutter" />
+  <img src="https://img.shields.io/badge/visualizer-flutter%203.0+-blue?style=flat-square" alt="Visualizer Flutter" />
   <img src="https://img.shields.io/badge/parse-144ms-gold?style=flat-square" alt="144ms Parse" />
   <a href="https://glama.ai/mcp/servers/Anandb71/arbor"><img src="https://glama.ai/mcp/servers/Anandb71/arbor/badge" alt="Glama MCP Server" /></a>
 </p>
@@ -72,13 +72,15 @@ arbor gui
 - 📋 **Copy as Markdown**: Export analysis for PR descriptions
 - 📜 **Search History**: Quick access to recent searches
 
+> CLI and GUI share the same engine — identical analysis across both.
+
 ---
 
 ## Quick Start
 
 ```bash
 # Install
-cargo install arbor
+cargo install arbor-graph-cli
 
 # Run on any project
 cd your-project
