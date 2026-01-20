@@ -221,7 +221,7 @@ impl eframe::App for ArborApp {
             // Header
             ui.horizontal(|ui| {
                 // ui.heading("🌲 Arbor");
-                ui.image(egui::include_image!("C:\\Users\\anand\\Repos\\arbor\\docs\\assets\\arbor-logo.svg"));
+                ui.image(egui::include_image!("../../../docs/assets/arbor-logo.svg"));
                 ui.heading("Arbor");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(if self.dark_mode { "☀" } else { "🌙" }).clicked() {
