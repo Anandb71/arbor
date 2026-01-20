@@ -10,7 +10,10 @@ arbor-graph = { path = "../arbor-graph" }
 arbor-watcher = { path = "../arbor-watcher" }
 eframe = "0.28"
 egui = "0.28"
+egui_extras = { version = "0.28", features = ["all_loaders"] }
+image = { version = "0.25", features = ["jpeg", "png"] } # Required for image loading
 arboard = "3.4"  # Clipboard support
+resvg = "0.44"
 
 [[bin]]
 name = "arbor-gui"
