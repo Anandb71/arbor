@@ -80,7 +80,7 @@ arbor gui
 
 ```bash
 # Install
-cargo install arbor-graph-cli
+cargo install arbor-graph-cli arbor-gui
 
 # Run on any project
 cd your-project
