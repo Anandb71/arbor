@@ -116,6 +116,7 @@ Traditional RAG:         Arbor:
 git clone https://github.com/Anandb71/arbor.git
 cd arbor/crates
 cargo build --release
+```
 
 ### System Dependencies (Linux)
 
@@ -126,6 +127,7 @@ sudo apt-get install -y pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-d
     libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libssl-dev cmake
 ```
 
+```bash
 # Build visualizer (requires Flutter)
 cd ../visualizer
 flutter build windows
