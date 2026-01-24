@@ -12,9 +12,9 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 
-arbor-core = { path = "../arbor-core", version = "1.0.0" }
-arbor-graph = { path = "../arbor-graph", version = "1.0.0" }
-arbor-watcher = { path = "../arbor-watcher", version = "1.0.0" }
+arbor-core = { path = "../arbor-core", version = "1.4.1" }
+arbor-graph = { path = "../arbor-graph", version = "1.4.1" }
+arbor-watcher = { path = "../arbor-watcher", version = "1.4.1" }
 
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
