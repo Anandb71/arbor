@@ -19,6 +19,7 @@ jobs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
+        toolchain: stable
         components: rustfmt, clippy
 
     - name: Install Linux Dependencies
@@ -69,6 +70,8 @@ jobs:
     
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
 
     - name: Install Linux Dependencies
       if: matrix.os == 'ubuntu-latest'
