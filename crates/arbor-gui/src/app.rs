@@ -388,6 +388,12 @@ impl eframe::App for ArborApp {
                     ui.label("Enter a function or class name above to analyze its impact.");
                 });
             }
+            
+            // Version watermark (bottom right)
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Arbor v1.5").small().weak());
+            });
         });
     }
 }

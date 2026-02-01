@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Arbor Demo</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #1a1a2e;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 40px;
+            font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace;
+        }
+
+        .terminal {
+            background: #0d1117;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+            width: 750px;
+            overflow: hidden;
+        }
+
+        .terminal-header {
+            background: #21262d;
+            padding: 12px 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .terminal-button {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+
+        .terminal-button.red {
+            background: #ff5f56;
+        }
+
+        .terminal-button.yellow {
+            background: #ffbd2e;
+        }
+
+        .terminal-button.green {
+            background: #27ca40;
+        }
+
+        .terminal-title {
+            color: #8b949e;
+            font-size: 13px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .terminal-body {
+            padding: 20px;
+            font-size: 14px;
+            line-height: 1.7;
+            color: #e6edf3;
+            min-height: 380px;
+        }
+
+        .prompt {
+            color: #58a6ff;
+        }
+
+        .command {
+            color: #7ee787;
+        }
+
+        .cyan {
+            color: #79c0ff;
+        }
+
+        .green {
+            color: #7ee787;
+        }
+
+        .yellow {
+            color: #e3b341;
+        }
+
+        .red {
+            color: #f85149;
+        }
+
+        .dim {
+            color: #8b949e;
+        }
+
+        .bold {
+            font-weight: bold;
+        }
+
+        .line {
+            margin: 2px 0;
+            white-space: pre;
+            opacity: 0;
+            transform: translateY(5px);
+            transition: opacity 0.2s, transform 0.2s;
+        }
+
+        .line.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .separator {
+            height: 8px;
+        }
+
+        .cursor {
+            display: inline-block;
+            width: 8px;
+            height: 16px;
+            background: #58a6ff;
+            animation: blink 1s infinite;
+            vertical-align: middle;
+        }
+
+        @keyframes blink {
+
+            0%,
+            50% {
+                opacity: 1;
+            }
+
+            51%,
+            100% {
+                opacity: 0;
+            }
+        }
+
+        .typing-text {
+            display: inline;
+        }
+
+        #command-line {
+            opacity: 1;
+            transform: none;
+        }
+
+        .restart-btn {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: #238636;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 14px;
+        }
+
+        .restart-btn:hover {
+            background: #2ea043;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="terminal">
+        <div class="terminal-header">
+            <div class="terminal-button red"></div>
+            <div class="terminal-button yellow"></div>
+            <div class="terminal-button green"></div>
+            <span class="terminal-title">arbor — ~/repos/arbor/crates</span>
+        </div>
+        <div class="terminal-body" id="terminal">
+            <div class="line visible" id="command-line">
+                <span class="prompt">❯</span> <span class="command" id="typed-command"></span><span class="cursor"
+                    id="cursor"></span>
+            </div>
+        </div>
+    </div>
+
+    <button class="restart-btn" onclick="restart()">↻ Restart Animation</button>
+
+    <script>
+        const command = "arbor refactor detect_language";
+        const outputLines = [
+            { text: '', type: 'separator' },
+            { text: '🔍 Analyzing detect_language', type: 'cyan bold' },
+            { text: '', type: 'separator' },
+            { text: '🟢  Confidence: High | Role: Adapter', type: 'mixed', html: '<span class="green">🟢</span>  <span class="green">Confidence: High</span> | <span class="dim">Role: Adapter</span>' },
+            { text: '   • 19 callers, 1 dependencies', type: 'dim' },
+            { text: '   • Well-connected with manageable impact', type: 'dim' },
+            { text: '   • 1 nodes will break immediately', type: 'dim' },
+            { text: '', type: 'separator' },
+            { text: 'This node sits in the middle of the graph.', type: 'cyan' },
+            { text: '  19 callers, 1 dependency.', type: 'normal' },
+            { text: '', type: 'separator' },
+            { text: '⚠️  20 nodes affected (2 direct, 18 transitive)', type: 'mixed', html: '<span class="yellow">⚠️</span> <span class="bold">20</span> nodes affected (<span class="red">2</span> direct, <span class="yellow">18</span> transitive)' },
+            { text: '', type: 'separator' },
+            { text: 'Will break immediately:', type: 'red' },
+            { text: '  • parse_file (function)', type: 'normal' },
+            { text: '  • get_parser (function)', type: 'normal' },
+            { text: '', type: 'separator' },
+            { text: '→ Proceed carefully. Test affected callers.', type: 'mixed', html: '<span class="red">→</span> Proceed carefully. Test affected callers.' },
+            { text: '', type: 'separator' },
+            { text: 'File: arbor-core/src/parser.rs', type: 'dim' },
+        ];
+
+        let charIndex = 0;
+        let lineIndex = 0;
+
+        function typeCommand() {
+            const typedEl = document.getElementById('typed-command');
+            if (charIndex < command.length) {
+                typedEl.textContent += command[charIndex];
+                charIndex++;
+                setTimeout(typeCommand, 50 + Math.random() * 30);
+            } else {
+                // Command typed, hide cursor briefly then show output
+                setTimeout(() => {
+                    document.getElementById('cursor').style.display = 'none';
+                    showOutput();
+                }, 500);
+            }
+        }
+
+        function showOutput() {
+            if (lineIndex < outputLines.length) {
+                const line = outputLines[lineIndex];
+                const terminal = document.getElementById('terminal');
+                const div = document.createElement('div');
+
+                if (line.type === 'separator') {
+                    div.className = 'line separator visible';
+                } else {
+                    div.className = 'line';
+                    if (line.html) {
+                        div.innerHTML = line.html;
+                    } else {
+                        div.innerHTML = `<span class="${line.type}">${line.text}</span>`;
+                    }
+                    // Trigger animation
+                    setTimeout(() => div.classList.add('visible'), 10);
+                }
+
+                terminal.appendChild(div);
+                lineIndex++;
+
+                const delay = line.type === 'separator' ? 50 : 80;
+                setTimeout(showOutput, delay);
+            } else {
+                // Add final prompt with cursor
+                setTimeout(() => {
+                    const terminal = document.getElementById('terminal');
+                    const div = document.createElement('div');
+                    div.className = 'line visible';
+                    div.innerHTML = '<span class="prompt">❯</span> <span class="cursor"></span>';
+                    terminal.appendChild(div);
+                }, 300);
+            }
+        }
+
+        function restart() {
+            charIndex = 0;
+            lineIndex = 0;
+            document.getElementById('terminal').innerHTML = `
+                <div class="line visible" id="command-line">
+                    <span class="prompt">❯</span> <span class="command" id="typed-command"></span><span class="cursor" id="cursor"></span>
+                </div>
+            `;
+            setTimeout(typeCommand, 500);
+        }
+
+        // Start animation after page load
+        setTimeout(typeCommand, 800);
+    </script>
+</body>
+
+</html>

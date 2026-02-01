@@ -74,22 +74,47 @@ impl ContextSlice {
         )
     }
 
-    /// Returns only pinned nodes.
     pub fn pinned_only(&self) -> Vec<&ContextNode> {
         self.nodes.iter().filter(|n| n.pinned).collect()
     }
 }
 
-/// Estimates tokens for a code node.
+use once_cell::sync::Lazy;
+use tiktoken_rs::cl100k_base;
+
+/// Global tokenizer instance (lazy-loaded once)
+static TOKENIZER: Lazy<tiktoken_rs::CoreBPE> =
+    Lazy::new(|| cl100k_base().expect("Failed to load cl100k_base tokenizer"));
+
+/// Threshold for falling back to heuristic tokenizer (800 KB)
+const LARGE_FILE_THRESHOLD: usize = 800 * 1024;
+
+/// Estimates tokens for a code node using tiktoken cl100k_base.
 ///
-/// Simple heuristic: 1 token ≈ 4 characters.
-/// This matches GPT-4's average for code.
+/// Falls back to heuristic (4 chars/token) for large content to avoid
+/// performance issues with massive JS bundles.
 fn estimate_tokens(node: &NodeInfo) -> usize {
     let base = node.name.len() + node.qualified_name.len() + node.file.len();
     let signature_len = node.signature.as_ref().map(|s| s.len()).unwrap_or(0);
     let lines = (node.line_end.saturating_sub(node.line_start) + 1) as usize;
     let estimated_chars = base + signature_len + (lines * 40);
-    (estimated_chars + 3) / 4
+
+    // Performance guardrail: use heuristic for very large content
+    if estimated_chars > LARGE_FILE_THRESHOLD {
+        return (estimated_chars + 3) / 4; // Heuristic fallback
+    }
+
+    // Build text representation for accurate tokenization
+    let text = format!(
+        "{} {} {}{}",
+        node.qualified_name,
+        node.file,
+        node.signature.as_deref().unwrap_or(""),
+        " ".repeat(lines * 40) // Approximate code content
+    );
+
+    // Use tiktoken for accurate count
+    TOKENIZER.encode_with_special_tokens(&text).len()
 }
 
 impl ArborGraph {

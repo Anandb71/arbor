@@ -114,11 +114,14 @@ impl McpServer {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {
                     "tools": {},
-                    "resources": {}
+                    "resources": {},
+                    "streaming": false,
+                    "pagination": false,
+                    "json": true
                 },
                 "serverInfo": {
                     "name": "arbor-mcp",
-                    "version": "0.1.0"
+                    "version": "1.5.0"
                 }
             })),
             "notifications/initialized" => Ok(json!({})),
@@ -254,6 +257,11 @@ impl McpServer {
                     Some(idx) => {
                         let analysis = graph.analyze_impact(idx, max_depth);
 
+                        // Compute confidence and role
+                        let confidence =
+                            arbor_graph::ConfidenceExplanation::from_analysis(&analysis);
+                        let role = arbor_graph::NodeRole::from_analysis(&analysis);
+
                         // Build structured response
                         let upstream: Vec<Value> = analysis
                             .upstream
@@ -297,11 +305,21 @@ impl McpServer {
                                         "kind": analysis.target.kind,
                                         "file": analysis.target.file
                                     },
+                                    "confidence": {
+                                        "level": confidence.level.to_string(),
+                                        "reasons": confidence.reasons
+                                    },
+                                    "role": role.to_string(),
                                     "upstream": upstream,
                                     "downstream": downstream,
                                     "total_affected": analysis.total_affected,
                                     "max_depth": analysis.max_depth,
-                                    "query_time_ms": analysis.query_time_ms
+                                    "query_time_ms": analysis.query_time_ms,
+                                    "edges_explained": format!(
+                                        "{} upstream callers, {} downstream dependencies",
+                                        analysis.upstream.len(),
+                                        analysis.downstream.len()
+                                    )
                                 })).unwrap_or_default()
                             }]
                         }))

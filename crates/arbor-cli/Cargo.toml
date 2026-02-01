@@ -27,3 +27,4 @@ colored = "2.0"
 indicatif = "0.17"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5.0"
+strsim = "0.11"

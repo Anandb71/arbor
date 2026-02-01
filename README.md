@@ -2,7 +2,7 @@
   <img src="docs/assets/arbor-logo.svg" alt="Arbor" width="120" height="120" />
 </p>
 
-# Arbor v1.4.0
+# Arbor v1.5.0
 
 **Graph‑Native Intelligence for Codebases**
 
@@ -10,10 +10,23 @@
 
 <p align="center">
   <a href="https://github.com/Anandb71/arbor/actions"><img src="https://img.shields.io/github/actions/workflow/status/Anandb71/arbor/rust.yml?style=flat-square&label=CI" alt="CI" /></a>
-  <img src="https://img.shields.io/badge/release-v1.4.0-blue?style=flat-square" alt="Release" />
+  <img src="https://img.shields.io/badge/release-v1.5.0-blue?style=flat-square" alt="Release" />
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" />
 </p>
 
+## What's New in v1.5
+
+- **Accurate Token Counting** — tiktoken (cl100k_base) replaces heuristic estimates for precise LLM context budgets
+- **Fuzzy Symbol Suggestions** — Typo tolerance with Jaro-Winkler matching: `arbor refactor autth` → "Did you mean: `auth`?"
+- **Enhanced MCP/AI Integration** — Rich JSON output with confidence, roles, and edge explanations for Claude/Cursor
+- **GUI Version Watermark** — "Arbor v1.5" badge for brand visibility in screenshots
+- **Better Python UX** — Empty `__init__.py` handled silently (no false warnings)
+
+<p align="center">
+  <img src="docs/assets/arbor-demo.gif" alt="Arbor refactor demo" width="700" />
+</p>
+
+## Overview
 ---
 
 ## What is Arbor?
