@@ -83,9 +83,8 @@ use once_cell::sync::Lazy;
 use tiktoken_rs::cl100k_base;
 
 /// Global tokenizer instance (lazy-loaded once)
-static TOKENIZER: Lazy<tiktoken_rs::CoreBPE> = Lazy::new(|| {
-    cl100k_base().expect("Failed to load cl100k_base tokenizer")
-});
+static TOKENIZER: Lazy<tiktoken_rs::CoreBPE> =
+    Lazy::new(|| cl100k_base().expect("Failed to load cl100k_base tokenizer"));
 
 /// Threshold for falling back to heuristic tokenizer (800 KB)
 const LARGE_FILE_THRESHOLD: usize = 800 * 1024;

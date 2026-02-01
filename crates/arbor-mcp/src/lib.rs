@@ -258,7 +258,8 @@ impl McpServer {
                         let analysis = graph.analyze_impact(idx, max_depth);
 
                         // Compute confidence and role
-                        let confidence = arbor_graph::ConfidenceExplanation::from_analysis(&analysis);
+                        let confidence =
+                            arbor_graph::ConfidenceExplanation::from_analysis(&analysis);
                         let role = arbor_graph::NodeRole::from_analysis(&analysis);
 
                         // Build structured response
