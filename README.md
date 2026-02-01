@@ -4,11 +4,9 @@
 
 # Arbor v1.5.0
 
-**The Graph-Native Intelligence Layer for Code**
+**Graph‑Native Intelligence for Codebases**
 
-> Know what breaks before you break it.
-
----
+> Know what breaks *before* you break it.
 
 <p align="center">
   <a href="https://github.com/Anandb71/arbor/actions"><img src="https://img.shields.io/github/actions/workflow/status/Anandb71/arbor/rust.yml?style=flat-square&label=CI" alt="CI" /></a>
@@ -29,12 +27,23 @@
 </p>
 
 ## Overview
+---
 
-Arbor is a local-first impact analysis engine for large codebases. Unlike traditional search or RAG which relies on keyword similarity, Arbor parses your code into a semantic graph, allowing you to trace actual execution paths and dependencies.
+## What is Arbor?
 
-### Example: Blast Radius Detection
+Arbor is a **local‑first impact analysis engine** for large codebases. Instead of treating code as text, Arbor parses your project into a **semantic dependency graph**. This lets you trace *real execution paths*—callers, callees, imports, inheritance, and cross‑file relationships—so you can confidently understand the consequences of change.
 
-Before refactoring `detect_language`, see exactly what depends on it:
+Unlike keyword search or vector‑based RAG systems, Arbor answers questions like:
+
+> *“If I change this function, what actually breaks?”*
+
+with **structural certainty**, not probabilistic guesses.
+
+---
+
+## Example: Blast Radius Detection
+
+Before refactoring `detect_language`, inspect its true impact:
 
 ```bash
 $ arbor refactor detect_language
@@ -54,11 +63,13 @@ Immediate Impact:
 Recommendation: Proceed with caution. Verify affected callers.
 ```
 
+This is **execution‑aware analysis**, not text matching.
+
 ---
 
 ## Graphical Interface
 
-Arbor v1.4 includes a native GUI for visual impact analysis.
+Arbor v1.4 ships with a **native GUI** for interactive impact analysis.
 
 ```bash
 arbor gui
@@ -66,98 +77,122 @@ arbor gui
 
 ![Arbor GUI](docs/gui_screenshot.png)
 
-**Key Capabilities:**
-- **Symbol Search**: Instant lookup for functions, classes, and methods.
-- **Impact Analysis**: Visualize direct and indirect dependencies.
-- **Privacy**: File paths are hidden by default to prevent accidental leaks in screenshots.
-- **Export**: Copy analysis results as Markdown for PR descriptions.
+### GUI Capabilities
 
-> **Note:** The CLI and GUI share the same analysis engine.
+* **Symbol Search** – Instantly locate functions, classes, and methods
+* **Impact Visualization** – Explore direct and transitive dependencies
+* **Privacy‑Safe** – File paths are hidden by default for clean screenshots
+* **Export** – Copy results as Markdown for PRs and design docs
+
+> The CLI and GUI share the *same* analysis engine—no feature gaps.
 
 ---
 
 ## Quick Start
 
-1. **Install Arbor** (includes both CLI and GUI):
+1. **Install Arbor** (CLI + GUI):
+
    ```bash
    cargo install arbor-graph-cli
    ```
 
 2. **Run Impact Analysis**:
+
    ```bash
    cd your-project
-   arbor refactor <function-name>
+   arbor refactor <symbol-name>
    ```
 
-3. **Launch GUI**:
+3. **Launch the GUI**:
+
    ```bash
    arbor gui
    ```
 
-> See the [Quickstart Guide](docs/QUICKSTART.md) for advanced commands.
+📘 See the [Quickstart Guide](docs/QUICKSTART.md) for advanced workflows.
 
 ---
 
 ## Why Arbor?
 
-Most AI coding tools treat code as unstructured text, relying on vector similarity which lacks precision.
+Most AI coding tools treat code as **unstructured text**, relying on vector similarity. This approach is fast—but imprecise.
 
-**Arbor builds a graph.** Every function, class, and import is a node; every call is an edge. When you ask "what breaks if I change this?", Arbor traces the actual execution path rather than guessing based on keyword matches.
+**Arbor builds a graph.**
+
+Every function, class, and module is a node. Every call, import, and reference is an edge. When you ask a question, Arbor follows the graph—*the same way your program executes*.
 
 ```text
-Traditional RAG:         Arbor Graph Analysis:
+Traditional RAG:              Arbor Graph Analysis:
 
-"auth" → 47 results      "auth" → AuthController
-(keyword match)                   ├── calls → TokenMiddleware
-                                  ├── queries → UserRepository
-                                  └── emits → AuthEvent
+"auth" → 47 results          AuthController
+(keyword similarity)           ├── calls → TokenMiddleware
+                               ├── queries → UserRepository
+                               └── emits → AuthEvent
 ```
 
-## Features
+The result: **deterministic, explainable answers**.
+
+---
+
+## Core Features
 
 ### Native GUI
-A lightweight, high-performance interface for impact analysis. Included securely in the main binary.
+
+A lightweight, high‑performance interface bundled directly with Arbor—no browser, no server.
 
 ### Confidence Scoring
-Every analysis provides an explainable confidence level:
-- **High**: Well-connected, static resolution confirmed.
-- **Medium**: Some uncertainty in resolution.
-- **Low**: Relies on heuristics or involves dynamic dispatch.
+
+Each result includes an **explainable confidence level**:
+
+* **High** – Fully resolved, statically verifiable paths
+* **Medium** – Partial uncertainty (e.g., polymorphism)
+* **Low** – Heuristic or dynamic resolution
 
 ### Node Classification
-Nodes are automatically classified by their architectural role:
-- **Entry Point**: API endpoints or main functions.
-- **Core Logic**: Domain-specific business logic.
-- **Utility**: Helper functions widely used across the codebase.
-- **Adapter**: Interface layers and bridges.
+
+Arbor infers architectural roles automatically:
+
+* **Entry Point** – APIs, CLIs, main functions
+* **Core Logic** – Domain and business rules
+* **Utility** – Widely reused helpers
+* **Adapter** – Interfaces, boundaries, and bridges
 
 ### AI Bridge (MCP)
-Arbor implements the Model Context Protocol (MCP), allowing LLMs (like Claude) to:
-- `find_path(start, end)`: Discover logic flow between components.
-- `analyze_impact(node)`: Determine blast radius programmatically.
-- `get_context(node)`: Retrieve semantically linked code.
 
-### Cross-File Resolution
-Arbor resolves imports, class inheritance, and function calls across file boundaries using a global symbol table. It distinguishes between `User` in `auth.ts` and `User` in `types.ts`.
+Arbor implements the **Model Context Protocol (MCP)**, enabling LLMs (e.g., Claude) to query the graph directly:
+
+* `find_path(start, end)` – Trace logic flow
+* `analyze_impact(node)` – Compute blast radius
+* `get_context(node)` – Retrieve semantically related code
+
+### Cross‑File Resolution
+
+A global symbol table resolves:
+
+* Imports and re‑exports
+* Inheritance and interfaces
+* Overloads and namespaces
+
+`User` in `auth.ts` is never confused with `User` in `types.ts`.
 
 ---
 
 ## Supported Languages
 
-| Language   | Status | Parser Entity Coverage |
-|------------|--------|------------------------|
-| **Rust**       | ✅     | Functions, Structs, Impls, Traits, Macros |
-| **TypeScript** | ✅     | Classes, Interfaces, Types, Imports, JSX |
-| **JavaScript** | ✅     | Functions, Classes, Vars, Imports |
-| **Python**     | ✅     | Classes, Functions, Imports, Decorators |
-| **Go**         | ✅     | Structs, Interfaces, Funcs, Methods |
-| **Java**       | ✅     | Classes, Interfaces, Methods, Fields, Connectors |
-| **C**          | ✅     | Structs, Functions, Enums, Typedefs |
-| **C++**        | ✅     | Classes, Namespaces, Templates, Impls |
-| **C#**         | ✅     | Classes, Methods, Properties, Interfaces, Structs |
-| **Dart**       | ✅     | Classes, Mixins, Methods, Widgets |
+| Language       | Status | Parser Coverage                           |
+| -------------- | ------ | ----------------------------------------- |
+| **Rust**       | ✅      | Functions, Structs, Traits, Impls, Macros |
+| **TypeScript** | ✅      | Classes, Interfaces, Types, Imports, JSX  |
+| **JavaScript** | ✅      | Functions, Classes, Vars, Imports         |
+| **Python**     | ✅      | Classes, Functions, Imports, Decorators   |
+| **Go**         | ✅      | Structs, Interfaces, Funcs, Methods       |
+| **Java**       | ✅      | Classes, Interfaces, Methods, Fields      |
+| **C**          | ✅      | Structs, Functions, Enums, Typedefs       |
+| **C++**        | ✅      | Classes, Namespaces, Templates            |
+| **C#**         | ✅      | Classes, Methods, Properties, Interfaces  |
+| **Dart**       | ✅      | Classes, Mixins, Widgets                  |
 
-> **Python support:** Includes static analysis for decorators, `__init__.py` modules, and `@dataclass` patterns. Dynamic dispatch is marked as uncertain.
+> **Python note:** Decorators, `__init__.py`, and `@dataclass` are statically analyzed. Dynamic dispatch is flagged with reduced confidence.
 
 ---
 
@@ -169,35 +204,41 @@ cd arbor/crates
 cargo build --release
 ```
 
-### Linux Dependencies
-If building the GUI on Linux, install development headers:
+### Linux GUI Dependencies
+
 ```bash
 sudo apt-get install -y pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-    libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libssl-dev cmake
+  libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libssl-dev cmake
 ```
 
 ---
 
 ## Troubleshooting
 
-### Why was my symbol not found?
-- **GitIgnore**: Arbor respects `.gitignore`. Check with `arbor status --files`.
-- **Extension**: Ensure the file type is supported (e.g., `.rs`, `.ts`, `.py`).
-- **Content**: Empty files are skipped (except `__init__.py`).
-- **Dynamic Calls**: Purely dynamic calls (e.g., `eval`) may not be detected.
-- **Typo**: Symbols are case-sensitive. Use `arbor query <partial_name>` to search.
+### Symbol not found?
 
-### Graph is empty?
+* **.gitignore** – Arbor respects it (`arbor status --files`)
+* **File type** – Ensure the extension is supported
+* **Empty files** – Skipped (except `__init__.py`)
+* **Dynamic calls** – `eval` / runtime reflection may not resolve
+* **Case sensitivity** – Use `arbor query <partial>` to search
+
+### Empty graph?
+
 Run `arbor status` to verify file detection and parser health.
 
 ---
 
-## Security
+## Security Model
 
-Arbor operates on a **Local-First** security model:
-- **No Exfiltration**: All analysis happens locally on your machine.
-- **Offline Capable**: No API keys or internet connection required.
-- **Open Source**: Full transparency for security audits.
+Arbor is **Local‑First by design**:
+
+* No data exfiltration
+* Fully offline
+* No API keys
+* Fully open source
+
+Your code never leaves your machine.
 
 ---
 
@@ -206,5 +247,5 @@ Arbor operates on a **Local-First** security model:
 MIT License. See [LICENSE](LICENSE) for details.
 
 <p align="center">
-  <a href="https://github.com/Anandb71/arbor">⭐ Star us on GitHub</a>
+  <a href="https://github.com/Anandb71/arbor">⭐ Star Arbor on GitHub</a>
 </p>
