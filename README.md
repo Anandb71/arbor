@@ -165,6 +165,8 @@ Arbor implements the **Model Context Protocol (MCP)**, enabling LLMs (e.g., Clau
 * `analyze_impact(node)` – Compute blast radius
 * `get_context(node)` – Retrieve semantically related code
 
+📦 **Available on [Glama](https://glama.ai/)** – Discover Arbor in the MCP server directory
+
 ### Cross‑File Resolution
 
 A global symbol table resolves:
