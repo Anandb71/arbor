@@ -1453,3 +1453,96 @@ mod tests {
         );
     }
 }
+
+/// Perform a security audit to find paths to a sensitive sink.
+pub fn audit(sink: &str, depth: usize, format: &str, path: &Path) -> Result<()> {
+    // 1. Load the graph
+    let graph = load_graph(path)?;
+    println!("{} Auditing security paths to sink: {}", "🔍".cyan(), sink.yellow().bold());
+
+    // 2. Configure audit
+    let config = crate::audit::AuditConfig {
+        max_depth: depth,
+        ignore_tests: true, // efficient default for security audit
+    };
+
+    // 3. Run audit
+    let start = std::time::Instant::now();
+    let result = crate::audit::run_audit(&graph, sink, &config)
+        .map_err(|e| e.to_string())?;
+    let duration = start.elapsed();
+
+    // 4. Output results
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    // Text output
+    println!(
+        "{} Found {} paths to sink in {:.2?}\n",
+        if result.path_count > 0 { "⚠️".yellow() } else { "✓".green() },
+        result.path_count,
+        duration
+    );
+
+    if result.path_count == 0 {
+        println!("No public entry points found leading to '{}'.", sink);
+        return Ok(());
+    }
+
+    println!("{}", "🚨 Exploit Paths Detected:".red().bold());
+    println!("{}", "=========================".dimmed());
+
+    for (i, path) in result.entry_points.iter().take(10).enumerate() {
+        println!("\n{}. Entry Point: {}", i + 1, path.source.name.green().bold());
+        println!("   File: {}", path.source.file.dimmed());
+        
+        println!("   Trace:");
+        for (j, step) in path.trace.iter().enumerate() {
+             let prefix = if j == path.trace.len() - 1 { "└─" } else { "├─" };
+             let style = if j == 0 { 
+                 colored::Colorize::green 
+             } else if j == path.trace.len() - 1 { 
+                 colored::Colorize::red 
+             } else { 
+                 colored::Colorize::white 
+             };
+             
+             println!("     {} {}", prefix.dimmed(), style(&step.name[..]));
+        }
+        
+        if !path.uncertainty.is_empty() {
+             println!("   Heuristics: {}", path.uncertainty.join(", ").yellow());
+        }
+    }
+
+    if result.path_count > 10 {
+        println!("\n... and {} more paths.", result.path_count - 10);
+    }
+    
+    // Suggest remediation or next steps?
+    println!("\n{}", "Recommended Action:".cyan().bold());
+    println!("  Review these paths to ensure input sanitization before reaching '{}'.", sink);
+
+    Ok(())
+}
+
+fn load_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
+    let arbor_dir = path.join(".arbor");
+    let graph_path = arbor_dir.join("graph.json");
+
+    if !graph_path.exists() {
+        return Err(format!(
+            "Graph not found at {}. Run 'arbor index' first.",
+            graph_path.display()
+        )
+        .into());
+    }
+
+    let file = std::fs::File::open(&graph_path)?;
+    let reader = std::io::BufReader::new(file);
+    let graph: arbor_graph::ArborGraph = serde_json::from_reader(reader)?;
+
+    Ok(graph)
+}

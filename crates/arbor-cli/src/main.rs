@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod commands;
+mod audit;
 
 #[derive(Parser)]
 #[command(name = "arbor")]
@@ -192,6 +193,24 @@ enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+
+    /// Security audit: Trace paths to sensitive sinks
+    Audit {
+        /// The sensitive sink to analyze (e.g., "db_query", "exec")
+        sink: String,
+
+        /// Maximum depth to search (default: 8)
+        #[arg(short, long, default_value = "8")]
+        depth: usize,
+
+        /// Output format (default: text, options: json, csv)
+        #[arg(long, default_value = "text")]
+        format: String,
+
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -251,6 +270,12 @@ async fn main() {
         Commands::Gui { path } => commands::gui(&path),
         Commands::PrSummary { symbols, path } => commands::pr_summary(&symbols, &path),
         Commands::Watch { path } => commands::watch(&path).await,
+        Commands::Audit {
+            sink,
+            depth,
+            format,
+            path,
+        } => commands::audit(&sink, depth, &format, &path),
     };
 
     if let Err(e) = result {
