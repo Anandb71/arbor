@@ -8,8 +8,8 @@ use colored::Colorize;
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod commands;
 mod audit;
+mod commands;
 
 #[derive(Parser)]
 #[command(name = "arbor")]
