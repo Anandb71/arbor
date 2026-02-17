@@ -776,7 +776,7 @@ pub fn refactor(target: &str, max_depth: usize, show_why: bool, json_output: boo
         println!();
 
         // 2. Check for heuristics fired
-        let all_nodes: Vec<_> = analysis
+        let _all_nodes: Vec<_> = analysis
             .all_affected()
             .iter()
             .map(|a| &a.node_info)
@@ -1452,4 +1452,174 @@ mod tests {
             viz_path
         );
     }
+}
+
+/// Perform a security audit to find paths to a sensitive sink.
+pub fn audit(sink: &str, depth: usize, format: &str, path: &Path) -> Result<()> {
+    // 1. Load the graph
+    let graph = load_graph(path)?;
+    println!(
+        "{} Auditing security paths to sink: {}",
+        "🔍".cyan(),
+        sink.yellow().bold()
+    );
+
+    // 2. Configure audit
+    let config = crate::audit::AuditConfig {
+        max_depth: depth,
+        ignore_tests: true,
+    };
+
+    // 3. Run audit
+    let start = std::time::Instant::now();
+    let result = crate::audit::run_audit(&graph, sink, &config).map_err(|e| e.to_string())?;
+    let duration = start.elapsed();
+
+    // 4. Output results
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            return Ok(());
+        }
+        "csv" => {
+            println!("severity,entry_point,entry_file,path_length,trace");
+            for audit_path in &result.paths {
+                let trace_str: Vec<&str> =
+                    audit_path.trace.iter().map(|n| n.name.as_str()).collect();
+                println!(
+                    "{},{},{},{},\"{}\"",
+                    audit_path.severity.label(),
+                    audit_path.source.name,
+                    audit_path.source.file,
+                    audit_path.trace.len(),
+                    trace_str.join(" -> ")
+                );
+            }
+            return Ok(());
+        }
+        _ => {} // text format below
+    }
+
+    // Text output
+    println!(
+        "\n{} Found {} paths to sink in {:.2?}",
+        if result.path_count > 0 {
+            "⚠️".yellow()
+        } else {
+            "✓".green()
+        },
+        result.path_count,
+        duration
+    );
+
+    if result.path_count == 0 {
+        println!(
+            "\nNo public entry points found leading to '{}'.",
+            sink.dimmed()
+        );
+        return Ok(());
+    }
+
+    // Summary box
+    println!("\n{}", "┌─ Audit Summary ─────────────────────┐".dimmed());
+    println!(
+        "│  {} Critical: {}  {} High: {}  {} Medium: {}  {} Low: {}",
+        "🔴",
+        result.summary.critical_count,
+        "🟠",
+        result.summary.high_count,
+        "🟡",
+        result.summary.medium_count,
+        "🟢",
+        result.summary.low_count
+    );
+    println!(
+        "│  Entry Points: {}  Files Touched: {}",
+        result.summary.unique_entry_points, result.summary.unique_files
+    );
+    println!("{}", "└─────────────────────────────────────┘".dimmed());
+
+    // Detailed paths
+    println!("\n{}", "Exploit Paths:".red().bold());
+    println!("{}", "═".repeat(50).dimmed());
+
+    for (i, audit_path) in result.paths.iter().take(15).enumerate() {
+        println!(
+            "\n{} {}. {} → {}",
+            audit_path.severity.emoji(),
+            i + 1,
+            audit_path.source.name.green().bold(),
+            sink.red().bold()
+        );
+        println!(
+            "   {} {}  Depth: {}",
+            "File:".dimmed(),
+            audit_path.source.file.dimmed(),
+            audit_path.trace.len()
+        );
+
+        println!("   {}", "Trace:".dimmed());
+        for (j, step) in audit_path.trace.iter().enumerate() {
+            let is_last = j == audit_path.trace.len() - 1;
+            let prefix = if is_last { "└─" } else { "├─" };
+            let name = if j == 0 {
+                step.name.green().to_string()
+            } else if is_last {
+                step.name.red().to_string()
+            } else {
+                step.name.white().to_string()
+            };
+            println!("     {} {}", prefix.dimmed(), name);
+        }
+
+        if !audit_path.uncertainty.is_empty() {
+            println!(
+                "   {} {}",
+                "⚠ Heuristic:".yellow(),
+                audit_path.uncertainty.join(", ")
+            );
+        }
+    }
+
+    if result.path_count > 15 {
+        println!(
+            "\n{} ... and {} more paths. Use --format json for full export.",
+            "→".dimmed(),
+            result.path_count - 15
+        );
+    }
+
+    // Remediation
+    println!("\n{}", "Recommended Actions:".cyan().bold());
+    println!(
+        "  1. Review direct callers of '{}' for input validation.",
+        sink
+    );
+    println!("  2. Add sanitization at entry points marked CRITICAL/HIGH.");
+    println!(
+        "  3. Export full report: {} {} --format csv",
+        "arbor audit".bold(),
+        sink
+    );
+
+    Ok(())
+}
+
+fn load_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
+    let arbor_dir = path.join(".arbor");
+    let graph_path = arbor_dir.join("graph.json");
+
+    if !graph_path.exists() {
+        return Err(format!(
+            "Graph not found at {}. Run 'arbor index' first.",
+            graph_path.display()
+        )
+        .into());
+    }
+
+    let file = std::fs::File::open(&graph_path)?;
+    let reader = std::io::BufReader::new(file);
+    let graph: arbor_graph::ArborGraph = serde_json::from_reader(reader)?;
+
+    Ok(graph)
 }

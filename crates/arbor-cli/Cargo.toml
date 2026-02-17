@@ -28,3 +28,5 @@ indicatif = "0.17"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5.0"
 strsim = "0.11"
+petgraph = "0.6"
+anyhow = "1.0"

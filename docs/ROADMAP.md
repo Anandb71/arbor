@@ -1,126 +1,48 @@
-# Arbor Roadmap: v1.3 → v2.0
+# Arbor Roadmap: Path to v2.0 & Beyond
 
-> **Goal:** Arbor becomes the default pre-refactor safety tool for any developer, with a simple, intuitive GUI and zero guesswork.
-
----
-
-## Phase 1: Hero Command Perfection (v1.3.x) ✅
-
-**Arbor must feel emotionally safe before adding new features.**
-
-- [x] Smart edge resolution
-- [x] Persistent caching
-- [x] Warm refactor output
-- [x] Fallback suggestions (with relevance ranking)
-- [x] Quickstart guide
-- [x] `arbor status --files` listing
-
-**Outcome:** `arbor refactor <target>` is reliable, predictable, and friendly.
+> **Vision:** Arbor is the "Nervous System" for AI Agents—a persistent, visual, and intelligent memory graph that prevents hallucinations and enables safe, massive-scale refactoring.
 
 ---
 
-## Phase 2: GUI v1 — Minimal, Impact-First (v1.4) ✅
+## 🧠 1. Architectural Memory Graph (Visual Intelligence)
+*Turn impact analysis into a persistent, explorable map.*
+- [ ] **Persistent Graph Store:** Move beyond ephemeral indexing to a persistent database (SQLite/Sled) for instant load times.
+- [ ] **Visual Dependency Explorer:** Interactive, queryable UI to answer "What breaks if I delete this?"
+- [ ] **Time-Travel Analysis:** Track architectural drift over time (integration with Git history).
 
-**The GUI should ONLY exist to make the "What breaks if I change this?" moment obvious.**
+## 🤖 2. AI Explanation Layer
+*Make the graph human-readable and trustable.*
+- [ ] **Narrative Engine:** Convert raw graph data into sentences (e.g., "This function affects 6 downstream services...").
+- [ ] **Confidence Contracts:** SLA for analysis certainty (e.g., "100% static certainty" vs "80% heuristic").
+- [ ] **Agent Bridge (MCP):** Deepen integration with Claude/Cursor to act as the "ground truth" for AI coding agents.
 
-- [x] Add `arbor gui` mode
-- [x] Egui-based window (Rust native)
-- [x] Text box: "Enter symbol"
-- [x] Button: Analyze Impact
-- [x] Clean results panel (direct callers, indirect callers, dependencies)
-- [x] Copy-as-markdown button
-- [x] Light/Dark theme (egui built-in)
+## 🛡️ 3. Security & Audit ("Blast Radius for CVEs")
+*Penetrate the security market with vulnerability tracing.*
+- [ ] **`arbor audit <function>`:** Trace tainted inputs and vulnerable execution paths.
+- [ ] **Compliance Reports:** Generate artifacts for SOC2/ISO 27001 showing impact analysis.
 
-**Outcome:** A single-window safety console any dev can understand in 10 seconds.
+## 🌍 4. Multi-Language & Ecosystem
+*Be the #1 tool for every stack.*
+- [ ] **Language Expansion:** Full support for JS/TS, Python, Go, Rust, Java, C#.
+- [ ] **Plugin System:** Wasm-based plugin architecture for community parsers.
+- [ ] **"Bounty Board":** Gamified community contributions for new language parsers.
 
----
+## 🏢 5. Enterprise Mode
+*Features for global dominance.*
+- [ ] **Air-Gapped Support:** Fully offline operation (already core, but explicit support).
+- [ ] **On-Premise Deployment:** Dockerized containers for enterprise CI/CD.
+- [ ] **Role-Based Access:** Graph views tailored for Junior vs Senior devs vs Architects.
 
-## Phase 3: Developer Trust Features (v1.4) ✅
-
-**Address the biggest real-world problem: "Can I trust this output?"**
-
-- [x] **Confidence Signal**: Low / Medium / High with colored indicators
-- [x] Explain WHY confidence is at that level
-- [x] **Node Roles**: Entry Point, Utility, Core Logic, Isolated, Adapter
-- [x] Display role and confidence in CLI output
-
-**Outcome:** Arbor is transparent, not mysterious.
-
----
-
-## Phase 4: Code Reality Support (v1.4) ✅
-
-**Real codebases aren't clean. Arbor must handle messiness.**
-
-- [x] Dynamic call heuristics (`HeuristicsMatcher`)
-- [x] Widget-tree heuristics for Flutter/Dart
-- [x] Event handler detection
-- [x] Callback pattern detection
-- [x] Dependency injection pattern detection
-- [x] `UncertainEdge` type for "possible runtime edges"
-
-**Outcome:** Arbor works on ugly, real-world code — not just pretty examples.
+## 🔄 6. Continuous Learning Engine
+*From rule-based to intelligent.*
+- [ ] **Feedback Loop:** Learn from user corrections ("No, this isn't a dependency") to improve heuristics.
+- [ ] **Pattern Recognition:** Automatically detect and adapt to repo-specific architectural patterns (e.g., "All `*Service` classes are singletons").
 
 ---
 
-## Phase 5: GUI v2 — Visual + Structured (v1.7) ✅
+## 🚀 Immediate Focus (v1.6)
+**Theme:** *The Security & Intelligence Layer*
 
-**Now that trust is solid, add carefully scoped visual features.**
-
-- [x] Search history list with clickable buttons
-- [ ] Optional graph panel (not default view)
-- [ ] Collapsible call tree
-- [ ] File path → click to open in editor
-- [ ] "Suggested safe refactors" section
-
-**Outcome:** GUI becomes a real productivity tool, not a gimmick.
-
----
-
-## Phase 6: Workflow Integration (v1.8–v1.9) ✅
-
-**Fit Arbor into developers' daily routines.**
-
-- [x] PR summary generator (`arbor pr-summary`)
-- [x] `arbor watch` mode: auto-refresh index on file save
-- [ ] AI-friendly JSON output modes
-- [ ] Editor integrations (Cursor, VS Code)
-- [ ] Configurable ignore patterns
-
-**Outcome:** Arbor becomes something people use 5× per day, not once per week.
-
----
-
-## Phase 7: v2.0 Identity Lock-In 🔜
-
-**Promise:** *"If Arbor says a change is safe, you understand why."*
-
-### Requirements
-- [x] GUI exists and functional
-- [x] CLI output consistent and human-friendly
-- [x] Clear confidence/uncertainty signals
-- [x] Supports common real-world patterns (frameworks, widgets, async)
-- [x] Caching stable for large repos
-- [x] No empty or useless outputs
-- [ ] Zero confusion around installation or crate name
-- [x] Single blessed install path shown everywhere (README, Quickstart, CLI)
-- [x] Polished documentation
-
-**Outcome:** Arbor reaches **trusted tool status**.  
-Not a toy. Not an experiment. Something developers depend on.
-
----
-
-## Phase X: Optional Long-Term (Post-2.0)
-
-*Only after adoption is strong.*
-
-- [ ] Full-blown logic visualizer (rebuilt properly)
-- [ ] Architecture smell detection
-- [ ] Automated refactor suggestions
-- [ ] LSP server
-- [ ] Multi-project tagging (concepts from issue #32)
-
----
-
-> **North Star:** Arbor is the tool you run *before* refactoring, not after something breaks.
+1. **`arbor audit` Command:** Trace impact of specific symbols with a security focus.
+2. **Docs & Community:** `CONTRIBUTING.md`, Bounty Board, and "Why Impact Analysis Fails" blog context.
+3. **Visualizer Polish:** Advanced filtering and "professional" UI overhaul.

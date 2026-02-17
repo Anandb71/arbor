@@ -39,6 +39,7 @@ pub struct ArborApp {
     status: String,
 
     /// Is analysis in progress
+    #[allow(dead_code)]
     loading: bool,
 
     /// Dark mode toggle
@@ -48,9 +49,11 @@ pub struct ArborApp {
     search_history: Vec<String>,
 
     /// Show call tree (collapsible)
+    #[allow(dead_code)]
     show_call_tree: bool,
 
     /// Show dependencies (collapsible)
+    #[allow(dead_code)]
     show_dependencies: bool,
 
     /// Show file path (spoiler mode - click to reveal)
@@ -181,6 +184,7 @@ impl ArborApp {
         }
     }
 
+    #[allow(dead_code)]
     fn copy_as_markdown(&self) -> String {
         if let Some(r) = &self.result {
             let mut md = format!("## Impact Analysis: {}\n\n", r.target_name);
