@@ -1,5 +1,3 @@
-import 'dart:convert';
-
 /// Represents a BroadcastMessage from the server.
 sealed class BroadcastMessage {
   final String type;

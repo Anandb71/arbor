@@ -41,7 +41,8 @@ This crate is used internally. For most use cases:
 
 ```bash
 cargo install arbor-graph-cli
-arbor index --watch  # Live re-indexing
+arbor setup
+arbor watch  # Live re-indexing
 ```
 
 ## Links

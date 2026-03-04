@@ -4,6 +4,29 @@
 
 ---
 
+## ✅ Current Execution Status (2026-03-04)
+
+This section tracks what is already shipped versus what remains strategic work.
+
+### Shipped / In-Progress Foundation
+
+- [x] **Agent Bridge (MCP):** Operational bridge and tool surface (`get_logic_path`, `analyze_impact`, `find_path`)
+- [x] **`arbor audit` command foundation:** Security-path tracing is available in CLI
+- [x] **Language expansion baseline:** JS/TS, Python, Go, Rust, Java, C/C++, C#, Dart parsing paths are present
+- [x] **Air-gapped local-first model:** Core workflows operate offline
+- [x] **Graph snapshot persistence:** CLI now writes/loads `.arbor/graph.json` for faster reuse across commands
+
+### Still Outstanding (Major Epics)
+
+- [ ] Persistent graph database (SQLite/Sled) with transactional updates and indexed queries
+- [ ] Time-travel/git-history architectural drift analysis
+- [ ] Compliance report generation (SOC2/ISO artifacts)
+- [ ] Plugin system for community parser/runtime extensions
+- [ ] Enterprise RBAC and deployment policy controls
+- [ ] Learning loop from developer feedback and correction signals
+
+---
+
 ## 🧠 1. Architectural Memory Graph (Visual Intelligence)
 *Turn impact analysis into a persistent, explorable map.*
 - [ ] **Persistent Graph Store:** Move beyond ephemeral indexing to a persistent database (SQLite/Sled) for instant load times.

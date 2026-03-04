@@ -4,11 +4,26 @@ Get AI-ready code context in 5 minutes.
 
 ## Install
 
+**No-build install (recommended):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.sh | bash
+```
+
+**Windows PowerShell:**
+
+```powershell
+irm https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.ps1 | iex
+```
+
+**Cargo alternative:**
+
 ```bash
 cargo install arbor-graph-cli
 ```
 
 > **Note:** The GUI is included in the binary. Run `arbor gui` after installation.
+> Need version pinning/manual assets? See [INSTALL.md](./INSTALL.md).
 
 ## Initialize (Optional)
 

@@ -25,10 +25,9 @@
 
 | Tool | Description |
 |------|-------------|
-| `get_context` | Retrieve semantic neighborhood of a node |
-| `find_path` | A* shortest path between two nodes |
+| `get_logic_path` | Generate an architectural brief for a symbol |
+| `find_path` | Shortest path between two nodes |
 | `analyze_impact` | Predict blast radius of changes |
-| `list_symbols` | Fuzzy search across the graph |
 
 ## Why MCP?
 
@@ -42,6 +41,7 @@ Instead of RAG-style "find similar text," Arbor lets the AI:
 
 ```bash
 cargo install arbor-graph-cli
+arbor setup
 arbor bridge  # Starts MCP server over stdio
 ```
 

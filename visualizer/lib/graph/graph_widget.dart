@@ -64,7 +64,7 @@ class _GraphWidgetState extends ConsumerState<GraphWidget>
       // Run physics simulation
       if (state.nodes.isNotEmpty) {
         // Use fixed delta time for stability
-        final stillMoving = ForceLayout.update(
+        ForceLayout.update(
           state.nodes, 
           state.edges, 
           0.016 // ~60 FPS

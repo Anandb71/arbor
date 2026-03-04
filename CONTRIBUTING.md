@@ -1,4 +1,4 @@
-# Contributing always to Arbor
+# Contributing to Arbor
 
 We want to make Arbor the standard for code intelligence. Your help is essential to making that happen!
 
@@ -7,10 +7,10 @@ We are aggressively expanding language support. If you know Tree-sitter, we want
 
 | Language | Status | Priority | Difficulty |
 |----------|--------|----------|------------|
-| **TypeScript** | ✅ Beta | High | Medium |
-| **Go** | 🚧 Planned | High | Low |
-| **Python** | 🚧 Planned | High | Low |
-| **Java** | ❌ Missing | Medium | High |
+| **TypeScript** | ✅ Stable | High | Medium |
+| **Go** | ✅ Stable | High | Low |
+| **Python** | ✅ Stable | High | Low |
+| **Java** | ✅ Stable | Medium | High |
 | **Kotlin** | ❌ Missing | Medium | High |
 | **Ruby** | ❌ Missing | Low | Medium |
 
@@ -35,9 +35,12 @@ We are aggressively expanding language support. If you know Tree-sitter, we want
 
 4.  **Test Your Changes**
     ```bash
-    cargo test --all
+    arbor setup
+    arbor doctor
+
+    cargo test --workspace
     cargo fmt --all
-    cargo clippy
+    cargo clippy --workspace -- -D warnings
     ```
 
 5.  **Submit a PR**
@@ -49,6 +52,7 @@ We are aggressively expanding language support. If you know Tree-sitter, we want
 *   **Local-First:** No data leaves the user's machine.
 *   **Fast:** Sub-100ms response times for queries.
 *   **Trustable:** Always explain *why* suggestions are made (see `arbor refactor --why`).
+*   **Easy Anywhere:** Arbor should work from any subdirectory with minimal setup friction.
 
 ## 💬 Community
 Join the discussion on GitHub Issues or start a standard Github Discussion!

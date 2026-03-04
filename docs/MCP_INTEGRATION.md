@@ -128,14 +128,16 @@ cargo install arbor-graph-cli
 Check that your project has been indexed:
 ```bash
 cd /path/to/project
-arbor init
-arbor index
+arbor setup
 ```
+
+> Arbor auto-creates `.arbor/` for most commands, but `arbor setup` is the fastest reliable first-run path.
 
 ### Tools not appearing in Cursor
 1. Check `.cursor/mcp.json` syntax
 2. Reload MCP servers from Command Palette
-3. Check Cursor's MCP logs for errors
+3. Run `arbor doctor` to verify local environment and ports
+4. Check Cursor's MCP logs for errors
 
 ### "Node not found" errors
 Use `arbor query <name>` to verify the symbol is indexed.

@@ -160,16 +160,21 @@ Command-line interface for end users.
 
 | Command | Description |
 |---------|-------------|
+| `arbor setup` | One-shot onboarding (initialize + index) |
 | `arbor init` | Creates `.arbor/` config directory |
 | `arbor index` | Full index of the codebase |
 | `arbor query <q>` | Search the graph |
 | `arbor serve` | Start the sidecar server |
 | `arbor export` | Export graph to JSON |
 | `arbor status` | Show index status |
+| `arbor watch` | Re-index automatically on file changes |
 | `arbor viz` | Launch the Logic Forest visualizer |
 | `arbor bridge` | Start MCP server for AI integration |
 | `arbor bridge --viz` | MCP + Visualizer together |
-| `arbor check-health` | System diagnostics and health check |
+| `arbor doctor` (`check-health`) | System diagnostics and health check |
+| `arbor refactor <symbol>` | Blast-radius preview before refactor |
+| `arbor explain <symbol>` | Graph-backed context for AI/code reviews |
+| `arbor audit <sink>` | Security-oriented path tracing to sensitive sinks |
 
 ### Visualizer Features (v0.1.0)
 

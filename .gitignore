@@ -47,6 +47,9 @@ crates/response.json
 crates/stderr.txt
 crates/stdout.txt
 crates/test_output.txt
+crates/clippy_output*.txt
+crates/error.txt
+visualizer/analysis.txt
 
 # Security - Never commit these
 .env
