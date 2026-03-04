@@ -88,4 +88,4 @@ Rust, TypeScript, JavaScript, Python, Go, Java, C, C++, C#, Dart
 
 - **Main Repository**: [github.com/Anandb71/arbor](https://github.com/Anandb71/arbor)
 - **Documentation**: [docs/](https://github.com/Anandb71/arbor/tree/main/docs)
-- **MCP Registry**: `io.github.Anandb71/arbor`
+- **Glama MCP Directory**: [glama.ai/mcp/servers/@Anandb71/arbor](https://glama.ai/mcp/servers/@Anandb71/arbor)

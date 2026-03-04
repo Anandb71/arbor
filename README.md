@@ -11,6 +11,7 @@
 <p align="center">
   <a href="https://github.com/Anandb71/arbor/actions"><img src="https://img.shields.io/github/actions/workflow/status/Anandb71/arbor/rust.yml?style=flat-square&label=CI" alt="CI" /></a>
   <img src="https://img.shields.io/badge/release-1.5%20stable%20%7C%201.6%20in%20progress-blue?style=flat-square" alt="Release channels" />
+  <a href="https://glama.ai/mcp/servers/@Anandb71/arbor"><img src="https://img.shields.io/badge/MCP%20Directory-Glama-6f42c1?style=flat-square" alt="Glama MCP Directory" /></a>
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" />
 </p>
 
@@ -152,6 +153,14 @@ To keep maintenance and feature work clean:
 - `release/v1.6` → 1.6 feature delivery and stabilization
 
 This avoids shipping new features into older maintenance branches and keeps backports explicit.
+
+---
+
+## MCP Directory Listing
+
+Arbor is listed on Glama MCP Directory:
+
+- **Glama:** https://glama.ai/mcp/servers/@Anandb71/arbor
 
 ---
 
