@@ -32,12 +32,12 @@ cargo install arbor-graph-cli
 ## Quick Start
 
 ```bash
-# Initialize in your project
+# One-shot setup in your project
 cd your-project
-arbor init
+arbor setup
 
-# Index the codebase
-arbor index
+# Run health diagnostics
+arbor doctor
 
 # Start the AI bridge + visualizer
 arbor bridge --viz
@@ -47,6 +47,7 @@ arbor bridge --viz
 
 | Command | Description |
 |---------|-------------|
+| `arbor setup` | One-shot setup (init + index) |
 | `arbor init` | Creates `.arbor/` config directory |
 | `arbor index` | Full index of the codebase |
 | `arbor query <q>` | Search the graph |
@@ -54,7 +55,7 @@ arbor bridge --viz
 | `arbor bridge` | Start MCP server for AI integration |
 | `arbor bridge --viz` | MCP + Visualizer together |
 | `arbor viz` | Launch the Logic Forest visualizer |
-| `arbor check-health` | System diagnostics |
+| `arbor doctor` (`check-health`) | System diagnostics |
 
 ## Supported Languages
 

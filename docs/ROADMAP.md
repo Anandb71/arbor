@@ -14,10 +14,11 @@ This section tracks what is already shipped versus what remains strategic work.
 - [x] **`arbor audit` command foundation:** Security-path tracing is available in CLI
 - [x] **Language expansion baseline:** JS/TS, Python, Go, Rust, Java, C/C++, C#, Dart parsing paths are present
 - [x] **Air-gapped local-first model:** Core workflows operate offline
+- [x] **Graph snapshot persistence:** CLI now writes/loads `.arbor/graph.json` for faster reuse across commands
 
 ### Still Outstanding (Major Epics)
 
-- [ ] Persistent graph database (SQLite/Sled) with fast warm-starts
+- [ ] Persistent graph database (SQLite/Sled) with transactional updates and indexed queries
 - [ ] Time-travel/git-history architectural drift analysis
 - [ ] Compliance report generation (SOC2/ISO artifacts)
 - [ ] Plugin system for community parser/runtime extensions

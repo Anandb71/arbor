@@ -96,6 +96,13 @@ arbor gui
    cargo install arbor-graph-cli
    ```
 
+  Or use one-command installers (no Rust toolchain required):
+
+  - macOS/Linux: `curl -fsSL https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.sh | bash`
+  - Windows (PowerShell): `irm https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.ps1 | iex`
+
+  See [Installation Guide](docs/INSTALL.md) for version pinning and manual assets.
+
 2. **One-shot setup + first index**:
 
   ```bash
@@ -171,7 +178,7 @@ Arbor implements the **Model Context Protocol (MCP)**, enabling LLMs (e.g., Clau
 
 * `find_path(start, end)` – Trace logic flow
 * `analyze_impact(node)` – Compute blast radius
-* `get_context(node)` – Retrieve semantically related code
+* `get_logic_path(node)` – Generate graph-backed architectural brief
 
 ### Cross‑File Resolution
 

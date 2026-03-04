@@ -91,6 +91,49 @@ fn ensure_arbor_initialized(path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+fn graph_snapshot_path(path: &Path) -> PathBuf {
+    path.join(".arbor").join("graph.json")
+}
+
+fn save_graph_snapshot(path: &Path, graph: &arbor_graph::ArborGraph) -> Result<()> {
+    let graph_path = graph_snapshot_path(path);
+    if let Some(parent) = graph_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let file = std::fs::File::create(&graph_path)?;
+    let writer = std::io::BufWriter::new(file);
+    serde_json::to_writer_pretty(writer, graph)?;
+    Ok(())
+}
+
+fn load_graph_snapshot(path: &Path) -> Result<arbor_graph::ArborGraph> {
+    let graph_path = graph_snapshot_path(path);
+
+    if !graph_path.exists() {
+        return Err(format!(
+            "Graph not found at {}. Run 'arbor index' first.",
+            graph_path.display()
+        )
+        .into());
+    }
+
+    let file = std::fs::File::open(&graph_path)?;
+    let reader = std::io::BufReader::new(file);
+    let graph: arbor_graph::ArborGraph = serde_json::from_reader(reader)?;
+    Ok(graph)
+}
+
+fn load_or_index_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
+    if let Ok(graph) = load_graph_snapshot(path) {
+        return Ok(graph);
+    }
+
+    let result = index_directory(path, IndexOptions::default())?;
+    save_graph_snapshot(path, &result.graph)?;
+    Ok(result.graph)
+}
+
 /// Initialize Arbor in a directory.
 pub fn init(path: &Path) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
@@ -195,6 +238,13 @@ pub fn index(
         export_graph(&result.graph, out_path)?;
     }
 
+    save_graph_snapshot(&resolved_path, &result.graph)?;
+    println!(
+        "{} Saved graph snapshot to {}",
+        "✓".green(),
+        graph_snapshot_path(&resolved_path).display()
+    );
+
     Ok(())
 }
 
@@ -219,9 +269,9 @@ fn export_graph(graph: &arbor_graph::ArborGraph, path: &Path) -> Result<()> {
 pub fn query(query: &str, limit: usize, path: &Path) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
-    let result = index_directory(&resolved_path, IndexOptions::default())?;
+    let graph = load_or_index_graph(&resolved_path)?;
 
-    let matches: Vec<_> = result.graph.search(query).into_iter().take(limit).collect();
+    let matches: Vec<_> = graph.search(query).into_iter().take(limit).collect();
 
     if matches.is_empty() {
         println!("No matches found for \"{}\"", query);
@@ -761,7 +811,7 @@ pub async fn check_health(path: Option<&Path>) -> Result<()> {
         println!("{} Arbor initialized (.arbor/ exists)", "✓".green());
     } else {
         println!(
-            "{} Arbor not initialized (run 'cargo run -- init' in workspace root)",
+            "{} Arbor not initialized (run 'arbor setup' in workspace root)",
             "⚠".yellow()
         );
         all_ok = false;
@@ -787,8 +837,7 @@ pub fn refactor(
 ) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
-    let result = index_directory(&resolved_path, IndexOptions::default())?;
-    let graph = result.graph;
+    let graph = load_or_index_graph(&resolved_path)?;
 
     // Find the target node
     let node_idx = graph.get_index(target).or_else(|| {
@@ -1252,8 +1301,7 @@ pub fn explain(
 ) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
-    let result = index_directory(&resolved_path, IndexOptions::default())?;
-    let graph = result.graph;
+    let graph = load_or_index_graph(&resolved_path)?;
 
     // Try to find a node matching the question (could be a function name)
     let node_idx = graph.get_index(question).or_else(|| {
@@ -1397,8 +1445,7 @@ pub fn pr_summary(symbols: &str, path: &Path) -> Result<()> {
     // Index the codebase
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
-    let result = index_directory(&resolved_path, IndexOptions::default())?;
-    let graph = result.graph;
+    let graph = load_or_index_graph(&resolved_path)?;
 
     let symbol_list: Vec<&str> = symbols.split(',').map(|s| s.trim()).collect();
 
@@ -1596,7 +1643,7 @@ pub fn audit(sink: &str, depth: usize, format: &str, path: &Path) -> Result<()> 
     let resolved_path = resolve_project_path(path)?;
 
     // 1. Load the graph
-    let graph = load_graph(&resolved_path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
     println!(
         "{} Auditing security paths to sink: {}",
         "🔍".cyan(),
@@ -1738,23 +1785,4 @@ pub fn audit(sink: &str, depth: usize, format: &str, path: &Path) -> Result<()> 
     );
 
     Ok(())
-}
-
-fn load_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
-    let arbor_dir = path.join(".arbor");
-    let graph_path = arbor_dir.join("graph.json");
-
-    if !graph_path.exists() {
-        return Err(format!(
-            "Graph not found at {}. Run 'arbor index' first.",
-            graph_path.display()
-        )
-        .into());
-    }
-
-    let file = std::fs::File::open(&graph_path)?;
-    let reader = std::io::BufReader::new(file);
-    let graph: arbor_graph::ArborGraph = serde_json::from_reader(reader)?;
-
-    Ok(graph)
 }
