@@ -226,16 +226,81 @@ fn is_git_repo(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn parse_git_name_status_output(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+
+            let parts: Vec<&str> = trimmed.split('\t').collect();
+            if parts.len() < 2 {
+                return None;
+            }
+
+            let status = parts[0];
+            let path = if status.starts_with('R') || status.starts_with('C') {
+                parts.get(2).copied().unwrap_or(parts[1])
+            } else if status.starts_with('D') {
+                return None;
+            } else {
+                parts[1]
+            };
+
+            let normalized = normalize_slashes(path.trim());
+            if normalized.is_empty() {
+                None
+            } else {
+                Some(normalized)
+            }
+        })
+        .collect()
+}
+
+fn is_generated_or_internal_path(path: &str) -> bool {
+    let normalized = normalize_slashes(path).to_lowercase();
+    let with_boundary = format!("/{normalized}/");
+
+    if normalized.starts_with(".arbor/") || with_boundary.contains("/.arbor/") {
+        return true;
+    }
+
+    ["target", "dist", "build", ".dart_tool", "generated"]
+        .iter()
+        .any(|segment| with_boundary.contains(&format!("/{segment}/")))
+        || [".g.dart", ".generated.rs", ".pb.go", ".designer.cs"]
+            .iter()
+            .any(|suffix| normalized.ends_with(suffix))
+}
+
 fn git_changed_files(path: &Path) -> Result<Vec<String>> {
     if !is_git_repo(path) {
         return Ok(Vec::new());
     }
 
-    let mut files = run_git(path, &["diff", "--name-only", "HEAD"])?
-        .lines()
-        .map(|s| s.trim().replace('\\', "/"))
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
+    let mut files = Vec::new();
+
+    let unstaged = run_git(path, &["diff", "-w", "--name-status", "--find-renames", "HEAD"])?;
+    files.extend(parse_git_name_status_output(&unstaged));
+
+    let staged = run_git(
+        path,
+        &["diff", "--cached", "-w", "--name-status", "--find-renames", "HEAD"],
+    )?;
+    files.extend(parse_git_name_status_output(&staged));
+
+    let untracked = run_git(path, &["ls-files", "--others", "--exclude-standard"])?;
+    files.extend(
+        untracked
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(normalize_slashes),
+    );
+
+    files.retain(|path| !is_generated_or_internal_path(path));
     files.sort();
     files.dedup();
     Ok(files)
@@ -2106,6 +2171,7 @@ pub async fn watch(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::{is_generated_or_internal_path, parse_git_name_status_output};
     use std::path::PathBuf;
 
     /// Returns the platform-specific bundled visualizer path relative to exe_dir.
@@ -2203,6 +2269,26 @@ mod tests {
             "Expected absolute path, got: {:?}",
             viz_path
         );
+    }
+
+    #[test]
+    fn test_parse_git_name_status_output_handles_rename_modify_delete() {
+        let output = "R100\tsrc/old.rs\tsrc/new.rs\nM\tsrc/lib.rs\nD\tsrc/dead.rs\n";
+        let parsed = parse_git_name_status_output(output);
+
+        assert!(parsed.contains(&"src/new.rs".to_string()));
+        assert!(parsed.contains(&"src/lib.rs".to_string()));
+        assert!(!parsed.contains(&"src/old.rs".to_string()));
+        assert!(!parsed.contains(&"src/dead.rs".to_string()));
+    }
+
+    #[test]
+    fn test_generated_or_internal_path_filter() {
+        assert!(is_generated_or_internal_path(".arbor/config.json"));
+        assert!(is_generated_or_internal_path("target/debug/foo"));
+        assert!(is_generated_or_internal_path("src/models/user.g.dart"));
+        assert!(is_generated_or_internal_path("pkg/generated/client.rs"));
+        assert!(!is_generated_or_internal_path("src/lib.rs"));
     }
 }
 

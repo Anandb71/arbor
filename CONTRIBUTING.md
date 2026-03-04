@@ -33,6 +33,20 @@ We are aggressively expanding language support. If you know Tree-sitter, we want
     git checkout -b feature/cool-new-thing
     ```
 
+## 🌿 Branch Strategy
+
+To keep releases maintainable and avoid cross-version confusion:
+
+- `main` → active development for next minor/major
+- `release/v1.5` → maintenance-only patches for 1.5.x
+- `release/v1.6` → 1.6 feature work and stabilization
+
+Rules of thumb:
+
+1. New features go to `main` or the current release branch (for example `release/v1.6`).
+2. Bug fixes that must ship to existing users are cherry-picked/backported to the matching maintenance branch (for example `release/v1.5`).
+3. Avoid landing new-version features in older maintenance branches.
+
 4.  **Test Your Changes**
     ```bash
     arbor setup
