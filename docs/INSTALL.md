@@ -2,7 +2,11 @@
 
 Install Arbor without building from source.
 
+> Updated for March 2026 standards (reproducibility + safer install flows).
+
 ## Fastest Install (Recommended)
+
+For local evaluation, one-line install is fine. For production/CI, use version-pinned install and review scripts before execution.
 
 ### macOS / Linux
 
@@ -21,17 +25,33 @@ irm https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.ps1 | 
 ### macOS / Linux
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.sh | bash -s -- --version v1.5.0
+curl -fsSL https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.sh | bash -s -- --version <tag>
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
 iwr https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.ps1 -OutFile install.ps1
-.\install.ps1 -Version v1.5.0
+.\install.ps1 -Version <tag>
 ```
 
 > For advanced options (`--install-dir`, `--force`, `--dry-run`), download and run the script locally.
+
+### Safer Script Execution Pattern
+
+Instead of piping directly to shell, download and inspect first:
+
+```bash
+curl -fsSLo install.sh https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.sh
+less install.sh
+bash install.sh --version <tag>
+```
+
+```powershell
+iwr https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.ps1 -OutFile install.ps1
+Get-Content .\install.ps1
+.\install.ps1 -Version <tag>
+```
 
 ## Verify
 

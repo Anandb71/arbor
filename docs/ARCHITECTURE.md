@@ -163,7 +163,11 @@ Command-line interface for end users.
 | `arbor setup` | One-shot onboarding (initialize + index) |
 | `arbor init` | Creates `.arbor/` config directory |
 | `arbor index` | Full index of the codebase |
+| `arbor index --changed-only` | Incremental index based on git-changed files |
 | `arbor query <q>` | Search the graph |
+| `arbor diff` | Preview blast radius for current git changes |
+| `arbor check` | CI safety gate for risky change sets |
+| `arbor open <symbol>` | Open a symbol/file in your editor |
 | `arbor serve` | Start the sidecar server |
 | `arbor export` | Export graph to JSON |
 | `arbor status` | Show index status |
@@ -196,7 +200,7 @@ The Flutter-based Arbor Visualizer includes:
    - Add nodes to graph
 4. Second pass: resolve edges (calls, imports, etc.)
 5. Compute centrality scores
-6. Write graph to `.arbor/graph.json`
+6. Write graph snapshots to `.arbor/graph.bin` and `.arbor/graph.json`
 
 ### Incremental Update
 

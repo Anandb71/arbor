@@ -2,7 +2,7 @@
   <img src="docs/assets/arbor-logo.svg" alt="Arbor" width="120" height="120" />
 </p>
 
-# Arbor v1.5.0
+# Arbor
 
 **Graph‑Native Intelligence for Codebases**
 
@@ -10,16 +10,23 @@
 
 <p align="center">
   <a href="https://github.com/Anandb71/arbor/actions"><img src="https://img.shields.io/github/actions/workflow/status/Anandb71/arbor/rust.yml?style=flat-square&label=CI" alt="CI" /></a>
-  <img src="https://img.shields.io/badge/release-v1.5.0-blue?style=flat-square" alt="Release" />
+  <img src="https://img.shields.io/badge/release-1.5%20stable%20%7C%201.6%20in%20progress-blue?style=flat-square" alt="Release channels" />
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" />
 </p>
 
-## What's New in v1.5
+## Status (March 2026)
+
+- **Stable line:** `release/v1.5`
+- **Current feature line:** `release/v1.6`
+- **Main development trunk:** `main`
+
+## Highlights
 
 - **Accurate Token Counting** — tiktoken (cl100k_base) replaces heuristic estimates for precise LLM context budgets
 - **Fuzzy Symbol Suggestions** — Typo tolerance with Jaro-Winkler matching: `arbor refactor autth` → "Did you mean: `auth`?"
 - **Enhanced MCP/AI Integration** — Rich JSON output with confidence, roles, and edge explanations for Claude/Cursor
-- **GUI Version Watermark** — "Arbor v1.5" badge for brand visibility in screenshots
+- **Git-Aware Risk Workflows** — `arbor diff`, `arbor check`, and `arbor open` for refactor confidence
+- **Incremental Refresh** — `arbor index --changed-only` for faster re-index during active branches
 - **Better Python UX** — Empty `__init__.py` handled silently (no false warnings)
 
 <p align="center">
@@ -69,7 +76,7 @@ This is **execution‑aware analysis**, not text matching.
 
 ## Graphical Interface
 
-Arbor v1.4 ships with a **native GUI** for interactive impact analysis.
+Arbor ships with a **native GUI** for interactive impact analysis.
 
 ```bash
 arbor gui
@@ -133,6 +140,18 @@ arbor gui
 > You can run Arbor from any nested subdirectory; it automatically resolves to your project root.
 
 📘 See the [Quickstart Guide](docs/QUICKSTART.md) for advanced workflows.
+
+---
+
+## Release Channels & Branches
+
+To keep maintenance and feature work clean:
+
+- `main` → ongoing development
+- `release/v1.5` → maintenance-only fixes for 1.5.x
+- `release/v1.6` → 1.6 feature delivery and stabilization
+
+This avoids shipping new features into older maintenance branches and keeps backports explicit.
 
 ---
 

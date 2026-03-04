@@ -14,7 +14,9 @@ This section tracks what is already shipped versus what remains strategic work.
 - [x] **`arbor audit` command foundation:** Security-path tracing is available in CLI
 - [x] **Language expansion baseline:** JS/TS, Python, Go, Rust, Java, C/C++, C#, Dart parsing paths are present
 - [x] **Air-gapped local-first model:** Core workflows operate offline
-- [x] **Graph snapshot persistence:** CLI now writes/loads `.arbor/graph.json` for faster reuse across commands
+- [x] **Graph snapshot persistence:** CLI now writes/loads `.arbor/graph.json` and `.arbor/graph.bin` for faster reuse across commands
+- [x] **Git-aware impact workflows:** `arbor diff`, `arbor check`, `arbor open`, and `arbor index --changed-only`
+- [x] **Diff edge-case test coverage:** rename, whitespace-only, and generated-file heuristics covered with integration tests
 
 ### Still Outstanding (Major Epics)
 
@@ -66,6 +68,7 @@ This section tracks what is already shipped versus what remains strategic work.
 ## 🚀 Immediate Focus (v1.6)
 **Theme:** *The Security & Intelligence Layer*
 
-1. **`arbor audit` Command:** Trace impact of specific symbols with a security focus.
-2. **Docs & Community:** `CONTRIBUTING.md`, Bounty Board, and "Why Impact Analysis Fails" blog context.
-3. **Visualizer Polish:** Advanced filtering and "professional" UI overhaul.
+1. **Heuristic Confidence Hardening:** Improve rename/partial-edit mapping and reduce false positives in `diff/check`.
+2. **CI & Policy Integrations:** Add policy presets and stronger machine-readable output for automated gates.
+3. **Visualizer Polish:** Advanced filtering, large-graph usability, and analyst-friendly views.
+4. **Security Layer Expansion:** Deepen `arbor audit` with taint-style path confidence and remediation hints.

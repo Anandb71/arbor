@@ -133,6 +133,12 @@ arbor setup
 
 > Arbor auto-creates `.arbor/` for most commands, but `arbor setup` is the fastest reliable first-run path.
 
+After significant branch updates, refresh incrementally:
+
+```bash
+arbor index --changed-only
+```
+
 ### Tools not appearing in Cursor
 1. Check `.cursor/mcp.json` syntax
 2. Reload MCP servers from Command Palette
@@ -146,4 +152,4 @@ Use `arbor query <name>` to verify the symbol is indexed.
 
 ## Version
 
-This guide is for Arbor v1.5.0+ with MCP capabilities.
+This guide is for Arbor releases with MCP capabilities (v1.5+). For branch/release channel policy, see `CONTRIBUTING.md`.

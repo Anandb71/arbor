@@ -55,11 +55,30 @@ arbor bridge --viz
 | `arbor diff` | Preview blast radius for current git changes |
 | `arbor check` | CI safety gate for risky change sets |
 | `arbor open <symbol>` | Open symbol/file in your editor |
+| `arbor refactor <symbol>` | Blast-radius preview before refactoring |
+| `arbor explain <symbol>` | Graph-backed context for code explanation |
+| `arbor audit <sink>` | Security path tracing to sensitive sinks |
 | `arbor serve` | Start the WebSocket server |
+| `arbor export` | Export graph to JSON |
+| `arbor status` | Show index statistics |
+| `arbor watch` | Continuous re-index on file changes |
 | `arbor bridge` | Start MCP server for AI integration |
 | `arbor bridge --viz` | MCP + Visualizer together |
 | `arbor viz` | Launch the Logic Forest visualizer |
+| `arbor gui` | Launch native Arbor GUI |
+| `arbor pr-summary` | Generate impact summary for pull requests |
 | `arbor doctor` (`check-health`) | System diagnostics |
+
+## CI and Team Use
+
+```bash
+# Incremental refresh
+arbor index --changed-only
+
+# Pull-request safety checks
+arbor diff
+arbor check --json --max-blast-radius 30
+```
 
 ## Supported Languages
 

@@ -1,6 +1,8 @@
 # Arbor Protocol Specification
 
-Version: 1.0.0
+Version: 1.0.0 (JSON-RPC over WebSocket)
+
+> Last reviewed: 2026-03-04
 
 ## Overview
 
@@ -58,8 +60,8 @@ Returns metadata about the indexed graph.
     "nodeCount": 1542,
     "edgeCount": 4820,
     "languages": ["typescript", "rust", "python"],
-    "lastIndexed": "2024-01-15T10:30:00Z",
-    "version": "0.1.0"
+    "lastIndexed": "2026-03-04T10:30:00Z",
+    "version": "1.x"
   }
 }
 ```
@@ -297,6 +299,8 @@ Simple text search across node names and signatures.
 ## Subscriptions
 
 The protocol supports subscriptions for real-time updates:
+
+> Note: subscription/event support depends on server mode and client transport. MCP-based agent integrations should use `arbor bridge` and the MCP tool surface documented in `docs/MCP_INTEGRATION.md`.
 
 ### `graph.subscribe`
 

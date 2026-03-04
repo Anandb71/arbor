@@ -18,17 +18,17 @@ We are aggressively expanding language support. If you know Tree-sitter, we want
 
 ## 🛠️ How to Contribute
 
-1.  **Fork & Clone**
+1. **Fork & Clone**
     ```bash
     git clone https://github.com/YOUR_USERNAME/arbor.git
     cd arbor
     ```
 
-2.  **Pick a Task**
+2. **Pick a Task**
     - Check [ROADMAP.md](docs/ROADMAP.md) for high-level goals.
     - Look for "Good First Issue" tags on GitHub.
 
-3.  **Create a Branch**
+3. **Create a Branch**
     ```bash
     git checkout -b feature/cool-new-thing
     ```
@@ -47,7 +47,7 @@ Rules of thumb:
 2. Bug fixes that must ship to existing users are cherry-picked/backported to the matching maintenance branch (for example `release/v1.5`).
 3. Avoid landing new-version features in older maintenance branches.
 
-4.  **Test Your Changes**
+4. **Test Your Changes**
     ```bash
     arbor setup
     arbor doctor
@@ -57,10 +57,27 @@ Rules of thumb:
     cargo clippy --workspace -- -D warnings
     ```
 
-5.  **Submit a PR**
+5. **Submit a PR**
     - Describe *why* you made the change.
     - Include screenshots for UI changes.
     - Reference any relevant issues.
+
+## ✅ PR Quality Checklist (2026)
+
+Before requesting review:
+
+- [ ] Branch targets the correct release line (`release/v1.5` vs `release/v1.6` vs `main`)
+- [ ] Tests pass locally (`cargo test --workspace`)
+- [ ] Lint and formatting pass (`cargo clippy --workspace -- -D warnings`, `cargo fmt --all`)
+- [ ] Docs are updated for user-facing changes (README + relevant docs under `docs/`)
+- [ ] New CLI behavior has tests (unit and/or integration where meaningful)
+- [ ] PR summary explains risk, rollout plan, and any migration impact
+
+## 🧾 Commit and Release Notes Guidance
+
+- Prefer clear, scoped commit messages (Conventional Commits style is welcome: `feat:`, `fix:`, `docs:`, `test:`).
+- Add user-visible behavior changes to `CHANGELOG.md` under `[Unreleased]`.
+- For risky behavior changes (diff heuristics, analysis confidence), include explicit edge cases in PR notes.
 
 ## 🎨 Design Philosophy
 *   **Local-First:** No data leaves the user's machine.

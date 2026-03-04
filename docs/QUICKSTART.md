@@ -2,7 +2,11 @@
 
 Get AI-ready code context in 5 minutes.
 
+> Updated for the March 2026 CLI surface.
+
 ## Install
+
+For reproducible environments (CI/team onboarding), prefer pinning a release tag in your install command.
 
 **No-build install (recommended):**
 
@@ -77,6 +81,9 @@ arbor diff
 
 # CI safety gate (fails on risky blast radius)
 arbor check --max-blast-radius 30
+
+# Machine-readable output for CI bots
+arbor check --json --max-blast-radius 30
 
 # Jump directly to a symbol in your editor
 arbor open parse_file
@@ -153,6 +160,19 @@ arbor doctor
 ```
 
 Runs environment diagnostics (ports, workspace layout, visualizer and extension presence).
+
+## Team Workflow (Recommended)
+
+```bash
+# after pulling changes
+arbor index --changed-only
+
+# before opening a PR
+arbor diff
+arbor check --max-blast-radius 30
+```
+
+If `arbor check` fails, run focused tests before merge and include blast-radius notes in your PR description.
 
 ## Next Steps
 
