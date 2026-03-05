@@ -91,9 +91,11 @@ Finds the architectural root for a semantic query. Unlike simple text search, th
         "name": "AuthController.validate",
         "kind": "function",
         "file": "src/controllers/auth.ts",
-        "line": 45,
-        "score": 0.95,
-        "reason": "Entry point for authentication flow, called by 12 routes"
+        "qualified_name": "auth::AuthController::validate",
+        "line_start": 45,
+        "line_end": 62,
+        "signature": "fn validate(token: &str) -> bool",
+        "centrality": 0.95
       }
     ],
     "queryTime": 8
@@ -126,14 +128,25 @@ Analyzes the blast radius of a code change. Returns all nodes that depend on the
       "id": "user_service_validate_token",
       "name": "UserService.validateToken",
       "kind": "function",
-      "file": "src/services/user.ts",
+      "line_start": 127,
+      "line_end": 146,
+      "qualified_name": "services::UserService::validateToken",
+      "signature": "async validateToken(token: string): Promise<boolean>",
+      "centrality": 0.76
       "line": 127
     },
     "dependents": [
-      {
-        "id": "auth_middleware_check",
-        "name": "authMiddleware.check",
-        "kind": "function",
+        "node": {
+          "id": "auth_middleware_check",
+          "name": "authMiddleware.check",
+          "qualified_name": "middleware::authMiddleware::check",
+          "kind": "function",
+          "file": "src/middleware/auth.ts",
+          "line_start": 23,
+          "line_end": 41,
+          "signature": "async check(ctx: RequestContext)",
+          "centrality": 0.62
+        },
         "file": "src/middleware/auth.ts",
         "line": 23,
         "relationship": "calls",
@@ -172,13 +185,14 @@ Retrieves ranked context for a task. Nodes are ordered by architectural signific
       {
         "id": "payment_service",
         "name": "PaymentService",
+        "qualified_name": "services::PaymentService",
         "kind": "class",
         "file": "src/services/payment.ts",
-        "lineStart": 15,
-        "lineEnd": 245,
+        "line_start": 15,
+        "line_end": 245,
+        "signature": null,
         "centrality": 0.87,
-        "source": "export class PaymentService { ... }",
-        "tokenCount": 1250
+        "query_note": "Source embedding is client-side; protocol returns ranked node metadata"
       }
     ],
     "totalTokens": 7840,
@@ -249,9 +263,13 @@ Simple text search across node names and signatures.
       {
         "id": "user_service_validate",
         "name": "UserService.validate",
+        "qualified_name": "services::UserService::validate",
         "kind": "function",
         "file": "src/services/user.ts",
-        "line": 45
+        "line_start": 45,
+        "line_end": 57,
+        "signature": "fn validate(input: &UserInput)",
+        "centrality": 0.41
       }
     ],
     "total": 127,

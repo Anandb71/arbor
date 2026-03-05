@@ -14,6 +14,8 @@ Arbor's MCP (Model Context Protocol) bridge allows AI agents like Claude and Cur
 
 The bridge communicates over **stdio** using JSON-RPC, following the [MCP specification](https://modelcontextprotocol.io/).
 
+**Directory listing:** [Glama MCP Directory — Arbor](https://glama.ai/mcp/servers/@Anandb71/arbor)
+
 ---
 
 ## Setup for Cursor
@@ -68,7 +70,7 @@ Restart Claude Desktop to load the integration.
 |------|-------------|
 | `get_logic_path` | Traces call graph from a symbol |
 | `analyze_impact` | Returns blast radius with confidence/roles |
-| `find_path` | Finds shortest path between two symbols |
+| `find_path` | Finds shortest path between two symbols (when exposed by current server build) |
 
 ### Example: analyze_impact
 
@@ -133,6 +135,12 @@ arbor setup
 
 > Arbor auto-creates `.arbor/` for most commands, but `arbor setup` is the fastest reliable first-run path.
 
+After significant branch updates, refresh incrementally:
+
+```bash
+arbor index --changed-only
+```
+
 ### Tools not appearing in Cursor
 1. Check `.cursor/mcp.json` syntax
 2. Reload MCP servers from Command Palette
@@ -146,4 +154,4 @@ Use `arbor query <name>` to verify the symbol is indexed.
 
 ## Version
 
-This guide is for Arbor v1.5.0+ with MCP capabilities.
+This guide is for Arbor releases with MCP capabilities (v1.5+). For branch/release channel policy, see [`CONTRIBUTING.md`](../CONTRIBUTING.md).

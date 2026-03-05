@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **CLI: `arbor diff`** — Git-aware blast radius preview for changed files
+  - Handles rename-aware changed-file detection
+  - Ignores whitespace-only diffs
+  - Filters generated/internal files for cleaner signal
+- **CLI: `arbor check`** — CI-oriented risk gate over changed blast radius
+  - Supports machine-readable JSON output for automation
+- **CLI: `arbor open <symbol>`** — Opens symbol/file location in configured editor
+- **CLI: `arbor index --changed-only`** — Incremental re-index path based on git changes
+- **Binary graph snapshots** — `.arbor/graph.bin` read/write support for faster warm starts
+- **Integration tests for diff heuristics** — rename, whitespace-only, generated-file scenarios
+
+### Changed
+
+- **Branching guidance** documented for `main`, `release/v1.5`, and `release/v1.6`
+- **Documentation refresh** across README, Quickstart, Install, Architecture, and MCP integration guides
+
+### Documentation
+
+- Added formal release notes for v1.6.0 in `docs/RELEASE_NOTES_v1.6.0.md`
+
 ## [1.1.0] - 2026-01-08 "The Sentinel Update"
 
 > **Predict breakage. Give AI only the logic it needs.**
