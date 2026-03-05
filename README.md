@@ -164,6 +164,12 @@ Arbor is listed on Glama MCP Directory:
 
 - **Glama:** https://glama.ai/mcp/servers/@Anandb71/arbor
 
+<p align="center">
+  <a href="https://glama.ai/mcp/servers/@Anandb71/arbor">
+    <img width="380" height="200" src="https://glama.ai/mcp/servers/@Anandb71/arbor/badge" />
+  </a>
+</p>
+
 ---
 
 ## Documentation Hub
