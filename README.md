@@ -36,9 +36,6 @@ Arbor is currently in final polish for the v1.6 release line.
   <img src="docs/assets/arbor-demo.gif" alt="Arbor refactor demo" width="700" />
 </p>
 
-## Overview
----
-
 ## What is Arbor?
 
 Arbor is a **local‑first impact analysis engine** for large codebases. Instead of treating code as text, Arbor parses your project into a **semantic dependency graph**. This lets you trace *real execution paths*—callers, callees, imports, inheritance, and cross‑file relationships—so you can confidently understand the consequences of change.
@@ -163,14 +160,18 @@ This avoids shipping new features into older maintenance branches and keeps back
 Arbor is listed on Glama MCP Directory:
 
 - **Glama:** https://glama.ai/mcp/servers/@Anandb71/arbor
+
 <p align="center">
   <a href="https://glama.ai/mcp/servers/@Anandb71/arbor">
     <img width="380" height="200" src="https://glama.ai/mcp/servers/@Anandb71/arbor/badge" />
-<br>
+  </a>
+</p>
+
 ---
+
 ## Contributors
 
-
+<p align="center">
   <a href="https://github.com/Anandb71" title="Anandb71">
     <img src="https://avatars.githubusercontent.com/u/169837340?v=4" width="64" height="64" alt="Anandb71" />
   </a>
@@ -193,4 +194,4 @@ Arbor is listed on Glama MCP Directory:
     <img src="https://avatars.githubusercontent.com/u/182798669?v=4" width="64" height="64" alt="sathguru07" />
   </a>
 </p>
-a
+
