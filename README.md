@@ -163,14 +163,14 @@ This avoids shipping new features into older maintenance branches and keeps back
 Arbor is listed on Glama MCP Directory:
 
 - **Glama:** https://glama.ai/mcp/servers/@Anandb71/arbor
-
+<p align="center">
+  <a href="https://glama.ai/mcp/servers/@Anandb71/arbor">
+    <img width="380" height="200" src="https://glama.ai/mcp/servers/@Anandb71/arbor/badge" />
 <br>
 ---
 ## Contributors
 
-<p align="center">
-  <a href="https://glama.ai/mcp/servers/@Anandb71/arbor">
-    <img width="380" height="200" src="https://glama.ai/mcp/servers/@Anandb71/arbor/badge" />
+
   <a href="https://github.com/Anandb71" title="Anandb71">
     <img src="https://avatars.githubusercontent.com/u/169837340?v=4" width="64" height="64" alt="Anandb71" />
   </a>
