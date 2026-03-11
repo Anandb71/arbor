@@ -163,6 +163,9 @@ This avoids shipping new features into older maintenance branches and keeps back
 Arbor is listed on Glama MCP Directory:
 
 - **Glama:** https://glama.ai/mcp/servers/@Anandb71/arbor
+
+<br>
+---
 ## Contributors
 
 <p align="center">
