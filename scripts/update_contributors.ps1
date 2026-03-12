@@ -27,6 +27,7 @@ if ($null -eq $contributors) {
 $humanContributors = @($contributors | Where-Object { $_.type -ne "Bot" })
 $total = $humanContributors.Count
 $shown = @($humanContributors | Select-Object -First $MaxContributors)
+$contributorsPage = "https://github.com/$Repo/graphs/contributors"
 
 $cards = @()
 foreach ($c in $shown) {
@@ -36,7 +37,7 @@ foreach ($c in $shown) {
 
     $card = @"
     <a href="$profile" title="$login" style="text-decoration:none; margin:6px; display:inline-block;">
-        <img src="$avatar" alt="$login" width="64" height="64" style="border-radius:50%;" />
+        <img src="$avatar" alt="$login" width="72" height="72" loading="lazy" style="border-radius:50%; border:2px solid #30363d; box-sizing:border-box;" />
   </a>
 "@
     $cards += $card.TrimEnd()
@@ -44,6 +45,7 @@ foreach ($c in $shown) {
 
 $more = if ($total -gt $MaxContributors) { $total - $MaxContributors } else { 0 }
 $moreLine = if ($more -gt 0) { '<p align="center"><strong>+' + $more + ' more</strong></p>' } else { '' }
+$summaryLine = '<p align="center"><sub><strong>' + $total + ' contributors</strong> | <a href="' + $contributorsPage + '">View all</a></sub></p>'
 
 $generated = @"
 ## Contributors
@@ -52,6 +54,7 @@ $generated = @"
 <p align="center">
 $($cards -join "`n")
 </p>
+$summaryLine
 $moreLine
 <!-- CONTRIBUTORS:END -->
 "@
