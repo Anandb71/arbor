@@ -336,3 +336,37 @@ MIT License. See [LICENSE](LICENSE) for details.
 <p align="center">
   <a href="https://github.com/Anandb71/arbor">⭐ Star Arbor on GitHub</a>
 </p>
+
+---
+
+## Contributors
+
+<!-- CONTRIBUTORS:START -->
+<p align="center">
+  <a href="https://github.com/Anandb71" title="Anand B" style="text-decoration:none; margin:8px; display:inline-block; text-align:center; width:88px;">
+    <img src="https://avatars.githubusercontent.com/u/169837340?v=4" alt="Anand B" width="64" height="64" style="border-radius:50%;" /><br />
+    <sub><b>Anand B</b></sub>
+  </a>
+  <a href="https://github.com/holg" title="Holger Trahe" style="text-decoration:none; margin:8px; display:inline-block; text-align:center; width:88px;">
+    <img src="https://avatars.githubusercontent.com/u/1383439?v=4" alt="Holger Trahe" width="64" height="64" style="border-radius:50%;" /><br />
+    <sub><b>Holger Trahe</b></sub>
+  </a>
+  <a href="https://github.com/cabinlab" title="cabinlab" style="text-decoration:none; margin:8px; display:inline-block; text-align:center; width:88px;">
+    <img src="https://avatars.githubusercontent.com/u/66889299?v=4" alt="cabinlab" width="64" height="64" style="border-radius:50%;" /><br />
+    <sub><b>cabinlab</b></sub>
+  </a>
+  <a href="https://github.com/Karthiksenthilkumar1" title="Karthiksenthilkumar1" style="text-decoration:none; margin:8px; display:inline-block; text-align:center; width:88px;">
+    <img src="https://avatars.githubusercontent.com/u/182195883?v=4" alt="Karthiksenthilkumar1" width="64" height="64" style="border-radius:50%;" /><br />
+    <sub><b>Karthiksenthilkumar1</b></sub>
+  </a>
+  <a href="https://github.com/sanjayy-j" title="SANJAY J" style="text-decoration:none; margin:8px; display:inline-block; text-align:center; width:88px;">
+    <img src="https://avatars.githubusercontent.com/u/178475117?v=4" alt="SANJAY J" width="64" height="64" style="border-radius:50%;" /><br />
+    <sub><b>SANJAY J</b></sub>
+  </a>
+  <a href="https://github.com/sathguru07" title="Sathguruvasan" style="text-decoration:none; margin:8px; display:inline-block; text-align:center; width:88px;">
+    <img src="https://avatars.githubusercontent.com/u/182798669?v=4" alt="Sathguruvasan" width="64" height="64" style="border-radius:50%;" /><br />
+    <sub><b>Sathguruvasan</b></sub>
+  </a>
+</p>
+
+<!-- CONTRIBUTORS:END -->
