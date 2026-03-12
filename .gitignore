@@ -51,6 +51,10 @@ crates/clippy_output*.txt
 crates/error.txt
 visualizer/analysis.txt
 
+# Releases - archive artifacts (zip/mp4 etc. live in releases/ and media/)
+releases/*.zip
+releases/*.tar.gz
+
 # Security - Never commit these
 .env
 .env.*
