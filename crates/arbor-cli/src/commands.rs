@@ -2180,6 +2180,7 @@ pub async fn watch(path: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{is_generated_or_internal_path, parse_git_name_status_output};
     use std::path::PathBuf;

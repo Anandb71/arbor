@@ -14,11 +14,13 @@
 - **CLI: `arbor index --changed-only`** — Incremental re-index path based on git changes
 - **Binary graph snapshots** — `.arbor/graph.bin` read/write support for faster warm starts
 - **Integration tests for diff heuristics** — rename, whitespace-only, generated-file scenarios
+- **Workspace cleanup scripts** — `scripts/clean.ps1` and `scripts/clean.sh` to safely prune large generated artifacts before releases
 
 ### Changed
 
 - **Branching guidance** documented for `main`, `release/v1.5`, and `release/v1.6`
 - **Documentation refresh** across README, Quickstart, Install, Architecture, and MCP integration guides
+- **Troubleshooting guidance** now includes a dedicated workflow for reclaiming multi-GB workspace bloat
 
 ### Documentation
 

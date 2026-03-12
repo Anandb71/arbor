@@ -1,0 +1,34 @@
+name: Update Contributors
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  refresh-contributors:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update contributors block in README
+        shell: pwsh
+        run: ./scripts/update_contributors.ps1 -Repo "${{ github.repository }}" -ReadmePath "README.md" -MaxContributors 15
+
+      - name: Commit and push changes
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "No contributor updates needed."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs(readme): refresh contributors list"
+          git push

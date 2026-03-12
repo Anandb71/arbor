@@ -247,7 +247,7 @@ mod tests {
 
         // Update with one node removed
         store
-            .update_file("test.rs", &[node1.clone()], 2000)
+            .update_file("test.rs", std::slice::from_ref(&node1), 2000)
             .unwrap();
         let graph2 = store.load_graph().unwrap();
         assert_eq!(graph2.node_count(), 1);

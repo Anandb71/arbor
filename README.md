@@ -169,29 +169,173 @@ Arbor is listed on Glama MCP Directory:
 
 ---
 
-## Contributors
+## Documentation Hub
+
+- **Quickstart:** [docs/QUICKSTART.md](docs/QUICKSTART.md)
+- **Installation:** [docs/INSTALL.md](docs/INSTALL.md)
+- **Architecture:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- **MCP Integration:** [docs/MCP_INTEGRATION.md](docs/MCP_INTEGRATION.md)
+- **Protocol Specification:** [docs/PROTOCOL.md](docs/PROTOCOL.md)
+- **Roadmap:** [docs/ROADMAP.md](docs/ROADMAP.md)
+- **Release Notes (v1.6):** [docs/RELEASE_NOTES_v1.6.0.md](docs/RELEASE_NOTES_v1.6.0.md)
+
+---
+
+## Why Arbor?
+
+Most AI coding tools treat code as **unstructured text**, relying on vector similarity. This approach is fast—but imprecise.
+
+**Arbor builds a graph.**
+
+Every function, class, and module is a node. Every call, import, and reference is an edge. When you ask a question, Arbor follows the graph—*the same way your program executes*.
+
+```text
+Traditional RAG:              Arbor Graph Analysis:
+
+"auth" → 47 results          AuthController
+(keyword similarity)           ├── calls → TokenMiddleware
+                               ├── queries → UserRepository
+                               └── emits → AuthEvent
+```
+
+The result: **deterministic, explainable answers**.
+
+---
+
+## Core Features
+
+### Native GUI
+
+
+A global symbol table resolves:
+
+* Imports and re‑exports
+* Inheritance and interfaces
+* Overloads and namespaces
+
+`User` in `auth.ts` is never confused with `User` in `types.ts`.
+
+---
+
+## Supported Languages
+
+| Language       | Status | Parser Coverage                           |
+| -------------- | ------ | ----------------------------------------- |
+| **Rust**       | ✅      | Functions, Structs, Traits, Impls, Macros |
+| **TypeScript** | ✅      | Classes, Interfaces, Types, Imports, JSX  |
+| **JavaScript** | ✅      | Functions, Classes, Vars, Imports         |
+| **Python**     | ✅      | Classes, Functions, Imports, Decorators   |
+| **Go**         | ✅      | Structs, Interfaces, Funcs, Methods       |
+| **Java**       | ✅      | Classes, Interfaces, Methods, Fields      |
+| **C**          | ✅      | Structs, Functions, Enums, Typedefs       |
+| **C++**        | ✅      | Classes, Namespaces, Templates            |
+| **C#**         | ✅      | Classes, Methods, Properties, Interfaces  |
+| **Dart**       | ✅      | Classes, Mixins, Widgets                  |
+
+> **Python note:** Decorators, `__init__.py`, and `@dataclass` are statically analyzed. Dynamic dispatch is flagged with reduced confidence.
+
+---
+
+## Build from Source
+
+```bash
+git clone https://github.com/Anandb71/arbor.git
+cd arbor/crates
+cargo build --release
+```
+
+### Linux GUI Dependencies
+
+```bash
+sudo apt-get install -y pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+  libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libssl-dev cmake
+```
+
+---
+
+## Troubleshooting
+
+### Symbol not found?
+
+* **.gitignore** – Arbor respects it (`arbor status --files`)
+* **File type** – Ensure the extension is supported
+* **Empty files** – Skipped (except `__init__.py`)
+* **Dynamic calls** – `eval` / runtime reflection may not resolve
+* **Case sensitivity** – Use `arbor query <partial>` to search
+
+### Empty graph?
+
+Run `arbor status` to verify file detection and parser health.
+
+### Need environment diagnostics?
+
+Run `arbor doctor` (or `arbor check-health`) to verify ports, project structure, and integration readiness.
+
+### Repo suddenly huge (multi-GB)?
+
+Rust and Flutter build artifacts can grow quickly during iterative testing.
+
+- Windows PowerShell: `./scripts/clean.ps1`
+- macOS/Linux: `./scripts/clean.sh`
+- Deeper cleanup (also removes local Arbor/Flutter cache artifacts):
+  - PowerShell: `./scripts/clean.ps1 -Deep`
+  - Bash: `./scripts/clean.sh --deep`
+
+This is safe for source code; it only removes generated artifacts that can be rebuilt.
+
+---
+
+## Security Model
+
+Arbor is **Local‑First by design**:
+
+* No data exfiltration
+* Fully offline
+* No API keys
+* Fully open source
+
+Your code never leaves your machine.
+
+---
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.
 
 <p align="center">
-  <a href="https://github.com/Anandb71" title="Anandb71">
-    <img src="https://avatars.githubusercontent.com/u/169837340?v=4" width="64" height="64" alt="Anandb71" />
+  <a href="https://github.com/Anandb71/arbor">⭐ Star Arbor on GitHub</a>
+</p>
+
+---
+
+## Contributors
+
+<!-- CONTRIBUTORS:START -->
+<p align="center">
+  <a href="https://github.com/Anandb71" title="Anand B" style="text-decoration:none; margin:8px; display:inline-block; text-align:center; width:88px;">
+    <img src="https://avatars.githubusercontent.com/u/169837340?v=4" alt="Anand B" width="64" height="64" style="border-radius:50%;" /><br />
+    <sub><b>Anand B</b></sub>
   </a>
-  <a href="https://github.com/holg" title="holg">
-    <img src="https://avatars.githubusercontent.com/u/1383439?v=4" width="64" height="64" alt="holg" />
+  <a href="https://github.com/holg" title="Holger Trahe" style="text-decoration:none; margin:8px; display:inline-block; text-align:center; width:88px;">
+    <img src="https://avatars.githubusercontent.com/u/1383439?v=4" alt="Holger Trahe" width="64" height="64" style="border-radius:50%;" /><br />
+    <sub><b>Holger Trahe</b></sub>
   </a>
-  <a href="https://github.com/apps/copilot-swe-agent" title="Copilot">
-    <img src="https://avatars.githubusercontent.com/in/1143301?v=4" width="64" height="64" alt="Copilot" />
+  <a href="https://github.com/cabinlab" title="cabinlab" style="text-decoration:none; margin:8px; display:inline-block; text-align:center; width:88px;">
+    <img src="https://avatars.githubusercontent.com/u/66889299?v=4" alt="cabinlab" width="64" height="64" style="border-radius:50%;" /><br />
+    <sub><b>cabinlab</b></sub>
   </a>
-  <a href="https://github.com/cabinlab" title="cabinlab">
-    <img src="https://avatars.githubusercontent.com/u/66889299?v=4" width="64" height="64" alt="cabinlab" />
+  <a href="https://github.com/Karthiksenthilkumar1" title="Karthiksenthilkumar1" style="text-decoration:none; margin:8px; display:inline-block; text-align:center; width:88px;">
+    <img src="https://avatars.githubusercontent.com/u/182195883?v=4" alt="Karthiksenthilkumar1" width="64" height="64" style="border-radius:50%;" /><br />
+    <sub><b>Karthiksenthilkumar1</b></sub>
   </a>
-  <a href="https://github.com/Karthiksenthilkumar1" title="Karthiksenthilkumar1">
-    <img src="https://avatars.githubusercontent.com/u/182195883?v=4" width="64" height="64" alt="Karthiksenthilkumar1" />
+  <a href="https://github.com/sanjayy-j" title="SANJAY J" style="text-decoration:none; margin:8px; display:inline-block; text-align:center; width:88px;">
+    <img src="https://avatars.githubusercontent.com/u/178475117?v=4" alt="SANJAY J" width="64" height="64" style="border-radius:50%;" /><br />
+    <sub><b>SANJAY J</b></sub>
   </a>
-  <a href="https://github.com/sanjayy-j" title="sanjayy-j">
-    <img src="https://avatars.githubusercontent.com/u/178475117?v=4" width="64" height="64" alt="sanjayy-j" />
-  </a>
-  <a href="https://github.com/sathguru07" title="sathguru07">
-    <img src="https://avatars.githubusercontent.com/u/182798669?v=4" width="64" height="64" alt="sathguru07" />
+  <a href="https://github.com/sathguru07" title="Sathguruvasan" style="text-decoration:none; margin:8px; display:inline-block; text-align:center; width:88px;">
+    <img src="https://avatars.githubusercontent.com/u/182798669?v=4" alt="Sathguruvasan" width="64" height="64" style="border-radius:50%;" /><br />
+    <sub><b>Sathguruvasan</b></sub>
   </a>
 </p>
 
+<!-- CONTRIBUTORS:END -->
