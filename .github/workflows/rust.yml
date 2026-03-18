@@ -36,24 +36,20 @@ jobs:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
-          crates/target
+          target
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
     
     - name: Check formatting
-      working-directory: ./crates
       run: cargo fmt --all -- --check
     
     - name: Run clippy
-      working-directory: ./crates
       run: cargo clippy --all-targets --all-features
       continue-on-error: true
     
     - name: Build
-      working-directory: ./crates
       run: cargo build --all --verbose
     
     - name: Run tests
-      working-directory: ./crates
       run: cargo test --all --verbose
 
   # Build on multiple platforms
@@ -82,5 +78,4 @@ jobs:
         sudo apt-get install -y --no-install-recommends pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libdbus-1-dev libssl-dev cmake
     
     - name: Build release
-      working-directory: ./crates
-      run: cargo build --release
+      run: cargo build --release -p arbor-graph-cli

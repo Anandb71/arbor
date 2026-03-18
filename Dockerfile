@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM rust:1.75-slim as builder
+FROM rust:1.92-slim AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -8,10 +8,10 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY Cargo.toml ./
 COPY crates/ ./crates/
 
-WORKDIR /app/crates
-RUN cargo build --release --bin arbor
+RUN cargo build --release --manifest-path crates/arbor-cli/Cargo.toml --bin arbor
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/crates/target/release/arbor /usr/local/bin/arbor
+COPY --from=builder /app/target/release/arbor /usr/local/bin/arbor
 
 # MCP servers communicate via stdio
 ENTRYPOINT ["arbor", "bridge"]

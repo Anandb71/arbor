@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  arbor-dev:
+    image: rust:1.75-slim
+    container_name: arbor-dev
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - arbor-target:/workspace/target
+    command: >
+      bash -lc "
+      apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates &&
+      cargo build &&
+      cargo test
+      "
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  arbor-target:
