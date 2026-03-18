@@ -41,6 +41,34 @@ Then in Cursor:
 
 ---
 
+## Setup for VS Code
+
+VS Code now supports MCP server definitions via workspace config.
+
+Create `.vscode/mcp.json`:
+
+```json
+{
+  "servers": {
+    "arbor": {
+      "command": "arbor",
+      "args": ["bridge"],
+      "cwd": "${workspaceFolder}"
+    }
+  }
+}
+```
+
+Then:
+1. Open Command Palette
+2. Run **MCP: List Servers**
+3. Trust/approve the workspace prompt if shown
+4. Verify Arbor tools are available in your MCP-enabled extension/chat workflow
+
+> Tip: use workspace-scoped MCP config for repos and user-scoped config only for globally trusted tooling.
+
+---
+
 ## Setup for Claude Desktop
 
 Edit your Claude Desktop config file:
@@ -154,4 +182,4 @@ Use `arbor query <name>` to verify the symbol is indexed.
 
 ## Version
 
-This guide is for Arbor releases with MCP capabilities (v1.5+). For branch/release channel policy, see [`CONTRIBUTING.md`](../.github/CONTRIBUTING.md).
+This guide is for Arbor releases with MCP capabilities (v1.6+). For branch/release channel policy, see [`CONTRIBUTING.md`](../CONTRIBUTING.md).

@@ -10,18 +10,17 @@
 
 <p align="center">
   <a href="https://github.com/Anandb71/arbor/actions"><img src="https://img.shields.io/github/actions/workflow/status/Anandb71/arbor/rust.yml?style=flat-square&label=CI" alt="CI" /></a>
-  <img src="https://img.shields.io/badge/release-1.5%20stable%20%7C%201.6%20in%20progress-blue?style=flat-square" alt="Release channels" />
+  <img src="https://img.shields.io/badge/release-1.6.1.1%20maintenance%20%7C%20main%20active-blue?style=flat-square" alt="Release channels" />
   <a href="https://glama.ai/mcp/servers/@Anandb71/arbor"><img src="https://img.shields.io/badge/MCP%20Directory-Glama-6f42c1?style=flat-square" alt="Glama MCP Directory" /></a>
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" />
 </p>
 
 ## Status (March 2026)
 
-- **Stable line:** `release/v1.5`
-- **Current feature line:** `release/v1.6`
+- **Stable maintenance line:** `release/v1.6` (`v1.6.1.1`)
 - **Main development trunk:** `main`
 
-Arbor is currently in final polish for the v1.6 release line.
+Arbor `v1.6.1.1` is the active maintenance cut as of **March 18, 2026**.
 
 ## Highlights
 
@@ -148,8 +147,8 @@ arbor gui
 To keep maintenance and feature work clean:
 
 - `main` → ongoing development
-- `release/v1.5` → maintenance-only fixes for 1.5.x
-- `release/v1.6` → 1.6 feature delivery and stabilization
+- `release/v1.6` → maintenance-only fixes for 1.6.x (`v1.6.1.1` current)
+- `release/v1.5` → legacy maintenance/backport branch
 
 This avoids shipping new features into older maintenance branches and keeps backports explicit.
 
@@ -178,6 +177,7 @@ Arbor is listed on Glama MCP Directory:
 - **Protocol Specification:** [docs/PROTOCOL.md](docs/PROTOCOL.md)
 - **Roadmap:** [docs/ROADMAP.md](docs/ROADMAP.md)
 - **Release Notes (v1.6):** [docs/RELEASE_NOTES_v1.6.0.md](docs/RELEASE_NOTES_v1.6.0.md)
+- **Release Notes (v1.6.1.1):** [docs/RELEASE_NOTES_v1.6.1.1.md](docs/RELEASE_NOTES_v1.6.1.1.md)
 
 ---
 

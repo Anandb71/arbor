@@ -121,7 +121,7 @@ impl McpServer {
                 },
                 "serverInfo": {
                     "name": "arbor-mcp",
-                    "version": "1.5.0"
+                    "version": "1.6.1.1"
                 }
             })),
             "notifications/initialized" => Ok(json!({})),

@@ -33,7 +33,7 @@ Usage:
 
 Examples:
   ./install.sh
-  ./install.sh --version v1.5.0
+  ./install.sh --version v1.6.1.1
   ./install.sh --install-dir ~/.arbor/bin
 EOF
       exit 0
