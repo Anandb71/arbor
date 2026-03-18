@@ -29,6 +29,13 @@
   "activationEvents": [
     "onStartupFinished"
   ],
+  "files": [
+    "out/**",
+    "src/**",
+    "package.json",
+    "README.md",
+    "LICENSE"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
