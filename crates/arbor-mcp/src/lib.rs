@@ -66,7 +66,7 @@ impl McpServer {
 
             if let Some(node) = node {
                 handle.spotlight_node(&node.id, &node.file, node.line_start);
-                eprintln!("🔦 Spotlight: {} in {}", node.name, node.file);
+                eprintln!("Spotlight: {} in {}", node.name, node.file);
             }
         }
     }
@@ -121,7 +121,7 @@ impl McpServer {
                 },
                 "serverInfo": {
                     "name": "arbor-mcp",
-                    "version": "1.5.0"
+                    "version": env!("CARGO_PKG_VERSION")
                 }
             })),
             "notifications/initialized" => Ok(json!({})),

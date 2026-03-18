@@ -68,6 +68,28 @@ If you already use Rust tooling:
 cargo install arbor-graph-cli
 ```
 
+## GitHub Packages (GHCR Container)
+
+Arbor container images are published to GitHub Container Registry (GHCR) when a release is published.
+
+Pull image:
+
+```bash
+docker pull ghcr.io/anandb71/arbor:latest
+```
+
+Or pull a specific release tag:
+
+```bash
+docker pull ghcr.io/anandb71/arbor:<tag>
+```
+
+Run MCP bridge over stdio:
+
+```bash
+docker run --rm -i ghcr.io/anandb71/arbor:latest
+```
+
 ## Manual Release Assets
 
 Download prebuilt binaries directly from GitHub Releases:

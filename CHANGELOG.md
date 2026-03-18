@@ -4,6 +4,18 @@
 
 ### Added
 
+- None yet.
+
+### Changed
+
+- None yet.
+
+## [1.6.1.1] - 2026-03-18 "Maintenance + Ecosystem Alignment"
+
+> **Maintenance release focused on workflow reliability, MCP guidance, and ecosystem currency as of March 18, 2026.**
+
+### Added
+
 - **CLI: `arbor diff`** — Git-aware blast radius preview for changed files
   - Handles rename-aware changed-file detection
   - Ignores whitespace-only diffs
@@ -22,9 +34,17 @@
 - **Documentation refresh** across README, Quickstart, Install, Architecture, and MCP integration guides
 - **Troubleshooting guidance** now includes a dedicated workflow for reclaiming multi-GB workspace bloat
 
+### Maintenance
+
+- Release channel and status messaging aligned to the `1.6.1.1` maintenance cut.
+- Workspace crate version advanced to `1.6.1` (SemVer-compliant crate line for Cargo).
+- MCP server metadata version now reports `1.6.1.1` for client-visible maintenance tracking.
+- Release context refreshed against current ecosystem signals (Rust `1.94.0`, tree-sitter `0.26.7`, and broader MCP client/platform adoption).
+
 ### Documentation
 
 - Added formal release notes for v1.6.0 in `docs/RELEASE_NOTES_v1.6.0.md`
+- Added formal release notes for v1.6.1.1 in `docs/RELEASE_NOTES_v1.6.1.1.md`
 
 ## [1.1.0] - 2026-01-08 "The Sentinel Update"
 
