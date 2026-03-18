@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM rust:1.92-slim as builder
+FROM rust:1.92-slim AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -9,7 +9,6 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 COPY Cargo.toml ./
-COPY Cargo.lock ./
 COPY crates/ ./crates/
 
 RUN cargo build --release --manifest-path crates/arbor-cli/Cargo.toml --bin arbor
