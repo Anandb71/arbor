@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "arbor-core",
-    "arbor-graph",
-    "arbor-watcher",
-    "arbor-server",
-    "arbor-cli",
-    "arbor-mcp",
-    "arbor-gui",
+    "crates/arbor-core",
+    "crates/arbor-graph",
+    "crates/arbor-watcher",
+    "crates/arbor-server",
+    "crates/arbor-cli",
+    "crates/arbor-mcp",
+    "crates/arbor-gui",
 ]
 
 [workspace.package]

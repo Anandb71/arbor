@@ -240,8 +240,22 @@ A global symbol table resolves:
 
 ```bash
 git clone https://github.com/Anandb71/arbor.git
-cd arbor/crates
+cd arbor
 cargo build --release
+cargo test
+```
+
+### Frictionless setup notes
+
+- **No external graph database is required.** Arbor is local-first and uses embedded storage.
+- From a fresh clone, contributors can start with just:
+  - `cargo build`
+  - `cargo test`
+
+If you prefer containerized setup, run:
+
+```bash
+docker compose up --build arbor-dev
 ```
 
 ### Linux GUI Dependencies
