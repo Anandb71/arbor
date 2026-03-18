@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   publish:
-    name: Publish to VS Code Marketplace
+    name: Publish to VS Code Marketplace + Open VSX
     runs-on: ubuntu-latest
 
     defaults:
@@ -42,10 +42,10 @@ jobs:
       - name: Compile extension
         run: npm run compile
 
-      - name: Install vsce
-        run: npm install -g @vscode/vsce
+      - name: Install publish CLIs
+        run: npm install -g @vscode/vsce ovsx
 
-      - name: Publish extension
+      - name: Publish to VS Code Marketplace
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
@@ -60,3 +60,15 @@ jobs:
           else
             vsce publish --pat "$VSCE_PAT"
           fi
+
+      - name: Publish to Open VSX
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          if [ -z "$OVSX_PAT" ]; then
+            echo "Missing OVSX_PAT secret. Add it in repository Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          # Publish the same current package version to Open VSX.
+          ovsx publish --pat "$OVSX_PAT"
