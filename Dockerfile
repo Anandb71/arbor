@@ -8,9 +8,9 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY Cargo.toml ./
 COPY crates/ ./crates/
 
-WORKDIR /app/crates
 RUN cargo build --release --bin arbor
 
 # Stage 2: Runtime
@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/crates/target/release/arbor /usr/local/bin/arbor
+COPY --from=builder /app/target/release/arbor /usr/local/bin/arbor
 
 # MCP servers communicate via stdio
 ENTRYPOINT ["arbor", "bridge"]

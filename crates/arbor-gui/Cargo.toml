@@ -6,9 +6,9 @@ license.workspace = true
 description = "Arbor GUI - Impact-first code analysis interface"
 
 [dependencies]
-arbor-core = { path = "../arbor-core", version = "1.4.1" }
-arbor-graph = { path = "../arbor-graph", version = "1.4.1" }
-arbor-watcher = { path = "../arbor-watcher", version = "1.4.1" }
+arbor-core = { path = "../arbor-core", version = "1.6.1" }
+arbor-graph = { path = "../arbor-graph", version = "1.6.1" }
+arbor-watcher = { path = "../arbor-watcher", version = "1.6.1" }
 eframe = "0.28"
 egui = "0.28"
 egui_extras = { version = "0.28", features = ["all_loaders"] }

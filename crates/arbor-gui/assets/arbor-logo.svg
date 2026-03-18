@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
+  <defs>
+    <linearGradient id="trunk" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#4A3728"/>
+      <stop offset="100%" stop-color="#6B4423"/>
+    </linearGradient>
+    <linearGradient id="leaves" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00D9FF"/>
+      <stop offset="50%" stop-color="#00F5A0"/>
+      <stop offset="100%" stop-color="#9D4EDD"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  
+  <!-- Background circle -->
+  <circle cx="60" cy="60" r="58" fill="#0A0A0F"/>
+  <circle cx="60" cy="60" r="56" fill="none" stroke="#2A2A35" stroke-width="1"/>
+  
+  <!-- Tree trunk -->
+  <path d="M60 110 Q60 75 55 60 Q48 40 60 30 Q72 40 65 60 Q60 75 60 110" fill="url(#trunk)"/>
+  
+  <!-- Branches and nodes -->
+  <g filter="url(#glow)">
+    <!-- Main branches -->
+    <line x1="60" y1="50" x2="35" y2="30" stroke="url(#leaves)" stroke-width="2" stroke-linecap="round"/>
+    <line x1="60" y1="50" x2="85" y2="30" stroke="url(#leaves)" stroke-width="2" stroke-linecap="round"/>
+    <line x1="60" y1="40" x2="40" y2="20" stroke="url(#leaves)" stroke-width="2" stroke-linecap="round"/>
+    <line x1="60" y1="40" x2="80" y2="20" stroke="url(#leaves)" stroke-width="2" stroke-linecap="round"/>
+    <line x1="60" y1="35" x2="60" y2="15" stroke="url(#leaves)" stroke-width="2" stroke-linecap="round"/>
+    
+    <!-- Sub-branches -->
+    <line x1="35" y1="30" x2="25" y2="25" stroke="url(#leaves)" stroke-width="1.5" stroke-linecap="round"/>
+    <line x1="35" y1="30" x2="30" y2="18" stroke="url(#leaves)" stroke-width="1.5" stroke-linecap="round"/>
+    <line x1="85" y1="30" x2="95" y2="25" stroke="url(#leaves)" stroke-width="1.5" stroke-linecap="round"/>
+    <line x1="85" y1="30" x2="90" y2="18" stroke="url(#leaves)" stroke-width="1.5" stroke-linecap="round"/>
+    
+    <!-- Nodes (glowing dots) -->
+    <circle cx="60" cy="50" r="6" fill="#00D9FF"/>
+    <circle cx="35" cy="30" r="5" fill="#00F5A0"/>
+    <circle cx="85" cy="30" r="5" fill="#9D4EDD"/>
+    <circle cx="40" cy="20" r="4" fill="#00D9FF"/>
+    <circle cx="80" cy="20" r="4" fill="#FFB800"/>
+    <circle cx="60" cy="15" r="4" fill="#00F5A0"/>
+    <circle cx="25" cy="25" r="3" fill="#FF6B6B"/>
+    <circle cx="30" cy="18" r="3" fill="#9D4EDD"/>
+    <circle cx="95" cy="25" r="3" fill="#00D9FF"/>
+    <circle cx="90" cy="18" r="3" fill="#00F5A0"/>
+  </g>
+</svg>

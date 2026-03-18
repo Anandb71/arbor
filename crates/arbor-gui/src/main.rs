@@ -30,7 +30,7 @@ fn main() -> eframe::Result<()> {
 
 fn load_icon() -> std::sync::Arc<egui::IconData> {
     // Embed the SVG logo
-    let svg_data = include_bytes!("../../../docs/assets/arbor-logo.svg");
+    let svg_data = include_bytes!("../assets/arbor-logo.svg");
 
     let options = resvg::usvg::Options::default();
     let tree = resvg::usvg::Tree::from_data(svg_data, &options).expect("Failed to parse SVG icon");

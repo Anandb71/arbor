@@ -1,17 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "arbor-core",
-    "arbor-graph",
-    "arbor-watcher",
-    "arbor-server",
-    "arbor-cli",
-    "arbor-mcp",
-    "arbor-gui",
+    "crates/arbor-core",
+    "crates/arbor-graph",
+    "crates/arbor-watcher",
+    "crates/arbor-server",
+    "crates/arbor-cli",
+    "crates/arbor-mcp",
+    "crates/arbor-gui",
 ]
 
 [workspace.package]
-version = "1.5.0"
+version = "1.6.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Anandb71/arbor"
