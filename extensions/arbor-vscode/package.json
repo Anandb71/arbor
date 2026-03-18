@@ -4,6 +4,22 @@
   "description": "Connect VS Code to the Arbor Logic Forest for AI-aware code navigation",
   "version": "0.1.0",
   "publisher": "arbor",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Anandb71/arbor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Anandb71/arbor/issues"
+  },
+  "homepage": "https://github.com/Anandb71/arbor",
+  "keywords": [
+    "arbor",
+    "mcp",
+    "code-graph",
+    "refactor",
+    "analysis"
+  ],
   "engines": {
     "vscode": "^1.85.0"
   },
