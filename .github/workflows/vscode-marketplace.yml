@@ -80,5 +80,9 @@ jobs:
             exit 0
           fi
 
+          PUBLISHER="$(node -p "require('./package.json').publisher")"
+          echo "Ensuring Open VSX namespace '$PUBLISHER' exists..."
+          ovsx create-namespace "$PUBLISHER" --pat "$OVSX_PAT" || true
+
           # Publish the same current package version to Open VSX.
           ovsx publish --pat "$OVSX_PAT"
