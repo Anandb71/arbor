@@ -49,7 +49,7 @@ Create `.vscode/mcp.json`:
 
 ```json
 {
-  "servers": {
+  "mcpServers": {
     "arbor": {
       "command": "arbor",
       "args": ["bridge"],
