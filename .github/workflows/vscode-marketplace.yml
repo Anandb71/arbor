@@ -56,11 +56,15 @@ jobs:
           fi
 
       - name: Publish to VS Code Marketplace
-        if: ${{ secrets.VSCE_PAT != '' }}
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
+          if [ -z "$VSCE_PAT" ]; then
+            echo "VSCE_PAT not set; skipping VS Code Marketplace publish."
+            exit 0
+          fi
+
           if [ -n "$INPUT_VERSION" ]; then
             vsce publish "$INPUT_VERSION" --pat "$VSCE_PAT"
           else
@@ -68,9 +72,13 @@ jobs:
           fi
 
       - name: Publish to Open VSX
-        if: ${{ secrets.OVSX_PAT != '' }}
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: |
+          if [ -z "$OVSX_PAT" ]; then
+            echo "OVSX_PAT not set; skipping Open VSX publish."
+            exit 0
+          fi
+
           # Publish the same current package version to Open VSX.
           ovsx publish --pat "$OVSX_PAT"
