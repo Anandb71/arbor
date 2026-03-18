@@ -49,7 +49,11 @@ jobs:
             exit 1
           fi
 
-          echo "ref=$safe_ref" >> "$GITHUB_OUTPUT"
+          {
+            echo 'ref<<EOF'
+            echo "$safe_ref"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Checkout
         uses: actions/checkout@v4
