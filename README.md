@@ -184,6 +184,32 @@ Then verify with:
 claude mcp list
 ```
 
+### Universal MCP Integration Kit
+
+Arbor ships ready-to-copy MCP templates and bootstrap scripts for multi-client onboarding:
+
+- Templates: `templates/mcp/`
+- macOS/Linux bootstrap: `scripts/setup-mcp.sh`
+- Windows bootstrap: `scripts/setup-mcp.ps1`
+
+```bash
+# Generate project-scoped config for Claude Code + Cursor + VS Code
+./scripts/setup-mcp.sh --client all --target-dir .
+```
+
+```powershell
+# Windows equivalent
+./scripts/setup-mcp.ps1 -Client all -TargetDir .
+```
+
+This creates:
+
+- `.mcp.json` (Claude Code project scope)
+- `.cursor/mcp.json`
+- `.vscode/mcp.json`
+
+For enterprise-managed setups, see `docs/MCP_INTEGRATION.md` (policy + managed registration notes).
+
 ---
 
 ## GitHub Marketplace Action

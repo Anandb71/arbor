@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "arbor": {
+      "type": "stdio",
+      "command": "arbor",
+      "args": ["bridge"],
+      "envFile": "${workspaceFolder}/.env"
+    }
+  },
+  "inputs": []
+}

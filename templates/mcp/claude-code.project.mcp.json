@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "arbor": {
+      "type": "stdio",
+      "command": "arbor",
+      "args": ["bridge"],
+      "env": {}
+    }
+  }
+}
