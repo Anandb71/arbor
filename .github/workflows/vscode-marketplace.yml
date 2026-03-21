@@ -11,10 +11,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: publish-vscode-extension-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   publish:
     name: Publish extension registries
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     defaults:
       run:
