@@ -94,6 +94,57 @@ Restart Claude Desktop to load the integration.
 
 ---
 
+## Setup for Claude Code (CLI)
+
+Claude Code supports MCP server installation directly from terminal.
+
+### Option A (recommended): add Arbor with CLI command
+
+From your project root:
+
+```bash
+claude mcp add --transport stdio arbor -- arbor bridge
+```
+
+To share the server config with your team via repo-level `.mcp.json`, use project scope:
+
+```bash
+claude mcp add --transport stdio --scope project arbor -- arbor bridge
+```
+
+Then verify inside Claude Code:
+
+```bash
+claude mcp list
+```
+
+And in an active Claude Code session, run:
+
+```text
+/mcp
+```
+
+### Option B: commit `.mcp.json` manually
+
+Create `.mcp.json` in repo root:
+
+```json
+{
+  "mcpServers": {
+    "arbor": {
+      "type": "stdio",
+      "command": "arbor",
+      "args": ["bridge"],
+      "env": {}
+    }
+  }
+}
+```
+
+> Reference: Claude Code MCP docs — https://code.claude.com/docs/en/mcp
+
+---
+
 ## Available Tools
 
 | Tool | Description |
