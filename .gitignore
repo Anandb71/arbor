@@ -70,6 +70,7 @@ arbor-windows-*/
 # Node.js (VS Code extension)
 node_modules/
 extensions/*/node_modules/
+extensions/*/out/
 *.vsix
 
 # Personal Release Guides

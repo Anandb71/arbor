@@ -1,0 +1,48 @@
+name: Arbor Impact Analysis
+description: Run Arbor graph-native code impact analysis in GitHub Actions.
+branding:
+  icon: git-branch
+  color: blue
+
+inputs:
+  command:
+    description: Arbor command to run (without leading 'arbor').
+    required: false
+    default: status .
+  arbor-version:
+    description: Arbor CLI version to install (e.g. 1.6.1). Use 'latest' for newest.
+    required: false
+    default: latest
+  install-from-source:
+    description: Install from this repository source using Cargo instead of crates.io.
+    required: false
+    default: "false"
+  working-directory:
+    description: Directory where the Arbor command should run.
+    required: false
+    default: .
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install Arbor CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${{ inputs.install-from-source }}" == "true" ]]; then
+          cargo install --path crates/arbor-cli --force
+        elif [[ "${{ inputs.arbor-version }}" == "latest" ]]; then
+          cargo install arbor-graph-cli --force
+        else
+          cargo install arbor-graph-cli --version "${{ inputs.arbor-version }}" --force
+        fi
+
+    - name: Run Arbor command
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "${{ inputs.working-directory }}"
+        arbor ${{ inputs.command }}

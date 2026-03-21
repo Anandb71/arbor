@@ -78,6 +78,8 @@ Before requesting review:
 - Prefer clear, scoped commit messages (Conventional Commits style is welcome: `feat:`, `fix:`, `docs:`, `test:`).
 - Add user-visible behavior changes to `CHANGELOG.md` under `[Unreleased]`.
 - For risky behavior changes (diff heuristics, analysis confidence), include explicit edge cases in PR notes.
+- Keep generated files out of commits (`target/`, extension `out/`, local logs, and temporary exports).
+- Before opening PRs, squash noisy local fixup commits into a small, reviewable set.
 
 ## 🎨 Design Philosophy
 *   **Local-First:** No data leaves the user's machine.
