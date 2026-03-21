@@ -17,6 +17,10 @@ inputs:
     description: Install from this repository source using Cargo instead of crates.io.
     required: false
     default: "false"
+  working-directory:
+    description: Directory where the Arbor command should run.
+    required: false
+    default: .
 
 runs:
   using: composite
@@ -40,4 +44,5 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        cd "${{ inputs.working-directory }}"
         arbor ${{ inputs.command }}
