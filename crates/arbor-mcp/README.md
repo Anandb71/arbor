@@ -12,6 +12,8 @@
 <p align="center">
   <a href="https://crates.io/crates/arbor-mcp"><img src="https://img.shields.io/crates/v/arbor-mcp?style=flat-square&color=blue" alt="Crates.io" /></a>
   <a href="https://registry.modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-registered-purple?style=flat-square" alt="MCP" /></a>
+  <a href="https://glama.ai/mcp/servers/Anandb71/arbor"><img src="https://glama.ai/mcp/servers/Anandb71/arbor/badges/score.svg" alt="Glama Score" /></a>
+  <a href="https://skillsplayground.com/mcps/nandb71-arbor/"><img src="https://skillsplayground.com/badges/mcp/nandb71-arbor.svg" alt="Skills Playground" /></a>
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" />
 </p>
 
@@ -20,6 +22,12 @@
 ## Overview
 
 `arbor-mcp` is the **AI Bridge** for [Arbor](https://github.com/Anandb71/arbor). It implements the [Model Context Protocol](https://modelcontextprotocol.io/) to let LLMs like Claude Desktop navigate your codebase as a graph.
+
+Compared with typical code-intel MCP servers, Arbor focuses on:
+
+- **Graph-backed impact analysis** (not keyword-only retrieval)
+- **Explainable confidence and architectural role classification**
+- **Git-aware CI workflows** (`arbor diff`, `arbor check`) for change risk gating
 
 ## MCP Tools
 
@@ -44,6 +52,23 @@ cargo install arbor-graph-cli
 arbor setup
 arbor bridge  # Starts MCP server over stdio
 ```
+
+### Claude Code (recommended)
+
+```bash
+claude mcp add --transport stdio --scope project arbor -- arbor bridge
+claude mcp list
+```
+
+Inside Claude Code, run:
+
+```text
+/mcp
+```
+
+### Cursor / VS Code / Claude Desktop
+
+See full multi-client setup in [`docs/MCP_INTEGRATION.md`](../../docs/MCP_INTEGRATION.md).
 
 ### Claude Desktop Config
 

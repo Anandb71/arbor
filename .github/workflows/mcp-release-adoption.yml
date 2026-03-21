@@ -1,0 +1,108 @@
+name: MCP Release Adoption Notes
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional release tag (for example v1.6.2). Leave empty to update latest release."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  enrich-release-notes:
+    name: Add MCP install snippets to release notes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Append MCP install section
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const marker = '<!-- arbor-mcp-install-snippets -->';
+            const snippet = `${marker}
+            ## 🤖 Arbor MCP Quick Install
+
+            Use Arbor as a local MCP server in your AI client:
+
+            ### Claude Code (project-scoped)
+            \`\`\`bash
+            claude mcp add --transport stdio --scope project arbor -- arbor bridge
+            claude mcp list
+            \`\`\`
+
+            In Claude Code, run:
+            \`\`\`text
+            /mcp
+            \`\`\`
+
+            ### Cursor / VS Code MCP config
+            Add this to your MCP config file:
+            \`\`\`json
+            {
+              "mcpServers": {
+                "arbor": {
+                  "command": "arbor",
+                  "args": ["bridge"],
+                  "cwd": "."
+                }
+              }
+            }
+            \`\`\`
+
+            ### MCP Directories
+            - Glama: https://glama.ai/mcp/servers/@Anandb71/arbor
+            - Skills Playground: https://skillsplayground.com/mcps/nandb71-arbor/
+            `;
+
+            async function resolveRelease() {
+              if (context.eventName === 'release' && context.payload.release) {
+                return context.payload.release;
+              }
+
+              const inputTag = core.getInput('tag')?.trim();
+              if (inputTag) {
+                const byTag = await github.rest.repos.getReleaseByTag({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  tag: inputTag,
+                });
+                return byTag.data;
+              }
+
+              const list = await github.rest.repos.listReleases({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 1,
+              });
+
+              if (!list.data.length) {
+                core.setFailed('No releases found to update.');
+                return null;
+              }
+
+              return list.data[0];
+            }
+
+            const release = await resolveRelease();
+            if (!release) return;
+
+            const body = (release.body || '').trim();
+            if (body.includes(marker)) {
+              core.notice(`Release ${release.tag_name} already contains MCP install snippets. Skipping.`);
+              return;
+            }
+
+            const updatedBody = [body, snippet].filter(Boolean).join('\n\n').trim();
+
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: release.id,
+              body: updatedBody,
+            });
+
+            core.notice(`Updated release notes for ${release.tag_name} with MCP install snippets.`);

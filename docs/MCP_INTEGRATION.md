@@ -236,3 +236,28 @@ Use `arbor query <name>` to verify the symbol is indexed.
 ## Version
 
 This guide is for Arbor releases with MCP capabilities (v1.6+). For branch/release channel policy, see [`CONTRIBUTING.md`](../.github/CONTRIBUTING.md).
+
+---
+
+## Competitive Notes (March 2026)
+
+Compared with code-intel MCP competitors (for example `syke`, `flyto-indexer`, `ckb`), the strongest adoption patterns are:
+
+1. **One-command install shown first** (especially Claude Code stdio setup)
+2. **Clear capability sentence** (`impact analysis`, `dependency graph`, `build gates`)
+3. **Visible directory badges** (Glama/Skills Playground) on README landing area
+4. **Registry/package metadata completeness** (npm/pypi/crates metadata + README)
+
+Arbor now includes these patterns in the root README and `arbor-mcp` README.
+
+## Why score can still appear low
+
+Some MCP directory scores include activity/usage signals (for example: “no recent usage”).
+Those cannot be fully improved by docs alone; they rise as real installs and tool calls increase.
+
+Practical growth levers:
+
+- Keep install command friction near zero (`claude mcp add ...` copy-paste ready)
+- Add MCP usage snippets to PR templates, docs, and release notes
+- Cut regular releases so directories re-index current metadata/tooling
+- Encourage users to run and keep Arbor MCP enabled in daily workflows

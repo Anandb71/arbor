@@ -161,11 +161,28 @@ Arbor is listed on Glama MCP Directory:
 
 - **Glama:** https://glama.ai/mcp/servers/@Anandb71/arbor
 
+### MCP Health Badges
+
+[![arbor MCP server](https://glama.ai/mcp/servers/Anandb71/arbor/badges/score.svg)](https://glama.ai/mcp/servers/Anandb71/arbor)
+[![arbor MCP server](https://glama.ai/mcp/servers/Anandb71/arbor/badges/card.svg)](https://glama.ai/mcp/servers/Anandb71/arbor)
+
 <p align="center">
   <a href="https://glama.ai/mcp/servers/@Anandb71/arbor">
     <img width="380" height="200" src="https://glama.ai/mcp/servers/@Anandb71/arbor/badge" />
   </a>
 </p>
+
+### Claude Code MCP Quick Install
+
+```bash
+claude mcp add --transport stdio --scope project arbor -- arbor bridge
+```
+
+Then verify with:
+
+```bash
+claude mcp list
+```
 
 ---
 
