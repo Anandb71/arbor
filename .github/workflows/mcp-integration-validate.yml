@@ -1,0 +1,67 @@
+name: MCP Integration Validation
+
+on:
+  pull_request:
+    paths:
+      - "templates/mcp/**"
+      - "scripts/setup-mcp.sh"
+      - "scripts/setup-mcp.ps1"
+      - "docs/MCP_INTEGRATION.md"
+      - "README.md"
+  workflow_dispatch:
+
+jobs:
+  validate-templates:
+    name: Validate MCP JSON templates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate JSON syntax
+        run: |
+          set -euo pipefail
+          for file in templates/mcp/*.json; do
+            echo "Checking ${file}"
+            jq -e . "${file}" >/dev/null
+          done
+
+      - name: Validate key structure
+        run: |
+          set -euo pipefail
+
+          jq -e '.mcpServers.arbor.command == "arbor"' templates/mcp/claude-code.project.mcp.json >/dev/null
+          jq -e '.mcpServers.arbor.command == "arbor"' templates/mcp/cursor.project.mcp.json >/dev/null
+          jq -e '.servers.arbor.command == "arbor"' templates/mcp/vscode.project.mcp.json >/dev/null
+
+  validate-bootstrap-scripts:
+    name: Validate setup scripts (Linux + Windows)
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run Bash bootstrap
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp_dir="$(mktemp -d)"
+          bash ./scripts/setup-mcp.sh --client all --target-dir "${tmp_dir}"
+          jq -e . "${tmp_dir}/.mcp.json" >/dev/null
+          jq -e . "${tmp_dir}/.cursor/mcp.json" >/dev/null
+          jq -e . "${tmp_dir}/.vscode/mcp.json" >/dev/null
+
+      - name: Run PowerShell bootstrap
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tmpDir = Join-Path $env:TEMP ("arbor-mcp-" + [Guid]::NewGuid().ToString())
+          New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+
+          ./scripts/setup-mcp.ps1 -Client all -TargetDir $tmpDir
+
+          Get-Content (Join-Path $tmpDir ".mcp.json") | ConvertFrom-Json | Out-Null
+          Get-Content (Join-Path $tmpDir ".cursor/mcp.json") | ConvertFrom-Json | Out-Null
+          Get-Content (Join-Path $tmpDir ".vscode/mcp.json") | ConvertFrom-Json | Out-Null

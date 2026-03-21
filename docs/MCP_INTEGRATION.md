@@ -26,9 +26,10 @@ Create or edit `.cursor/mcp.json` in your project root:
 {
   "mcpServers": {
     "arbor": {
+      "type": "stdio",
       "command": "arbor",
       "args": ["bridge"],
-      "cwd": "."
+      "envFile": "${workspaceFolder}/.env"
     }
   }
 }
@@ -51,13 +52,15 @@ Create `.vscode/mcp.json`:
 
 ```json
 {
-  "mcpServers": {
+  "servers": {
     "arbor": {
+      "type": "stdio",
       "command": "arbor",
       "args": ["bridge"],
-      "cwd": "${workspaceFolder}"
+      "envFile": "${workspaceFolder}/.env"
     }
-  }
+  },
+  "inputs": []
 }
 ```
 
@@ -142,6 +145,57 @@ Create `.mcp.json` in repo root:
 ```
 
 > Reference: Claude Code MCP docs — https://code.claude.com/docs/en/mcp
+
+---
+
+## Universal MCP Integration Kit (Beginner → Enterprise)
+
+Arbor includes reusable templates and setup scripts so users can bootstrap MCP clients without hand-writing JSON.
+
+### Included templates
+
+- `templates/mcp/claude-code.project.mcp.json`
+- `templates/mcp/cursor.project.mcp.json`
+- `templates/mcp/vscode.project.mcp.json`
+- `templates/mcp/claude-desktop.user.config.json`
+
+### One-command bootstrap scripts
+
+- macOS/Linux: `scripts/setup-mcp.sh`
+- Windows: `scripts/setup-mcp.ps1`
+
+Examples:
+
+```bash
+# Generate all project-scoped configs (.mcp.json, .cursor/mcp.json, .vscode/mcp.json)
+./scripts/setup-mcp.sh --client all --target-dir .
+
+# Generate only Cursor config in another repo
+./scripts/setup-mcp.sh --client cursor --target-dir /path/to/repo
+```
+
+```powershell
+# Generate all project-scoped configs in current directory
+./scripts/setup-mcp.ps1 -Client all -TargetDir .
+
+# Overwrite existing files
+./scripts/setup-mcp.ps1 -Client vscode -TargetDir . -Force
+```
+
+### Recommended path by customer level
+
+1. **Individual developers (fastest path)**
+  - Run `claude mcp add --transport stdio --scope project arbor -- arbor bridge`
+  - Or generate `.mcp.json` with setup scripts above.
+
+2. **Teams (shared and versioned setup)**
+  - Commit project-scoped MCP files (`.mcp.json`, `.cursor/mcp.json`, `.vscode/mcp.json`).
+  - Keep secrets out of source; prefer `envFile` + local `.env`.
+
+3. **Enterprise / managed environments**
+  - Prefer centrally managed or programmatic registration where supported.
+  - For VS Code, use organization-level AI/MCP policy controls.
+  - For Cursor, use extension API registration for managed onboarding flows.
 
 ---
 
