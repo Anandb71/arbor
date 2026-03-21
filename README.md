@@ -168,6 +168,36 @@ Arbor is listed on Glama MCP Directory:
 
 ---
 
+## GitHub Marketplace Action
+
+Arbor now includes a reusable GitHub Action at the repo root (`action.yml`) so teams can run impact analysis directly in CI.
+
+### Quick usage
+
+```yaml
+name: Arbor Check
+on: [pull_request]
+
+jobs:
+  arbor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Anandb71/arbor@release/v1.6
+        with:
+          command: check . --max-blast-radius 30
+```
+
+Inputs:
+
+- `command` (default: `status .`) — Arbor subcommand + args (without leading `arbor`)
+- `arbor-version` (default: `latest`) — install from crates.io at a pinned version
+- `install-from-source` (default: `false`) — build from this repository source
+
+> To publish this action in GitHub Marketplace: create a release tag (for example `v1`), add marketplace listing metadata in the release flow, and submit from the repository's Marketplace listing page.
+
+---
+
 ## Documentation Hub
 
 - **Quickstart:** [docs/QUICKSTART.md](docs/QUICKSTART.md)
