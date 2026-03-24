@@ -37,7 +37,7 @@
     "LICENSE"
   ],
   "main": "./out/extension.js",
-  "icon": "logo.svg",
+  "icon": "arbor-logo.png",
   "contributes": {
     "commands": [
       {
@@ -87,7 +87,7 @@
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
-    "@types/vscode": "^1.110.0",
+    "@types/vscode": "^1.85.0",
     "@types/ws": "^8.18.1",
     "typescript": "^6.0.2"
   },
