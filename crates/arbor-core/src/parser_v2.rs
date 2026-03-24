@@ -161,19 +161,24 @@ impl ArborParser {
             return Err(ParseError::EmptyFile(path.to_path_buf()));
         }
 
-        // Get the extension
+        // Get the extension (normalize to lowercase)
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
             .ok_or_else(|| ParseError::UnsupportedLanguage(path.to_path_buf()))?;
+        let ext = ext.to_ascii_lowercase();
 
         // Get compiled queries
-        let compiled = match self.queries.get(ext) {
+        let compiled = match self.queries.get(&ext) {
             Some(compiled) => compiled,
             None => {
-                if fallback_parser::is_fallback_supported_extension(ext) {
+                if fallback_parser::is_fallback_supported_extension(&ext) {
                     return Ok(ParseResult {
-                        symbols: fallback_parser::parse_fallback_source(&source, &path.to_string_lossy(), ext),
+                        symbols: fallback_parser::parse_fallback_source(
+                            &source,
+                            &path.to_string_lossy(),
+                            &ext,
+                        ),
                         relations: Vec::new(),
                         file_path: path.to_string_lossy().to_string(),
                     });
@@ -223,14 +228,14 @@ impl ArborParser {
             return Err(ParseError::EmptyFile(file_path.into()));
         }
 
-        let compiled = self
-            .queries
-            .get(language);
+        // Normalize language/extension to lowercase
+        let language = language.to_ascii_lowercase();
+        let compiled = self.queries.get(&language);
 
         if compiled.is_none() {
-            if fallback_parser::is_fallback_supported_extension(language) {
+            if fallback_parser::is_fallback_supported_extension(&language) {
                 return Ok(ParseResult {
-                    symbols: fallback_parser::parse_fallback_source(source, file_path, language),
+                    symbols: fallback_parser::parse_fallback_source(source, file_path, &language),
                     relations: Vec::new(),
                     file_path: file_path.to_string(),
                 });
@@ -944,7 +949,10 @@ class UserService:
         let result = parser.parse_source(source, "billing.kt", "kt").unwrap();
 
         assert!(result.symbols.iter().any(|s| s.name == "BillingService"));
-        assert!(result.symbols.iter().any(|s| s.name == "computeInvoiceTotal"));
+        assert!(result
+            .symbols
+            .iter()
+            .any(|s| s.name == "computeInvoiceTotal"));
         assert!(result.relations.is_empty());
     }
 }

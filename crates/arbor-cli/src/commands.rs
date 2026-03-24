@@ -589,7 +589,7 @@ pub fn index(
     // Warn if graph is empty
     if result.nodes_extracted == 0 {
         eprintln!("\n{} No nodes extracted. Check:", "⚠ Warning:".yellow());
-        eprintln!("  - File extensions match supported languages (.rs, .ts, .py, .dart, .go, .kt, .swift, .rb, .php, .sh)");
+        eprintln!("  - File extensions match the languages Arbor supports in this project (see `arbor status` for a list)");
         eprintln!("  - Path is not excluded by .gitignore");
         eprintln!("  - Files contain parseable function/class definitions");
     }

@@ -44,7 +44,10 @@ pub fn parse_file(path: &Path) -> Result<Vec<CodeNode>> {
         return Err(ParseError::EmptyFile(path.to_path_buf()));
     }
 
-    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
 
     // Get the appropriate parser for this file type (tree-sitter path first)
     let parser = detect_language(path);
@@ -53,9 +56,7 @@ pub fn parse_file(path: &Path) -> Result<Vec<CodeNode>> {
         if fallback_parser::is_fallback_supported_extension(extension) {
             let file_path = path.to_string_lossy().to_string();
             return Ok(fallback_parser::parse_fallback_source(
-                &source,
-                &file_path,
-                extension,
+                &source, &file_path, extension,
             ));
         }
         return Err(ParseError::UnsupportedLanguage(path.to_path_buf()));

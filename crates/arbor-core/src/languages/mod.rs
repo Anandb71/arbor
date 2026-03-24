@@ -13,8 +13,8 @@ mod python;
 mod rust;
 mod typescript;
 
-use crate::node::CodeNode;
 use crate::fallback_parser::is_fallback_supported_extension;
+use crate::node::CodeNode;
 
 /// Trait for language-specific parsing logic.
 ///
@@ -86,9 +86,9 @@ pub fn supported_extensions() -> &'static [&'static str] {
         "c", "h", // C
         "cpp", "hpp", "cc", "hh", "cxx", "hxx",  // C++
         "dart", // Dart
-        "kt", "kts", // Kotlin (fallback parser)
+        "kt", "kts",   // Kotlin (fallback parser)
         "swift", // Swift (fallback parser)
-        "rb", // Ruby (fallback parser)
+        "rb",    // Ruby (fallback parser)
         "php", "phtml", // PHP (fallback parser)
         "sh", "bash", "zsh", // Shell (fallback parser)
     ]

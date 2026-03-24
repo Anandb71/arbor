@@ -8,9 +8,9 @@ use crate::node::{CodeNode, NodeKind};
 
 /// Extra language extensions supported via fallback parsing.
 pub const FALLBACK_EXTENSIONS: &[&str] = &[
-    "kt", "kts", // Kotlin
+    "kt", "kts",   // Kotlin
     "swift", // Swift
-    "rb", // Ruby
+    "rb",    // Ruby
     "php", "phtml", // PHP
     "sh", "bash", "zsh", // Shell
 ];

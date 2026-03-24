@@ -20,6 +20,6 @@ tokio.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 
-arbor-core = { path = "../arbor-core", version = "1.6.2" }
-arbor-graph = { path = "../arbor-graph", version = "1.6.2" }
-arbor-server = { path = "../arbor-server", version = "1.6.2" }
+arbor-core = { path = "../arbor-core", version = "1.6.3" }
+arbor-graph = { path = "../arbor-graph", version = "1.6.3" }
+arbor-server = { path = "../arbor-server", version = "1.6.3" }
