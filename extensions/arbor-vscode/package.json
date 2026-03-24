@@ -2,7 +2,7 @@
   "name": "arbor-vscode",
   "displayName": "Arbor - Logic Forest",
   "description": "Connect VS Code to the Arbor Logic Forest for AI-aware code navigation",
-  "version": "0.1.0",
+  "version": "1.6.3",
   "publisher": "arbor",
   "license": "MIT",
   "repository": {
@@ -37,6 +37,7 @@
     "LICENSE"
   ],
   "main": "./out/extension.js",
+  "icon": "logo.svg",
   "contributes": {
     "commands": [
       {
@@ -85,12 +86,12 @@
     "watch": "tsc -watch -p ./"
   },
   "devDependencies": {
-    "@types/node": "^20.10.0",
-    "@types/vscode": "^1.85.0",
+    "@types/node": "^25.5.0",
+    "@types/vscode": "^1.110.0",
     "@types/ws": "^8.18.1",
-    "typescript": "^5.3.0"
+    "typescript": "^6.0.2"
   },
   "dependencies": {
-    "ws": "^8.14.0"
+    "ws": "^8.20.0"
   }
 }
