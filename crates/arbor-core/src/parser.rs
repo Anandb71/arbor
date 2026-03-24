@@ -5,6 +5,7 @@
 //! on file extension.
 
 use crate::error::{ParseError, Result};
+use crate::fallback_parser;
 use crate::languages::{get_parser, LanguageParser};
 use crate::node::CodeNode;
 use std::fs;
@@ -43,9 +44,24 @@ pub fn parse_file(path: &Path) -> Result<Vec<CodeNode>> {
         return Err(ParseError::EmptyFile(path.to_path_buf()));
     }
 
-    // Get the appropriate parser for this file type
-    let parser =
-        detect_language(path).ok_or_else(|| ParseError::UnsupportedLanguage(path.to_path_buf()))?;
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+
+    // Get the appropriate parser for this file type (tree-sitter path first)
+    let parser = detect_language(path);
+
+    if parser.is_none() {
+        if fallback_parser::is_fallback_supported_extension(extension) {
+            let file_path = path.to_string_lossy().to_string();
+            return Ok(fallback_parser::parse_fallback_source(
+                &source,
+                &file_path,
+                extension,
+            ));
+        }
+        return Err(ParseError::UnsupportedLanguage(path.to_path_buf()));
+    }
+
+    let parser = parser.unwrap();
 
     // Use the file path as a string for node IDs
     let file_path = path.to_string_lossy().to_string();
@@ -98,6 +114,22 @@ mod tests {
         assert!(detect_language(Path::new("bar.ts")).is_some());
         assert!(detect_language(Path::new("baz.py")).is_some());
         assert!(detect_language(Path::new("unknown.xyz")).is_none());
+    }
+
+    #[test]
+    fn test_parse_fallback_language_source() {
+        let source = r#"
+            fun calculateTax(price: Double): Double = price * 0.18
+            class TaxService
+        "#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("billing.kt");
+        std::fs::write(&path, source).unwrap();
+
+        let nodes = parse_file(&path).unwrap();
+        assert!(nodes.iter().any(|n| n.name == "calculateTax"));
+        assert!(nodes.iter().any(|n| n.name == "TaxService"));
     }
 
     #[test]

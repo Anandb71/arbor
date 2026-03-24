@@ -126,7 +126,7 @@ Generates a Markdown summary of impact for multiple changed symbols.
 1. Add to `.cursor/mcp.json`:
 ```json
 {
-  "servers": {
+  "mcpServers": {
     "arbor": {
       "command": "arbor",
       "args": ["bridge"]
@@ -182,4 +182,5 @@ If `arbor check` fails, run focused tests before merge and include blast-radius 
 - [MCP Protocol](./PROTOCOL.md)
 - [MCP Integration](./MCP_INTEGRATION.md)
 - [Release Notes (v1.6)](./RELEASE_NOTES_v1.6.0.md)
+- [Release Notes (v1.6.2)](./RELEASE_NOTES_v1.6.2.md)
 - [Glama MCP Directory Listing](https://glama.ai/mcp/servers/@Anandb71/arbor)

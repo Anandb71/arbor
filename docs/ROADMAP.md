@@ -4,7 +4,7 @@
 
 ---
 
-## ✅ Current Execution Status (2026-03-04)
+## ✅ Current Execution Status (2026-03-24)
 
 This section tracks what is already shipped versus what remains strategic work.
 
@@ -13,6 +13,7 @@ This section tracks what is already shipped versus what remains strategic work.
 - [x] **Agent Bridge (MCP):** Operational bridge and tool surface (`get_logic_path`, `analyze_impact`, `find_path`)
 - [x] **`arbor audit` command foundation:** Security-path tracing is available in CLI
 - [x] **Language expansion baseline:** JS/TS, Python, Go, Rust, Java, C/C++, C#, Dart parsing paths are present
+- [x] **Language expansion wave (v1.6.2):** Kotlin, Swift, Ruby, PHP, and Shell are now indexed via fallback parser support
 - [x] **Air-gapped local-first model:** Core workflows operate offline
 - [x] **Graph snapshot persistence:** CLI now writes/loads `.arbor/graph.json` and `.arbor/graph.bin` for faster reuse across commands
 - [x] **Git-aware impact workflows:** `arbor diff`, `arbor check`, `arbor open`, and `arbor index --changed-only`
@@ -48,7 +49,8 @@ This section tracks what is already shipped versus what remains strategic work.
 
 ## 🌍 4. Multi-Language & Ecosystem
 *Be the #1 tool for every stack.*
-- [ ] **Language Expansion:** Full support for JS/TS, Python, Go, Rust, Java, C#.
+- [x] **Language Expansion:** Full support for JS/TS, Python, Go, Rust, Java, C#.
+- [x] **Language Expansion (v1.6.2):** Added pragmatic parser support for Kotlin, Swift, Ruby, PHP, and Shell.
 - [ ] **Plugin System:** Wasm-based plugin architecture for community parsers.
 - [ ] **"Bounty Board":** Gamified community contributions for new language parsers.
 

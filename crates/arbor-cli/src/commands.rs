@@ -589,7 +589,7 @@ pub fn index(
     // Warn if graph is empty
     if result.nodes_extracted == 0 {
         eprintln!("\n{} No nodes extracted. Check:", "⚠ Warning:".yellow());
-        eprintln!("  - File extensions match supported languages (.rs, .ts, .py, .dart, .go)");
+        eprintln!("  - File extensions match supported languages (.rs, .ts, .py, .dart, .go, .kt, .swift, .rb, .php, .sh)");
         eprintln!("  - Path is not excluded by .gitignore");
         eprintln!("  - Files contain parseable function/class definitions");
     }
@@ -955,6 +955,15 @@ pub async fn viz(path: &Path, follow_symlinks: bool) -> Result<()> {
             "cxx".to_string(),
             "hh".to_string(),
             "cs".to_string(),
+            "kt".to_string(),
+            "kts".to_string(),
+            "swift".to_string(),
+            "rb".to_string(),
+            "php".to_string(),
+            "phtml".to_string(),
+            "sh".to_string(),
+            "bash".to_string(),
+            "zsh".to_string(),
         ],
     };
     let sync_server = arbor_server::SyncServer::new_with_shared(sync_config, shared_graph.clone());
@@ -1228,6 +1237,15 @@ pub async fn bridge(path: &Path, launch_viz: bool, follow_symlinks: bool) -> Res
             "cxx".to_string(),
             "hh".to_string(),
             "cs".to_string(),
+            "kt".to_string(),
+            "kts".to_string(),
+            "swift".to_string(),
+            "rb".to_string(),
+            "php".to_string(),
+            "phtml".to_string(),
+            "sh".to_string(),
+            "bash".to_string(),
+            "zsh".to_string(),
         ],
     };
 

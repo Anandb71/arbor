@@ -17,6 +17,7 @@
 //! ```
 
 pub mod error;
+pub mod fallback_parser;
 pub mod languages;
 pub mod node;
 pub mod parser;

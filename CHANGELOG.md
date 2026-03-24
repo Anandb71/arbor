@@ -10,6 +10,33 @@
 
 - None yet.
 
+## [1.6.2] - 2026-03-24 "Revival Release: Language Expansion + Developer Momentum"
+
+> **Feature release focused on expanding parser reach, improving live sync coverage, and strengthening release momentum workflows.**
+
+### Added
+
+- **Fallback parser engine** in `arbor-core` for rapid support of additional ecosystems when a full Tree-sitter path is unavailable in all runtime surfaces
+- **New language extension support (5+)** via fallback parsing:
+  - Kotlin (`.kt`, `.kts`)
+  - Swift (`.swift`)
+  - Ruby (`.rb`)
+  - PHP (`.php`, `.phtml`)
+  - Shell (`.sh`, `.bash`, `.zsh`)
+- **Regression tests** for fallback parsing in both legacy parser path and query parser v2 path
+
+### Changed
+
+- **Indexer support matrix** now includes fallback-language extensions in support checks
+- **Bridge + visualizer sync watchers** now watch and re-index the newly added language extensions
+- **CLI empty-graph hints** now include the expanded extension set
+- **Workspace crate line bumped** to `1.6.2` and internal crate dependency versions aligned
+
+### Documentation
+
+- Updated release/status messaging and supported-language listings
+- Added release notes for `v1.6.2`
+
 ## [1.6.1.1] - 2026-03-18 "Maintenance + Ecosystem Alignment"
 
 > **Maintenance release focused on workflow reliability, MCP guidance, and ecosystem currency as of March 18, 2026.**

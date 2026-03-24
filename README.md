@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/Anandb71/arbor/actions"><img src="https://img.shields.io/github/actions/workflow/status/Anandb71/arbor/rust.yml?style=flat-square&label=CI" alt="CI" /></a>
-  <img src="https://img.shields.io/badge/release-1.6.1.1%20maintenance%20%7C%20main%20active-blue?style=flat-square" alt="Release channels" />
+  <img src="https://img.shields.io/badge/release-1.6.2%20maintenance%20%7C%20main%20active-blue?style=flat-square" alt="Release channels" />
   <a href="https://glama.ai/mcp/servers/@Anandb71/arbor"><img src="https://img.shields.io/badge/MCP%20Directory-Glama-6f42c1?style=flat-square" alt="Glama MCP Directory" /></a>
   <a href="https://skillsplayground.com/mcps/nandb71-arbor/"><img src="https://skillsplayground.com/badges/mcp/nandb71-arbor.svg" alt="Skills Playground MCP badge" /></a>
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" />
@@ -18,10 +18,10 @@
 
 ## Status (March 2026)
 
-- **Stable maintenance line:** `release/v1.6` (`v1.6.1.1`)
+- **Stable maintenance line:** `release/v1.6` (`v1.6.2`)
 - **Main development trunk:** `main`
 
-Arbor `v1.6.1.1` is the active maintenance cut as of **March 18, 2026**.
+Arbor `v1.6.2` is the active maintenance cut as of **March 24, 2026**.
 
 ## Highlights
 
@@ -31,6 +31,7 @@ Arbor `v1.6.1.1` is the active maintenance cut as of **March 18, 2026**.
 - **Git-Aware Risk Workflows** — `arbor diff`, `arbor check`, and `arbor open` for refactor confidence
 - **Incremental Refresh** — `arbor index --changed-only` for faster re-index during active branches
 - **Better Python UX** — Empty `__init__.py` handled silently (no false warnings)
+- **Polyglot Parser Expansion** — New fallback parsing support for Kotlin, Swift, Ruby, PHP, and Shell families
 
 <p align="center">
   <img src="docs/assets/arbor-demo.gif" alt="Arbor refactor demo" width="700" />
@@ -148,7 +149,7 @@ arbor gui
 To keep maintenance and feature work clean:
 
 - `main` → ongoing development
-- `release/v1.6` → maintenance-only fixes for 1.6.x (`v1.6.1.1` current)
+- `release/v1.6` → maintenance-only fixes for 1.6.x (`v1.6.2` current)
 - `release/v1.5` → legacy maintenance/backport branch
 
 This avoids shipping new features into older maintenance branches and keeps backports explicit.
@@ -252,6 +253,7 @@ Inputs:
 - **Roadmap:** [docs/ROADMAP.md](docs/ROADMAP.md)
 - **Release Notes (v1.6):** [docs/RELEASE_NOTES_v1.6.0.md](docs/RELEASE_NOTES_v1.6.0.md)
 - **Release Notes (v1.6.1.1):** [docs/RELEASE_NOTES_v1.6.1.1.md](docs/RELEASE_NOTES_v1.6.1.1.md)
+- **Release Notes (v1.6.2):** [docs/RELEASE_NOTES_v1.6.2.md](docs/RELEASE_NOTES_v1.6.2.md)
 
 ---
 
@@ -305,6 +307,11 @@ A global symbol table resolves:
 | **C++**        | ✅      | Classes, Namespaces, Templates            |
 | **C#**         | ✅      | Classes, Methods, Properties, Interfaces  |
 | **Dart**       | ✅      | Classes, Mixins, Widgets                  |
+| **Kotlin**     | ✅      | Functions, Classes, Interfaces (fallback parser) |
+| **Swift**      | ✅      | Functions, Types, Protocols (fallback parser) |
+| **Ruby**       | ✅      | Methods, Classes, Modules (fallback parser) |
+| **PHP**        | ✅      | Functions, Classes, Traits (fallback parser) |
+| **Shell**      | ✅      | Function definitions (fallback parser) |
 
 > **Python note:** Decorators, `__init__.py`, and `@dataclass` are statically analyzed. Dynamic dispatch is flagged with reduced confidence.
 

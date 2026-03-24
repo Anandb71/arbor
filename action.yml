@@ -10,7 +10,7 @@ inputs:
     required: false
     default: status .
   arbor-version:
-    description: Arbor CLI version to install (e.g. 1.6.1). Use 'latest' for newest.
+    description: Arbor CLI version to install (e.g. 1.6.2). Use 'latest' for newest.
     required: false
     default: latest
   install-from-source:

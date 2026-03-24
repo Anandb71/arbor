@@ -37,6 +37,14 @@
 | C# | `tree-sitter-c-sharp` | class, method, property, interface |
 | Dart | `tree-sitter-dart` | class, mixin, method, widget |
 
+Additional fallback parser support (v1.6.2+):
+
+- Kotlin (`.kt`, `.kts`)
+- Swift (`.swift`)
+- Ruby (`.rb`)
+- PHP (`.php`, `.phtml`)
+- Shell (`.sh`, `.bash`, `.zsh`)
+
 ## Usage
 
 This crate is primarily used internally by `arbor-graph` and `arbor-watcher`. For most use cases, install `arbor-graph-cli` instead:

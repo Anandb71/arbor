@@ -8,6 +8,7 @@
 //! will update existing nodes rather than creating duplicates.
 
 use crate::error::{ParseError, Result};
+use crate::fallback_parser;
 use crate::node::{CodeNode, NodeKind};
 use std::collections::HashMap;
 use std::fs;
@@ -167,10 +168,19 @@ impl ArborParser {
             .ok_or_else(|| ParseError::UnsupportedLanguage(path.to_path_buf()))?;
 
         // Get compiled queries
-        let compiled = self
-            .queries
-            .get(ext)
-            .ok_or_else(|| ParseError::UnsupportedLanguage(path.to_path_buf()))?;
+        let compiled = match self.queries.get(ext) {
+            Some(compiled) => compiled,
+            None => {
+                if fallback_parser::is_fallback_supported_extension(ext) {
+                    return Ok(ParseResult {
+                        symbols: fallback_parser::parse_fallback_source(&source, &path.to_string_lossy(), ext),
+                        relations: Vec::new(),
+                        file_path: path.to_string_lossy().to_string(),
+                    });
+                }
+                return Err(ParseError::UnsupportedLanguage(path.to_path_buf()));
+            }
+        };
 
         // Configure parser for this language
         self.parser
@@ -215,8 +225,20 @@ impl ArborParser {
 
         let compiled = self
             .queries
-            .get(language)
-            .ok_or_else(|| ParseError::UnsupportedLanguage(file_path.into()))?;
+            .get(language);
+
+        if compiled.is_none() {
+            if fallback_parser::is_fallback_supported_extension(language) {
+                return Ok(ParseResult {
+                    symbols: fallback_parser::parse_fallback_source(source, file_path, language),
+                    relations: Vec::new(),
+                    file_path: file_path.to_string(),
+                });
+            }
+            return Err(ParseError::UnsupportedLanguage(file_path.into()));
+        }
+
+        let compiled = compiled.unwrap();
 
         self.parser
             .set_language(&compiled.language)
@@ -908,5 +930,21 @@ class UserService:
         assert!(result.symbols.iter().any(|s| s.name == "greet"));
         assert!(result.symbols.iter().any(|s| s.name == "UserService"));
         assert!(result.symbols.iter().any(|s| s.name == "validate"));
+    }
+
+    #[test]
+    fn test_parse_fallback_kotlin_symbols() {
+        let mut parser = ArborParser::new().unwrap();
+
+        let source = r#"
+            class BillingService
+            fun computeInvoiceTotal(amount: Double): Double = amount
+        "#;
+
+        let result = parser.parse_source(source, "billing.kt", "kt").unwrap();
+
+        assert!(result.symbols.iter().any(|s| s.name == "BillingService"));
+        assert!(result.symbols.iter().any(|s| s.name == "computeInvoiceTotal"));
+        assert!(result.relations.is_empty());
     }
 }

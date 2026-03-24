@@ -51,6 +51,15 @@ impl Default for SyncServerConfig {
                 "jsx".into(),
                 "rs".into(),
                 "py".into(),
+                "kt".into(),
+                "kts".into(),
+                "swift".into(),
+                "rb".into(),
+                "php".into(),
+                "phtml".into(),
+                "sh".into(),
+                "bash".into(),
+                "zsh".into(),
             ],
         }
     }

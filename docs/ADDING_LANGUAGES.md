@@ -103,6 +103,23 @@ Add your language to:
 - Look at existing language implementations for patterns
 - Test with real-world code from open source projects
 
+## Fast Path: Fallback Parser (v1.6.2+)
+
+If you want immediate indexing support before wiring a full Tree-sitter parser module,
+add the extension to the fallback parser:
+
+- `crates/arbor-core/src/fallback_parser.rs`
+
+This path is heuristic-based (line scanning) and is ideal for quickly supporting
+additional language families in polyglot repos while full grammar support is in progress.
+
+Recommended workflow:
+
+1. Add extension + symbol patterns in fallback parser
+2. Add tests for extraction behavior
+3. Wire extension into watcher/sync lists
+4. Promote to full Tree-sitter parser in a follow-up milestone
+
 ## Example: Adding Go
 
 Here's a condensed example for Go:
