@@ -8,7 +8,7 @@ repository = "https://github.com/Anandb71/arbor"
 homepage = "https://github.com/Anandb71/arbor"
 documentation = "https://github.com/Anandb71/arbor/blob/main/docs/MCP_INTEGRATION.md"
 readme = "README.md"
-keywords = ["mcp", "model-context-protocol", "code-analysis", "graph", "ai"]
+keywords = ["mcp", "code-analysis", "graph", "ai"]
 categories = ["development-tools"]
 
 [dependencies]
