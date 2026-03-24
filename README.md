@@ -154,6 +154,18 @@ To keep maintenance and feature work clean:
 
 This avoids shipping new features into older maintenance branches and keeps backports explicit.
 
+### Automated distribution (not GitHub-only)
+
+Tagged releases (`vX.Y.Z`) are automated across channels:
+
+- GitHub Release assets (CLI binaries)
+- crates.io packages
+- GHCR container images
+- VS Code Marketplace extension
+- Open VSX extension
+
+Maintainer setup and verification steps are in [docs/RELEASING.md](docs/RELEASING.md).
+
 ---
 
 ## MCP Directory Listing
@@ -251,6 +263,7 @@ Inputs:
 - **MCP Integration:** [docs/MCP_INTEGRATION.md](docs/MCP_INTEGRATION.md)
 - **Protocol Specification:** [docs/PROTOCOL.md](docs/PROTOCOL.md)
 - **Roadmap:** [docs/ROADMAP.md](docs/ROADMAP.md)
+- **Release Runbook (all channels):** [docs/RELEASING.md](docs/RELEASING.md)
 - **Release Notes (v1.6):** [docs/RELEASE_NOTES_v1.6.0.md](docs/RELEASE_NOTES_v1.6.0.md)
 - **Release Notes (v1.6.1.1):** [docs/RELEASE_NOTES_v1.6.1.1.md](docs/RELEASE_NOTES_v1.6.1.1.md)
 - **Release Notes (v1.6.2):** [docs/RELEASE_NOTES_v1.6.2.md](docs/RELEASE_NOTES_v1.6.2.md)

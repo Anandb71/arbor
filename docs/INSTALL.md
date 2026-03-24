@@ -103,3 +103,9 @@ Download prebuilt binaries directly from GitHub Releases:
 Release page:
 
 `https://github.com/Anandb71/arbor/releases`
+
+---
+
+For maintainers shipping new versions across registries (GitHub Releases, crates.io, GHCR, VS Code Marketplace, Open VSX), follow:
+
+- [Release Runbook](./RELEASING.md)

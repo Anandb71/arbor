@@ -39,17 +39,30 @@ jobs:
             /mcp
             \`\`\`
 
-            ### Cursor / VS Code MCP config
-            Add this to your MCP config file:
+            ### Cursor MCP config (`.cursor/mcp.json`)
+            Add this to your Cursor project MCP config:
             \`\`\`json
             {
               "mcpServers": {
                 "arbor": {
                   "command": "arbor",
-                  "args": ["bridge"],
-                  "cwd": "."
+                  "args": ["bridge"]
                 }
               }
+            }
+            \`\`\`
+
+            ### VS Code MCP config (`.vscode/mcp.json`)
+            \`\`\`json
+            {
+              "servers": {
+                "arbor": {
+                  "type": "stdio",
+                  "command": "arbor",
+                  "args": ["bridge"]
+                }
+              },
+              "inputs": []
             }
             \`\`\`
 

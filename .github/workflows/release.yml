@@ -86,9 +86,61 @@ jobs:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_name }}
 
+  publish-crates:
+    name: Publish crates.io packages
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify crates.io token is available
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "CARGO_REGISTRY_TOKEN is missing. Add it in repository secrets to publish crates."
+            exit 1
+          fi
+
+      - name: Publish crates (skip already-published versions)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          VERSION="${RELEASE_VERSION#v}"
+          CRATES=(
+            "arbor-core"
+            "arbor-graph"
+            "arbor-watcher"
+            "arbor-server"
+            "arbor-mcp"
+            "arbor-gui"
+            "arbor-graph-cli"
+          )
+
+          for crate in "${CRATES[@]}"; do
+            echo "Checking crates.io for ${crate} ${VERSION}"
+            if curl -fsSL "https://crates.io/api/v1/crates/${crate}/${VERSION}" > /dev/null 2>&1; then
+              echo "${crate} ${VERSION} already published. Skipping."
+              continue
+            fi
+
+            echo "Publishing ${crate} ${VERSION}"
+            cargo publish -p "${crate}" --locked
+            sleep 20
+          done
+
   create-release:
     name: Create GitHub Release
-    needs: build-cli
+    needs: [build-cli, publish-crates]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     

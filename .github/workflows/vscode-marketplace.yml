@@ -1,6 +1,8 @@
 name: Publish VS Code Extension
 
 on:
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       version:
@@ -50,6 +52,34 @@ jobs:
       - name: Install publish CLIs
         run: npm install -g @vscode/vsce ovsx
 
+      - name: Resolve publish version
+        id: version
+        run: |
+          INPUT_VERSION="${{ github.event.inputs.version }}"
+          RELEASE_TAG="${{ github.event.release.tag_name }}"
+
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+          elif [ "${{ github.event_name }}" = "release" ] && echo "$RELEASE_TAG" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+$'; then
+            VERSION="${RELEASE_TAG#v}"
+          else
+            VERSION=""
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ -n "$VERSION" ]; then
+            echo "Using extension version: $VERSION"
+          else
+            echo "Using current package.json extension version"
+          fi
+
+      - name: Apply release version to package.json
+        if: steps.version.outputs.version != ''
+        run: npm version "${{ steps.version.outputs.version }}" --no-git-tag-version --allow-same-version
+
+      - name: Package extension artifact
+        run: vsce package --out arbor-vscode.vsix
+
       - name: Validate publishing token presence
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
@@ -63,18 +93,13 @@ jobs:
       - name: Publish to VS Code Marketplace
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
-          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           if [ -z "$VSCE_PAT" ]; then
             echo "VSCE_PAT not set; skipping VS Code Marketplace publish."
             exit 0
           fi
 
-          if [ -n "$INPUT_VERSION" ]; then
-            vsce publish "$INPUT_VERSION" --pat "$VSCE_PAT"
-          else
-            vsce publish --pat "$VSCE_PAT"
-          fi
+          vsce publish --packagePath arbor-vscode.vsix --pat "$VSCE_PAT"
 
       - name: Publish to Open VSX
         env:
@@ -89,5 +114,5 @@ jobs:
           echo "Ensuring Open VSX namespace '$PUBLISHER' exists..."
           ovsx create-namespace "$PUBLISHER" --pat "$OVSX_PAT" || true
 
-          # Publish the same current package version to Open VSX.
-          ovsx publish --pat "$OVSX_PAT"
+          # Publish the same packaged artifact to Open VSX.
+          ovsx publish arbor-vscode.vsix --pat "$OVSX_PAT"
