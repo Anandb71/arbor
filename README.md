@@ -177,7 +177,7 @@ Arbor is listed on Glama MCP Directory:
 ### MCP Health Badges
 
 [![arbor MCP server](https://glama.ai/mcp/servers/Anandb71/arbor/badges/score.svg)](https://glama.ai/mcp/servers/Anandb71/arbor)
-[![arbor MCP server](https://glama.ai/mcp/servers/Anandb71/arbor/badges/card.svg)](https://glama.ai/mcp/servers/Anandb71/arbor)
+
 
 <p align="center">
   <a href="https://glama.ai/mcp/servers/@Anandb71/arbor">
