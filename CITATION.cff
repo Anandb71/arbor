@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+title: "Arbor: Graph-Native Intelligence for Codebases"
+message: "If you use Arbor in your research, please cite it as below."
+type: software
+authors:
+  - name: "Arbor Contributors"
+    website: "https://github.com/Anandb71/arbor"
+repository-code: "https://github.com/Anandb71/arbor"
+url: "https://github.com/Anandb71/arbor"
+license: MIT
+version: "1.7.0"
+date-released: "2026-03-25"
+keywords:
+  - code-analysis
+  - dependency-graph
+  - impact-analysis
+  - static-analysis
+  - refactoring
+  - mcp
+  - model-context-protocol
+  - tree-sitter
+  - rust
+abstract: >-
+  Arbor is a local-first impact analysis engine that parses codebases into
+  semantic dependency graphs. It provides deterministic, explainable answers
+  to questions like "If I change this function, what actually breaks?" by
+  following real execution paths rather than relying on text similarity.

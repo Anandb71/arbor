@@ -84,3 +84,8 @@ server.json
 
 # Handoff
 HANDOFF_FOR_NEW_LAPTOP.md
+
+# Duplicate / orphaned root files
+/package-lock.json
+/arbor-logo.png
+crates/Cargo.lock

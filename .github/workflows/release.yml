@@ -1,0 +1,199 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # Build cross-platform CLI binaries
+  # ──────────────────────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: arbor-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: arbor-linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: arbor-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: arbor-macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: arbor-windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu pkg-config libssl-dev
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} -p arbor-graph-cli
+
+      - name: Package artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/arbor dist/arbor
+          chmod +x dist/arbor
+          cd dist && tar -czf ../${{ matrix.artifact }}.tar.gz arbor
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item "target/${{ matrix.target }}/release/arbor.exe" "dist/arbor.exe"
+          Compress-Archive -Path "dist/arbor.exe" -DestinationPath "${{ matrix.artifact }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.zip
+          if-no-files-found: ignore
+
+  # ──────────────────────────────────────────────────────────────
+  # Publish crates to crates.io
+  # ──────────────────────────────────────────────────────────────
+  publish-crates:
+    name: Publish crates to crates.io
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libdbus-1-dev libssl-dev cmake
+
+      - name: Publish crates (dependency order)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN not set; skipping crates.io publish."
+            exit 0
+          fi
+
+          # Publish in dependency order with delay between each
+          for crate in arbor-core arbor-graph arbor-watcher arbor-server arbor-mcp arbor-graph-cli arbor-gui; do
+            echo "Publishing $crate..."
+            cargo publish -p "$crate" --allow-dirty || echo "Warning: $crate publish failed (may already exist)"
+            sleep 30
+          done
+
+  # ──────────────────────────────────────────────────────────────
+  # Create GitHub Release with all binary assets
+  # ──────────────────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build, publish-crates]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Gather release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release-assets/ \;
+          ls -la release-assets/
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "## Arbor ${TAG}" > release-notes.md
+          echo "" >> release-notes.md
+          echo "### Installation" >> release-notes.md
+          echo "" >> release-notes.md
+          echo '```bash' >> release-notes.md
+          echo "# Cargo" >> release-notes.md
+          echo "cargo install arbor-graph-cli --version ${{ steps.version.outputs.version }}" >> release-notes.md
+          echo "" >> release-notes.md
+          echo "# Homebrew (macOS/Linux)" >> release-notes.md
+          echo "brew install Anandb71/tap/arbor" >> release-notes.md
+          echo "" >> release-notes.md
+          echo "# Scoop (Windows)" >> release-notes.md
+          echo "scoop bucket add arbor https://github.com/Anandb71/arbor" >> release-notes.md
+          echo "scoop install arbor" >> release-notes.md
+          echo "" >> release-notes.md
+          echo "# npm" >> release-notes.md
+          echo "npx @arbor-graph/cli" >> release-notes.md
+          echo "" >> release-notes.md
+          echo "# Docker" >> release-notes.md
+          echo "docker pull ghcr.io/anandb71/arbor:${TAG}" >> release-notes.md
+          echo '```' >> release-notes.md
+          echo "" >> release-notes.md
+          echo "### Assets" >> release-notes.md
+          echo "" >> release-notes.md
+          echo "| Platform | Architecture | File |" >> release-notes.md
+          echo "|----------|-------------|------|" >> release-notes.md
+          echo "| Linux | x86_64 | \`arbor-linux-x86_64.tar.gz\` |" >> release-notes.md
+          echo "| Linux | aarch64 | \`arbor-linux-aarch64.tar.gz\` |" >> release-notes.md
+          echo "| macOS | x86_64 | \`arbor-macos-x86_64.tar.gz\` |" >> release-notes.md
+          echo "| macOS | Apple Silicon | \`arbor-macos-aarch64.tar.gz\` |" >> release-notes.md
+          echo "| Windows | x86_64 | \`arbor-windows-x86_64.zip\` |" >> release-notes.md
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          files: release-assets/*
+          fail_on_unmatched_files: false
+          generate_release_notes: true
+          append_body: true

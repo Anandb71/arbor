@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM rust:1.92-slim AS builder
+FROM rust:1.85-slim AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 
 RUN cargo build --release --manifest-path crates/arbor-cli/Cargo.toml --bin arbor
@@ -17,13 +17,17 @@ RUN cargo build --release --manifest-path crates/arbor-cli/Cargo.toml --bin arbo
 FROM debian:bookworm-slim
 WORKDIR /app
 
-# Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     libssl3 \
     ca-certificates \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/arbor /usr/local/bin/arbor
+
+LABEL org.opencontainers.image.source="https://github.com/Anandb71/arbor"
+LABEL org.opencontainers.image.description="Arbor: Graph-native intelligence for codebases"
+LABEL org.opencontainers.image.licenses="MIT"
 
 # MCP servers communicate via stdio
 ENTRYPOINT ["arbor", "bridge"]

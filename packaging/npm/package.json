@@ -1,0 +1,37 @@
+{
+  "name": "@arbor-graph/cli",
+  "version": "1.7.0",
+  "description": "Graph-native intelligence for codebases — know what breaks before you break it",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Anandb71/arbor.git"
+  },
+  "homepage": "https://github.com/Anandb71/arbor",
+  "keywords": [
+    "arbor",
+    "code-analysis",
+    "graph",
+    "impact-analysis",
+    "refactoring",
+    "mcp",
+    "ast",
+    "tree-sitter",
+    "cli"
+  ],
+  "bin": {
+    "arbor": "bin/arbor"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "install.js",
+    "bin/"
+  ],
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"],
+  "engines": {
+    "node": ">=18"
+  }
+}

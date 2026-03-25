@@ -10,6 +10,37 @@
 
 - None yet.
 
+## [1.7.0] - 2026-03-25 "Distribution & Reach"
+
+> **Feature release focused on making Arbor available everywhere — every package manager, every editor, every CI pipeline.**
+
+### Added
+
+- **Automated release workflow** (`release.yml`) — Cross-platform binary builds (5 targets), crates.io publishing, and GitHub Release creation on tag push
+- **Homebrew formula** (`packaging/homebrew/arbor.rb`) — macOS/Linux install via `brew install`
+- **Scoop manifest** (`packaging/scoop/arbor.json`) — Windows install via `scoop install`
+- **npm wrapper** (`packaging/npm/`) — Cross-platform install via `npx @arbor-graph/cli`
+- **VS Code extension: 5 new commands** — `arbor.refactor`, `arbor.status`, `arbor.quickPick`, `arbor.diff`, `arbor.index`
+- **VS Code extension: Quick-pick command menu** — `Ctrl+Shift+R` for all Arbor actions
+- **VS Code extension: Walkthrough onboarding** — Get Started guide with step-by-step setup
+- **VS Code extension: New settings** — `arbor.autoIndex`, `arbor.maxBlastRadius`
+- **GitHub Sponsors** (`.github/FUNDING.yml`)
+- **Academic citation** (`CITATION.cff`)
+- **Docker Compose bridge service** for MCP container usage
+
+### Changed
+
+- **Dockerfile** updated to Rust 1.85 with OCI labels, git support
+- **docker-compose.yml** modernized (removed deprecated `version` key)
+- **VS Code extension categories** improved for marketplace discoverability
+- **README badges** expanded (crates.io, GitHub Release, GHCR, Docker)
+- **Install instructions** expanded with Homebrew, Scoop, npm, Docker options
+
+### Removed
+
+- **`vscode-publish.yml`** workflow (duplicate of `vscode-marketplace.yml`, caused CI failures)
+- Stale `package-lock.json`, `crates/Cargo.lock`, `crates/test_output.txt`
+
 ## [1.6.2] - 2026-03-24 "Revival Release: Language Expansion + Developer Momentum"
 
 > **Feature release focused on expanding parser reach, improving live sync coverage, and strengthening release momentum workflows.**

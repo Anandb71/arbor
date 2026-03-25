@@ -1,8 +1,8 @@
 {
   "name": "arbor-vscode",
-  "displayName": "Arbor - Logic Forest",
-  "description": "Connect VS Code to the Arbor Logic Forest for AI-aware code navigation",
-  "version": "1.6.3",
+  "displayName": "Arbor — Graph Intelligence for Code",
+  "description": "Impact analysis, refactor prediction, and AI-aware code navigation powered by semantic dependency graphs",
+  "version": "1.7.0",
   "publisher": "arbor",
   "license": "MIT",
   "repository": {
@@ -18,14 +18,23 @@
     "mcp",
     "code-graph",
     "refactor",
-    "analysis"
+    "impact-analysis",
+    "dependency-graph",
+    "static-analysis",
+    "ai-tools"
   ],
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
+    "Programming Languages",
+    "Linters",
     "Other"
   ],
+  "galleryBanner": {
+    "color": "#1a1a2e",
+    "theme": "dark"
+  },
   "activationEvents": [
     "onStartupFinished"
   ],
@@ -37,20 +46,48 @@
     "LICENSE"
   ],
   "main": "./out/extension.js",
-  "icon": "logo.svg",
+  "icon": "arbor-logo.png",
   "contributes": {
     "commands": [
       {
         "command": "arbor.showInVisualizer",
-        "title": "Show in Arbor Visualizer"
+        "title": "Arbor: Show in Visualizer",
+        "icon": "$(eye)"
       },
       {
         "command": "arbor.connect",
-        "title": "Arbor: Connect to Server"
+        "title": "Arbor: Connect to Server",
+        "icon": "$(plug)"
       },
       {
         "command": "arbor.toggleVisualizer",
-        "title": "Arbor: Toggle Visualizer"
+        "title": "Arbor: Toggle Visualizer",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "arbor.refactor",
+        "title": "Arbor: Analyze Impact (Refactor)",
+        "icon": "$(search)"
+      },
+      {
+        "command": "arbor.status",
+        "title": "Arbor: Show Index Status",
+        "icon": "$(info)"
+      },
+      {
+        "command": "arbor.quickPick",
+        "title": "Arbor: Command Palette",
+        "icon": "$(list-unordered)"
+      },
+      {
+        "command": "arbor.diff",
+        "title": "Arbor: Git Diff Impact",
+        "icon": "$(git-compare)"
+      },
+      {
+        "command": "arbor.index",
+        "title": "Arbor: Re-index Workspace",
+        "icon": "$(refresh)"
       }
     ],
     "keybindings": [
@@ -58,12 +95,34 @@
         "command": "arbor.toggleVisualizer",
         "key": "ctrl+shift+a",
         "mac": "cmd+shift+a"
+      },
+      {
+        "command": "arbor.quickPick",
+        "key": "ctrl+shift+r",
+        "mac": "cmd+shift+r"
+      },
+      {
+        "command": "arbor.refactor",
+        "key": "ctrl+alt+a",
+        "mac": "cmd+alt+a"
       }
     ],
     "menus": {
       "editor/context": [
         {
           "command": "arbor.showInVisualizer",
+          "when": "editorTextFocus",
+          "group": "navigation"
+        },
+        {
+          "command": "arbor.refactor",
+          "when": "editorTextFocus",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "arbor.refactor",
           "when": "editorTextFocus",
           "group": "navigation"
         }
@@ -76,9 +135,60 @@
           "type": "string",
           "default": "ws://127.0.0.1:8080",
           "description": "WebSocket URL for the Arbor Sync Server"
+        },
+        "arbor.autoIndex": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically re-index workspace on file save"
+        },
+        "arbor.maxBlastRadius": {
+          "type": "number",
+          "default": 30,
+          "description": "Maximum blast radius threshold before warning"
         }
       }
-    }
+    },
+    "walkthroughs": [
+      {
+        "id": "arbor.getStarted",
+        "title": "Get Started with Arbor",
+        "description": "Set up graph-native code intelligence in your workspace",
+        "steps": [
+          {
+            "id": "arbor.getStarted.index",
+            "title": "Index Your Codebase",
+            "description": "Run `arbor setup` in your terminal or use the command palette.\n\n[Run Arbor Index](command:arbor.index)",
+            "media": {
+              "markdown": "## First, build the graph\n\nArbor parses your code into a semantic dependency graph. Every function, class, and import becomes a node with real edges.\n\n```bash\narbor setup\n```"
+            }
+          },
+          {
+            "id": "arbor.getStarted.refactor",
+            "title": "Analyze Impact",
+            "description": "Right-click any function and select **Arbor: Analyze Impact** to see what breaks before you change it.\n\n[Try Impact Analysis](command:arbor.refactor)",
+            "media": {
+              "markdown": "## See the blast radius\n\nBefore refactoring, Arbor tells you:\n- How many callers depend on this symbol\n- Which files need updates\n- The full transitive impact"
+            }
+          },
+          {
+            "id": "arbor.getStarted.diff",
+            "title": "Git-Aware Workflows",
+            "description": "Use `arbor diff` to preview the impact of your uncommitted changes.\n\n[Run Git Diff Impact](command:arbor.diff)",
+            "media": {
+              "markdown": "## Predict before you push\n\n`arbor diff` analyzes your git changes and shows:\n- Changed symbols and their callers\n- API entrypoints affected\n- Files likely requiring updates"
+            }
+          },
+          {
+            "id": "arbor.getStarted.mcp",
+            "title": "Connect AI Agents (MCP)",
+            "description": "Arbor serves as an MCP tool so Claude, Cursor, and other AI agents get structural code understanding.\n\n```bash\nclaude mcp add --transport stdio --scope project arbor -- arbor bridge\n```",
+            "media": {
+              "markdown": "## Give AI agents real code intelligence\n\nInstead of keyword search, AI agents traverse your actual dependency graph for precise, deterministic answers."
+            }
+          }
+        ]
+      }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
@@ -86,10 +196,10 @@
     "watch": "tsc -watch -p ./"
   },
   "devDependencies": {
-    "@types/node": "^25.5.0",
-    "@types/vscode": "^1.110.0",
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.85.0",
     "@types/ws": "^8.18.1",
-    "typescript": "^6.0.2"
+    "typescript": "^5.7.0"
   },
   "dependencies": {
     "ws": "^8.20.0"

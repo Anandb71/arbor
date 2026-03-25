@@ -4,7 +4,7 @@
 
 ---
 
-## ✅ Current Execution Status (2026-03-24)
+## ✅ Current Execution Status (2026-03-25)
 
 This section tracks what is already shipped versus what remains strategic work.
 
@@ -18,6 +18,9 @@ This section tracks what is already shipped versus what remains strategic work.
 - [x] **Graph snapshot persistence:** CLI now writes/loads `.arbor/graph.json` and `.arbor/graph.bin` for faster reuse across commands
 - [x] **Git-aware impact workflows:** `arbor diff`, `arbor check`, `arbor open`, and `arbor index --changed-only`
 - [x] **Diff edge-case test coverage:** rename, whitespace-only, and generated-file heuristics covered with integration tests
+- [x] **Automated release pipeline (v1.7.0):** Cross-platform binary builds, crates.io, GHCR, VS Code Marketplace, Open VSX
+- [x] **Multi-channel distribution (v1.7.0):** Homebrew, Scoop, npm, Docker
+- [x] **VS Code extension v1.7.0:** 8 commands, quick-pick menu, walkthrough onboarding
 
 ### Still Outstanding (Major Epics)
 

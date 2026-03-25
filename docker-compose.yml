@@ -1,8 +1,6 @@
-version: "3.9"
-
 services:
   arbor-dev:
-    image: rust:1.75-slim
+    image: rust:1.85-slim
     container_name: arbor-dev
     working_dir: /workspace
     volumes:
@@ -12,10 +10,18 @@ services:
       - arbor-target:/workspace/target
     command: >
       bash -lc "
-      apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates &&
+      apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates git &&
       cargo build &&
       cargo test
       "
+
+  arbor-bridge:
+    build: .
+    container_name: arbor-bridge
+    stdin_open: true
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
 
 volumes:
   cargo-registry:
