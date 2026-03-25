@@ -24,7 +24,6 @@ jobs:
                 'tree-sitter',
                 'developer-tools',
                 'rust',
-                'flutter',
                 'mcp',
                 'model-context-protocol',
                 'visualization',
@@ -34,10 +33,12 @@ jobs:
                 'code-intelligence',
                 'code-navigation',
                 'vscode',
-                'websocket',
-                'json-rpc',
                 'cli',
-                'tree-visualization'
+                'impact-analysis',
+                'dependency-graph',
+                'refactoring',
+                'open-vsx',
+                'homebrew'
               ]
             });
             console.log('Topics updated successfully!');
