@@ -62,6 +62,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
 
       - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
         run: cargo build --release --target ${{ matrix.target }} -p arbor-graph-cli
 
       - name: Package artifact (Unix)
