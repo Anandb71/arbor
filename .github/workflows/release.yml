@@ -47,9 +47,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross
+      - name: Install cargo-zigbuild
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: taiki-e/install-action@cross
+        uses: korandoru/setup-zigbuild@v1
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -62,7 +62,7 @@ jobs:
       - name: Build release binary
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            cross build --release --target ${{ matrix.target }} -p arbor-graph-cli
+            cargo zigbuild --release --target ${{ matrix.target }} -p arbor-graph-cli
           else
             cargo build --release --target ${{ matrix.target }} -p arbor-graph-cli
           fi
