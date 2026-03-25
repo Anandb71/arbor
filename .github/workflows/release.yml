@@ -197,3 +197,57 @@ jobs:
           fail_on_unmatched_files: false
           generate_release_notes: true
           append_body: true
+
+  # ──────────────────────────────────────────────────────────────
+  # Update package manager checksums (Homebrew / Scoop)
+  # ──────────────────────────────────────────────────────────────
+  update-checksums:
+    name: Update Homebrew & Scoop Checksums
+    runs-on: ubuntu-latest
+    needs: release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Compute checksums and update manifests
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          
+          # Compute hashes
+          MAC_X64_SHA=$(sha256sum artifacts/arbor-macos-x86_64/arbor-macos-x86_64.tar.gz | cut -d' ' -f1)
+          MAC_ARM_SHA=$(sha256sum artifacts/arbor-macos-aarch64/arbor-macos-aarch64.tar.gz | cut -d' ' -f1)
+          LINUX_X64_SHA=$(sha256sum artifacts/arbor-linux-x86_64/arbor-linux-x86_64.tar.gz | cut -d' ' -f1)
+          LINUX_ARM_SHA=$(sha256sum artifacts/arbor-linux-aarch64/arbor-linux-aarch64.tar.gz | cut -d' ' -f1)
+          WIN_X64_SHA=$(sha256sum artifacts/arbor-windows-x86_64/arbor-windows-x86_64.zip | cut -d' ' -f1)
+          
+          # Update Homebrew
+          FILE="packaging/homebrew/arbor.rb"
+          sed -i "s|version \".*\"|version \"${VERSION}\"|" $FILE
+          sed -i "/arbor-macos-aarch64.tar.gz/!b;n;s|sha256 \".*\"|sha256 \"${MAC_ARM_SHA}\"|" $FILE || echo "sha256 \"${MAC_ARM_SHA}\"" >> $FILE
+          sed -i "/arbor-macos-x86_64.tar.gz/!b;n;s|sha256 \".*\"|sha256 \"${MAC_X64_SHA}\"|" $FILE || echo "sha256 \"${MAC_X64_SHA}\"" >> $FILE
+          sed -i "/arbor-linux-aarch64.tar.gz/!b;n;s|sha256 \".*\"|sha256 \"${LINUX_ARM_SHA}\"|" $FILE || echo "sha256 \"${LINUX_ARM_SHA}\"" >> $FILE
+          sed -i "/arbor-linux-x86_64.tar.gz/!b;n;s|sha256 \".*\"|sha256 \"${LINUX_X64_SHA}\"|" $FILE || echo "sha256 \"${LINUX_X64_SHA}\"" >> $FILE
+          
+          # Update Scoop
+          SCOOP="packaging/scoop/arbor.json"
+          sed -i "s|\"version\": \".*\"|\"version\": \"${VERSION}\"|" $SCOOP
+          sed -i "s|\"hash\": \".*\"|\"hash\": \"${WIN_X64_SHA}\"|" $SCOOP || sed -i '/"arbor-windows-x86_64.zip",/a\      "hash": "'${WIN_X64_SHA}'"' $SCOOP
+
+      - name: Commit manifest updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add packaging/homebrew/arbor.rb packaging/scoop/arbor.json
+          git commit -m "chore: update manifests for v${GITHUB_REF_NAME#v} [skip ci]" || echo "No changes to commit"
+          git push
+
