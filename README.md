@@ -10,7 +10,9 @@
 
 <p align="center">
   <a href="https://github.com/Anandb71/arbor/actions"><img src="https://img.shields.io/github/actions/workflow/status/Anandb71/arbor/rust.yml?style=flat-square&label=CI" alt="CI" /></a>
-  <img src="https://img.shields.io/badge/release-1.6.2%20maintenance%20%7C%20main%20active-blue?style=flat-square" alt="Release channels" />
+  <a href="https://crates.io/crates/arbor-graph-cli"><img src="https://img.shields.io/crates/v/arbor-graph-cli?style=flat-square&label=crates.io" alt="crates.io" /></a>
+  <a href="https://github.com/Anandb71/arbor/releases"><img src="https://img.shields.io/github/v/release/Anandb71/arbor?style=flat-square&label=release" alt="Release" /></a>
+  <a href="https://github.com/Anandb71/arbor/pkgs/container/arbor"><img src="https://img.shields.io/badge/GHCR-container-blue?style=flat-square" alt="GHCR" /></a>
   <a href="https://glama.ai/mcp/servers/@Anandb71/arbor"><img src="https://img.shields.io/badge/MCP%20Directory-Glama-6f42c1?style=flat-square" alt="Glama MCP Directory" /></a>
   <a href="https://skillsplayground.com/mcps/nandb71-arbor/"><img src="https://skillsplayground.com/badges/mcp/nandb71-arbor.svg" alt="Skills Playground MCP badge" /></a>
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" />
@@ -18,10 +20,11 @@
 
 ## Status (March 2026)
 
-- **Stable maintenance line:** `release/v1.6` (`v1.6.2`)
+- **Latest release:** `v1.7.0`
 - **Main development trunk:** `main`
+- **Maintenance line:** `release/v1.6` (`v1.6.3`)
 
-Arbor `v1.6.2` is the active maintenance cut as of **March 24, 2026**.
+Arbor `v1.7.0` is the active release as of **March 25, 2026**.
 
 ## Highlights
 
@@ -104,12 +107,29 @@ arbor gui
    cargo install arbor-graph-cli
    ```
 
-  Or use one-command installers (no Rust toolchain required):
+   Or use package managers:
 
-  - macOS/Linux: `curl -fsSL https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.sh | bash`
-  - Windows (PowerShell): `irm https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.ps1 | iex`
+   ```bash
+   # Homebrew (macOS/Linux)
+   brew install Anandb71/tap/arbor
 
-  See [Installation Guide](docs/INSTALL.md) for version pinning and manual assets.
+   # Scoop (Windows)
+   scoop bucket add arbor https://github.com/Anandb71/arbor
+   scoop install arbor
+
+   # npm (any platform)
+   npx @arbor-graph/cli
+
+   # Docker
+   docker pull ghcr.io/anandb71/arbor:latest
+   ```
+
+   Or use one-command installers (no Rust toolchain required):
+
+   - macOS/Linux: `curl -fsSL https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.sh | bash`
+   - Windows (PowerShell): `irm https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.ps1 | iex`
+
+   See [Installation Guide](docs/INSTALL.md) for version pinning and manual assets.
 
 2. **One-shot setup + first index**:
 
@@ -149,7 +169,8 @@ arbor gui
 To keep maintenance and feature work clean:
 
 - `main` → ongoing development
-- `release/v1.6` → maintenance-only fixes for 1.6.x (`v1.6.2` current)
+- `release/v1.7` → current release line (`v1.7.0`)
+- `release/v1.6` → maintenance-only fixes for 1.6.x (`v1.6.3` current)
 - `release/v1.5` → legacy maintenance/backport branch
 
 This avoids shipping new features into older maintenance branches and keeps backports explicit.
@@ -158,11 +179,14 @@ This avoids shipping new features into older maintenance branches and keeps back
 
 Tagged releases (`vX.Y.Z`) are automated across channels:
 
-- GitHub Release assets (CLI binaries)
+- GitHub Release assets (CLI binaries for Linux, macOS, Windows)
 - crates.io packages
 - GHCR container images
 - VS Code Marketplace extension
 - Open VSX extension
+- Homebrew formula
+- Scoop manifest
+- npm wrapper package
 
 Maintainer setup and verification steps are in [docs/RELEASING.md](docs/RELEASING.md).
 
@@ -267,6 +291,7 @@ Inputs:
 - **Release Notes (v1.6):** [docs/RELEASE_NOTES_v1.6.0.md](docs/RELEASE_NOTES_v1.6.0.md)
 - **Release Notes (v1.6.1.1):** [docs/RELEASE_NOTES_v1.6.1.1.md](docs/RELEASE_NOTES_v1.6.1.1.md)
 - **Release Notes (v1.6.2):** [docs/RELEASE_NOTES_v1.6.2.md](docs/RELEASE_NOTES_v1.6.2.md)
+- **Release Notes (v1.7.0):** [docs/RELEASE_NOTES_v1.7.0.md](docs/RELEASE_NOTES_v1.7.0.md)
 
 ---
 

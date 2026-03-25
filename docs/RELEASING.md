@@ -9,6 +9,9 @@ This runbook ensures Arbor releases propagate across all distribution channels �
 - GHCR container image (`ghcr.io/anandb71/arbor`)
 - VS Code Marketplace extension
 - Open VSX extension
+- Homebrew formula (`packaging/homebrew/arbor.rb`)
+- Scoop manifest (`packaging/scoop/arbor.json`)
+- npm wrapper (`packaging/npm/`)
 - MCP release note enrichment snippets
 
 ## Required repository secrets
@@ -25,7 +28,7 @@ Configure these in **Settings → Secrets and variables → Actions**:
 
 - `.github/workflows/release.yml`
   - Trigger: tag push (`v*`)
-  - Builds cross-platform CLI binaries
+  - Builds cross-platform CLI binaries (5 targets)
   - Publishes crates to crates.io
   - Creates GitHub Release and uploads assets
 
