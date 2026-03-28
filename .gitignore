@@ -1,7 +1,10 @@
 # Rust
 target/
-Cargo.lock
 *.rs.bk
+
+# Cargo.lock is committed intentionally — Arbor is a binary project.
+# See: https://doc.rust-lang.org/cargo/faq.html#why-have-cargolock-in-version-control
+crates/Cargo.lock
 
 # Flutter
 visualizer/.dart_tool/
@@ -33,7 +36,7 @@ arbor-graph.json
 *.so
 *.dylib
 
-# Debug Artifacts
+# Debug artifacts
 log_dump.txt
 debug_wrapper.bat
 err_check.txt
@@ -51,11 +54,17 @@ crates/clippy_output*.txt
 crates/error.txt
 visualizer/analysis.txt
 
-# Releases - archive artifacts (zip/mp4 etc. live in releases/ and media/)
-releases/*.zip
+# Release artifacts (upload to GitHub Releases, not the repo)
+*.zip
 releases/*.tar.gz
+releases/v*/
+arbor-windows-*/
 
-# Security - Never commit these
+# Media recordings (keep source assets, not large recordings)
+media/*.mp4
+media/*.mov
+
+# Security — never commit
 .env
 .env.*
 *.pem
@@ -63,29 +72,20 @@ releases/*.tar.gz
 secrets.json
 credentials.json
 
-# Release artifacts (upload to GitHub Releases instead)
-*.zip
-arbor-windows-*/
-
 # Node.js (VS Code extension)
 node_modules/
 extensions/*/node_modules/
 extensions/*/out/
 *.vsix
 
-# Personal Release Guides
+# Personal / ephemeral files
 v1_release_checklist.md
+HANDOFF_FOR_NEW_LAPTOP.md
+/package-lock.json
+/arbor-logo.png
 
-# MCP Publisher (NEVER COMMIT)
+# MCP Publisher (never commit)
 .mcpregistry_*
 mcp-publisher.exe
 server.json
 .servers-fork/
-
-# Handoff
-HANDOFF_FOR_NEW_LAPTOP.md
-
-# Duplicate / orphaned root files
-/package-lock.json
-/arbor-logo.png
-crates/Cargo.lock
