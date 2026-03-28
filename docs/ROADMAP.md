@@ -70,10 +70,10 @@ This section tracks what is already shipped versus what remains strategic work.
 
 ---
 
-## 🚀 Immediate Focus (v1.6)
-**Theme:** *The Security & Intelligence Layer*
+## 🚀 Immediate Focus (v1.8 / v2.0)
+**Theme:** *Persistent Intelligence & Enterprise Readiness*
 
-1. **Heuristic Confidence Hardening:** Improve rename/partial-edit mapping and reduce false positives in `diff/check`.
-2. **CI & Policy Integrations:** Add policy presets and stronger machine-readable output for automated gates.
-3. **Visualizer Polish:** Advanced filtering, large-graph usability, and analyst-friendly views.
-4. **Security Layer Expansion:** Deepen `arbor audit` with taint-style path confidence and remediation hints.
+1. **Persistent Graph Database:** Move to SQLite/Sled with transactional updates and indexed queries for instant load.
+2. **Plugin System (Wasm):** Community-extensible parser and runtime plugins.
+3. **Time-Travel Analysis:** Git-history-aware architectural drift detection.
+4. **Security Layer Expansion:** Deepen `arbor audit` with taint-style path confidence and compliance report generation.

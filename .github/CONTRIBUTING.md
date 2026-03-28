@@ -11,8 +11,13 @@ We are aggressively expanding language support. If you know Tree-sitter, we want
 | **Go** | ✅ Stable | High | Low |
 | **Python** | ✅ Stable | High | Low |
 | **Java** | ✅ Stable | Medium | High |
-| **Kotlin** | ❌ Missing | Medium | High |
-| **Ruby** | ❌ Missing | Low | Medium |
+| **Kotlin** | ✅ Fallback (v1.6.2) | Medium | High |
+| **Swift** | ✅ Fallback (v1.6.2) | Medium | Medium |
+| **Ruby** | ✅ Fallback (v1.6.2) | Low | Medium |
+| **PHP** | ✅ Fallback (v1.6.2) | Low | Medium |
+| **Shell** | ✅ Fallback (v1.6.2) | Low | Low |
+
+> Fallback parsers provide function/class extraction. Full Tree-sitter support upgrades are always welcome!
 
 **Reward:** Contributors of new language parsers will be featured in our "Hall of Fame" in the README and Release Notes.
 
@@ -38,13 +43,14 @@ We are aggressively expanding language support. If you know Tree-sitter, we want
 To keep releases maintainable and avoid cross-version confusion:
 
 - `main` → active development for next minor/major
-- `release/v1.5` → maintenance-only patches for 1.5.x
-- `release/v1.6` → 1.6 feature work and stabilization
+- `release/v1.7` → current release line (v1.7.0)
+- `release/v1.6` → maintenance-only patches for 1.6.x
+- `release/v1.5` → legacy maintenance
 
 Rules of thumb:
 
-1. New features go to `main` or the current release branch (for example `release/v1.6`).
-2. Bug fixes that must ship to existing users are cherry-picked/backported to the matching maintenance branch (for example `release/v1.5`).
+1. New features go to `main` or the current release branch (currently `release/v1.7`).
+2. Bug fixes that must ship to existing users are cherry-picked/backported to the matching maintenance branch.
 3. Avoid landing new-version features in older maintenance branches.
 
 4. **Test Your Changes**

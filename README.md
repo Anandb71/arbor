@@ -264,7 +264,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: Anandb71/arbor@release/v1.6
+      - uses: Anandb71/arbor@release/v1.7
         with:
           command: check . --max-blast-radius 30
 ```
@@ -318,10 +318,9 @@ The result: **deterministic, explainable answers**.
 
 ## Core Features
 
-### Native GUI
+### Symbol Resolution
 
-
-A global symbol table resolves:
+Arbor resolves symbols across files with full qualification:
 
 * Imports and re‑exports
 * Inheritance and interfaces
