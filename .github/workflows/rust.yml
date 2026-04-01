@@ -2,80 +2,83 @@ name: Rust CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main, "release/**"]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  build-test-linux:
+    name: Build/Test (ubuntu-latest)
     runs-on: ubuntu-latest
-    
+
     steps:
-    - uses: actions/checkout@v5
-    
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: stable
-        components: rustfmt, clippy
+      - name: Checkout
+        uses: actions/checkout@v5
 
-    - name: Install Linux Dependencies
-      if: runner.os == 'Linux'
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libdbus-1-dev libssl-dev cmake
-    
-    - name: Cache cargo registry
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-    
-    - name: Check formatting
-      run: cargo fmt --all -- --check
-    
-    - name: Run clippy
-      run: cargo clippy --all-targets --all-features
-      continue-on-error: true
-    
-    - name: Build
-      run: cargo build --all --verbose
-    
-    - name: Run tests
-      run: cargo test --all --verbose
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
-  # Build on multiple platforms
-  cross-platform:
-    needs: build
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libdbus-1-dev libssl-dev cmake
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features
+
+      - name: Build workspace
+        run: cargo build --workspace --verbose
+
+      - name: Test workspace
+        run: cargo test --workspace --verbose
+
+  cross-platform-cli:
+    name: Cross-platform CLI build (${{ matrix.os }})
+    needs: build-test-linux
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    
-    runs-on: ${{ matrix.os }}
-    
-    steps:
-    - uses: actions/checkout@v5
-    
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: stable
 
-    - name: Install Linux Dependencies
-      if: matrix.os == 'ubuntu-latest'
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libdbus-1-dev libssl-dev cmake
-    
-    - name: Build release
-      run: cargo build --release -p arbor-graph-cli
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libdbus-1-dev libssl-dev cmake
+
+      - name: Build release CLI
+        run: cargo build --release -p arbor-graph-cli

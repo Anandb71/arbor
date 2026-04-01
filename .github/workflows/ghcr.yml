@@ -6,13 +6,17 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Optional explicit image tag (e.g. v1.6.1)"
+        description: "Optional explicit image tag (e.g. v1.8.0)"
         required: false
         type: string
 
 permissions:
   contents: read
   packages: write
+
+concurrency:
+  group: ghcr-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
@@ -36,16 +40,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "release" ]; then
+            echo "value=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository }}
           tags: |
-            type=raw,value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
+            type=raw,value=${{ steps.tag.outputs.value }}
             type=raw,value=latest,enable=${{ github.event_name == 'release' }}
-            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
-            type=sha,enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '' }}
 
       - name: Build and push image
         uses: docker/build-push-action@v6

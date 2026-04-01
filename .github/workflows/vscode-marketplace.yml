@@ -46,6 +46,12 @@ jobs:
             npm install
           fi
 
+      - name: Debug extension metadata
+        run: |
+          node -e "const p=require('./package.json'); console.log('version=',p.version,'icon=',p.icon)"
+          test -f arbor-logo.png && echo "Found arbor-logo.png"
+          test -f extension/arbor-logo.png && echo "Found extension/arbor-logo.png (compat)" || true
+
       - name: Compile extension
         run: npm run compile
 
@@ -67,11 +73,6 @@ jobs:
           fi
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          if [ -n "$VERSION" ]; then
-            echo "Using extension version: $VERSION"
-          else
-            echo "Using current package.json extension version"
-          fi
 
       - name: Apply release version to package.json
         if: steps.version.outputs.version != ''
@@ -86,7 +87,7 @@ jobs:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: |
           if [ -z "$VSCE_PAT" ] && [ -z "$OVSX_PAT" ]; then
-            echo "No publish token found. Add VSCE_PAT and/or OVSX_PAT in repository Settings > Secrets and variables > Actions."
+            echo "No publish token found. Add VSCE_PAT and/or OVSX_PAT in repository settings."
             exit 1
           fi
 
@@ -98,7 +99,6 @@ jobs:
             echo "VSCE_PAT not set; skipping VS Code Marketplace publish."
             exit 0
           fi
-
           vsce publish --packagePath arbor-vscode.vsix --pat "$VSCE_PAT"
 
       - name: Publish to Open VSX
@@ -111,8 +111,5 @@ jobs:
           fi
 
           PUBLISHER="$(node -p "require('./package.json').publisher")"
-          echo "Ensuring Open VSX namespace '$PUBLISHER' exists..."
           ovsx create-namespace "$PUBLISHER" --pat "$OVSX_PAT" || true
-
-          # Publish the same packaged artifact to Open VSX.
           ovsx publish arbor-vscode.vsix --pat "$OVSX_PAT"
