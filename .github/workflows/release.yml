@@ -43,7 +43,7 @@ jobs:
 
           VERSION="${TAG#v}"
 
-          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
             echo "Invalid semver tag/version resolved: TAG=$TAG VERSION=$VERSION"
             exit 1
           fi
