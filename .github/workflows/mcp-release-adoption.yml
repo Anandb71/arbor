@@ -6,12 +6,16 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Optional release tag (for example v1.6.2). Leave empty to update latest release."
+        description: "Optional release tag (for example v1.8.0). Leave empty to update latest release."
         required: false
         type: string
 
 permissions:
   contents: write
+
+concurrency:
+  group: mcp-release-notes-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   enrich-release-notes:
@@ -39,8 +43,7 @@ jobs:
             /mcp
             \`\`\`
 
-            ### Cursor MCP config (`.cursor/mcp.json`)
-            Add this to your Cursor project MCP config:
+            ### Cursor MCP config (\`.cursor/mcp.json\`)
             \`\`\`json
             {
               "mcpServers": {
@@ -52,7 +55,7 @@ jobs:
             }
             \`\`\`
 
-            ### VS Code MCP config (`.vscode/mcp.json`)
+            ### VS Code MCP config (\`.vscode/mcp.json\`)
             \`\`\`json
             {
               "servers": {
