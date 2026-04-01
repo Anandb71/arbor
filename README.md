@@ -118,7 +118,7 @@ arbor gui
    scoop install arbor
 
    # npm (any platform)
-   npx @arbor-graph/cli
+  npx @anandb71/arbor-cli
 
    # Docker
    docker pull ghcr.io/anandb71/arbor:latest

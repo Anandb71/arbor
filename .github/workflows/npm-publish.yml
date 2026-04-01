@@ -32,6 +32,20 @@ jobs:
         run: |
           npm pkg get name version
 
+      - name: Resolve publish version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "value=${{ github.event.release.tag_name }}" | sed 's/^value=v/value=/' >> "$GITHUB_OUTPUT"
+          else
+            echo "value=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply release version to npm package
+        if: steps.version.outputs.value != ''
+        working-directory: packaging/npm
+        run: npm version "${{ steps.version.outputs.value }}" --no-git-tag-version --allow-same-version
+
       - name: Publish to npm
         working-directory: packaging/npm
         env:

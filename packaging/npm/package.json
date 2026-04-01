@@ -1,6 +1,6 @@
 {
-  "name": "@arbor-graph/cli",
-  "version": "1.7.0",
+  "name": "@anandb71/arbor-cli",
+  "version": "1.8.0",
   "description": "Graph-native intelligence for codebases — know what breaks before you break it",
   "license": "MIT",
   "repository": {
@@ -20,7 +20,7 @@
     "cli"
   ],
   "bin": {
-    "arbor": "bin/arbor"
+    "arbor": "bin/arbor.js"
   },
   "scripts": {
     "postinstall": "node install.js"

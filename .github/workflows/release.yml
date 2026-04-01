@@ -223,7 +223,7 @@ jobs:
           scoop install arbor
 
           # npm
-          npx @arbor-graph/cli
+          npx @anandb71/arbor-cli
 
           # Docker
           docker pull ghcr.io/anandb71/arbor:${TAG}
