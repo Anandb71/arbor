@@ -8,10 +8,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     name: Publish npm wrapper
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -20,9 +25,15 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: 22
-          registry-url: "https://registry.npmjs.org"
+          registry-url: https://registry.npmjs.org
 
-      - name: Publish to NPM
+      - name: Verify package metadata
+        working-directory: packaging/npm
+        run: |
+          npm pkg get name version
+
+      - name: Publish to npm
+        working-directory: packaging/npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -30,5 +41,5 @@ jobs:
             echo "NPM_TOKEN not set; skipping publish."
             exit 0
           fi
-          cd packaging/npm
+
           npm publish --access public

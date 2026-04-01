@@ -2,43 +2,53 @@ name: Flutter CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main, "release/**"]
     paths:
-      - 'visualizer/**'
+      - "visualizer/**"
   pull_request:
-    branches: [ main ]
+    branches: [main]
     paths:
-      - 'visualizer/**'
+      - "visualizer/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flutter-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  analyze:
+  analyze-and-test:
+    name: Analyze and test (ubuntu)
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v5
+      - name: Checkout
+        uses: actions/checkout@v5
 
-    - name: Setup Flutter
-      uses: subosito/flutter-action@v2
-      with:
-        flutter-version: '3.16.0'
-        channel: 'stable'
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.24.5"
+          channel: stable
+          cache: true
 
-    - name: Get dependencies
-      working-directory: ./visualizer
-      run: flutter pub get
+      - name: Get dependencies
+        working-directory: visualizer
+        run: flutter pub get
 
-    - name: Analyze code
-      working-directory: ./visualizer
-      run: flutter analyze
-      continue-on-error: true
+      - name: Analyze
+        working-directory: visualizer
+        run: flutter analyze
 
-    - name: Run tests
-      working-directory: ./visualizer
-      run: flutter test
-      continue-on-error: true
+      - name: Test
+        working-directory: visualizer
+        run: flutter test
 
-  build:
-    needs: analyze
+  build-desktop:
+    name: Build desktop (${{ matrix.platform }})
+    needs: analyze-and-test
     strategy:
       fail-fast: false
       matrix:
@@ -51,18 +61,20 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-    - uses: actions/checkout@v5
+      - name: Checkout
+        uses: actions/checkout@v5
 
-    - name: Setup Flutter
-      uses: subosito/flutter-action@v2
-      with:
-        flutter-version: '3.16.0'
-        channel: 'stable'
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.24.5"
+          channel: stable
+          cache: true
 
-    - name: Get dependencies
-      working-directory: ./visualizer
-      run: flutter pub get
+      - name: Get dependencies
+        working-directory: visualizer
+        run: flutter pub get
 
-    - name: Build ${{ matrix.platform }}
-      working-directory: ./visualizer
-      run: flutter build ${{ matrix.platform }}
+      - name: Build ${{ matrix.platform }}
+        working-directory: visualizer
+        run: flutter build ${{ matrix.platform }}

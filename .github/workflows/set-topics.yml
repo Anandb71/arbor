@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: read
+  administration: write
 
 jobs:
   set-topics:
@@ -15,30 +16,36 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            const topics = [
+              'code-analysis',
+              'ast',
+              'tree-sitter',
+              'developer-tools',
+              'rust',
+              'mcp',
+              'model-context-protocol',
+              'visualization',
+              'graph',
+              'ai-tools',
+              'static-analysis',
+              'code-intelligence',
+              'code-navigation',
+              'vscode',
+              'cli',
+              'impact-analysis',
+              'dependency-graph',
+              'refactoring',
+              'open-vsx',
+              'homebrew'
+            ];
+
             await github.rest.repos.replaceAllTopics({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              names: [
-                'code-analysis',
-                'ast',
-                'tree-sitter',
-                'developer-tools',
-                'rust',
-                'mcp',
-                'model-context-protocol',
-                'visualization',
-                'graph',
-                'ai-tools',
-                'static-analysis',
-                'code-intelligence',
-                'code-navigation',
-                'vscode',
-                'cli',
-                'impact-analysis',
-                'dependency-graph',
-                'refactoring',
-                'open-vsx',
-                'homebrew'
-              ]
+              names: topics,
             });
-            console.log('Topics updated successfully!');
+
+            core.summary
+              .addHeading('Repository topics updated')
+              .addRaw(topics.join(', '))
+              .write();

@@ -21,8 +21,11 @@ Configure these in **Settings → Secrets and variables → Actions**:
 - `CARGO_REGISTRY_TOKEN` — crates.io publishing token
 - `VSCE_PAT` — VS Code Marketplace publisher token (optional but recommended)
 - `OVSX_PAT` — Open VSX publisher token (optional but recommended)
+- `NPM_TOKEN` — npm publish token for `@arbor-graph/cli` wrapper (optional but recommended)
 
 > Extension publishing requires at least one of `VSCE_PAT` or `OVSX_PAT`.
+>
+> npm wrapper publishing requires `NPM_TOKEN`.
 
 ## Workflow map
 
@@ -45,6 +48,10 @@ Configure these in **Settings → Secrets and variables → Actions**:
 - `.github/workflows/mcp-release-adoption.yml`
   - Trigger: GitHub Release published
   - Appends MCP quick-install snippets to release notes
+
+- `.github/workflows/npm-publish.yml`
+  - Trigger: GitHub Release published or manual dispatch
+  - Publishes npm wrapper package from `packaging/npm/`
 
 ## Recommended release sequence
 
