@@ -13,7 +13,7 @@ while ($attempt -lt $maxAttempts) {
     git fetch origin -q 2>&1 | Out-Null
     $mainContent = git show origin/main:.github/workflows/release.yml 2>&1 | Select-String '\(\.\[0-9\]\+\.\)'
     
-    if ($mainContent -match '\(\\.\\[0-9\\]\\+\\\\\.\\[0-9\\]\\+\\)') {
+    if ($mainContent -match '\(\\.\[0-9\]\\+\\\.\[0-9\]\\+\)') {
         Write-Host "✓ PR merge detected! Completing release..." -ForegroundColor Green
         
         # Remove old tag

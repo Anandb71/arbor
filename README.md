@@ -23,6 +23,7 @@ Know what breaks *before* you break it.
 
 - [Why Arbor](#why-arbor)
 - [What you get](#what-you-get)
+- [Visual tour](#visual-tour)
 - [Quickstart](#quickstart)
 - [Installation options](#installation-options)
 - [MCP integration](#mcp-integration)
@@ -57,6 +58,20 @@ You get deterministic, explainable impact analysis instead of approximate keywor
 - **CLI + GUI + MCP bridge** sharing the same analysis engine
 - **Incremental indexing** for fast inner-loop development
 - **Git-aware checks** for pull-request risk gates
+
+---
+
+## Visual tour
+
+<p align="center">
+  <img src="docs/assets/arbor-demo.gif" alt="Arbor demo animation" width="760" />
+</p>
+
+<p align="center">
+  <img src="docs/assets/visualizer-screenshot.png" alt="Arbor visualizer screenshot" width="760" />
+</p>
+
+For a full-screen recording of the workflow, see [media/recording-2026-01-13.mp4](media/recording-2026-01-13.mp4).
 
 ---
 
