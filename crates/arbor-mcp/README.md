@@ -87,3 +87,6 @@ See full multi-client setup in [`docs/MCP_INTEGRATION.md`](../../docs/MCP_INTEGR
 
 - **Main Repository**: [github.com/Anandb71/arbor](https://github.com/Anandb71/arbor)
 - **MCP Registry**: `io.github.Anandb71/arbor`
+- **Official Registry API (exact lookup)**: https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.Anandb71/arbor
+
+> If `github.com/mcp` search does not show Arbor yet, rely on the official registry API lookup above (authoritative source).

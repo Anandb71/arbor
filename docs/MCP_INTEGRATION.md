@@ -16,6 +16,11 @@ The bridge communicates over **stdio** using JSON-RPC, following the [MCP specif
 
 **Directory listing:** [Glama MCP Directory — Arbor](https://glama.ai/mcp/servers/@Anandb71/arbor)
 
+**Official MCP Registry name:** `io.github.Anandb71/arbor`  
+**Official API verification:** https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.Anandb71/arbor
+
+> Note: GitHub MCP discovery UI (`github.com/mcp`) may lag indexing. Use the official API endpoint above as the authoritative verification source.
+
 ---
 
 ## Setup for Cursor

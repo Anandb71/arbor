@@ -198,6 +198,13 @@ Arbor is listed on Glama MCP Directory:
 
 - **Glama:** https://glama.ai/mcp/servers/@Anandb71/arbor
 
+Official MCP registry source-of-truth:
+
+- **Registry name:** `io.github.Anandb71/arbor`
+- **Official API lookup:** https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.Anandb71/arbor
+
+> Note: `github.com/mcp` search can lag behind official registry indexing. If UI search misses Arbor, use the official API lookup above.
+
 ### MCP Health Badges
 
 [![arbor MCP server](https://glama.ai/mcp/servers/Anandb71/arbor/badges/score.svg)](https://glama.ai/mcp/servers/Anandb71/arbor)
