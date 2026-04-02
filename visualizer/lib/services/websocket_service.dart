@@ -100,22 +100,9 @@ class WebSocketService {
                'is_delta': false,
                'node_count': _pendingNodes.length,
                'edge_count': _pendingEdges.length,
-               'file_count': 0, // Not vital for viz
+               'file_count': 0,
                'changed_files': [],
                'timestamp': DateTime.now().millisecondsSinceEpoch,
-               // We need to re-serialize to match the GraphUpdate constructor expectation
-               // Or we can manually construct it if we change the constructor. 
-               // For now, let's just make the list available.
-               // Wait, GraphUpdate expects Map<String, dynamic> in constructor? 
-               // Yes. Let's construct the object directly or change the constructor.
-               // Actually, let's look at protocol.dart again. GraphUpdate takes a Map.
-               // I can't pass List<GraphNode> directly to constructor unless I change it.
-               // Hack: Serialize back to JSON or modify protocol.dart? 
-               // Modify protocol.dart is cleaner but I just finished it.
-               // I will manually instantiate GraphUpdate if I can... 
-               // Wait, Dart doesn't have public fields constructor if it takes Map.
-               // I will pass nulls to map and set fields? No fields are final.
-               // Okay, I will construct a Map for the GraphUpdate constructor.
                'nodes': _pendingNodes.map((n) => {
                  'id': n.id,
                  'name': n.name,
