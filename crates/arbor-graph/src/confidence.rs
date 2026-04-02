@@ -72,16 +72,16 @@ impl ConfidenceExplanation {
                 upstream_count, downstream_count
             ));
 
-            if total > 20 {
-                reasons.push("Large blast radius detected".to_string());
-                suggestions
-                    .push("Consider breaking this change into smaller refactors".to_string());
-                ConfidenceLevel::Medium
-            } else if total > 50 {
+            if total > 50 {
                 reasons.push("Very large blast radius".to_string());
                 suggestions
                     .push("This change affects a significant portion of the codebase".to_string());
                 ConfidenceLevel::Low
+            } else if total > 20 {
+                reasons.push("Large blast radius detected".to_string());
+                suggestions
+                    .push("Consider breaking this change into smaller refactors".to_string());
+                ConfidenceLevel::Medium
             } else {
                 reasons.push("Well-connected with manageable impact".to_string());
                 ConfidenceLevel::High
@@ -169,6 +169,57 @@ impl NodeRole {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AffectedNode, EdgeKind, ImpactDirection, ImpactSeverity, NodeInfo};
+
+    fn node_info(id: &str) -> NodeInfo {
+        NodeInfo {
+            id: id.to_string(),
+            name: id.to_string(),
+            qualified_name: id.to_string(),
+            kind: "function".to_string(),
+            file: "test.rs".to_string(),
+            line_start: 1,
+            line_end: 1,
+            signature: None,
+            centrality: 0.0,
+        }
+    }
+
+    fn affected(id: &str, hop_distance: usize, direction: ImpactDirection) -> AffectedNode {
+        AffectedNode {
+            node_id: crate::NodeId::new(hop_distance),
+            node_info: node_info(id),
+            severity: ImpactSeverity::from_hops(hop_distance),
+            hop_distance,
+            entry_edge: EdgeKind::Calls,
+            direction,
+        }
+    }
+
+    fn analysis(upstream: usize, downstream: usize, total_affected: usize) -> ImpactAnalysis {
+        let upstream_nodes = (0..upstream)
+            .map(|i| {
+                let hop = if i % 2 == 0 { 1 } else { 2 };
+                affected(&format!("u{i}"), hop, ImpactDirection::Upstream)
+            })
+            .collect();
+
+        let downstream_nodes = (0..downstream)
+            .map(|i| {
+                let hop = if i % 2 == 0 { 1 } else { 2 };
+                affected(&format!("d{i}"), hop, ImpactDirection::Downstream)
+            })
+            .collect();
+
+        ImpactAnalysis {
+            target: node_info("target"),
+            upstream: upstream_nodes,
+            downstream: downstream_nodes,
+            total_affected,
+            max_depth: 3,
+            query_time_ms: 1,
+        }
+    }
 
     #[test]
     fn test_confidence_level_display() {
@@ -184,5 +235,146 @@ mod tests {
         assert_eq!(NodeRole::CoreLogic.to_string(), "Core Logic");
         assert_eq!(NodeRole::Isolated.to_string(), "Isolated");
         assert_eq!(NodeRole::Adapter.to_string(), "Adapter");
+    }
+
+    #[test]
+    fn test_confidence_connected_thresholds_regression() {
+        let medium_case = analysis(10, 20, 30);
+        let low_case = analysis(20, 40, 60);
+
+        let medium = ConfidenceExplanation::from_analysis(&medium_case);
+        let low = ConfidenceExplanation::from_analysis(&low_case);
+
+        assert_eq!(medium.level, ConfidenceLevel::Medium);
+        assert_eq!(low.level, ConfidenceLevel::Low);
+        assert!(medium
+            .reasons
+            .iter()
+            .any(|r| r.contains("Large blast radius")));
+        assert!(low
+            .reasons
+            .iter()
+            .any(|r| r.contains("Very large blast radius")));
+    }
+
+    #[test]
+    fn test_confidence_entry_point_matrix_120_cases() {
+        let mut cases = 0;
+        for downstream in 1..=120 {
+            let a = analysis(0, downstream, downstream);
+            let explanation = ConfidenceExplanation::from_analysis(&a);
+            let expected = if downstream > 5 {
+                ConfidenceLevel::Medium
+            } else {
+                ConfidenceLevel::High
+            };
+            assert_eq!(
+                explanation.level, expected,
+                "entry-point mismatch for downstream={downstream}"
+            );
+            cases += 1;
+        }
+        assert_eq!(cases, 120);
+    }
+
+    #[test]
+    fn test_confidence_utility_matrix_120_cases() {
+        let mut cases = 0;
+        for upstream in 1..=120 {
+            let a = analysis(upstream, 0, upstream);
+            let explanation = ConfidenceExplanation::from_analysis(&a);
+            assert_eq!(
+                explanation.level,
+                ConfidenceLevel::High,
+                "utility mismatch for upstream={upstream}"
+            );
+            cases += 1;
+        }
+        assert_eq!(cases, 120);
+    }
+
+    #[test]
+    fn test_confidence_connected_matrix_121_cases() {
+        let mut cases = 0;
+        for upstream in 1..=11 {
+            for downstream in 1..=11 {
+                // Ensure we exercise all connected-tier branches deterministically:
+                // <=20 (High), 21..=50 (Medium), >50 (Low)
+                let total = match (upstream + downstream) % 3 {
+                    0 => 15,
+                    1 => 35,
+                    _ => 70,
+                };
+
+                let expected = if total > 50 {
+                    ConfidenceLevel::Low
+                } else if total > 20 {
+                    ConfidenceLevel::Medium
+                } else {
+                    ConfidenceLevel::High
+                };
+
+                let a = analysis(upstream, downstream, total);
+                let explanation = ConfidenceExplanation::from_analysis(&a);
+                assert_eq!(
+                    explanation.level, expected,
+                    "connected mismatch for upstream={upstream}, downstream={downstream}, total={total}"
+                );
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 121);
+    }
+
+    #[test]
+    fn test_node_role_matrix_121_cases() {
+        let mut cases = 0;
+        for upstream in 0..=10 {
+            for downstream in 0..=10 {
+                let a = analysis(upstream, downstream, upstream + downstream);
+                let role = NodeRole::from_analysis(&a);
+                let expected = match (upstream > 0, downstream > 0) {
+                    (false, false) => NodeRole::Isolated,
+                    (false, true) => NodeRole::EntryPoint,
+                    (true, false) => NodeRole::Utility,
+                    (true, true) => {
+                        if (upstream <= 2 && downstream > 5) || (downstream <= 2 && upstream > 5) {
+                            NodeRole::Adapter
+                        } else {
+                            NodeRole::CoreLogic
+                        }
+                    }
+                };
+
+                assert_eq!(
+                    role, expected,
+                    "role mismatch for upstream={upstream}, downstream={downstream}"
+                );
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 121);
+    }
+
+    #[test]
+    fn test_confidence_standard_suggestion_always_present() {
+        for (upstream, downstream, total) in [
+            (0, 0, 0),
+            (0, 8, 8),
+            (12, 0, 12),
+            (4, 4, 15),
+            (4, 20, 30),
+            (20, 20, 70),
+        ] {
+            let a = analysis(upstream, downstream, total);
+            let explanation = ConfidenceExplanation::from_analysis(&a);
+            assert!(
+                explanation
+                    .suggestions
+                    .iter()
+                    .any(|s| s.contains("Tests still recommended")),
+                "missing standard suggestion for upstream={upstream}, downstream={downstream}, total={total}"
+            );
+        }
     }
 }

@@ -207,7 +207,7 @@ class _GraphWidgetState extends ConsumerState<GraphWidget>
        final node = nodes[i];
        final dx = graphX - node.x;
        final dy = graphY - node.y;
-       final r = 20.0; // Approximation of radius
+      const r = 20.0; // Approximation of radius
        
        if (dx * dx + dy * dy < r * r) {
          return node;
@@ -235,7 +235,7 @@ class _GraphWidgetState extends ConsumerState<GraphWidget>
     if (w == 0 || h == 0) return;
     
     // Fit
-    final padding = 100.0;
+    const padding = 100.0;
     final scaleX = (screenSize.width - padding * 2) / w;
     final scaleY = (screenSize.height - padding * 2) / h;
     final targetScale = (scaleX < scaleY ? scaleX : scaleY).clamp(0.1, 2.0);

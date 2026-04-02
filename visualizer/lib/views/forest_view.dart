@@ -100,7 +100,7 @@ class _ForestViewState extends ConsumerState<ForestView> {
 
   Widget _buildBackground() {
     return Container(
-      decoration: BoxDecoration(
+      decoration: const BoxDecoration(
         gradient: RadialGradient(
           center: Alignment.center,
           radius: 1.5,

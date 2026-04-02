@@ -203,7 +203,7 @@ class GraphPainter extends CustomPainter {
           color: color,
           fontSize: 12,
           fontWeight: FontWeight.bold,
-          shadows: [
+          shadows: const [
             Shadow(
               color: ArborTheme.background,
               blurRadius: 4,

@@ -144,7 +144,7 @@ class GraphNotifier extends StateNotifier<GraphState> {
      // Simple client-side search for now
      try {
        final match = state.nodes.firstWhere(
-         (n) => (n.name ?? '').toLowerCase().contains(query.toLowerCase()),
+         (n) => n.name.toLowerCase().contains(query.toLowerCase()),
        );
        state = state.copyWith(selectedNodeId: match.id);
      } catch (e) {

@@ -55,12 +55,10 @@ class ArborTheme {
         primary: function,
         secondary: classType,
         surface: surface,
-        background: background,
         error: importType,
         onPrimary: background,
         onSecondary: background,
         onSurface: textPrimary,
-        onBackground: textPrimary,
         onError: background,
       ),
       textTheme: GoogleFonts.jetBrainsMonoTextTheme(
