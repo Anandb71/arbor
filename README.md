@@ -1,259 +1,197 @@
 <p align="center">
-  <img src="docs/assets/arbor-logo.svg" alt="Arbor" width="120" height="120" />
+  <img src="docs/assets/arbor-logo.svg" alt="Arbor logo" width="120" height="120" />
 </p>
 
 # Arbor
 
-**Graph‑Native Intelligence for Codebases**
+**Graph-native intelligence for codebases.**
 
-> Know what breaks *before* you break it.
+Know what breaks *before* you break it.
 
 <p align="center">
-  <a href="https://github.com/Anandb71/arbor/actions"><img src="https://img.shields.io/github/actions/workflow/status/Anandb71/arbor/rust.yml?style=flat-square&label=CI" alt="CI" /></a>
-  <a href="https://crates.io/crates/arbor-graph-cli"><img src="https://img.shields.io/crates/v/arbor-graph-cli?style=flat-square&label=crates.io" alt="crates.io" /></a>
-  <a href="https://github.com/Anandb71/arbor/releases"><img src="https://img.shields.io/github/v/release/Anandb71/arbor?style=flat-square&label=release" alt="Release" /></a>
+  <a href="https://github.com/Anandb71/arbor/actions"><img src="https://img.shields.io/github/actions/workflow/status/Anandb71/arbor/rust.yml?style=flat-square&label=Rust%20CI" alt="Rust CI" /></a>
+  <a href="https://crates.io/crates/arbor-graph-cli"><img src="https://img.shields.io/crates/v/arbor-graph-cli?style=flat-square&label=crates.io" alt="Crates.io" /></a>
+  <a href="https://github.com/Anandb71/arbor/releases"><img src="https://img.shields.io/github/v/release/Anandb71/arbor?style=flat-square&label=release" alt="Latest release" /></a>
   <a href="https://github.com/Anandb71/arbor/pkgs/container/arbor"><img src="https://img.shields.io/badge/GHCR-container-blue?style=flat-square" alt="GHCR" /></a>
   <a href="https://glama.ai/mcp/servers/@Anandb71/arbor"><img src="https://img.shields.io/badge/MCP%20Directory-Glama-6f42c1?style=flat-square" alt="Glama MCP Directory" /></a>
-  <a href="https://skillsplayground.com/mcps/nandb71-arbor/"><img src="https://skillsplayground.com/badges/mcp/nandb71-arbor.svg" alt="Skills Playground MCP badge" /></a>
-  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" />
+  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License" />
 </p>
-
-## Status (March 2026)
-
-- **Latest release:** `v1.7.0`
-- **Main development trunk:** `main`
-- **Maintenance line:** `release/v1.6` (`v1.6.3`)
-
-Arbor `v1.7.0` is the active release as of **March 25, 2026**.
-
-## Highlights
-
-- **Accurate Token Counting** — tiktoken (cl100k_base) replaces heuristic estimates for precise LLM context budgets
-- **Fuzzy Symbol Suggestions** — Typo tolerance with Jaro-Winkler matching: `arbor refactor autth` → "Did you mean: `auth`?"
-- **Enhanced MCP/AI Integration** — Rich JSON output with confidence, roles, and edge explanations for Claude/Cursor
-- **Git-Aware Risk Workflows** — `arbor diff`, `arbor check`, and `arbor open` for refactor confidence
-- **Incremental Refresh** — `arbor index --changed-only` for faster re-index during active branches
-- **Better Python UX** — Empty `__init__.py` handled silently (no false warnings)
-- **Polyglot Parser Expansion** — New fallback parsing support for Kotlin, Swift, Ruby, PHP, and Shell families
-
-<p align="center">
-  <img src="docs/assets/arbor-demo.gif" alt="Arbor refactor demo" width="700" />
-</p>
-
-## What is Arbor?
-
-Arbor is a **local‑first impact analysis engine** for large codebases. Instead of treating code as text, Arbor parses your project into a **semantic dependency graph**. This lets you trace *real execution paths*—callers, callees, imports, inheritance, and cross‑file relationships—so you can confidently understand the consequences of change.
-
-Unlike keyword search or vector‑based RAG systems, Arbor answers questions like:
-
-> *“If I change this function, what actually breaks?”*
-
-with **structural certainty**, not probabilistic guesses.
 
 ---
 
-## Example: Blast Radius Detection
+## Table of Contents
 
-Before refactoring `detect_language`, inspect its true impact:
-
-```bash
-$ arbor refactor detect_language
-
-Analyzing detect_language...
-
-Confidence: High | Role: Core Logic
-• 15 callers, 3 dependencies
-• Well-connected with manageable impact
-
-> 18 nodes affected (4 direct, 14 transitive)
-
-Immediate Impact:
-  • parse_file (function)
-  • get_parser (function)
-
-Recommendation: Proceed with caution. Verify affected callers.
-```
-
-This is **execution‑aware analysis**, not text matching.
+- [Why Arbor](#why-arbor)
+- [What you get](#what-you-get)
+- [Quickstart](#quickstart)
+- [Installation options](#installation-options)
+- [MCP integration](#mcp-integration)
+- [Language support](#language-support)
+- [Architecture and docs](#architecture-and-docs)
+- [Git-aware CI workflows](#git-aware-ci-workflows)
+- [Release channels](#release-channels)
+- [Contributing](#contributing)
+- [Security](#security)
+- [License](#license)
 
 ---
 
-## Graphical Interface
+## Why Arbor
 
-Arbor ships with a **native GUI** for interactive impact analysis.
+Most AI code tooling treats code as text retrieval.
+
+Arbor builds a **semantic dependency graph** and answers execution-aware questions:
+
+- *If I change this symbol, what breaks?*
+- *Who calls this function, directly and transitively?*
+- *What is the shortest architectural path between these two nodes?*
+
+You get deterministic, explainable impact analysis instead of approximate keyword matches.
+
+---
+
+## What you get
+
+- **Blast radius analysis** with confidence levels and role classification
+- **Graph-backed symbol resolution** across files and language boundaries
+- **CLI + GUI + MCP bridge** sharing the same analysis engine
+- **Incremental indexing** for fast inner-loop development
+- **Git-aware checks** for pull-request risk gates
+
+---
+
+## Quickstart
 
 ```bash
+# 1) Install Arbor CLI
+cargo install arbor-graph-cli
+
+# 2) Initialize in your repository
+cd your-project
+arbor setup
+
+# 3) Explore impact before refactor
+arbor refactor <symbol-name>
+
+# 4) Optional: run git-aware checks
+arbor diff
+arbor check --max-blast-radius 30
+
+# 5) Launch GUI
 arbor gui
 ```
 
-![Arbor GUI](docs/gui_screenshot.png)
+---
 
-### GUI Capabilities
+## Installation options
 
-* **Symbol Search** – Instantly locate functions, classes, and methods
-* **Impact Visualization** – Explore direct and transitive dependencies
-* **Privacy‑Safe** – File paths are hidden by default for clean screenshots
-* **Export** – Copy results as Markdown for PRs and design docs
+Use whichever channel fits your environment:
 
-> The CLI and GUI share the *same* analysis engine—no feature gaps.
+```bash
+# Rust / Cargo
+cargo install arbor-graph-cli
+
+# Homebrew (macOS/Linux)
+brew install Anandb71/tap/arbor
+
+# Scoop (Windows)
+scoop bucket add arbor https://github.com/Anandb71/arbor
+scoop install arbor
+
+# npm wrapper (cross-platform)
+npx @anandb71/arbor-cli
+
+# Docker
+docker pull ghcr.io/anandb71/arbor:latest
+```
+
+No-Rust installers:
+
+- macOS/Linux: `curl -fsSL https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.sh | bash`
+- Windows PowerShell: `irm https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.ps1 | iex`
+
+For pinned/versioned installs, see [docs/INSTALL.md](docs/INSTALL.md).
 
 ---
 
-## Quick Start
+## MCP integration
 
-1. **Install Arbor** (CLI + GUI):
+Arbor includes a real MCP server via `arbor bridge` (stdio transport).
 
-   ```bash
-   cargo install arbor-graph-cli
-   ```
-
-   Or use package managers:
-
-   ```bash
-   # Homebrew (macOS/Linux)
-   brew install Anandb71/tap/arbor
-
-   # Scoop (Windows)
-   scoop bucket add arbor https://github.com/Anandb71/arbor
-   scoop install arbor
-
-   # npm (any platform)
-  npx @anandb71/arbor-cli
-
-   # Docker
-   docker pull ghcr.io/anandb71/arbor:latest
-   ```
-
-   Or use one-command installers (no Rust toolchain required):
-
-   - macOS/Linux: `curl -fsSL https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.sh | bash`
-   - Windows (PowerShell): `irm https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.ps1 | iex`
-
-   See [Installation Guide](docs/INSTALL.md) for version pinning and manual assets.
-
-2. **One-shot setup + first index**:
-
-  ```bash
-  cd your-project
-  arbor setup
-  ```
-
-3. **Run Impact Analysis**:
-
-   ```bash
-   arbor refactor <symbol-name>
-   ```
-
-  For git-aware workflows:
-
-  ```bash
-  arbor diff
-  arbor check --max-blast-radius 30
-  arbor open <symbol>
-  ```
-
-4. **Launch the GUI**:
-
-   ```bash
-   arbor gui
-   ```
-
-> You can run Arbor from any nested subdirectory; it automatically resolves to your project root.
-
-📘 See the [Quickstart Guide](docs/QUICKSTART.md) for advanced workflows.
-
----
-
-## Release Channels & Branches
-
-To keep maintenance and feature work clean:
-
-- `main` → ongoing development
-- `release/v1.7` → current release line (`v1.7.0`)
-- `release/v1.6` → maintenance-only fixes for 1.6.x (`v1.6.3` current)
-- `release/v1.5` → legacy maintenance/backport branch
-
-This avoids shipping new features into older maintenance branches and keeps backports explicit.
-
-### Automated distribution (not GitHub-only)
-
-Tagged releases (`vX.Y.Z`) are automated across channels:
-
-- GitHub Release assets (CLI binaries for Linux, macOS, Windows)
-- crates.io packages
-- GHCR container images
-- VS Code Marketplace extension
-- Open VSX extension
-- Homebrew formula
-- Scoop manifest
-- npm wrapper package
-
-Maintainer setup and verification steps are in [docs/RELEASING.md](docs/RELEASING.md).
-
----
-
-## MCP Directory Listing
-
-Arbor is listed on Glama MCP Directory:
-
-- **Glama:** https://glama.ai/mcp/servers/@Anandb71/arbor
-
-### MCP Health Badges
-
-[![arbor MCP server](https://glama.ai/mcp/servers/Anandb71/arbor/badges/score.svg)](https://glama.ai/mcp/servers/Anandb71/arbor)
-
-
-<p align="center">
-  <a href="https://glama.ai/mcp/servers/@Anandb71/arbor">
-    <img width="380" height="200" src="https://glama.ai/mcp/servers/@Anandb71/arbor/badge" />
-  </a>
-</p>
-
-### Claude Code MCP Quick Install
+### Claude Code quick install
 
 ```bash
 claude mcp add --transport stdio --scope project arbor -- arbor bridge
-```
-
-Then verify with:
-
-```bash
 claude mcp list
 ```
 
-### Universal MCP Integration Kit
+### Multi-client setup
 
-Arbor ships ready-to-copy MCP templates and bootstrap scripts for multi-client onboarding:
+- Full guide: [docs/MCP_INTEGRATION.md](docs/MCP_INTEGRATION.md)
+- Ready templates: [`templates/mcp/`](templates/mcp/)
+- Bootstrap scripts:
+  - `scripts/setup-mcp.sh`
+  - `scripts/setup-mcp.ps1`
 
-- Templates: `templates/mcp/`
-- macOS/Linux bootstrap: `scripts/setup-mcp.sh`
-- Windows bootstrap: `scripts/setup-mcp.ps1`
+### Registry verification (authoritative)
 
-```bash
-# Generate project-scoped config for Claude Code + Cursor + VS Code
-./scripts/setup-mcp.sh --client all --target-dir .
-```
+- Registry name: `io.github.Anandb71/arbor`
+- Official API lookup: https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.Anandb71/arbor
 
-```powershell
-# Windows equivalent
-./scripts/setup-mcp.ps1 -Client all -TargetDir .
-```
-
-This creates:
-
-- `.mcp.json` (Claude Code project scope)
-- `.cursor/mcp.json`
-- `.vscode/mcp.json`
-
-For enterprise-managed setups, see `docs/MCP_INTEGRATION.md` (policy + managed registration notes).
+> [!NOTE]
+> `github.com/mcp` search UI may lag indexing. Use the official registry API lookup above as source of truth.
 
 ---
 
-## GitHub Marketplace Action
+## Language support
 
-Arbor now includes a reusable GitHub Action at the repo root (`action.yml`) so teams can run impact analysis directly in CI.
+Arbor supports production parsing and graph analysis across major ecosystems:
 
-### Quick usage
+- Rust
+- TypeScript / JavaScript
+- Python
+- Go
+- Java
+- C / C++
+- C#
+- Dart
+- Kotlin (fallback parser)
+- Swift (fallback parser)
+- Ruby (fallback parser)
+- PHP (fallback parser)
+- Shell (fallback parser)
+
+Detailed parser notes and expansion guidance:
+
+- [docs/ADDING_LANGUAGES.md](docs/ADDING_LANGUAGES.md)
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+
+---
+
+## Architecture and docs
+
+Start here when you need deeper internals:
+
+- [docs/QUICKSTART.md](docs/QUICKSTART.md)
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/GRAPH_SCHEMA.md](docs/GRAPH_SCHEMA.md)
+- [docs/PROTOCOL.md](docs/PROTOCOL.md)
+- [docs/MCP_INTEGRATION.md](docs/MCP_INTEGRATION.md)
+- [docs/ROADMAP.md](docs/ROADMAP.md)
+
+---
+
+## Git-aware CI workflows
+
+Arbor supports pre-merge risk checks and change gating:
+
+```bash
+arbor diff
+arbor check --max-blast-radius 30
+arbor open <symbol>
+```
+
+Use the repository GitHub Action for CI integration:
 
 ```yaml
 name: Arbor Check
@@ -264,205 +202,58 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: Anandb71/arbor@release/v1.7
+      - uses: Anandb71/arbor@release/v1.8
         with:
           command: check . --max-blast-radius 30
 ```
 
-Inputs:
+---
 
-- `command` (default: `status .`) — Arbor subcommand + args (without leading `arbor`)
-- `arbor-version` (default: `latest`) — install from crates.io at a pinned version
-- `install-from-source` (default: `false`) — build from this repository source
+## Release channels
 
-> To publish this action in GitHub Marketplace: create a release tag (for example `v1`), add marketplace listing metadata in the release flow, and submit from the repository's Marketplace listing page.
+Automated release distribution includes:
+
+- GitHub Releases (platform binaries)
+- crates.io
+- GHCR container images
+- npm wrapper package
+- VS Code Marketplace / Open VSX extension channels
+- Homebrew + Scoop
+
+Runbook: [docs/RELEASING.md](docs/RELEASING.md)
 
 ---
 
-## Documentation Hub
+## Contributing
 
-- **Quickstart:** [docs/QUICKSTART.md](docs/QUICKSTART.md)
-- **Installation:** [docs/INSTALL.md](docs/INSTALL.md)
-- **Architecture:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- **MCP Integration:** [docs/MCP_INTEGRATION.md](docs/MCP_INTEGRATION.md)
-- **Protocol Specification:** [docs/PROTOCOL.md](docs/PROTOCOL.md)
-- **Roadmap:** [docs/ROADMAP.md](docs/ROADMAP.md)
-- **Release Runbook (all channels):** [docs/RELEASING.md](docs/RELEASING.md)
-- **Release Notes (v1.6):** [docs/RELEASE_NOTES_v1.6.0.md](docs/RELEASE_NOTES_v1.6.0.md)
-- **Release Notes (v1.6.1.1):** [docs/RELEASE_NOTES_v1.6.1.1.md](docs/RELEASE_NOTES_v1.6.1.1.md)
-- **Release Notes (v1.6.2):** [docs/RELEASE_NOTES_v1.6.2.md](docs/RELEASE_NOTES_v1.6.2.md)
-- **Release Notes (v1.7.0):** [docs/RELEASE_NOTES_v1.7.0.md](docs/RELEASE_NOTES_v1.7.0.md)
+Contributions are welcome.
 
----
+- Start with: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Code of conduct: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+- Security policy: [SECURITY.md](SECURITY.md)
+- Good first tasks: [docs/GOOD_FIRST_ISSUES.md](docs/GOOD_FIRST_ISSUES.md)
 
-## Why Arbor?
-
-Most AI coding tools treat code as **unstructured text**, relying on vector similarity. This approach is fast—but imprecise.
-
-**Arbor builds a graph.**
-
-Every function, class, and module is a node. Every call, import, and reference is an edge. When you ask a question, Arbor follows the graph—*the same way your program executes*.
-
-```text
-Traditional RAG:              Arbor Graph Analysis:
-
-"auth" → 47 results          AuthController
-(keyword similarity)           ├── calls → TokenMiddleware
-                               ├── queries → UserRepository
-                               └── emits → AuthEvent
-```
-
-The result: **deterministic, explainable answers**.
-
----
-
-## Core Features
-
-### Symbol Resolution
-
-Arbor resolves symbols across files with full qualification:
-
-* Imports and re‑exports
-* Inheritance and interfaces
-* Overloads and namespaces
-
-`User` in `auth.ts` is never confused with `User` in `types.ts`.
-
----
-
-## Supported Languages
-
-| Language       | Status | Parser Coverage                           |
-| -------------- | ------ | ----------------------------------------- |
-| **Rust**       | ✅      | Functions, Structs, Traits, Impls, Macros |
-| **TypeScript** | ✅      | Classes, Interfaces, Types, Imports, JSX  |
-| **JavaScript** | ✅      | Functions, Classes, Vars, Imports         |
-| **Python**     | ✅      | Classes, Functions, Imports, Decorators   |
-| **Go**         | ✅      | Structs, Interfaces, Funcs, Methods       |
-| **Java**       | ✅      | Classes, Interfaces, Methods, Fields      |
-| **C**          | ✅      | Structs, Functions, Enums, Typedefs       |
-| **C++**        | ✅      | Classes, Namespaces, Templates            |
-| **C#**         | ✅      | Classes, Methods, Properties, Interfaces  |
-| **Dart**       | ✅      | Classes, Mixins, Widgets                  |
-| **Kotlin**     | ✅      | Functions, Classes, Interfaces (fallback parser) |
-| **Swift**      | ✅      | Functions, Types, Protocols (fallback parser) |
-| **Ruby**       | ✅      | Methods, Classes, Modules (fallback parser) |
-| **PHP**        | ✅      | Functions, Classes, Traits (fallback parser) |
-| **Shell**      | ✅      | Function definitions (fallback parser) |
-
-> **Python note:** Decorators, `__init__.py`, and `@dataclass` are statically analyzed. Dynamic dispatch is flagged with reduced confidence.
-
----
-
-## Build from Source
+For local development:
 
 ```bash
-git clone https://github.com/Anandb71/arbor.git
-cd arbor
-cargo build --release
-cargo test
-```
-
-### Frictionless setup notes
-
-- **No external graph database is required.** Arbor is local-first and uses embedded storage.
-- From a fresh clone, contributors can start with just:
-  - `cargo build`
-  - `cargo test`
-
-If you prefer containerized setup, run:
-
-```bash
-docker compose up --build arbor-dev
-```
-
-### Linux GUI Dependencies
-
-```bash
-sudo apt-get install -y pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-  libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libssl-dev cmake
+cargo build --workspace
+cargo test --workspace
 ```
 
 ---
 
-## Troubleshooting
+## Security
 
-### Symbol not found?
+Arbor is local-first by design:
 
-* **.gitignore** – Arbor respects it (`arbor status --files`)
-* **File type** – Ensure the extension is supported
-* **Empty files** – Skipped (except `__init__.py`)
-* **Dynamic calls** – `eval` / runtime reflection may not resolve
-* **Case sensitivity** – Use `arbor query <partial>` to search
+- No mandatory data exfiltration
+- Offline-capable workflows
+- Open-source code paths
 
-### Empty graph?
-
-Run `arbor status` to verify file detection and parser health.
-
-### Need environment diagnostics?
-
-Run `arbor doctor` (or `arbor check-health`) to verify ports, project structure, and integration readiness.
-
-### Repo suddenly huge (multi-GB)?
-
-Rust and Flutter build artifacts can grow quickly during iterative testing.
-
-- Windows PowerShell: `./scripts/clean.ps1`
-- macOS/Linux: `./scripts/clean.sh`
-- Deeper cleanup (also removes local Arbor/Flutter cache artifacts):
-  - PowerShell: `./scripts/clean.ps1 -Deep`
-  - Bash: `./scripts/clean.sh --deep`
-
-This is safe for source code; it only removes generated artifacts that can be rebuilt.
-
----
-
-## Security Model
-
-Arbor is **Local‑First by design**:
-
-* No data exfiltration
-* Fully offline
-* No API keys
-* Fully open source
-
-Your code never leaves your machine.
+Report vulnerabilities via [SECURITY.md](SECURITY.md).
 
 ---
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
-
-<p align="center">
-  <a href="https://github.com/Anandb71/arbor">⭐ Star Arbor on GitHub</a>
-</p>
-
----
-
-## Contributors
-
-<!-- CONTRIBUTORS:START -->
-<p align="center">
-    <a href="https://github.com/Anandb71" title="Anandb71" style="text-decoration:none; margin:6px; display:inline-block;">
-        <img src="https://avatars.githubusercontent.com/u/169837340?v=4" alt="Anandb71" width="72" height="72" loading="lazy" style="border-radius:50%; border:2px solid #30363d; box-sizing:border-box;" />
-  </a>
-    <a href="https://github.com/holg" title="holg" style="text-decoration:none; margin:6px; display:inline-block;">
-        <img src="https://avatars.githubusercontent.com/u/1383439?v=4" alt="holg" width="72" height="72" loading="lazy" style="border-radius:50%; border:2px solid #30363d; box-sizing:border-box;" />
-  </a>
-    <a href="https://github.com/cabinlab" title="cabinlab" style="text-decoration:none; margin:6px; display:inline-block;">
-        <img src="https://avatars.githubusercontent.com/u/66889299?v=4" alt="cabinlab" width="72" height="72" loading="lazy" style="border-radius:50%; border:2px solid #30363d; box-sizing:border-box;" />
-  </a>
-    <a href="https://github.com/Karthiksenthilkumar1" title="Karthiksenthilkumar1" style="text-decoration:none; margin:6px; display:inline-block;">
-        <img src="https://avatars.githubusercontent.com/u/182195883?v=4" alt="Karthiksenthilkumar1" width="72" height="72" loading="lazy" style="border-radius:50%; border:2px solid #30363d; box-sizing:border-box;" />
-  </a>
-    <a href="https://github.com/sanjayy-j" title="sanjayy-j" style="text-decoration:none; margin:6px; display:inline-block;">
-        <img src="https://avatars.githubusercontent.com/u/178475117?v=4" alt="sanjayy-j" width="72" height="72" loading="lazy" style="border-radius:50%; border:2px solid #30363d; box-sizing:border-box;" />
-  </a>
-    <a href="https://github.com/sathguru07" title="sathguru07" style="text-decoration:none; margin:6px; display:inline-block;">
-        <img src="https://avatars.githubusercontent.com/u/182798669?v=4" alt="sathguru07" width="72" height="72" loading="lazy" style="border-radius:50%; border:2px solid #30363d; box-sizing:border-box;" />
-  </a>
-</p>
-<p align="center"><sub><strong>6 contributors</strong> | <a href="https://github.com/Anandb71/arbor/graphs/contributors">View all</a></sub></p>
-
-<!-- CONTRIBUTORS:END -->
+MIT — see [LICENSE](LICENSE).
