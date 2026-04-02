@@ -251,7 +251,10 @@ mod tests {
             .reasons
             .iter()
             .any(|r| r.contains("Large blast radius")));
-        assert!(low.reasons.iter().any(|r| r.contains("Very large blast radius")));
+        assert!(low
+            .reasons
+            .iter()
+            .any(|r| r.contains("Very large blast radius")));
     }
 
     #[test]
@@ -335,8 +338,7 @@ mod tests {
                     (false, true) => NodeRole::EntryPoint,
                     (true, false) => NodeRole::Utility,
                     (true, true) => {
-                        if (upstream <= 2 && downstream > 5) || (downstream <= 2 && upstream > 5)
-                        {
+                        if (upstream <= 2 && downstream > 5) || (downstream <= 2 && upstream > 5) {
                             NodeRole::Adapter
                         } else {
                             NodeRole::CoreLogic
