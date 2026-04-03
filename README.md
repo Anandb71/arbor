@@ -32,6 +32,7 @@ Know what breaks *before* you break it.
 - [Git-aware CI workflows](#git-aware-ci-workflows)
 - [Release channels](#release-channels)
 - [Contributing](#contributing)
+- [Contributors](#contributors)
 - [Security](#security)
 - [License](#license)
 
@@ -254,6 +255,16 @@ For local development:
 cargo build --workspace
 cargo test --workspace
 ```
+
+---
+
+## Contributors
+
+<!-- CONTRIBUTORS:START -->
+<p align="center">
+  <em>Automatically maintained by <code>.github/workflows/contributors.yml</code>.</em>
+</p>
+<!-- CONTRIBUTORS:END -->
 
 ---
 
