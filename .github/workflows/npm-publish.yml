@@ -36,9 +36,20 @@ jobs:
         id: version
         run: |
           if [ "${{ github.event_name }}" = "release" ]; then
-            echo "value=${{ github.event.release.tag_name }}" | sed 's/^value=v/value=/' >> "$GITHUB_OUTPUT"
+            VALUE="${{ github.event.release.tag_name }}"
+            VALUE="${VALUE#v}"
+
+            if echo "$VALUE" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "value=$VALUE" >> "$GITHUB_OUTPUT"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "value=" >> "$GITHUB_OUTPUT"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "::warning::Skipping npm publish because release tag '$VALUE' is not a 3-part npm semver version."
+            fi
           else
             echo "value=" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Apply release version to npm package
@@ -47,6 +58,7 @@ jobs:
         run: npm version "${{ steps.version.outputs.value }}" --no-git-tag-version --allow-same-version
 
       - name: Publish to npm
+        if: steps.version.outputs.skip != 'true'
         working-directory: packaging/npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

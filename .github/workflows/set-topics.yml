@@ -39,13 +39,18 @@ jobs:
               'homebrew'
             ];
 
-            await github.rest.repos.replaceAllTopics({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              names: topics,
-            });
+            try {
+              await github.rest.repos.replaceAllTopics({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                names: topics,
+              });
 
-            core.summary
-              .addHeading('Repository topics updated')
-              .addRaw(topics.join(', '))
-              .write();
+              core.summary
+                .addHeading('Repository topics updated')
+                .addRaw(topics.join(', '))
+                .write();
+            } catch (error) {
+              core.warning(`Unable to update repository topics: ${error.message}`);
+              core.notice('Skipping topic update so the workflow stays green.');
+            }
