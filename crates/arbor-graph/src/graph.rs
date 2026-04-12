@@ -249,25 +249,15 @@ impl ArborGraph {
     pub fn export_edges(&self) -> Vec<GraphEdge> {
         self.graph
             .edge_references()
-            .map(|edge_ref| {
-                let source = self
-                    .graph
-                    .node_weight(edge_ref.source())
-                    .unwrap()
-                    .id
-                    .clone();
-                let target = self
-                    .graph
-                    .node_weight(edge_ref.target())
-                    .unwrap()
-                    .id
-                    .clone();
+            .filter_map(|edge_ref| {
+                let source = self.graph.node_weight(edge_ref.source())?.id.clone();
+                let target = self.graph.node_weight(edge_ref.target())?.id.clone();
                 let weight = edge_ref.weight(); // &Edge
-                GraphEdge {
+                Some(GraphEdge {
                     source,
                     target,
                     kind: weight.kind,
-                }
+                })
             })
             .collect()
     }

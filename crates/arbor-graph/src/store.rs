@@ -6,7 +6,7 @@ use std::path::Path;
 use thiserror::Error;
 
 /// Current cache format version. Increment when schema changes.
-const CACHE_VERSION: &str = "arbor-1.3";
+const CACHE_VERSION: &str = concat!("arbor-", env!("CARGO_PKG_VERSION"));
 
 #[derive(Error, Debug)]
 pub enum StoreError {
