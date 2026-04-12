@@ -5,14 +5,13 @@ on:
 
 permissions:
   contents: read
-  administration: write
 
 jobs:
   set-topics:
     runs-on: ubuntu-latest
     steps:
       - name: Set repository topics
-        uses: actions/github-script@v8
+        uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |

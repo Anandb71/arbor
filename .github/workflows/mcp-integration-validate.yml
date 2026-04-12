@@ -22,7 +22,7 @@ jobs:
     name: Validate MCP JSON templates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Validate JSON syntax
         shell: bash
@@ -50,7 +50,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Run Bash bootstrap
         if: runner.os == 'Linux'

@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Append MCP install section
-        uses: actions/github-script@v8
+        uses: actions/github-script@v7
         with:
           script: |
             const marker = '<!-- arbor-mcp-install-snippets -->';
