@@ -1004,7 +1004,9 @@ public class OrderService {
 }
 "#;
 
-        let result = parser.parse_source(source, "OrderService.java", "java").unwrap();
+        let result = parser
+            .parse_source(source, "OrderService.java", "java")
+            .unwrap();
 
         assert!(result.symbols.iter().any(|s| s.name == "OrderService"));
         assert!(result.symbols.iter().any(|s| s.name == "processOrder"));
@@ -1093,7 +1095,9 @@ namespace MyApp
 }
 "#;
 
-        let result = parser.parse_source(source, "UserController.cs", "cs").unwrap();
+        let result = parser
+            .parse_source(source, "UserController.cs", "cs")
+            .unwrap();
 
         assert!(result.symbols.iter().any(|s| s.name == "UserController"));
         assert!(result.symbols.iter().any(|s| s.name == "GetUser"));
@@ -1111,7 +1115,9 @@ namespace MyApp
     #[test]
     fn test_parse_result_file_path() {
         let mut parser = ArborParser::new().unwrap();
-        let result = parser.parse_source("fn main() {}", "test.rs", "rs").unwrap();
+        let result = parser
+            .parse_source("fn main() {}", "test.rs", "rs")
+            .unwrap();
         assert_eq!(result.file_path, "test.rs");
     }
 
@@ -1130,6 +1136,9 @@ def read_file(path):
 
         let result = parser.parse_source(source, "utils.py", "py").unwrap();
         assert!(result.symbols.iter().any(|s| s.name == "read_file"));
-        assert!(result.relations.iter().any(|r| r.kind == RelationType::Imports));
+        assert!(result
+            .relations
+            .iter()
+            .any(|r| r.kind == RelationType::Imports));
     }
 }

@@ -772,21 +772,9 @@ mod tests {
 
         // Verify all primary extensions from arbor_core::languages are present
         let required = vec![
-            "ts", "tsx", "mts", "cts",
-            "js", "jsx", "mjs", "cjs",
-            "rs",
-            "py", "pyi",
-            "go",
-            "java",
-            "c", "h",
-            "cpp", "hpp", "cc", "hh", "cxx", "hxx",
-            "cs",
-            "dart",
-            "kt", "kts",
-            "swift",
-            "rb",
-            "php", "phtml",
-            "sh", "bash", "zsh",
+            "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "rs", "py", "pyi", "go", "java",
+            "c", "h", "cpp", "hpp", "cc", "hh", "cxx", "hxx", "cs", "dart", "kt", "kts", "swift",
+            "rb", "php", "phtml", "sh", "bash", "zsh",
         ];
 
         for ext in &required {

@@ -238,14 +238,24 @@ mod tests {
 
     #[test]
     fn test_react_component_detection() {
-        let component = CodeNode::new("UserProfile", "UserProfile", NodeKind::Function, "profile.tsx");
+        let component = CodeNode::new(
+            "UserProfile",
+            "UserProfile",
+            NodeKind::Function,
+            "profile.tsx",
+        );
         assert!(HeuristicsMatcher::is_react_component(&component));
 
         let non_component = CodeNode::new("helper", "helper", NodeKind::Function, "utils.tsx");
         assert!(!HeuristicsMatcher::is_react_component(&non_component));
 
         // Not a .tsx file -> not a React component
-        let wrong_ext = CodeNode::new("UserProfile", "UserProfile", NodeKind::Function, "profile.rs");
+        let wrong_ext = CodeNode::new(
+            "UserProfile",
+            "UserProfile",
+            NodeKind::Function,
+            "profile.rs",
+        );
         assert!(!HeuristicsMatcher::is_react_component(&wrong_ext));
 
         // Class in .tsx is also a React component
@@ -255,7 +265,12 @@ mod tests {
 
     #[test]
     fn test_callback_style_detection() {
-        let callback = CodeNode::new("on_click_handler", "on_click_handler", NodeKind::Function, "a.rs");
+        let callback = CodeNode::new(
+            "on_click_handler",
+            "on_click_handler",
+            NodeKind::Function,
+            "a.rs",
+        );
         assert!(HeuristicsMatcher::is_callback_style(&callback));
 
         let callback_fn = CodeNode::new("sortFn", "sortFn", NodeKind::Function, "a.ts");
@@ -287,8 +302,12 @@ mod tests {
         let edges = HeuristicsMatcher::infer_uncertain_edges(&nodes);
 
         // Should have edges for handler (EventHandler) and widget (WidgetTree)
-        assert!(edges.iter().any(|e| matches!(e.kind, UncertainEdgeKind::EventHandler)));
-        assert!(edges.iter().any(|e| matches!(e.kind, UncertainEdgeKind::WidgetTree)));
+        assert!(edges
+            .iter()
+            .any(|e| matches!(e.kind, UncertainEdgeKind::EventHandler)));
+        assert!(edges
+            .iter()
+            .any(|e| matches!(e.kind, UncertainEdgeKind::WidgetTree)));
         // Regular function shouldn't produce uncertain edges
         assert!(!edges.iter().any(|e| e.to == regular.id));
     }
@@ -296,14 +315,16 @@ mod tests {
     #[test]
     fn test_detect_analysis_limitations_callbacks() {
         // Create 6+ callback-style nodes to trigger the warning
-        let nodes: Vec<CodeNode> = (0..7).map(|i| {
-            CodeNode::new(
-                &format!("on_event_{}", i),
-                &format!("on_event_{}", i),
-                NodeKind::Function,
-                "events.ts"
-            )
-        }).collect();
+        let nodes: Vec<CodeNode> = (0..7)
+            .map(|i| {
+                CodeNode::new(
+                    &format!("on_event_{}", i),
+                    &format!("on_event_{}", i),
+                    NodeKind::Function,
+                    "events.ts",
+                )
+            })
+            .collect();
         let node_refs: Vec<&CodeNode> = nodes.iter().collect();
 
         let warnings = detect_analysis_limitations(&node_refs);
@@ -313,9 +334,12 @@ mod tests {
 
     #[test]
     fn test_detect_analysis_limitations_flutter_widgets() {
-        let widgets: Vec<CodeNode> = vec![
-            CodeNode::new("HomeWidget", "HomeWidget", NodeKind::Class, "home.dart"),
-        ];
+        let widgets: Vec<CodeNode> = vec![CodeNode::new(
+            "HomeWidget",
+            "HomeWidget",
+            NodeKind::Class,
+            "home.dart",
+        )];
         let node_refs: Vec<&CodeNode> = widgets.iter().collect();
 
         let warnings = detect_analysis_limitations(&node_refs);
@@ -325,10 +349,16 @@ mod tests {
     #[test]
     fn test_uncertain_edge_kind_display() {
         assert_eq!(UncertainEdgeKind::Callback.to_string(), "callback");
-        assert_eq!(UncertainEdgeKind::DynamicDispatch.to_string(), "dynamic dispatch");
+        assert_eq!(
+            UncertainEdgeKind::DynamicDispatch.to_string(),
+            "dynamic dispatch"
+        );
         assert_eq!(UncertainEdgeKind::WidgetTree.to_string(), "widget tree");
         assert_eq!(UncertainEdgeKind::EventHandler.to_string(), "event handler");
-        assert_eq!(UncertainEdgeKind::DependencyInjection.to_string(), "dependency injection");
+        assert_eq!(
+            UncertainEdgeKind::DependencyInjection.to_string(),
+            "dependency injection"
+        );
         assert_eq!(UncertainEdgeKind::Reflection.to_string(), "reflection");
     }
 

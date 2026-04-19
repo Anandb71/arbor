@@ -200,7 +200,11 @@ mod tests {
         let graph = builder.build();
 
         assert_eq!(graph.node_count(), 1);
-        assert_eq!(graph.edge_count(), 0, "Unresolved references should not create edges");
+        assert_eq!(
+            graph.edge_count(),
+            0,
+            "Unresolved references should not create edges"
+        );
     }
 
     #[test]

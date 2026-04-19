@@ -49,13 +49,7 @@ fn extract_from_node(
                 if let Some(body) = node.child_by_field_name("body") {
                     for i in 0..body.child_count() {
                         if let Some(child) = body.child(i) {
-                            extract_from_node(
-                                &child,
-                                source,
-                                file_path,
-                                nodes,
-                                Some(&class_name),
-                            );
+                            extract_from_node(&child, source, file_path, nodes, Some(&class_name));
                         }
                     }
                 }
@@ -65,8 +59,7 @@ fn extract_from_node(
 
         // Interface declarations
         "interface_declaration" => {
-            if let Some(code_node) =
-                extract_type_decl(node, source, file_path, NodeKind::Interface)
+            if let Some(code_node) = extract_type_decl(node, source, file_path, NodeKind::Interface)
             {
                 let iface_name = code_node.name.clone();
                 nodes.push(code_node);
@@ -74,13 +67,7 @@ fn extract_from_node(
                 if let Some(body) = node.child_by_field_name("body") {
                     for i in 0..body.child_count() {
                         if let Some(child) = body.child(i) {
-                            extract_from_node(
-                                &child,
-                                source,
-                                file_path,
-                                nodes,
-                                Some(&iface_name),
-                            );
+                            extract_from_node(&child, source, file_path, nodes, Some(&iface_name));
                         }
                     }
                 }
@@ -97,13 +84,7 @@ fn extract_from_node(
                 if let Some(body) = node.child_by_field_name("body") {
                     for i in 0..body.child_count() {
                         if let Some(child) = body.child(i) {
-                            extract_from_node(
-                                &child,
-                                source,
-                                file_path,
-                                nodes,
-                                Some(&struct_name),
-                            );
+                            extract_from_node(&child, source, file_path, nodes, Some(&struct_name));
                         }
                     }
                 }

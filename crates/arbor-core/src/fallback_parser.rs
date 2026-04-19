@@ -224,10 +224,18 @@ enum Status {
 }
 "#;
         let nodes = parse_fallback_source(source, "Users.swift", "swift");
-        assert!(nodes.iter().any(|n| n.name == "UserManager" && matches!(n.kind, NodeKind::Class)));
-        assert!(nodes.iter().any(|n| n.name == "getUser" && matches!(n.kind, NodeKind::Function)));
-        assert!(nodes.iter().any(|n| n.name == "Point" && matches!(n.kind, NodeKind::Struct)));
-        assert!(nodes.iter().any(|n| n.name == "Status" && matches!(n.kind, NodeKind::Enum)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "UserManager" && matches!(n.kind, NodeKind::Class)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "getUser" && matches!(n.kind, NodeKind::Function)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "Point" && matches!(n.kind, NodeKind::Struct)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "Status" && matches!(n.kind, NodeKind::Enum)));
     }
 
     #[test]
@@ -247,10 +255,18 @@ module Authentication
 end
 "#;
         let nodes = parse_fallback_source(source, "controller.rb", "rb");
-        assert!(nodes.iter().any(|n| n.name == "ApplicationController" && matches!(n.kind, NodeKind::Class)));
-        assert!(nodes.iter().any(|n| n.name == "index" && matches!(n.kind, NodeKind::Function)));
-        assert!(nodes.iter().any(|n| n.name == "show" && matches!(n.kind, NodeKind::Function)));
-        assert!(nodes.iter().any(|n| n.name == "Authentication" && matches!(n.kind, NodeKind::Module)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "ApplicationController" && matches!(n.kind, NodeKind::Class)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "index" && matches!(n.kind, NodeKind::Function)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "show" && matches!(n.kind, NodeKind::Function)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "Authentication" && matches!(n.kind, NodeKind::Module)));
     }
 
     #[test]
@@ -269,10 +285,18 @@ function helper() {
 }
 "#;
         let nodes = parse_fallback_source(source, "payment.php", "php");
-        assert!(nodes.iter().any(|n| n.name == "PaymentProcessor" && matches!(n.kind, NodeKind::Class)));
-        assert!(nodes.iter().any(|n| n.name == "processPayment" && matches!(n.kind, NodeKind::Function)));
-        assert!(nodes.iter().any(|n| n.name == "Gateway" && matches!(n.kind, NodeKind::Interface)));
-        assert!(nodes.iter().any(|n| n.name == "helper" && matches!(n.kind, NodeKind::Function)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "PaymentProcessor" && matches!(n.kind, NodeKind::Class)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "processPayment" && matches!(n.kind, NodeKind::Function)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "Gateway" && matches!(n.kind, NodeKind::Interface)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "helper" && matches!(n.kind, NodeKind::Function)));
     }
 
     #[test]
@@ -298,9 +322,15 @@ data class UserDto(val name: String)
 object Singleton
 "#;
         let nodes = parse_fallback_source(source, "models.kt", "kt");
-        assert!(nodes.iter().any(|n| n.name == "Repository" && matches!(n.kind, NodeKind::Class)));
-        assert!(nodes.iter().any(|n| n.name == "UserDto" && matches!(n.kind, NodeKind::Class)));
-        assert!(nodes.iter().any(|n| n.name == "Singleton" && matches!(n.kind, NodeKind::Class)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "Repository" && matches!(n.kind, NodeKind::Class)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "UserDto" && matches!(n.kind, NodeKind::Class)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "Singleton" && matches!(n.kind, NodeKind::Class)));
     }
 
     #[test]
