@@ -63,6 +63,10 @@ fn parse_kotlin_line(line: &str) -> Option<(String, NodeKind)> {
         return take_ident(rest).map(|name| (name, NodeKind::Class));
     }
 
+    if let Some(rest) = line.strip_prefix("data class ") {
+        return take_ident(rest).map(|name| (name, NodeKind::Class));
+    }
+
     if let Some(rest) = line.strip_prefix("interface ") {
         return take_ident(rest).map(|name| (name, NodeKind::Interface));
     }
@@ -198,5 +202,154 @@ mod tests {
         let source = "deploy_prod() { echo hi; }";
         let nodes = parse_fallback_source(source, "deploy.sh", "sh");
         assert!(nodes.iter().any(|n| n.name == "deploy_prod"));
+    }
+
+    #[test]
+    fn parses_swift_source() {
+        let source = r#"
+class UserManager {
+    func getUser() -> User {
+        return User()
+    }
+}
+
+struct Point {
+    var x: Double
+    var y: Double
+}
+
+enum Status {
+    case active
+    case inactive
+}
+"#;
+        let nodes = parse_fallback_source(source, "Users.swift", "swift");
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "UserManager" && matches!(n.kind, NodeKind::Class)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "getUser" && matches!(n.kind, NodeKind::Function)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "Point" && matches!(n.kind, NodeKind::Struct)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "Status" && matches!(n.kind, NodeKind::Enum)));
+    }
+
+    #[test]
+    fn parses_ruby_source() {
+        let source = r#"
+class ApplicationController
+  def index
+    render json: { status: "ok" }
+  end
+
+  def show
+    @user = User.find(params[:id])
+  end
+end
+
+module Authentication
+end
+"#;
+        let nodes = parse_fallback_source(source, "controller.rb", "rb");
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "ApplicationController" && matches!(n.kind, NodeKind::Class)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "index" && matches!(n.kind, NodeKind::Function)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "show" && matches!(n.kind, NodeKind::Function)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "Authentication" && matches!(n.kind, NodeKind::Module)));
+    }
+
+    #[test]
+    fn parses_php_source() {
+        let source = r#"
+class PaymentProcessor {
+    function processPayment($amount) {
+        return true;
+    }
+}
+
+interface Gateway {
+}
+
+function helper() {
+}
+"#;
+        let nodes = parse_fallback_source(source, "payment.php", "php");
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "PaymentProcessor" && matches!(n.kind, NodeKind::Class)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "processPayment" && matches!(n.kind, NodeKind::Function)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "Gateway" && matches!(n.kind, NodeKind::Interface)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "helper" && matches!(n.kind, NodeKind::Function)));
+    }
+
+    #[test]
+    fn fallback_ignores_comments() {
+        // Lines starting with // or # should not produce nodes
+        let source = r#"
+// class NotAClass
+# def not_a_function
+fun realFunction(x: Int): Int = x
+"#;
+        let nodes = parse_fallback_source(source, "test.kt", "kt");
+        assert!(!nodes.iter().any(|n| n.name == "NotAClass"));
+        assert!(!nodes.iter().any(|n| n.name == "not_a_function"));
+        assert!(nodes.iter().any(|n| n.name == "realFunction"));
+    }
+
+    #[test]
+    fn fallback_kotlin_class_and_data_class() {
+        let source = r#"
+class Repository {
+}
+data class UserDto(val name: String)
+object Singleton
+"#;
+        let nodes = parse_fallback_source(source, "models.kt", "kt");
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "Repository" && matches!(n.kind, NodeKind::Class)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "UserDto" && matches!(n.kind, NodeKind::Class)));
+        assert!(nodes
+            .iter()
+            .any(|n| n.name == "Singleton" && matches!(n.kind, NodeKind::Class)));
+    }
+
+    #[test]
+    fn fallback_empty_source_returns_empty() {
+        let nodes = parse_fallback_source("", "empty.kt", "kt");
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn fallback_unsupported_extension_returns_empty() {
+        // Make sure unsupported extensions don't panic
+        assert!(!is_fallback_supported_extension("xyz"));
+        assert!(!is_fallback_supported_extension("rs"));
+    }
+
+    #[test]
+    fn parses_shell_function_keyword() {
+        let source = "function deploy_staging { echo staging; }";
+        let nodes = parse_fallback_source(source, "deploy.bash", "bash");
+        assert!(nodes.iter().any(|n| n.name == "deploy_staging"));
     }
 }

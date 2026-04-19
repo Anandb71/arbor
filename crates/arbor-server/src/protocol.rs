@@ -159,3 +159,107 @@ fn default_depth() -> usize {
 fn default_max_tokens() -> usize {
     8000
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_response_success() {
+        let resp = Response::success(Some(serde_json::json!(1)), serde_json::json!({"ok": true}));
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+        assert_eq!(resp.jsonrpc, "2.0");
+        assert_eq!(resp.id, Some(serde_json::json!(1)));
+    }
+
+    #[test]
+    fn test_response_error() {
+        let resp = Response::error(Some(serde_json::json!(2)), -32600, "Bad request");
+        assert!(resp.result.is_none());
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32600);
+        assert_eq!(err.message, "Bad request");
+    }
+
+    #[test]
+    fn test_response_parse_error() {
+        let resp = Response::parse_error();
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32700);
+        assert!(resp.id.is_none());
+    }
+
+    #[test]
+    fn test_response_method_not_found() {
+        let resp = Response::method_not_found(Some(serde_json::json!(5)), "foo.bar");
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32601);
+        assert!(err.message.contains("foo.bar"));
+    }
+
+    #[test]
+    fn test_response_invalid_params() {
+        let resp = Response::invalid_params(Some(serde_json::json!(3)), "missing field");
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("missing field"));
+    }
+
+    #[test]
+    fn test_response_internal_error() {
+        let resp = Response::internal_error(None, "something broke");
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32603);
+    }
+
+    #[test]
+    fn test_default_limit() {
+        assert_eq!(default_limit(), 10);
+    }
+
+    #[test]
+    fn test_default_depth() {
+        assert_eq!(default_depth(), 3);
+    }
+
+    #[test]
+    fn test_default_max_tokens() {
+        assert_eq!(default_max_tokens(), 8000);
+    }
+
+    #[test]
+    fn test_discover_params_deserialization() {
+        let json = serde_json::json!({"query": "foo"});
+        let params: DiscoverParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.query, "foo");
+        assert_eq!(params.limit, 10); // default
+    }
+
+    #[test]
+    fn test_impact_params_deserialization() {
+        let json = serde_json::json!({"node": "main", "depth": 5});
+        let params: ImpactParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.node, "main");
+        assert_eq!(params.depth, 5);
+    }
+
+    #[test]
+    fn test_search_params_with_kind_filter() {
+        let json = serde_json::json!({"query": "user", "kind": "function", "limit": 20});
+        let params: SearchParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.query, "user");
+        assert_eq!(params.kind.as_deref(), Some("function"));
+        assert_eq!(params.limit, 20);
+    }
+
+    #[test]
+    fn test_response_serialization_roundtrip() {
+        let resp = Response::success(Some(serde_json::json!(1)), "hello");
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"jsonrpc\":\"2.0\""));
+        assert!(json.contains("\"hello\""));
+        // Error field should be skipped
+        assert!(!json.contains("\"error\""));
+    }
+}
