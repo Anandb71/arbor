@@ -21,6 +21,7 @@ Know what breaks *before* you break it.
 
 ## Table of Contents
 
+- [The Arbor Philosophy](#the-arbor-philosophy)
 - [Why Arbor](#why-arbor)
 - [What you get](#what-you-get)
 - [Visual tour](#visual-tour)
@@ -35,6 +36,18 @@ Know what breaks *before* you break it.
 - [Contributors](#contributors)
 - [Security](#security)
 - [License](#license)
+
+---
+
+## The Arbor Philosophy
+
+Arbor is rooted in three unwavering principles, listed in strict order of priority. Every architectural decision is measured against this hierarchy:
+
+1. **Consumer First**: Tooling must be beautiful, intuitive, and instantly useful out of the box. The developer experience triumphs over all other metrics.
+2. **Accessibility Second**: Deep AI intelligence and graph analysis should never be gatekept. Our tooling is built to work seamlessly across language ecosystems and run deterministically on any machine.
+3. **Affordability Next**: We ruthlessly optimize for minimal computational overhead. From edge laptops to giant monoliths, graph exploration should have zero-friction adoption.
+
+For comprehensive details on our approach, read our [PHILOSOPHY.md](PHILOSOPHY.md).
 
 ---
 
