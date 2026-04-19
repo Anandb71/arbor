@@ -187,4 +187,45 @@ mod tests {
             "Should resolve cross-file edge via FQN"
         );
     }
+
+    #[test]
+    fn test_build_unresolved_references_no_false_edges() {
+        // If a reference can't be resolved, no edge should be created
+        let mut builder = GraphBuilder::new();
+
+        let node = CodeNode::new("caller", "caller", NodeKind::Function, "a.rs")
+            .with_references(vec!["nonexistent_function".to_string()]);
+
+        builder.add_nodes(vec![node]);
+        let graph = builder.build();
+
+        assert_eq!(graph.node_count(), 1);
+        assert_eq!(graph.edge_count(), 0, "Unresolved references should not create edges");
+    }
+
+    #[test]
+    fn test_build_empty_graph() {
+        let builder = GraphBuilder::new();
+        let graph = builder.build();
+
+        assert_eq!(graph.node_count(), 0);
+        assert_eq!(graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn test_build_multiple_edges_between_same_nodes() {
+        let mut builder = GraphBuilder::new();
+
+        let caller = CodeNode::new("main", "main", NodeKind::Function, "main.rs")
+            .with_references(vec!["helper".to_string(), "helper".to_string()]);
+
+        let callee = CodeNode::new("helper", "helper", NodeKind::Function, "lib.rs");
+
+        builder.add_nodes(vec![caller, callee]);
+        let graph = builder.build();
+
+        assert_eq!(graph.node_count(), 2);
+        // Even with duplicate references, edges should still work
+        assert!(graph.edge_count() >= 1);
+    }
 }

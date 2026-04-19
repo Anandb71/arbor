@@ -235,4 +235,112 @@ mod tests {
         let non_handler = CodeNode::new("calculate", "calculate", NodeKind::Function, "math.ts");
         assert!(!HeuristicsMatcher::is_event_handler(&non_handler));
     }
+
+    #[test]
+    fn test_react_component_detection() {
+        let component = CodeNode::new("UserProfile", "UserProfile", NodeKind::Function, "profile.tsx");
+        assert!(HeuristicsMatcher::is_react_component(&component));
+
+        let non_component = CodeNode::new("helper", "helper", NodeKind::Function, "utils.tsx");
+        assert!(!HeuristicsMatcher::is_react_component(&non_component));
+
+        // Not a .tsx file -> not a React component
+        let wrong_ext = CodeNode::new("UserProfile", "UserProfile", NodeKind::Function, "profile.rs");
+        assert!(!HeuristicsMatcher::is_react_component(&wrong_ext));
+
+        // Class in .tsx is also a React component
+        let class_comp = CodeNode::new("AppContainer", "AppContainer", NodeKind::Class, "app.tsx");
+        assert!(HeuristicsMatcher::is_react_component(&class_comp));
+    }
+
+    #[test]
+    fn test_callback_style_detection() {
+        let callback = CodeNode::new("on_click_handler", "on_click_handler", NodeKind::Function, "a.rs");
+        assert!(HeuristicsMatcher::is_callback_style(&callback));
+
+        let callback_fn = CodeNode::new("sortFn", "sortFn", NodeKind::Function, "a.ts");
+        assert!(HeuristicsMatcher::is_callback_style(&callback_fn));
+
+        let regular = CodeNode::new("process_data", "process_data", NodeKind::Function, "a.rs");
+        assert!(!HeuristicsMatcher::is_callback_style(&regular));
+    }
+
+    #[test]
+    fn test_dependency_injection_detection() {
+        let factory = CodeNode::new("UserFactory", "UserFactory", NodeKind::Class, "factory.ts");
+        assert!(HeuristicsMatcher::is_dependency_injection(&factory));
+
+        let provider = CodeNode::new("AuthProvider", "AuthProvider", NodeKind::Class, "auth.ts");
+        assert!(HeuristicsMatcher::is_dependency_injection(&provider));
+
+        let regular = CodeNode::new("UserService", "UserService", NodeKind::Class, "service.ts");
+        assert!(!HeuristicsMatcher::is_dependency_injection(&regular));
+    }
+
+    #[test]
+    fn test_infer_uncertain_edges_from_patterns() {
+        let handler = CodeNode::new("onClick", "onClick", NodeKind::Function, "button.ts");
+        let widget = CodeNode::new("HomeWidget", "HomeWidget", NodeKind::Class, "home.dart");
+        let regular = CodeNode::new("calculate", "calculate", NodeKind::Function, "math.ts");
+
+        let nodes: Vec<&CodeNode> = vec![&handler, &widget, &regular];
+        let edges = HeuristicsMatcher::infer_uncertain_edges(&nodes);
+
+        // Should have edges for handler (EventHandler) and widget (WidgetTree)
+        assert!(edges.iter().any(|e| matches!(e.kind, UncertainEdgeKind::EventHandler)));
+        assert!(edges.iter().any(|e| matches!(e.kind, UncertainEdgeKind::WidgetTree)));
+        // Regular function shouldn't produce uncertain edges
+        assert!(!edges.iter().any(|e| e.to == regular.id));
+    }
+
+    #[test]
+    fn test_detect_analysis_limitations_callbacks() {
+        // Create 6+ callback-style nodes to trigger the warning
+        let nodes: Vec<CodeNode> = (0..7).map(|i| {
+            CodeNode::new(
+                &format!("on_event_{}", i),
+                &format!("on_event_{}", i),
+                NodeKind::Function,
+                "events.ts"
+            )
+        }).collect();
+        let node_refs: Vec<&CodeNode> = nodes.iter().collect();
+
+        let warnings = detect_analysis_limitations(&node_refs);
+        assert!(!warnings.is_empty());
+        assert!(warnings.iter().any(|w| w.message.contains("callback")));
+    }
+
+    #[test]
+    fn test_detect_analysis_limitations_flutter_widgets() {
+        let widgets: Vec<CodeNode> = vec![
+            CodeNode::new("HomeWidget", "HomeWidget", NodeKind::Class, "home.dart"),
+        ];
+        let node_refs: Vec<&CodeNode> = widgets.iter().collect();
+
+        let warnings = detect_analysis_limitations(&node_refs);
+        assert!(warnings.iter().any(|w| w.message.contains("Flutter")));
+    }
+
+    #[test]
+    fn test_uncertain_edge_kind_display() {
+        assert_eq!(UncertainEdgeKind::Callback.to_string(), "callback");
+        assert_eq!(UncertainEdgeKind::DynamicDispatch.to_string(), "dynamic dispatch");
+        assert_eq!(UncertainEdgeKind::WidgetTree.to_string(), "widget tree");
+        assert_eq!(UncertainEdgeKind::EventHandler.to_string(), "event handler");
+        assert_eq!(UncertainEdgeKind::DependencyInjection.to_string(), "dependency injection");
+        assert_eq!(UncertainEdgeKind::Reflection.to_string(), "reflection");
+    }
+
+    #[test]
+    fn test_no_warnings_for_clean_code() {
+        let nodes: Vec<CodeNode> = vec![
+            CodeNode::new("main", "main", NodeKind::Function, "main.rs"),
+            CodeNode::new("helper", "helper", NodeKind::Function, "utils.rs"),
+        ];
+        let node_refs: Vec<&CodeNode> = nodes.iter().collect();
+
+        let warnings = detect_analysis_limitations(&node_refs);
+        assert!(warnings.is_empty());
+    }
 }

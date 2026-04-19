@@ -6,8 +6,8 @@
 use crate::edge::{Edge, EdgeKind, GraphEdge};
 use crate::search_index::SearchIndex;
 use arbor_core::CodeNode;
-use petgraph::graph::{DiGraph, NodeIndex};
-use petgraph::visit::EdgeRef; // For edge_references
+use petgraph::stable_graph::{NodeIndex, StableDiGraph};
+use petgraph::visit::{EdgeRef, IntoEdgeReferences}; // For edge_references
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -21,7 +21,7 @@ pub type NodeId = NodeIndex;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ArborGraph {
     /// The underlying petgraph graph.
-    pub(crate) graph: DiGraph<CodeNode, Edge>,
+    pub(crate) graph: StableDiGraph<CodeNode, Edge>,
 
     /// Maps string IDs to graph node indexes.
     id_index: HashMap<String, NodeId>,
@@ -50,7 +50,7 @@ impl ArborGraph {
     /// Creates a new empty graph.
     pub fn new() -> Self {
         Self {
-            graph: DiGraph::new(),
+            graph: StableDiGraph::new(),
             id_index: HashMap::new(),
             name_index: HashMap::new(),
             file_index: HashMap::new(),
@@ -247,7 +247,7 @@ impl ArborGraph {
 
     /// Returns all edges with source and target IDs for export.
     pub fn export_edges(&self) -> Vec<GraphEdge> {
-        self.graph
+        (&self.graph)
             .edge_references()
             .filter_map(|edge_ref| {
                 let source = self.graph.node_weight(edge_ref.source())?.id.clone();
@@ -308,5 +308,217 @@ impl ArborGraph {
             edge_count: self.edge_count(),
             files: self.file_index.len(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::edge::{Edge, EdgeKind};
+    use arbor_core::{CodeNode, NodeKind};
+
+    fn make_node(name: &str, file: &str) -> CodeNode {
+        CodeNode::new(name, name, NodeKind::Function, file)
+    }
+
+    #[test]
+    fn test_graph_new_is_empty() {
+        let g = ArborGraph::new();
+        assert_eq!(g.node_count(), 0);
+        assert_eq!(g.edge_count(), 0);
+        assert!(g.nodes().next().is_none());
+    }
+
+    #[test]
+    fn test_graph_add_and_get_node() {
+        let mut g = ArborGraph::new();
+        let node = make_node("foo", "main.rs");
+        let id = g.add_node(node.clone());
+        assert_eq!(g.node_count(), 1);
+
+        let got = g.get(id).unwrap();
+        assert_eq!(got.name, "foo");
+    }
+
+    #[test]
+    fn test_graph_find_by_name() {
+        let mut g = ArborGraph::new();
+        g.add_node(make_node("alpha", "a.rs"));
+        g.add_node(make_node("beta", "b.rs"));
+
+        let found = g.find_by_name("alpha");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "alpha");
+
+        let not_found = g.find_by_name("gamma");
+        assert!(not_found.is_empty());
+    }
+
+    #[test]
+    fn test_graph_find_by_file() {
+        let mut g = ArborGraph::new();
+        g.add_node(make_node("foo", "main.rs"));
+        g.add_node(make_node("bar", "main.rs"));
+        g.add_node(make_node("baz", "other.rs"));
+
+        let main_nodes = g.find_by_file("main.rs");
+        assert_eq!(main_nodes.len(), 2);
+
+        let other_nodes = g.find_by_file("other.rs");
+        assert_eq!(other_nodes.len(), 1);
+
+        let empty = g.find_by_file("nonexistent.rs");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_graph_search_substring() {
+        let mut g = ArborGraph::new();
+        g.add_node(make_node("validate_user", "a.rs"));
+        g.add_node(make_node("validate_email", "b.rs"));
+        g.add_node(make_node("send_email", "c.rs"));
+
+        let results = g.search("validate");
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|n| n.name == "validate_user"));
+        assert!(results.iter().any(|n| n.name == "validate_email"));
+    }
+
+    #[test]
+    fn test_graph_callers_callees() {
+        let mut g = ArborGraph::new();
+        let a = g.add_node(make_node("caller", "a.rs"));
+        let b = g.add_node(make_node("callee", "b.rs"));
+        g.add_edge(a, b, Edge::new(EdgeKind::Calls));
+
+        let callees = g.get_callees(a);
+        assert_eq!(callees.len(), 1);
+        assert_eq!(callees[0].name, "callee");
+
+        let callers = g.get_callers(b);
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].name, "caller");
+
+        // No callers/callees for disconnected nodes
+        assert!(g.get_callers(a).is_empty());
+        assert!(g.get_callees(b).is_empty());
+    }
+
+    #[test]
+    fn test_graph_get_dependents() {
+        // a -> b -> c
+        let mut g = ArborGraph::new();
+        let a = g.add_node(make_node("a", "a.rs"));
+        let b = g.add_node(make_node("b", "b.rs"));
+        let c = g.add_node(make_node("c", "c.rs"));
+        g.add_edge(a, b, Edge::new(EdgeKind::Calls));
+        g.add_edge(b, c, Edge::new(EdgeKind::Calls));
+
+        // Dependents of c at depth 2 should include a and b
+        let deps = g.get_dependents(c, 2);
+        assert!(deps.iter().any(|(idx, _)| g.get(*idx).unwrap().name == "b"));
+        assert!(deps.iter().any(|(idx, _)| g.get(*idx).unwrap().name == "a"));
+    }
+
+    #[test]
+    fn test_graph_remove_file_cleanup() {
+        let mut g = ArborGraph::new();
+        g.add_node(make_node("foo", "remove_me.rs"));
+        g.add_node(make_node("bar", "remove_me.rs"));
+        g.add_node(make_node("keep", "keep.rs"));
+
+        assert_eq!(g.node_count(), 3);
+
+        g.remove_file("remove_me.rs");
+
+        // Nodes from removed file are gone
+        assert!(g.find_by_name("foo").is_empty());
+        assert!(g.find_by_name("bar").is_empty());
+        // Node from other file remains
+        assert_eq!(g.find_by_name("keep").len(), 1);
+        assert!(g.find_by_file("remove_me.rs").is_empty());
+    }
+
+    #[test]
+    fn test_graph_find_path() {
+        // a -> b -> c
+        let mut g = ArborGraph::new();
+        let a = g.add_node(make_node("start", "a.rs"));
+        let b = g.add_node(make_node("middle", "b.rs"));
+        let c = g.add_node(make_node("end", "c.rs"));
+        g.add_edge(a, b, Edge::new(EdgeKind::Calls));
+        g.add_edge(b, c, Edge::new(EdgeKind::Calls));
+
+        let path = g.find_path(a, c).unwrap();
+        assert_eq!(path.len(), 3);
+        assert_eq!(path[0].name, "start");
+        assert_eq!(path[1].name, "middle");
+        assert_eq!(path[2].name, "end");
+    }
+
+    #[test]
+    fn test_graph_find_path_no_connection() {
+        let mut g = ArborGraph::new();
+        let a = g.add_node(make_node("island_a", "a.rs"));
+        let b = g.add_node(make_node("island_b", "b.rs"));
+
+        // No edges → no path
+        assert!(g.find_path(a, b).is_none());
+    }
+
+    #[test]
+    fn test_graph_export_edges() {
+        let mut g = ArborGraph::new();
+        let a = g.add_node(make_node("a", "a.rs"));
+        let b = g.add_node(make_node("b", "b.rs"));
+        g.add_edge(a, b, Edge::new(EdgeKind::Calls));
+
+        let exported = g.export_edges();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].kind, EdgeKind::Calls);
+    }
+
+    #[test]
+    fn test_graph_stats() {
+        let mut g = ArborGraph::new();
+        g.add_node(make_node("a", "x.rs"));
+        g.add_node(make_node("b", "y.rs"));
+
+        let stats = g.stats();
+        assert_eq!(stats.node_count, 2);
+        assert_eq!(stats.edge_count, 0);
+        assert_eq!(stats.files, 2);
+    }
+
+    #[test]
+    fn test_graph_get_index_and_get_by_id() {
+        let mut g = ArborGraph::new();
+        let node = make_node("lookup_me", "test.rs");
+        let node_id_str = node.id.clone();
+        let idx = g.add_node(node);
+
+        assert_eq!(g.get_index(&node_id_str), Some(idx));
+        assert!(g.get_by_id(&node_id_str).is_some());
+        assert!(g.get_index("nonexistent").is_none());
+        assert!(g.get_by_id("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_graph_centrality_default_zero() {
+        let mut g = ArborGraph::new();
+        let idx = g.add_node(make_node("a", "a.rs"));
+        assert_eq!(g.centrality(idx), 0.0);
+    }
+
+    #[test]
+    fn test_graph_set_centrality() {
+        let mut g = ArborGraph::new();
+        let idx = g.add_node(make_node("a", "a.rs"));
+
+        let mut scores = HashMap::new();
+        scores.insert(idx, 0.75);
+        g.set_centrality(scores);
+
+        assert!((g.centrality(idx) - 0.75).abs() < f64::EPSILON);
     }
 }

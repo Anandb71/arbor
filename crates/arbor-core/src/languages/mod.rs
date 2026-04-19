@@ -6,6 +6,7 @@
 
 mod c;
 mod cpp;
+mod csharp;
 mod dart;
 mod go;
 mod java;
@@ -67,6 +68,9 @@ pub fn get_parser(extension: &str) -> Option<Box<dyn LanguageParser>> {
         // C++
         "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx" => Some(Box::new(cpp::CppParser)),
 
+        // C#
+        "cs" => Some(Box::new(csharp::CSharpParser)),
+
         // Dart
         "dart" => Some(Box::new(dart::DartParser)),
 
@@ -85,6 +89,7 @@ pub fn supported_extensions() -> &'static [&'static str] {
         "java", // Java
         "c", "h", // C
         "cpp", "hpp", "cc", "hh", "cxx", "hxx",  // C++
+        "cs",   // C#
         "dart", // Dart
         "kt", "kts",   // Kotlin (fallback parser)
         "swift", // Swift (fallback parser)

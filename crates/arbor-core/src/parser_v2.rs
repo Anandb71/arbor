@@ -954,4 +954,182 @@ class UserService:
             .any(|s| s.name == "computeInvoiceTotal"));
         assert!(result.relations.is_empty());
     }
+
+    #[test]
+    fn test_parse_go_symbols() {
+        let mut parser = ArborParser::new().unwrap();
+
+        let source = r#"
+package main
+
+import "fmt"
+
+func greet(name string) string {
+    return fmt.Sprintf("Hello, %s!", name)
+}
+
+type User struct {
+    Name string
+    Age  int
+}
+
+type Service interface {
+    Process(data []byte) error
+}
+"#;
+
+        let result = parser.parse_source(source, "main.go", "go").unwrap();
+
+        assert!(result.symbols.iter().any(|s| s.name == "greet"));
+        assert!(result.symbols.iter().any(|s| s.name == "User"));
+        assert!(result.symbols.iter().any(|s| s.name == "Service"));
+    }
+
+    #[test]
+    fn test_parse_java_symbols() {
+        let mut parser = ArborParser::new().unwrap();
+
+        let source = r#"
+package com.example;
+
+import java.util.List;
+
+public class OrderService {
+    public void processOrder(String orderId) {
+        validate(orderId);
+    }
+
+    private void validate(String id) {
+    }
+}
+"#;
+
+        let result = parser.parse_source(source, "OrderService.java", "java").unwrap();
+
+        assert!(result.symbols.iter().any(|s| s.name == "OrderService"));
+        assert!(result.symbols.iter().any(|s| s.name == "processOrder"));
+        assert!(result.symbols.iter().any(|s| s.name == "validate"));
+    }
+
+    #[test]
+    fn test_parse_c_symbols() {
+        let mut parser = ArborParser::new().unwrap();
+
+        let source = r#"
+#include <stdio.h>
+
+struct Point {
+    int x;
+    int y;
+};
+
+void print_point(struct Point p) {
+    printf("(%d, %d)\n", p.x, p.y);
+}
+
+int add(int a, int b) {
+    return a + b;
+}
+"#;
+
+        let result = parser.parse_source(source, "math.c", "c").unwrap();
+
+        assert!(result.symbols.iter().any(|s| s.name == "Point"));
+        assert!(result.symbols.iter().any(|s| s.name == "print_point"));
+        assert!(result.symbols.iter().any(|s| s.name == "add"));
+    }
+
+    #[test]
+    fn test_parse_cpp_symbols() {
+        let mut parser = ArborParser::new().unwrap();
+
+        let source = r#"
+#include <iostream>
+
+class Calculator {
+public:
+    int add(int a, int b) {
+        return a + b;
+    }
+};
+
+struct Config {
+    int timeout;
+};
+
+void helpers() {
+    std::cout << "ok" << std::endl;
+}
+"#;
+
+        let result = parser.parse_source(source, "calc.cpp", "cpp").unwrap();
+
+        assert!(result.symbols.iter().any(|s| s.name == "Calculator"));
+        assert!(result.symbols.iter().any(|s| s.name == "Config"));
+        assert!(result.symbols.iter().any(|s| s.name == "helpers"));
+    }
+
+    #[test]
+    fn test_parse_csharp_symbols() {
+        let mut parser = ArborParser::new().unwrap();
+
+        let source = r#"
+using System;
+
+namespace MyApp
+{
+    public class UserController
+    {
+        public string GetUser(int id)
+        {
+            return "user";
+        }
+    }
+
+    public interface IRepository
+    {
+        void Save(string data);
+    }
+}
+"#;
+
+        let result = parser.parse_source(source, "UserController.cs", "cs").unwrap();
+
+        assert!(result.symbols.iter().any(|s| s.name == "UserController"));
+        assert!(result.symbols.iter().any(|s| s.name == "GetUser"));
+        assert!(result.symbols.iter().any(|s| s.name == "IRepository"));
+        assert!(result.symbols.iter().any(|s| s.name == "Save"));
+    }
+
+    #[test]
+    fn test_parse_unsupported_extension_errors() {
+        let mut parser = ArborParser::new().unwrap();
+        let result = parser.parse_source("anything", "test.xyz", "xyz");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_result_file_path() {
+        let mut parser = ArborParser::new().unwrap();
+        let result = parser.parse_source("fn main() {}", "test.rs", "rs").unwrap();
+        assert_eq!(result.file_path, "test.rs");
+    }
+
+    #[test]
+    fn test_parse_python_imports_detected() {
+        let mut parser = ArborParser::new().unwrap();
+
+        let source = r#"
+import os
+from pathlib import Path
+
+def read_file(path):
+    with open(path) as f:
+        return f.read()
+"#;
+
+        let result = parser.parse_source(source, "utils.py", "py").unwrap();
+        assert!(result.symbols.iter().any(|s| s.name == "read_file"));
+        assert!(result.relations.iter().any(|r| r.kind == RelationType::Imports));
+    }
 }

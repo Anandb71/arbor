@@ -71,6 +71,10 @@ impl SearchIndex {
     ///
     /// Returns matching NodeIds sorted for deterministic output.
     pub fn search(&self, query: &str) -> Vec<NodeId> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+
         let query_lower = query.to_lowercase();
 
         // For very short queries, fall back to prefix matching on exact index
@@ -244,5 +248,51 @@ mod tests {
         assert!(results.contains(&node_id(0)));
         assert!(results.contains(&node_id(1)));
         assert!(!results.contains(&node_id(2)));
+    }
+
+    #[test]
+    fn test_index_len_and_is_empty() {
+        let mut index = SearchIndex::new();
+        assert!(index.is_empty());
+        assert_eq!(index.len(), 0);
+
+        index.insert("foo", node_id(0));
+        assert!(!index.is_empty());
+        assert_eq!(index.len(), 1);
+
+        index.insert("bar", node_id(1));
+        assert_eq!(index.len(), 2);
+    }
+
+    #[test]
+    fn test_duplicate_name_different_ids() {
+        let mut index = SearchIndex::new();
+        // Two different nodes with the same name (overloads, different files)
+        index.insert("process", node_id(0));
+        index.insert("process", node_id(1));
+
+        let results = index.search("process");
+        assert!(results.contains(&node_id(0)));
+        assert!(results.contains(&node_id(1)));
+        // len() should still be 1 since it's the same name
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn test_remove_nonexistent_does_not_panic() {
+        let mut index = SearchIndex::new();
+        // Removing from empty index should not panic
+        index.remove("nonexistent", node_id(99));
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn test_search_empty_query() {
+        let mut index = SearchIndex::new();
+        index.insert("hello", node_id(0));
+
+        // Empty query should return empty (no prefix matches)
+        let results = index.search("");
+        assert!(results.is_empty());
     }
 }

@@ -255,3 +255,131 @@ impl Hash for CodeNode {
         self.id.hash(state);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_node_kind_display_all_variants() {
+        // Exhaustive check of Display for every NodeKind variant
+        assert_eq!(NodeKind::Function.to_string(), "function");
+        assert_eq!(NodeKind::Method.to_string(), "method");
+        assert_eq!(NodeKind::Class.to_string(), "class");
+        assert_eq!(NodeKind::Struct.to_string(), "struct");
+        assert_eq!(NodeKind::Interface.to_string(), "interface");
+        assert_eq!(NodeKind::Enum.to_string(), "enum");
+        assert_eq!(NodeKind::Module.to_string(), "module");
+        assert_eq!(NodeKind::Field.to_string(), "field");
+        assert_eq!(NodeKind::Constant.to_string(), "constant");
+        assert_eq!(NodeKind::Constructor.to_string(), "constructor");
+        assert_eq!(NodeKind::Import.to_string(), "import");
+        assert_eq!(NodeKind::Export.to_string(), "export");
+        assert_eq!(NodeKind::TypeAlias.to_string(), "type_alias");
+        assert_eq!(NodeKind::Variable.to_string(), "variable");
+    }
+
+    #[test]
+    fn test_visibility_default_is_private() {
+        let vis = Visibility::default();
+        assert!(matches!(vis, Visibility::Private));
+    }
+
+    #[test]
+    fn test_builder_pattern_chain() {
+        // Verify that all builder methods compose correctly
+        let node = CodeNode::new("foo", "pkg.foo", NodeKind::Function, "main.rs")
+            .with_lines(10, 20)
+            .with_bytes(100, 300)
+            .with_column(4)
+            .with_signature("fn foo(x: i32) -> bool")
+            .with_visibility(Visibility::Public)
+            .as_async()
+            .as_static()
+            .as_exported()
+            .with_references(vec!["bar".to_string(), "baz".to_string()]);
+
+        assert_eq!(node.name, "foo");
+        assert_eq!(node.qualified_name, "pkg.foo");
+        assert_eq!(node.file, "main.rs");
+        assert_eq!(node.line_start, 10);
+        assert_eq!(node.line_end, 20);
+        assert_eq!(node.byte_start, 100);
+        assert_eq!(node.byte_end, 300);
+        assert_eq!(node.column, 4);
+        assert_eq!(node.signature.as_deref(), Some("fn foo(x: i32) -> bool"));
+        assert!(matches!(node.visibility, Visibility::Public));
+        assert!(node.is_async);
+        assert!(node.is_static);
+        assert!(node.is_exported);
+        assert_eq!(node.references.len(), 2);
+    }
+
+    #[test]
+    fn test_code_node_equality_by_id() {
+        // PartialEq compares by ID only, not by other fields
+        let node1 = CodeNode::new("foo", "foo", NodeKind::Function, "a.rs");
+        let node2 = CodeNode::new("foo", "foo", NodeKind::Function, "a.rs");
+        // Same inputs → same ID → equal
+        assert_eq!(node1, node2);
+
+        // Different kind → different ID → not equal
+        let node3 = CodeNode::new("foo", "foo", NodeKind::Method, "a.rs");
+        assert_ne!(node1, node3);
+    }
+
+    #[test]
+    fn test_code_node_hash_consistency() {
+        // Same node should hash identically, and be usable in HashSet
+        let node1 = CodeNode::new("foo", "foo", NodeKind::Function, "main.rs");
+        let node2 = CodeNode::new("foo", "foo", NodeKind::Function, "main.rs");
+
+        let mut set = HashSet::new();
+        set.insert(node1.clone());
+        assert!(set.contains(&node2));
+        // Inserting duplicate should not increase size
+        set.insert(node2);
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn test_compute_id_deterministic() {
+        // Same inputs must always produce the same ID
+        let id1 = CodeNode::compute_id("test.rs", "main", NodeKind::Function);
+        let id2 = CodeNode::compute_id("test.rs", "main", NodeKind::Function);
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_compute_id_different_kinds_differ() {
+        // A function and a struct with the same name should have different IDs
+        let id_fn = CodeNode::compute_id("test.rs", "Foo", NodeKind::Function);
+        let id_struct = CodeNode::compute_id("test.rs", "Foo", NodeKind::Struct);
+        assert_ne!(id_fn, id_struct);
+    }
+
+    #[test]
+    fn test_compute_id_different_files_differ() {
+        let id1 = CodeNode::compute_id("a.rs", "main", NodeKind::Function);
+        let id2 = CodeNode::compute_id("b.rs", "main", NodeKind::Function);
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_node_default_values() {
+        // Verify sensible defaults for a freshly created node
+        let node = CodeNode::new("f", "f", NodeKind::Function, "x.rs");
+        assert_eq!(node.line_start, 0);
+        assert_eq!(node.line_end, 0);
+        assert_eq!(node.byte_start, 0);
+        assert_eq!(node.byte_end, 0);
+        assert_eq!(node.column, 0);
+        assert!(node.signature.is_none());
+        assert!(!node.is_async);
+        assert!(!node.is_static);
+        assert!(!node.is_exported);
+        assert!(node.references.is_empty());
+        assert!(matches!(node.visibility, Visibility::Private));
+    }
+}

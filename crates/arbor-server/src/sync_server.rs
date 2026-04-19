@@ -47,10 +47,15 @@ impl Default for SyncServerConfig {
             extensions: vec![
                 "ts".into(),
                 "tsx".into(),
+                "mts".into(),
+                "cts".into(),
                 "js".into(),
                 "jsx".into(),
+                "mjs".into(),
+                "cjs".into(),
                 "rs".into(),
                 "py".into(),
+                "pyi".into(),
                 "go".into(),
                 "java".into(),
                 "c".into(),
@@ -758,5 +763,86 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("GraphUpdate"));
         assert!(json.contains("42"));
+    }
+
+    #[test]
+    fn test_sync_config_default_has_all_extensions() {
+        let config = SyncServerConfig::default();
+        let exts = &config.extensions;
+
+        // Verify all primary extensions from arbor_core::languages are present
+        let required = vec![
+            "ts", "tsx", "mts", "cts",
+            "js", "jsx", "mjs", "cjs",
+            "rs",
+            "py", "pyi",
+            "go",
+            "java",
+            "c", "h",
+            "cpp", "hpp", "cc", "hh", "cxx", "hxx",
+            "cs",
+            "dart",
+            "kt", "kts",
+            "swift",
+            "rb",
+            "php", "phtml",
+            "sh", "bash", "zsh",
+        ];
+
+        for ext in &required {
+            assert!(
+                exts.contains(&ext.to_string()),
+                "SyncServerConfig is missing extension: {}",
+                ext
+            );
+        }
+    }
+
+    #[test]
+    fn test_focus_node_serialization() {
+        let msg = BroadcastMessage::FocusNode(FocusNodePayload {
+            node_id: "abc123".to_string(),
+            file: "main.rs".to_string(),
+            line: 42,
+        });
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("FocusNode"));
+        assert!(json.contains("abc123"));
+        assert!(json.contains("main.rs"));
+    }
+
+    #[test]
+    fn test_indexer_status_serialization() {
+        let msg = BroadcastMessage::IndexerStatus(IndexerStatusPayload {
+            phase: "scanning".to_string(),
+            files_processed: 10,
+            files_total: 100,
+            current_file: Some("test.rs".to_string()),
+        });
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("scanning"));
+        assert!(json.contains("test.rs"));
+    }
+
+    #[test]
+    fn test_hello_payload_serialization() {
+        let msg = BroadcastMessage::Hello(HelloPayload {
+            version: "1.9.0".to_string(),
+            node_count: 100,
+            edge_count: 200,
+        });
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("1.9.0"));
+        assert!(json.contains("100"));
+    }
+
+    #[test]
+    fn test_graph_end_serialization() {
+        let msg = BroadcastMessage::GraphEnd;
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("GraphEnd"));
     }
 }
