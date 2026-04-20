@@ -2,7 +2,7 @@
   "name": "arbor-vscode",
   "displayName": "Arbor — Graph Intelligence for Code",
   "description": "Impact analysis, refactor prediction, and AI-aware code navigation powered by semantic dependency graphs",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "publisher": "arbor",
   "license": "MIT",
   "repository": {

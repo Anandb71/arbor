@@ -231,7 +231,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: Anandb71/arbor@v2.0.0
+      - uses: Anandb71/arbor@v2.0.1
         with:
           command: check . --max-blast-radius 30
 ```

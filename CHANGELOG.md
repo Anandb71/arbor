@@ -5,6 +5,18 @@ All notable changes to Arbor will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-04-20 "Patch Stability & Automation Fixes"
+
+### Fixed
+- **PR Bot reliability**: switched to valid CLI-driven impact report generation (`arbor diff . --json`) and added PR base/head commit-range support via `ARBOR_DIFF_BASE` / `ARBOR_DIFF_HEAD`.
+- **PR Bot formatting**: corrected Markdown code-fence rendering so JSON output appears as a proper fenced block in PR comments.
+- **CLI regression coverage**: added integration test coverage for ranged diff mode to prevent regressions in PR-impact reporting.
+- **Contributors automation**: hardened `contributors.yml` by skipping PR creation when README has no contributor changes and using `github.token` consistently.
+- **Contributors script resilience**: updated GitHub auth header usage and graceful API failure handling to avoid flaky scheduled workflow failures.
+
+### Changed
+- Release-facing versions aligned to **2.0.1** across workspace/package-manager/editor manifests (Cargo workspace version, Homebrew, Scoop, npm wrapper, VS Code extension metadata).
+
 ## [2.0.0] - 2026-04-20 "Context-Driven OS + Stability Release"
 
 ### Added

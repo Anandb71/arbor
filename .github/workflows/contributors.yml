@@ -23,18 +23,32 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ github.token }}
 
       - name: Update contributors block in README
         shell: pwsh
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: ./scripts/update_contributors.ps1 -Repo "${{ github.repository }}" -ReadmePath "README.md" -MaxContributors 15 -Token $env:GITHUB_TOKEN
 
+      - name: Detect README changes
+        id: changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- README.md; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No README contributor changes detected."
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "README contributor block changed."
+          fi
+
       - name: Create pull request
+        if: steps.changes.outputs.has_changes == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ github.token }}
           commit-message: docs(readme): refresh contributors list
           branch: chore/refresh-contributors
           base: main
@@ -46,3 +60,7 @@ jobs:
           delete-branch: true
           add-paths: |
             README.md
+
+      - name: Skip notice
+        if: steps.changes.outputs.has_changes != 'true'
+        run: echo "Contributors are already up to date; skipping PR creation."
