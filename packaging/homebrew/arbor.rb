@@ -4,7 +4,7 @@ class Arbor < Formula
   desc "Graph-native intelligence for codebases — know what breaks before you break it"
   homepage "https://github.com/Anandb71/arbor"
   license "MIT"
-  version "2.0.0"
+  version "2.0.1"
 
   on_macos do
     if Hardware::CPU.arm?

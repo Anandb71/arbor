@@ -18,11 +18,19 @@ $headers = @{
 }
 
 if ($Token -and $Token -ne '') {
-    $headers["Authorization"] = "token $Token"
+    $headers["Authorization"] = "Bearer $Token"
 }
 
 $contributorsUrl = "https://api.github.com/repos/$Repo/contributors?per_page=100"
-$contributors = Invoke-RestMethod -Uri $contributorsUrl -Headers $headers -Method Get
+$contributors = @()
+try {
+    $contributors = Invoke-RestMethod -Uri $contributorsUrl -Headers $headers -Method Get
+}
+catch {
+    Write-Warning "Failed to fetch contributors from GitHub API: $($_.Exception.Message)"
+    Write-Warning "Skipping contributors update for this run to avoid workflow flakiness."
+    exit 0
+}
 
 if ($null -eq $contributors) {
     $contributors = @()
