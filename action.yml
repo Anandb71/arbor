@@ -6,7 +6,7 @@ branding:
 
 inputs:
   command:
-    description: Arbor command to run (without leading 'arbor'). Supports 'analyze-impact --pr=NNN' for PR Bot blast radius using graph centrality.
+    description: Arbor command to run (without leading 'arbor'). For PR bot reports, use a valid CLI command like 'diff . --json' or 'check . --json --no-fail'.
     required: false
     default: status .
   arbor-version:
@@ -45,23 +45,26 @@ runs:
       run: |
         set -euo pipefail
         cd "${{ inputs.working-directory }}"
-        if [[ "${{ inputs.command }}" == *"analyze-impact"* ]]; then
-          if arbor ${{ inputs.command }} --format markdown > arbor-impact.md 2>/tmp/arbor-impact.err; then
-            echo "Generated markdown impact report."
-          elif arbor ${{ inputs.command }} > arbor-impact.md 2>/tmp/arbor-impact.err; then
-            echo "Generated text impact report (markdown flag unsupported by this command)."
+        if [[ "${{ inputs.command }}" == *"diff"* || "${{ inputs.command }}" == *"check"* || "${{ inputs.command }}" == *"pr-summary"* || "${{ inputs.command }}" == *"analyze-impact"* ]]; then
+          if arbor ${{ inputs.command }} > /tmp/arbor-impact.out 2>/tmp/arbor-impact.err; then
+            {
+              echo "Command: \`${{ inputs.command }}\`"
+              echo
+              echo '```json'
+              cat /tmp/arbor-impact.out || true
+              echo '```'
+            } > arbor-impact.md
+            echo "Generated impact report from CLI output."
           else
             {
-              echo "## 🧠 Arbor Graph Impact Report"
-              echo
               echo "Unable to generate impact report."
               echo
               echo "Command: \`${{ inputs.command }}\`"
               echo
               echo "stderr:"
-              echo '\`\`\`'
+              echo '```'
               cat /tmp/arbor-impact.err || true
-              echo '\`\`\`'
+              echo '```'
             } > arbor-impact.md
             echo "::warning::Arbor impact analysis failed; wrote fallback report to arbor-impact.md."
           fi
