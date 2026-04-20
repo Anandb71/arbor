@@ -72,13 +72,5 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Install Linux dependencies
-        if: matrix.os == 'ubuntu-latest'
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libdbus-1-dev libssl-dev cmake
-
       - name: Build release CLI
-        run: cargo build --release -p arbor-graph-cli
+        run: cargo build --locked --release -p arbor-graph-cli
