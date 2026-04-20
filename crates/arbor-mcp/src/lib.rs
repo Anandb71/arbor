@@ -317,7 +317,8 @@ impl McpServer {
                                         "{} upstream callers, {} downstream dependencies",
                                         analysis.upstream.len(),
                                         analysis.downstream.len()
-                                    )
+                                    ),
+                                    "sorted_by_centrality": true
                                 })).unwrap_or_default()
                             }]
                         }))
