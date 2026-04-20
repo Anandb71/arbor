@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Distribution manifests fully aligned to 2.0.0 (Homebrew, Scoop, npm wrapper, VS Code extension metadata/lockfile, server serialization version fixture).
 
 ### Stable for v2.0 Release
-- Ready for `git tag v2.0.0`, workflows (release, GHCR, Marketplace, MCP notes). Everything discussed is stable.
+- `v2.0.0` tagged and `v2.0` PR branch prepared; release workflows (release, GHCR, Marketplace, MCP notes) are aligned and stable.
 
 ## [Unreleased]
 

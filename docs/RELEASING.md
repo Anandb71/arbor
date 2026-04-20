@@ -49,6 +49,11 @@ Configure these in **Settings → Secrets and variables → Actions**:
   - Trigger: GitHub Release published
   - Appends MCP quick-install snippets to release notes
 
+- `.github/workflows/arbor-pr-bot.yml`
+  - Trigger: Pull request events
+  - Runs `analyze-impact` and posts blast-radius governance comment
+  - Gracefully posts fallback context when markdown report generation fails
+
 - `.github/workflows/npm-publish.yml`
   - Trigger: GitHub Release published or manual dispatch
   - Publishes npm wrapper package from `packaging/npm/`
@@ -81,3 +86,4 @@ After release completion, verify:
 - VS Code Marketplace listing shows latest extension version
 - Open VSX listing shows latest extension version
 - Release notes include MCP install snippet section
+- Arbor PR Bot posts impact comments on new PRs (or explicit fallback comment with run URL if analysis fails)

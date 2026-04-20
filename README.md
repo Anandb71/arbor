@@ -230,8 +230,8 @@ jobs:
   arbor:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: Anandb71/arbor@release/v1.8
+      - uses: actions/checkout@v4
+      - uses: Anandb71/arbor@v2.0.0
         with:
           command: check . --max-blast-radius 30
 ```
