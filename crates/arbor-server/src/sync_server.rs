@@ -41,7 +41,7 @@ pub struct SyncServerConfig {
 impl Default for SyncServerConfig {
     fn default() -> Self {
         Self {
-            addr: "127.0.0.1:8080".parse().unwrap(),
+            addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
             watch_path: PathBuf::from("."),
             debounce_ms: 150,
             extensions: vec![
@@ -619,7 +619,16 @@ async fn run_background_indexer(
     broadcast_tx: broadcast::Sender<BroadcastMessage>,
     _root_path: PathBuf,
 ) {
-    let mut parser = ArborParser::new().expect("Failed to initialize parser");
+    let mut parser = match ArborParser::new() {
+        Ok(parser) => Some(parser),
+        Err(error) => {
+            warn!(
+                "Failed to initialize parser for background indexer; will retry lazily per event: {}",
+                error
+            );
+            None
+        }
+    };
 
     info!("🔧 Background indexer started");
 
@@ -634,6 +643,24 @@ async fn run_background_indexer(
                     .unwrap_or("unknown");
 
                 info!("📝 Re-indexing: {}", file_name);
+
+                if parser.is_none() {
+                    parser = match ArborParser::new() {
+                        Ok(parser) => Some(parser),
+                        Err(error) => {
+                            warn!(
+                                "Skipping '{}' due to parser init failure: {}",
+                                file_name,
+                                error
+                            );
+                            None
+                        }
+                    };
+                }
+
+                let Some(parser) = parser.as_mut() else {
+                    continue;
+                };
 
                 match parser.parse_file(&path) {
                     Ok(result) => {
@@ -688,8 +715,7 @@ async fn run_background_indexer(
                             changed_files: vec![result.file_path],
                             timestamp: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs(),
+                                .map_or(0, |d| d.as_secs()),
                             nodes: Some(g.nodes().cloned().collect()),
                             edges: Some(g.export_edges()),
                         });
@@ -717,8 +743,7 @@ async fn run_background_indexer(
                     changed_files: vec![file_str],
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
+                        .map_or(0, |d| d.as_secs()),
                     nodes: Some(g.nodes().cloned().collect()),
                     edges: Some(g.export_edges()),
                 });

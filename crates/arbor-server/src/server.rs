@@ -27,7 +27,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            addr: "127.0.0.1:7432".parse().unwrap(),
+            addr: SocketAddr::from(([127, 0, 0, 1], 7432)),
         }
     }
 }

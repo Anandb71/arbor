@@ -11,6 +11,7 @@ use petgraph::Direction;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
+use tracing::warn;
 
 /// Reason for stopping context collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,9 +83,18 @@ impl ContextSlice {
 use once_cell::sync::Lazy;
 use tiktoken_rs::cl100k_base;
 
-/// Global tokenizer instance (lazy-loaded once)
-static TOKENIZER: Lazy<tiktoken_rs::CoreBPE> =
-    Lazy::new(|| cl100k_base().expect("Failed to load cl100k_base tokenizer"));
+/// Global tokenizer instance (lazy-loaded once).
+/// Falls back to heuristic mode if tokenizer init fails.
+static TOKENIZER: Lazy<Option<tiktoken_rs::CoreBPE>> = Lazy::new(|| match cl100k_base() {
+    Ok(tokenizer) => Some(tokenizer),
+    Err(error) => {
+        warn!(
+            "Failed to initialize cl100k_base tokenizer; falling back to heuristic token estimates: {}",
+            error
+        );
+        None
+    }
+});
 
 /// Threshold for falling back to heuristic tokenizer (800 KB)
 const LARGE_FILE_THRESHOLD: usize = 800 * 1024;
@@ -113,8 +123,12 @@ fn estimate_tokens(node: &NodeInfo) -> usize {
         " ".repeat(lines * 40) // Approximate code content
     );
 
-    // Use tiktoken for accurate count
-    TOKENIZER.encode_with_special_tokens(&text).len()
+    // Use tiktoken for accurate count, fall back to heuristic if unavailable.
+    if let Some(tokenizer) = TOKENIZER.as_ref() {
+        tokenizer.encode_with_special_tokens(&text).len()
+    } else {
+        estimated_chars.div_ceil(4)
+    }
 }
 
 impl ArborGraph {
