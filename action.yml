@@ -48,27 +48,23 @@ runs:
         if [[ "${{ inputs.command }}" == *"diff"* || "${{ inputs.command }}" == *"check"* || "${{ inputs.command }}" == *"pr-summary"* || "${{ inputs.command }}" == *"analyze-impact"* ]]; then
           if arbor ${{ inputs.command }} > /tmp/arbor-impact.out 2>/tmp/arbor-impact.err; then
             {
-              echo "## 🧠 Arbor Graph Impact Report"
-              echo
               echo "Command: \`${{ inputs.command }}\`"
               echo
-              echo '\`\`\`json'
+              echo '```json'
               cat /tmp/arbor-impact.out || true
-              echo '\`\`\`'
+              echo '```'
             } > arbor-impact.md
             echo "Generated impact report from CLI output."
           else
             {
-              echo "## 🧠 Arbor Graph Impact Report"
-              echo
               echo "Unable to generate impact report."
               echo
               echo "Command: \`${{ inputs.command }}\`"
               echo
               echo "stderr:"
-              echo '\`\`\`'
+              echo '```'
               cat /tmp/arbor-impact.err || true
-              echo '\`\`\`'
+              echo '```'
             } > arbor-impact.md
             echo "::warning::Arbor impact analysis failed; wrote fallback report to arbor-impact.md."
           fi
