@@ -18,8 +18,11 @@ jobs:
 
       - name: Run Arbor PR Impact Analysis
         uses: ./
+        env:
+          ARBOR_DIFF_BASE: ${{ github.event.pull_request.base.sha }}
+          ARBOR_DIFF_HEAD: ${{ github.event.pull_request.head.sha }}
         with:
-          command: analyze-impact --pr=${{ github.event.pull_request.number }}
+          command: diff . --json
           install-from-source: true
           working-directory: .
 

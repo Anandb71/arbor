@@ -280,6 +280,28 @@ fn git_changed_files(path: &Path) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
 
+    let range_base = std::env::var("ARBOR_DIFF_BASE").ok();
+    let range_head = std::env::var("ARBOR_DIFF_HEAD").ok();
+
+    if let (Some(base), Some(head)) = (range_base, range_head) {
+        let base = base.trim();
+        let head = head.trim();
+
+        if !base.is_empty() && !head.is_empty() {
+            let ranged = run_git(
+                path,
+                &["diff", "-w", "--name-status", "--find-renames", base, head],
+            )?;
+
+            let mut files = parse_git_name_status_output(&ranged);
+            files.retain(|path| !is_generated_or_internal_path(path));
+            files.sort();
+            files.dedup();
+
+            return Ok(files);
+        }
+    }
+
     let mut files = Vec::new();
 
     let unstaged = run_git(
