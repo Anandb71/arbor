@@ -1,4 +1,4 @@
-# Arbor v2.0.1 Release Notes — "Patch Stability & Automation"
+# Arbor v2.0.1 Release Notes — "Patch Stability & Automation Fixes"
 
 > **Theme:** Fast, low-risk patch release to stabilize release automation and PR-impact reporting after v2.0.0.
 
