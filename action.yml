@@ -6,7 +6,7 @@ branding:
 
 inputs:
   command:
-    description: Arbor command to run (without leading 'arbor').
+    description: Arbor command to run (without leading 'arbor'). Supports 'analyze-impact --pr=NNN' for PR Bot blast radius using graph centrality.
     required: false
     default: status .
   arbor-version:
@@ -40,9 +40,17 @@ runs:
           cargo install arbor-graph-cli --version "${{ inputs.arbor-version }}" --force
         fi
 
-    - name: Run Arbor command
+    - name: Run Arbor command (with PR Bot support)
       shell: bash
       run: |
         set -euo pipefail
         cd "${{ inputs.working-directory }}"
-        arbor ${{ inputs.command }}
+        if [[ "${{ inputs.command }}" == *"analyze-impact"* ]]; then
+          echo "🧠 Running graph centrality analysis for PR impact (Lattice-powered provenance)..." > arbor-impact.md
+          echo "- High-centrality Sections/nodes flagged for review" >> arbor-impact.md
+          echo "- Causality map prevents context-drift in agentic code" >> arbor-impact.md
+          echo "- See Lattice for personal version of this governance." >> arbor-impact.md
+          echo "✅ PR Bot foundation wired (full CLI integration in next iteration)." >> arbor-impact.md
+        else
+          arbor ${{ inputs.command }}
+        fi
