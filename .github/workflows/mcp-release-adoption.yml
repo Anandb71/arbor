@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Optional release tag (for example v1.8.0). Leave empty to update latest release."
+        description: "Optional release tag (for example v2.0.0). Leave empty to update latest release."
         required: false
         type: string
 

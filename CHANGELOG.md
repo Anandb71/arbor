@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - All discussed features stabilized: parser eat-own-dog-food, MCP supercharged for agents (Priority 3), Markdown support, tests 58/58 passing with feedback loop, no mistakes.
 - ROADMAP, PHILOSOPHY aligned (Consumer First = stable, Accessibility = registry, Affordability = sled).
 - Versions bumped, docs updated, sequential commits on audit-and-testing-overhaul.
+- Release automation hardened: fixed contributors workflow failures (tokened GitHub API + robust LF/CRLF marker replacement), fixed aarch64 Linux linker in release cross-compilation, replaced PR bot action mock output with real command execution.
+- Distribution manifests fully aligned to 2.0.0 (Homebrew, Scoop, npm wrapper, VS Code extension metadata/lockfile, server serialization version fixture).
 
 ### Stable for v2.0 Release
 - Ready for `git tag v2.0.0`, workflows (release, GHCR, Marketplace, MCP notes). Everything discussed is stable.

@@ -35,8 +35,6 @@ jobs:
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: docs(readme): refresh contributors list
           branch: chore/refresh-contributors
           base: main

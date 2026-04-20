@@ -10,7 +10,7 @@ inputs:
     required: false
     default: status .
   arbor-version:
-    description: Arbor CLI version to install (e.g. 1.6.2). Use 'latest' for newest.
+    description: Arbor CLI version to install (e.g. 2.0.0). Use 'latest' for newest.
     required: false
     default: latest
   install-from-source:
@@ -46,21 +46,27 @@ runs:
         set -euo pipefail
         cd "${{ inputs.working-directory }}"
         if [[ "${{ inputs.command }}" == *"analyze-impact"* ]]; then
-          cat > arbor-impact.md << 'EOF'
-# 🧠 Arbor PR Impact Audit Report (Professional Governance)
+          if arbor ${{ inputs.command }} --format markdown > arbor-impact.md 2>/tmp/arbor-impact.err; then
+            echo "Generated markdown impact report."
+          elif arbor ${{ inputs.command }} > arbor-impact.md 2>/tmp/arbor-impact.err; then
+            echo "Generated text impact report (markdown flag unsupported by this command)."
+          else
+            {
+              echo "## 🧠 Arbor Graph Impact Report"
+              echo
+              echo "Unable to generate impact report."
+              echo
+              echo "
 
-**PR:** #${{ github.event.number || 'N/A' }} | **Graph Centrality Used:** Yes | **Sorted by Risk**
-
-| File | Risk Level | Confidence | Recommendation |
-|------|------------|------------|----------------|
-| **`core/habits.rs`** | **HIGH** | **0.92** | **Bold high-risk: Review load-bearing nodes (affects 13 downstream). Use get_knowledge_path for causality.** |
-| `notes/goals.md` | Medium | 0.78 | Check [[Core Habits]] links; medium blast radius on Sections. |
-| `lib/parser_v2.rs` | Low | 0.41 | Low centrality — safe change but verify Markdown fallback relations. |
-
-**Summary:** 1 **high-risk** file (bolded per ConfidenceExplanation). Total affected nodes: 13. Upstream/downstream explained. Prevents architectural debt via graph provenance.
-
-*Powered by Lattice (Personal AI Governance) + Arbor PR Bot. Real causality, not RAG.*
-EOF
+Command: \\`${{ inputs.command }}\\`"
+              echo
+              echo "stderr:"
+              echo '\`\`\`'
+              cat /tmp/arbor-impact.err || true
+              echo '\`\`\`'
+            } > arbor-impact.md
+            exit 1
+          fi
         else
           arbor ${{ inputs.command }}
         fi

@@ -819,13 +819,13 @@ mod tests {
     #[test]
     fn test_hello_payload_serialization() {
         let msg = BroadcastMessage::Hello(HelloPayload {
-            version: "1.9.0".to_string(),
+            version: "2.0.0".to_string(),
             node_count: 100,
             edge_count: 200,
         });
 
         let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("1.9.0"));
+        assert!(json.contains("2.0.0"));
         assert!(json.contains("100"));
     }
 
