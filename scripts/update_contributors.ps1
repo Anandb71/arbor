@@ -1,7 +1,8 @@
 param(
     [string]$Repo = "Anandb71/arbor",
     [string]$ReadmePath = "README.md",
-    [int]$MaxContributors = 15
+    [int]$MaxContributors = 15,
+    [string]$Token = $null
 )
 
 Set-StrictMode -Version Latest
@@ -14,6 +15,10 @@ if (-not (Test-Path $ReadmePath)) {
 $headers = @{
     "User-Agent" = "arbor-contributors-updater"
     "Accept"     = "application/vnd.github+json"
+}
+
+if ($Token -and $Token -ne '') {
+    $headers["Authorization"] = "token $Token"
 }
 
 $contributorsUrl = "https://api.github.com/repos/$Repo/contributors?per_page=100"
@@ -66,7 +71,7 @@ $startMarker = "<!-- CONTRIBUTORS:START -->"
 $endMarker = "<!-- CONTRIBUTORS:END -->"
 
 if ($readme.Contains($startMarker) -and $readme.Contains($endMarker)) {
-    $pattern = "(?s)## Contributors\s*\r?\n\r?\n<!-- CONTRIBUTORS:START -->.*?<!-- CONTRIBUTORS:END -->"
+    $pattern = "(?s)## Contributors\s*[\r\n]+\s*<!-- CONTRIBUTORS:START -->.*?<!-- CONTRIBUTORS:END -->"
     $updated = [regex]::Replace($readme, $pattern, $generated.Trim())
 } else {
     $updated = $readme.TrimEnd() + "`r`n`r`n---`r`n`r`n" + $generated.Trim() + "`r`n"

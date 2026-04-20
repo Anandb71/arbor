@@ -23,13 +23,18 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Update contributors block in README
         shell: pwsh
-        run: ./scripts/update_contributors.ps1 -Repo "${{ github.repository }}" -ReadmePath "README.md" -MaxContributors 15
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/update_contributors.ps1 -Repo "${{ github.repository }}" -ReadmePath "README.md" -MaxContributors 15 -Token $env:GITHUB_TOKEN
 
       - name: Create pull request
         uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: docs(readme): refresh contributors list
