@@ -18,11 +18,8 @@ jobs:
 
       - name: Run Arbor PR Impact Analysis
         uses: ./
-        env:
-          ARBOR_DIFF_BASE: ${{ github.event.pull_request.base.sha }}
-          ARBOR_DIFF_HEAD: ${{ github.event.pull_request.head.sha }}
         with:
-          command: diff . --json
+          command: analyze-impact --pr=${{ github.event.pull_request.number }}
           install-from-source: true
           working-directory: .
 
@@ -33,25 +30,10 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            const reportPath = 'arbor-impact.md';
-            const fallback = [
-              '## 🧠 Arbor Graph Impact Report',
-              '',
-              'Impact report file was not generated in this run.',
-              '',
-              `Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`,
-              '',
-              'Likely cause: Arbor analysis step failed before writing markdown output.',
-              'Check the **Run Arbor PR Impact Analysis** step logs for details.'
-            ].join('\n');
-
-            const impact = fs.existsSync(reportPath)
-              ? (fs.readFileSync(reportPath, 'utf8') || fallback)
-              : fallback;
-
+            const impact = fs.readFileSync('arbor-impact.md', 'utf8') || 'No impact report generated. Graph centrality analysis pending full CLI integration.';
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `## 🧠 Arbor Graph Impact Report\n\n**Blast Radius:** High-centrality nodes affected?\n\n${impact}\n\n*Powered by Arbor graph governance for code. See https://github.com/Anandb71/arbor for details.*`
+              body: `## 🧠 Arbor Graph Impact Report\n\n**Blast Radius:** High-centrality nodes affected?\n\n${impact}\n\n*Powered by Lattice-style personal governance graph for code. Prevents architectural debt. See https://github.com/arbor/arbor for details.*`
             });

@@ -318,8 +318,8 @@ mod tests {
         let nodes: Vec<CodeNode> = (0..7)
             .map(|i| {
                 CodeNode::new(
-                    &format!("on_event_{}", i),
-                    &format!("on_event_{}", i),
+                    format!("on_event_{}", i),
+                    format!("on_event_{}", i),
                     NodeKind::Function,
                     "events.ts",
                 )

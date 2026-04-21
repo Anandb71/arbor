@@ -95,4 +95,3 @@ server.json
 
 # Private startup scaffolding (Lattice - personal knowledge graph starter)
 lattice/
-.lattice.db/

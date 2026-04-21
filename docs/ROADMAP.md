@@ -1,4 +1,4 @@
-# Arbor Roadmap: Path Beyond v2.0
+# Arbor Roadmap: Path to v2.0 & Beyond
 
 > **Vision:** Arbor is the "Nervous System" for AI Agents—a persistent, visual, and intelligent memory graph that prevents hallucinations and enables safe, massive-scale refactoring.
 
@@ -67,7 +67,7 @@ This section tracks what is already shipped versus what remains strategic work.
 
 ---
 
-## 🚀 Immediate Focus (Post-v2.0)
+## 🚀 Immediate Focus (v1.8 / v2.0)
 **Theme:** *Persistent Intelligence & Enterprise Readiness*
 
 1. **Persistent Graph Database:** Move to SQLite/Sled with transactional updates and indexed queries for instant load.
