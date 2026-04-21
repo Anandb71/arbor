@@ -1,0 +1,508 @@
+:root {
+  font-family: "Aptos", "Segoe UI Variable Display", "Trebuchet MS", sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #f4efe6;
+  background:
+    radial-gradient(circle at top, rgba(103, 214, 190, 0.14), transparent 24%),
+    radial-gradient(circle at 22% 18%, rgba(245, 183, 74, 0.15), transparent 20%),
+    linear-gradient(160deg, #07131d 0%, #0b2028 35%, #132d2b 100%);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  --glass-border: rgba(242, 227, 192, 0.16);
+  --panel-shadow: 0 28px 80px rgba(0, 0, 0, 0.26);
+  --mint: #8fe4d2;
+  --amber: #ffca72;
+  --text-soft: rgba(244, 239, 230, 0.72);
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  overflow-x: hidden;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  border: 0;
+  cursor: pointer;
+}
+
+input {
+  color: inherit;
+}
+
+.app-shell {
+  position: relative;
+  min-height: 100vh;
+  overflow: hidden;
+}
+
+.ambient {
+  position: absolute;
+  border-radius: 999px;
+  filter: blur(10px);
+  opacity: 0.7;
+  animation: drift 20s ease-in-out infinite;
+}
+
+.ambient-a {
+  width: 30rem;
+  height: 30rem;
+  top: -6rem;
+  right: -8rem;
+  background: rgba(143, 228, 210, 0.16);
+}
+
+.ambient-b {
+  width: 18rem;
+  height: 18rem;
+  bottom: 12rem;
+  left: -2rem;
+  background: rgba(255, 143, 90, 0.14);
+  animation-delay: -6s;
+}
+
+.ambient-c {
+  width: 16rem;
+  height: 16rem;
+  bottom: -4rem;
+  right: 22%;
+  background: rgba(255, 202, 114, 0.12);
+  animation-delay: -10s;
+}
+
+.dashboard {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 1.4rem;
+  max-width: 1520px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+.glass,
+.glass-subtle {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--panel-shadow);
+  backdrop-filter: blur(22px);
+}
+
+.glass {
+  background: linear-gradient(155deg, rgba(10, 22, 31, 0.78), rgba(13, 31, 38, 0.64));
+  border-radius: 30px;
+}
+
+.glass-subtle {
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 22px;
+}
+
+.hero {
+  display: grid;
+  gap: 1.2rem;
+  grid-template-columns: minmax(0, 1.4fr) minmax(340px, 0.85fr);
+  padding: 1.7rem;
+}
+
+.hero-copy h1,
+.workspace-grid h2,
+.analysis-grid h2,
+.topography h2 {
+  margin: 0;
+  font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
+  letter-spacing: -0.03em;
+}
+
+.hero-copy h1 {
+  font-size: clamp(2.5rem, 4vw, 4.85rem);
+  line-height: 0.96;
+  max-width: 10ch;
+}
+
+.eyebrow {
+  margin: 0 0 0.4rem;
+  color: var(--mint);
+  text-transform: uppercase;
+  letter-spacing: 0.26em;
+  font-size: 0.72rem;
+}
+
+.lede {
+  max-width: 58ch;
+  color: var(--text-soft);
+  font-size: 1.02rem;
+}
+
+.hero-actions,
+.input-row {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.primary,
+.ghost,
+.compact {
+  padding: 0.9rem 1.25rem;
+  border-radius: 999px;
+  transition:
+    transform 180ms ease,
+    background-color 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.primary {
+  background: linear-gradient(135deg, var(--mint), #d9f8f0);
+  color: #032028;
+  box-shadow: 0 16px 35px rgba(143, 228, 210, 0.22);
+}
+
+.ghost {
+  background: rgba(255, 255, 255, 0.06);
+  color: #fff7eb;
+}
+
+.compact {
+  padding-inline: 1rem;
+}
+
+.wide {
+  width: 100%;
+  justify-content: center;
+}
+
+.primary:hover,
+.ghost:hover,
+.result-card:hover,
+.cloud-node:hover {
+  transform: translateY(-2px);
+}
+
+.primary:disabled,
+.ghost:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.hero-status {
+  display: grid;
+  gap: 1rem;
+  align-content: start;
+}
+
+.status-pill {
+  align-self: start;
+  width: fit-content;
+  padding: 0.6rem 0.9rem;
+  border-radius: 999px;
+  background: rgba(255, 202, 114, 0.12);
+  color: #ffe2aa;
+  font-size: 0.92rem;
+}
+
+.error-card {
+  padding: 0.95rem 1rem;
+  border-radius: 18px;
+  background: rgba(255, 118, 118, 0.11);
+  color: #ffd7d7;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.8rem;
+}
+
+.metric {
+  padding: 1rem;
+}
+
+.metric span {
+  display: block;
+  color: var(--text-soft);
+  font-size: 0.84rem;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+}
+
+.metric strong {
+  display: block;
+  margin-top: 0.45rem;
+  font-size: 1.8rem;
+}
+
+.workspace-grid,
+.analysis-grid {
+  display: grid;
+  gap: 1.2rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.explorer,
+.panel,
+.topography {
+  padding: 1.35rem;
+}
+
+.stack {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.stack span,
+.legend,
+.subtle,
+.result-card span,
+.meta-list span {
+  color: var(--text-soft);
+}
+
+input {
+  width: 100%;
+  padding: 0.92rem 1rem;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  background: rgba(6, 18, 25, 0.55);
+  box-sizing: border-box;
+}
+
+input:focus {
+  outline: 2px solid rgba(143, 228, 210, 0.32);
+  border-color: rgba(143, 228, 210, 0.4);
+}
+
+.meta-list {
+  display: grid;
+  gap: 0.8rem;
+  margin-top: 1rem;
+}
+
+.meta-list strong {
+  display: block;
+  font-size: 0.93rem;
+  overflow-wrap: anywhere;
+}
+
+.summary-band {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  margin-top: 1rem;
+}
+
+.summary-band span {
+  padding: 0.45rem 0.7rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  color: #f2e5d0;
+  font-size: 0.87rem;
+}
+
+.results-list,
+.impact-report,
+.path-list {
+  margin-top: 1rem;
+}
+
+.result-card {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: center;
+  padding: 0.95rem 1rem;
+  margin-top: 0.7rem;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.045);
+  color: inherit;
+}
+
+.result-card strong,
+.path-list strong,
+.mini-node span,
+.cloud-node span,
+.target-headline strong {
+  display: block;
+}
+
+.result-card b,
+.cloud-node b {
+  color: var(--amber);
+}
+
+.empty-state {
+  padding: 1.1rem;
+  margin-top: 1rem;
+  border-radius: 18px;
+  border: 1px dashed rgba(255, 255, 255, 0.13);
+  color: var(--text-soft);
+}
+
+.dual-list {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.mini-node {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.72rem 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.mini-node b {
+  color: #ffe8bf;
+  text-transform: capitalize;
+}
+
+.path-grid {
+  display: grid;
+  gap: 0.8rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.path-list {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 0.7rem;
+}
+
+.path-list li {
+  position: relative;
+  padding: 0.95rem 1rem 0.95rem 1.2rem;
+  border-radius: 18px;
+  background: linear-gradient(90deg, rgba(143, 228, 210, 0.14), rgba(255, 255, 255, 0.03));
+  animation: rise 480ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation-delay: var(--delay);
+}
+
+.path-list li::before {
+  content: "";
+  position: absolute;
+  left: 0.42rem;
+  top: 0.8rem;
+  bottom: 0.8rem;
+  width: 3px;
+  border-radius: 99px;
+  background: linear-gradient(180deg, var(--mint), var(--amber));
+}
+
+.topography header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: end;
+}
+
+.node-cloud {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.85rem;
+  margin-top: 1.15rem;
+}
+
+.cloud-node {
+  min-width: 180px;
+  padding: 1rem 1rem 0.95rem;
+  border-radius: 22px;
+  color: #fff9ef;
+  background: linear-gradient(
+    155deg,
+    rgba(255, 255, 255, 0.08),
+    rgba(143, 228, 210, 0.08)
+  );
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.14);
+  transform: scale(var(--weight));
+  transform-origin: center;
+  animation: rise 520ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation-delay: var(--delay);
+}
+
+.cloud-node span {
+  font-size: 1rem;
+}
+
+.cloud-node b {
+  display: block;
+  margin-top: 0.4rem;
+  font-size: 0.84rem;
+}
+
+@keyframes drift {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(12px, 20px, 0) scale(1.05);
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(20px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (max-width: 1120px) {
+  .hero,
+  .workspace-grid,
+  .analysis-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .path-grid,
+  .dual-list {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 720px) {
+  .dashboard {
+    padding: 1rem;
+  }
+
+  .hero,
+  .explorer,
+  .panel,
+  .topography {
+    padding: 1.05rem;
+    border-radius: 24px;
+  }
+
+  .metric-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .hero-copy h1 {
+    font-size: 2.6rem;
+  }
+
+  .node-cloud {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+}

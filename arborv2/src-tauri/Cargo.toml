@@ -1,0 +1,18 @@
+[package]
+name = "arborv2-app"
+version = "0.1.0"
+edition = "2021"
+description = "Arbor V2 desktop shell for deterministic Lattice workflows"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1.0"
+arbor-core = { path = "../../crates/arbor-core" }
+arbor-graph = { path = "../../crates/arbor-graph" }
+dirs = "6.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "2", features = [] }
+walkdir = "2.5"
