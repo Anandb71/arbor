@@ -6,7 +6,7 @@
 
 **Graph-native intelligence for codebases.**
 
-Know what breaks *before* you break it.
+Know what breaks *before* you break it.a
 
 <p align="center">
   <a href="https://github.com/Anandb71/arbor/actions"><img src="https://img.shields.io/github/actions/workflow/status/Anandb71/arbor/rust.yml?style=flat-square&label=Rust%20CI" alt="Rust CI" /></a>
