@@ -1,8 +1,8 @@
 //! Centrality ranking for code nodes.
 //!
-//! We use a simplified PageRank variant to score nodes by their
-//! architectural significance. Nodes that are called by many
-//! others rank higher.
+//! We use a production-aware PageRank variant: callers from test files
+//! contribute 10x less weight than production callers, so utility functions
+//! called heavily by tests don't false-inflate centrality scores.
 
 use crate::graph::{ArborGraph, NodeId};
 use std::collections::HashMap;
@@ -25,12 +25,38 @@ impl CentralityScores {
     }
 }
 
-/// Computes centrality scores for all nodes in the graph.
+/// Returns true if this file path is a test/spec/fixture file.
+/// Callers from test files get de-weighted 10x so test utilities don't
+/// false-inflate their centrality scores vs. production callers.
+fn is_test_file(file: &str) -> bool {
+    let lower = file.to_lowercase();
+    lower.contains("/test")
+        || lower.contains("\\test")
+        || lower.contains("/spec")
+        || lower.contains("\\spec")
+        || lower.contains("__test__")
+        || lower.contains("_test.")
+        || lower.contains(".test.")
+        || lower.contains(".spec.")
+        || lower.contains("/fixture")
+        || lower.contains("/mock")
+        || lower.contains("/stub")
+        || lower.contains("/fake")
+        || lower.ends_with("_test.go")
+        || lower.ends_with("_test.py")
+        || lower.ends_with("_test.rs")
+        || lower.ends_with("test.ts")
+        || lower.ends_with("test.js")
+}
+
+/// Computes production-aware centrality scores for all nodes in the graph.
 ///
-/// This is a simplified PageRank that:
-/// 1. Initializes all nodes with equal score
-/// 2. Iteratively distributes scores along edges
-/// 3. Applies damping to prevent score concentration
+/// Uses a modified PageRank where:
+/// 1. Nodes initialize with equal score
+/// 2. Each iteration distributes scores along edges
+/// 3. Callers from test/spec/fixture files contribute 10x less weight
+///    — prevents test utilities from appearing more central than production code
+/// 4. Scores are normalized to [0.0, 1.0]
 ///
 /// # Arguments
 ///
@@ -54,7 +80,7 @@ pub fn compute_centrality(graph: &ArborGraph, iterations: usize, damping: f64) -
     let mut out_degree: HashMap<NodeId, usize> = HashMap::new();
     for idx in graph.node_indexes() {
         let callees = graph.get_callees(idx);
-        out_degree.insert(idx, callees.len().max(1)); // Avoid division by zero
+        out_degree.insert(idx, callees.len().max(1));
     }
 
     // Iterate
@@ -62,10 +88,8 @@ pub fn compute_centrality(graph: &ArborGraph, iterations: usize, damping: f64) -
         let mut new_scores: HashMap<NodeId, f64> = HashMap::new();
 
         for idx in graph.node_indexes() {
-            // Base score (random jump)
             let base = (1.0 - damping) / node_count as f64;
 
-            // Score from callers
             let callers = graph.get_callers(idx);
             let incoming: f64 = callers
                 .iter()
@@ -73,7 +97,13 @@ pub fn compute_centrality(graph: &ArborGraph, iterations: usize, damping: f64) -
                     let caller_idx = graph.get_index(&caller.id)?;
                     let caller_score = scores.get(&caller_idx)?;
                     let caller_out = *out_degree.get(&caller_idx)? as f64;
-                    Some(caller_score / caller_out)
+
+                    // Test callers contribute 10% weight — they inflate utility functions
+                    // but don't represent real production blast radius
+                    let caller_node = graph.get(caller_idx)?;
+                    let weight = if is_test_file(&caller_node.file) { 0.1 } else { 1.0 };
+
+                    Some(weight * caller_score / caller_out)
                 })
                 .sum();
 
