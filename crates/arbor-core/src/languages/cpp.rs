@@ -28,7 +28,6 @@ impl LanguageParser for CppParser {
     }
 }
 
-/// Recursively extracts nodes from the C++ AST.
 fn extract_from_node(
     node: &Node,
     source: &str,
@@ -36,6 +35,7 @@ fn extract_from_node(
     nodes: &mut Vec<CodeNode>,
     context: Option<&str>,
 ) {
+    stacker::maybe_grow(64 * 1024, 4 * 1024 * 1024, || {
     let kind = node.kind();
 
     match kind {
@@ -184,6 +184,7 @@ fn extract_from_node(
             extract_from_node(&child, source, file_path, nodes, context);
         }
     }
+    }); // stacker::maybe_grow
 }
 
 /// Extracts a class definition.
@@ -467,18 +468,28 @@ fn extract_call_references(node: &Node, source: &str) -> Vec<String> {
     refs
 }
 
-/// Recursively collects function call names.
-fn collect_calls(node: &Node, source: &str, refs: &mut Vec<String>) {
-    if node.kind() == "call_expression" {
-        if let Some(func_node) = node.child_by_field_name("function") {
-            let call_name = get_text(&func_node, source);
-            refs.push(call_name);
+fn collect_calls(root: &Node, source: &str, refs: &mut Vec<String>) {
+    let mut cursor = root.walk();
+    'outer: loop {
+        let node = cursor.node();
+        if node.kind() == "call_expression" {
+            if let Some(func_node) = node.child_by_field_name("function") {
+                let range = func_node.byte_range();
+                if range.end <= source.len() {
+                    let call_text = &source[range];
+                    // Keep direct calls and namespace-qualified calls (::), drop dotted method calls
+                    if !call_text.contains('.') {
+                        refs.push(call_text.to_string());
+                    }
+                }
+            }
         }
-    }
-
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            collect_calls(&child, source, refs);
+        if cursor.goto_first_child() { continue; }
+        if cursor.goto_next_sibling() { continue; }
+        loop {
+            if !cursor.goto_parent() { break 'outer; }
+            if cursor.depth() == 0 { break 'outer; }
+            if cursor.goto_next_sibling() { break; }
         }
     }
 }

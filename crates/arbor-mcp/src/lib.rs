@@ -169,13 +169,12 @@ impl McpServer {
                 },
                 {
                     "name": "analyze_impact",
-                    "description": "Analyzes the impact (blast radius) of changing a node. Returns structured data or Markdown table report with **bold high-risk** files using ConfidenceExplanation (for PR bot).",
+                    "description": "Analyzes the impact (blast radius) of changing a node. Returns structured data with upstream/downstream affected nodes.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "node_id": { "type": "string", "description": "ID or name of the node to analyze" },
-                            "max_depth": { "type": "integer", "description": "Maximum hop distance (default: 5, 0 = unlimited)", "default": 5 },
-                            "format": { "type": "string", "description": "Output format: json (default) or markdown for PR comment table", "enum": ["json", "markdown"], "default": "json" }
+                            "max_depth": { "type": "integer", "description": "Maximum hop distance (default: 5, 0 = unlimited)", "default": 5 }
                         },
                         "required": ["node_id"]
                     }
@@ -250,11 +249,6 @@ impl McpServer {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(5) as usize;
 
-                let format = arguments
-                    .get("format")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("json");
-
                 // Trigger Spotlight
                 self.trigger_spotlight(node_id).await;
 
@@ -277,104 +271,68 @@ impl McpServer {
                             arbor_graph::ConfidenceExplanation::from_analysis(&analysis);
                         let role = arbor_graph::NodeRole::from_analysis(&analysis);
 
-                        if format == "markdown" {
-                            // Polish for PR bot: professional Markdown table with **bold** high-risk using ConfidenceExplanation
-                            let mut table = format!(
-                                "## 🧠 Arbor PR Bot Impact Report for `{}`\n\n**High-Risk Changes (Centrality-Based, sorted_by_centrality=true)**\n\n| File | Node | Risk | Confidence | Explanation |\n|------|------|------|------------|-------------|\n",
-                                node_id
-                            );
-                            for u in &analysis.upstream {
-                                let risk = match u.severity.as_str() {
-                                    "high" => "**HIGH**",
-                                    _ => "Medium",
-                                };
-                                let bold = if matches!(
-                                    confidence.level,
-                                    arbor_graph::ConfidenceLevel::High
-                                ) {
-                                    "**"
-                                } else {
-                                    ""
-                                };
-                                table.push_str(&format!(
-                                    "| {} | {} | {} | {}{:?}{} | {} |\n",
-                                    u.node_info.file,
-                                    u.node_info.name,
-                                    risk,
-                                    bold,
-                                    confidence.level,
-                                    bold,
-                                    u.entry_edge
-                                ));
-                            }
-                            table.push_str(&format!("\n**Summary**: {} affected. **Review bolded high-centrality nodes**. Powered by Lattice graph (Priority 1/3).", analysis.total_affected));
-                            Ok(json!({
-                                "content": [{ "type": "text", "text": table }]
-                            }))
-                        } else {
-                            // Build structured response (default JSON for MCP)
-                            let upstream: Vec<Value> = analysis
-                                .upstream
-                                .iter()
-                                .map(|n| {
-                                    json!({
-                                        "id": n.node_info.id,
-                                        "name": n.node_info.name,
-                                        "kind": n.node_info.kind,
-                                        "file": n.node_info.file,
-                                        "severity": n.severity.as_str(),
-                                        "hop_distance": n.hop_distance,
-                                        "entry_edge": n.entry_edge.to_string()
-                                    })
+                        // Build structured response
+                        let upstream: Vec<Value> = analysis
+                            .upstream
+                            .iter()
+                            .map(|n| {
+                                json!({
+                                    "id": n.node_info.id,
+                                    "name": n.node_info.name,
+                                    "kind": n.node_info.kind,
+                                    "file": n.node_info.file,
+                                    "severity": n.severity.as_str(),
+                                    "hop_distance": n.hop_distance,
+                                    "entry_edge": n.entry_edge.to_string()
                                 })
-                                .collect();
+                            })
+                            .collect();
 
-                            let downstream: Vec<Value> = analysis
-                                .downstream
-                                .iter()
-                                .map(|n| {
-                                    json!({
-                                        "id": n.node_info.id,
-                                        "name": n.node_info.name,
-                                        "kind": n.node_info.kind,
-                                        "file": n.node_info.file,
-                                        "severity": n.severity.as_str(),
-                                        "hop_distance": n.hop_distance,
-                                        "entry_edge": n.entry_edge.to_string()
-                                    })
+                        let downstream: Vec<Value> = analysis
+                            .downstream
+                            .iter()
+                            .map(|n| {
+                                json!({
+                                    "id": n.node_info.id,
+                                    "name": n.node_info.name,
+                                    "kind": n.node_info.kind,
+                                    "file": n.node_info.file,
+                                    "severity": n.severity.as_str(),
+                                    "hop_distance": n.hop_distance,
+                                    "entry_edge": n.entry_edge.to_string()
                                 })
-                                .collect();
+                            })
+                            .collect();
 
-                            Ok(json!({
-                                "content": [{
-                                    "type": "text",
-                                    "text": serde_json::to_string_pretty(&json!({
-                                        "target": {
-                                            "id": analysis.target.id,
-                                            "name": analysis.target.name,
-                                            "kind": analysis.target.kind,
-                                            "file": analysis.target.file
-                                        },
-                                        "confidence": {
-                                            "level": confidence.level.to_string(),
-                                            "reasons": confidence.reasons
-                                        },
-                                        "role": role.to_string(),
-                                        "upstream": upstream,
-                                        "downstream": downstream,
-                                        "total_affected": analysis.total_affected,
-                                        "max_depth": analysis.max_depth,
-                                        "query_time_ms": analysis.query_time_ms,
-                                        "edges_explained": format!(
-                                            "{} upstream callers, {} downstream dependencies",
-                                            analysis.upstream.len(),
-                                            analysis.downstream.len()
-                                        ),
-                                        "sorted_by_centrality": true
-                                    })).unwrap_or_default()
-                                }]
-                            }))
-                        }
+                        Ok(json!({
+                            "content": [{
+                                "type": "text",
+                                "text": serde_json::to_string_pretty(&json!({
+                                    "target": {
+                                        "id": analysis.target.id,
+                                        "name": analysis.target.name,
+                                        "kind": analysis.target.kind,
+                                        "file": analysis.target.file
+                                    },
+                                    "confidence": {
+                                        "level": confidence.level.to_string(),
+                                        "reasons": confidence.reasons
+                                    },
+                                    "role": role.to_string(),
+                                    "upstream": upstream,
+                                    "downstream": downstream,
+                                    "total_affected": analysis.total_affected,
+                                    "max_depth": analysis.max_depth,
+                                    "query_time_ms": analysis.query_time_ms,
+                                    "edges_explained": format!(
+                                        "{} upstream callers, {} downstream dependencies",
+                                        analysis.upstream.len(),
+                                        analysis.downstream.len()
+                                    ),
+                                    "sorted_by_centrality": true
+                                })).unwrap_or_default()
+                            }]
+                        }))
                     }
                     None => Ok(json!({
                         "content": [{
@@ -488,18 +446,10 @@ impl McpServer {
         };
 
         // 2. Extract Data
-        let Some(node) = graph.get(node_idx) else {
-            return format!(
-                "Node '{}' resolved to index {:?} but no longer exists in graph.",
-                node_start, node_idx
-            );
-        };
-        let mut callers = graph.get_callers(node_idx);
-        let mut callees = graph.get_callees(node_idx);
+        let node = graph.get(node_idx).unwrap();
+        let callers = graph.get_callers(node_idx);
+        let callees = graph.get_callees(node_idx);
         let centrality = graph.centrality(node_idx);
-
-        callers.sort_by(|a, b| (&a.file, &a.name, &a.id).cmp(&(&b.file, &b.name, &b.id)));
-        callees.sort_by(|a, b| (&a.file, &a.name, &a.id).cmp(&(&b.file, &b.name, &b.id)));
 
         // 3. Format Output (The "Architectural Brief" with Markdown Tables)
         let mut brief = String::new();
