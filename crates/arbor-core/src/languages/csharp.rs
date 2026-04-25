@@ -28,7 +28,6 @@ impl LanguageParser for CSharpParser {
     }
 }
 
-/// Recursively extracts nodes from the C# AST.
 fn extract_from_node(
     node: &Node,
     source: &str,
@@ -36,6 +35,7 @@ fn extract_from_node(
     nodes: &mut Vec<CodeNode>,
     context: Option<&str>,
 ) {
+    stacker::maybe_grow(64 * 1024, 4 * 1024 * 1024, || {
     let kind = node.kind();
 
     match kind {
@@ -156,6 +156,7 @@ fn extract_from_node(
             extract_from_node(&child, source, file_path, nodes, context);
         }
     }
+    }); // stacker::maybe_grow
 }
 
 /// Extracts a type declaration (class, interface, struct, enum).
@@ -417,27 +418,46 @@ fn extract_call_references(node: &Node, source: &str) -> Vec<String> {
     refs
 }
 
-/// Recursively collects method call names.
-fn collect_calls(node: &Node, source: &str, refs: &mut Vec<String>) {
-    if node.kind() == "invocation_expression" {
-        if let Some(func) = node.child_by_field_name("function") {
-            match func.kind() {
-                "identifier" => {
-                    refs.push(get_text(&func, source));
-                }
-                "member_access_expression" => {
-                    if let Some(name_node) = func.child_by_field_name("name") {
-                        refs.push(get_text(&name_node, source));
+fn collect_calls(root: &Node, source: &str, refs: &mut Vec<String>) {
+    let mut cursor = root.walk();
+    'outer: loop {
+        let node = cursor.node();
+        if node.kind() == "invocation_expression" {
+            if let Some(func) = node.child_by_field_name("function") {
+                match func.kind() {
+                    "identifier" => {
+                        let range = func.byte_range();
+                        if range.end <= source.len() {
+                            refs.push(source[range].to_string());
+                        }
                     }
+                    "member_access_expression" => {
+                        // Only keep this.X / base.X calls to avoid name collision
+                        if let Some(obj) = func.child_by_field_name("expression") {
+                            let obj_range = obj.byte_range();
+                            if obj_range.end <= source.len() {
+                                let obj_text = &source[obj_range];
+                                if obj_text == "this" || obj_text == "base" {
+                                    if let Some(name_node) = func.child_by_field_name("name") {
+                                        let range = name_node.byte_range();
+                                        if range.end <= source.len() {
+                                            refs.push(source[range].to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
-    }
-
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            collect_calls(&child, source, refs);
+        if cursor.goto_first_child() { continue; }
+        if cursor.goto_next_sibling() { continue; }
+        loop {
+            if !cursor.goto_parent() { break 'outer; }
+            if cursor.depth() == 0 { break 'outer; }
+            if cursor.goto_next_sibling() { break; }
         }
     }
 }
