@@ -69,6 +69,7 @@ You get deterministic, explainable impact analysis instead of approximate keywor
 
 - **Blast radius analysis**: See exactly which files and modules will be affected by a change (complete with depth confidence levels) before you ever press save.
 - **Graph-backed symbol resolution**: Accurately tracks dependencies across files and entire language boundaries automatically.
+- **Agent-native MCP (v2.1.0)**: 10 MCP tools — surgical traversal (`get_callers`, `get_callees`, `list_entry_points`, `search_symbols`, `get_file_graph`, `get_node_detail`) plus broad analysis tools, all returning a `suggested_next_tool` hint for zero-reprompt agent chaining.
 - **Unified Tooling (CLI + GUI + MCP)**: Native desktop GUI, a blazing fast CLI, and Claude/AI Model Context Protocol integration all utilizing the exact same core analytical reasoning engine.
 - **Git-aware risk gating**: Block pull-requests automatically in your CI/CD if a PR introduces a dangerously high architectural blast radius.
 - **Lightning fast incremental indexing**: Sub-second background cache updates instantly tracking your code edits in real-time.
@@ -145,7 +146,7 @@ For pinned/versioned installs, see [docs/INSTALL.md](docs/INSTALL.md).
 
 ## MCP integration
 
-Arbor includes a real MCP server via `arbor bridge` (stdio transport).
+Arbor includes a real MCP server via `arbor bridge` (stdio transport). **v2.1.0 adds 10 tools** — 6 surgical tools for precise graph traversal and 4 broad tools for architectural analysis.
 
 ### Claude Code quick install
 
@@ -153,6 +154,14 @@ Arbor includes a real MCP server via `arbor bridge` (stdio transport).
 claude mcp add --transport stdio --scope project arbor -- arbor bridge
 claude mcp list
 ```
+
+### Available tools
+
+**Surgical (v2.1.0):** `list_entry_points` · `get_callers` · `get_callees` · `search_symbols` · `get_file_graph` · `get_node_detail`
+
+**Broad:** `get_logic_path` · `analyze_impact` · `find_path` · `get_knowledge_path`
+
+All tools return a standard envelope with `suggested_next_tool` + `suggested_next_args` so agents can chain calls without re-prompting.
 
 ### Multi-client setup
 
