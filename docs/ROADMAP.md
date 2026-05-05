@@ -1,4 +1,4 @@
-# Arbor Roadmap: Path Beyond v2.0
+# Arbor Roadmap: Path to v2.0 & Beyond
 
 > **Vision:** Arbor is the "Nervous System" for AI Agents—a persistent, visual, and intelligent memory graph that prevents hallucinations and enables safe, massive-scale refactoring.
 
@@ -19,6 +19,7 @@ This section tracks what is already shipped versus what remains strategic work.
 - [x] **Local-first air-gapped:** All core + Lattice MVP offline
 - [x] **VS Code extension, releases, distribution:** Updated with PR bot foundation
 - [x] **Eat own dog food:** Parser_v2 registry, Markdown support for Lattice/visualizer
+- [x] **v2.1.0 Agent-Native MCP:** 6 new surgical tools (`list_entry_points`, `get_callers`, `get_callees`, `search_symbols`, `get_file_graph`, `get_node_detail`) with standard JSON envelope and `suggested_next_tool` routing hints. Total: 10 MCP tools.
 
 ### Still Outstanding (Major Epics)
 
@@ -67,7 +68,7 @@ This section tracks what is already shipped versus what remains strategic work.
 
 ---
 
-## 🚀 Immediate Focus (Post-v2.0)
+## 🚀 Immediate Focus (v1.8 / v2.0)
 **Theme:** *Persistent Intelligence & Enterprise Readiness*
 
 1. **Persistent Graph Database:** Move to SQLite/Sled with transactional updates and indexed queries for instant load.

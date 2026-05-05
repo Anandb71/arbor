@@ -28,7 +28,6 @@ impl LanguageParser for CppParser {
     }
 }
 
-/// Recursively extracts nodes from the C++ AST.
 fn extract_from_node(
     node: &Node,
     source: &str,
@@ -36,154 +35,156 @@ fn extract_from_node(
     nodes: &mut Vec<CodeNode>,
     context: Option<&str>,
 ) {
-    let kind = node.kind();
+    stacker::maybe_grow(64 * 1024, 4 * 1024 * 1024, || {
+        let kind = node.kind();
 
-    match kind {
-        // Class definitions
-        "class_specifier" => {
-            if let Some(code_node) = extract_class(node, source, file_path) {
-                let class_name = code_node.name.clone();
-                nodes.push(code_node);
+        match kind {
+            // Class definitions
+            "class_specifier" => {
+                if let Some(code_node) = extract_class(node, source, file_path) {
+                    let class_name = code_node.name.clone();
+                    nodes.push(code_node);
 
-                // Extract class members from body or field_declaration_list
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i) {
-                        if child.kind() == "field_declaration_list"
-                            || child.kind() == "declaration_list"
-                        {
-                            for j in 0..child.child_count() {
-                                if let Some(member) = child.child(j) {
-                                    extract_from_node(
-                                        &member,
-                                        source,
-                                        file_path,
-                                        nodes,
-                                        Some(&class_name),
-                                    );
+                    // Extract class members from body or field_declaration_list
+                    for i in 0..node.child_count() {
+                        if let Some(child) = node.child(i) {
+                            if child.kind() == "field_declaration_list"
+                                || child.kind() == "declaration_list"
+                            {
+                                for j in 0..child.child_count() {
+                                    if let Some(member) = child.child(j) {
+                                        extract_from_node(
+                                            &member,
+                                            source,
+                                            file_path,
+                                            nodes,
+                                            Some(&class_name),
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
+                    return;
                 }
-                return;
             }
-        }
 
-        // Struct definitions (C++ adds methods to structs)
-        "struct_specifier" => {
-            if let Some(code_node) = extract_struct(node, source, file_path) {
-                let struct_name = code_node.name.clone();
-                nodes.push(code_node);
+            // Struct definitions (C++ adds methods to structs)
+            "struct_specifier" => {
+                if let Some(code_node) = extract_struct(node, source, file_path) {
+                    let struct_name = code_node.name.clone();
+                    nodes.push(code_node);
 
-                // Extract struct members from body or field_declaration_list
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i) {
-                        if child.kind() == "field_declaration_list"
-                            || child.kind() == "declaration_list"
-                        {
-                            for j in 0..child.child_count() {
-                                if let Some(member) = child.child(j) {
-                                    extract_from_node(
-                                        &member,
-                                        source,
-                                        file_path,
-                                        nodes,
-                                        Some(&struct_name),
-                                    );
+                    // Extract struct members from body or field_declaration_list
+                    for i in 0..node.child_count() {
+                        if let Some(child) = node.child(i) {
+                            if child.kind() == "field_declaration_list"
+                                || child.kind() == "declaration_list"
+                            {
+                                for j in 0..child.child_count() {
+                                    if let Some(member) = child.child(j) {
+                                        extract_from_node(
+                                            &member,
+                                            source,
+                                            file_path,
+                                            nodes,
+                                            Some(&struct_name),
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
+                    return;
                 }
-                return;
             }
-        }
 
-        // Namespace definitions
-        "namespace_definition" => {
-            if let Some(code_node) = extract_namespace(node, source, file_path) {
-                let ns_name = code_node.name.clone();
-                nodes.push(code_node);
+            // Namespace definitions
+            "namespace_definition" => {
+                if let Some(code_node) = extract_namespace(node, source, file_path) {
+                    let ns_name = code_node.name.clone();
+                    nodes.push(code_node);
 
-                // Extract namespace members from body or declaration_list
-                for i in 0..node.child_count() {
-                    if let Some(child) = node.child(i) {
-                        if child.kind() == "declaration_list"
-                            || child.kind() == "compound_statement"
-                        {
-                            for j in 0..child.child_count() {
-                                if let Some(member) = child.child(j) {
-                                    extract_from_node(
-                                        &member,
-                                        source,
-                                        file_path,
-                                        nodes,
-                                        Some(&ns_name),
-                                    );
+                    // Extract namespace members from body or declaration_list
+                    for i in 0..node.child_count() {
+                        if let Some(child) = node.child(i) {
+                            if child.kind() == "declaration_list"
+                                || child.kind() == "compound_statement"
+                            {
+                                for j in 0..child.child_count() {
+                                    if let Some(member) = child.child(j) {
+                                        extract_from_node(
+                                            &member,
+                                            source,
+                                            file_path,
+                                            nodes,
+                                            Some(&ns_name),
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
+                    return;
+                }
+            }
+
+            // Function definitions
+            "function_definition" => {
+                if let Some(code_node) = extract_function(node, source, file_path, context) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Field declarations in class
+            "field_declaration" => {
+                if context.is_some() {
+                    extract_fields(node, source, file_path, nodes, context);
+                }
+            }
+
+            // Template declarations
+            "template_declaration" => {
+                // Recurse into template body
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i) {
+                        extract_from_node(&child, source, file_path, nodes, context);
+                    }
                 }
                 return;
             }
-        }
 
-        // Function definitions
-        "function_definition" => {
-            if let Some(code_node) = extract_function(node, source, file_path, context) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Field declarations in class
-        "field_declaration" => {
-            if context.is_some() {
-                extract_fields(node, source, file_path, nodes, context);
-            }
-        }
-
-        // Template declarations
-        "template_declaration" => {
-            // Recurse into template body
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
-                    extract_from_node(&child, source, file_path, nodes, context);
+            // Enum definitions
+            "enum_specifier" => {
+                if let Some(code_node) = extract_enum(node, source, file_path) {
+                    nodes.push(code_node);
                 }
             }
-            return;
+
+            // Include directives
+            "preproc_include" => {
+                if let Some(code_node) = extract_include(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Using directives
+            "using_declaration" => {
+                if let Some(code_node) = extract_using(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            _ => {}
         }
 
-        // Enum definitions
-        "enum_specifier" => {
-            if let Some(code_node) = extract_enum(node, source, file_path) {
-                nodes.push(code_node);
+        // Recurse into children
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                extract_from_node(&child, source, file_path, nodes, context);
             }
         }
-
-        // Include directives
-        "preproc_include" => {
-            if let Some(code_node) = extract_include(node, source, file_path) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Using directives
-        "using_declaration" => {
-            if let Some(code_node) = extract_using(node, source, file_path) {
-                nodes.push(code_node);
-            }
-        }
-
-        _ => {}
-    }
-
-    // Recurse into children
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            extract_from_node(&child, source, file_path, nodes, context);
-        }
-    }
+    }); // stacker::maybe_grow
 }
 
 /// Extracts a class definition.
@@ -467,18 +468,38 @@ fn extract_call_references(node: &Node, source: &str) -> Vec<String> {
     refs
 }
 
-/// Recursively collects function call names.
-fn collect_calls(node: &Node, source: &str, refs: &mut Vec<String>) {
-    if node.kind() == "call_expression" {
-        if let Some(func_node) = node.child_by_field_name("function") {
-            let call_name = get_text(&func_node, source);
-            refs.push(call_name);
+fn collect_calls(root: &Node, source: &str, refs: &mut Vec<String>) {
+    let mut cursor = root.walk();
+    'outer: loop {
+        let node = cursor.node();
+        if node.kind() == "call_expression" {
+            if let Some(func_node) = node.child_by_field_name("function") {
+                let range = func_node.byte_range();
+                if range.end <= source.len() {
+                    let call_text = &source[range];
+                    // Keep direct calls and namespace-qualified calls (::), drop dotted method calls
+                    if !call_text.contains('.') {
+                        refs.push(call_text.to_string());
+                    }
+                }
+            }
         }
-    }
-
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            collect_calls(&child, source, refs);
+        if cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            continue;
+        }
+        loop {
+            if !cursor.goto_parent() {
+                break 'outer;
+            }
+            if cursor.depth() == 0 {
+                break 'outer;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 }

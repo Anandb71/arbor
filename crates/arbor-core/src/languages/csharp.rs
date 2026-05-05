@@ -28,7 +28,6 @@ impl LanguageParser for CSharpParser {
     }
 }
 
-/// Recursively extracts nodes from the C# AST.
 fn extract_from_node(
     node: &Node,
     source: &str,
@@ -36,126 +35,151 @@ fn extract_from_node(
     nodes: &mut Vec<CodeNode>,
     context: Option<&str>,
 ) {
-    let kind = node.kind();
+    stacker::maybe_grow(64 * 1024, 4 * 1024 * 1024, || {
+        let kind = node.kind();
 
-    match kind {
-        // Class declarations
-        "class_declaration" => {
-            if let Some(code_node) = extract_type_decl(node, source, file_path, NodeKind::Class) {
-                let class_name = code_node.name.clone();
-                nodes.push(code_node);
+        match kind {
+            // Class declarations
+            "class_declaration" => {
+                if let Some(code_node) = extract_type_decl(node, source, file_path, NodeKind::Class)
+                {
+                    let class_name = code_node.name.clone();
+                    nodes.push(code_node);
 
-                // Extract class members
-                if let Some(body) = node.child_by_field_name("body") {
-                    for i in 0..body.child_count() {
-                        if let Some(child) = body.child(i) {
-                            extract_from_node(&child, source, file_path, nodes, Some(&class_name));
+                    // Extract class members
+                    if let Some(body) = node.child_by_field_name("body") {
+                        for i in 0..body.child_count() {
+                            if let Some(child) = body.child(i) {
+                                extract_from_node(
+                                    &child,
+                                    source,
+                                    file_path,
+                                    nodes,
+                                    Some(&class_name),
+                                );
+                            }
                         }
                     }
+                    return;
                 }
-                return;
             }
-        }
 
-        // Interface declarations
-        "interface_declaration" => {
-            if let Some(code_node) = extract_type_decl(node, source, file_path, NodeKind::Interface)
-            {
-                let iface_name = code_node.name.clone();
-                nodes.push(code_node);
+            // Interface declarations
+            "interface_declaration" => {
+                if let Some(code_node) =
+                    extract_type_decl(node, source, file_path, NodeKind::Interface)
+                {
+                    let iface_name = code_node.name.clone();
+                    nodes.push(code_node);
 
-                if let Some(body) = node.child_by_field_name("body") {
-                    for i in 0..body.child_count() {
-                        if let Some(child) = body.child(i) {
-                            extract_from_node(&child, source, file_path, nodes, Some(&iface_name));
+                    if let Some(body) = node.child_by_field_name("body") {
+                        for i in 0..body.child_count() {
+                            if let Some(child) = body.child(i) {
+                                extract_from_node(
+                                    &child,
+                                    source,
+                                    file_path,
+                                    nodes,
+                                    Some(&iface_name),
+                                );
+                            }
                         }
                     }
+                    return;
                 }
-                return;
             }
-        }
 
-        // Struct declarations
-        "struct_declaration" => {
-            if let Some(code_node) = extract_type_decl(node, source, file_path, NodeKind::Struct) {
-                let struct_name = code_node.name.clone();
-                nodes.push(code_node);
+            // Struct declarations
+            "struct_declaration" => {
+                if let Some(code_node) =
+                    extract_type_decl(node, source, file_path, NodeKind::Struct)
+                {
+                    let struct_name = code_node.name.clone();
+                    nodes.push(code_node);
 
-                if let Some(body) = node.child_by_field_name("body") {
-                    for i in 0..body.child_count() {
-                        if let Some(child) = body.child(i) {
-                            extract_from_node(&child, source, file_path, nodes, Some(&struct_name));
+                    if let Some(body) = node.child_by_field_name("body") {
+                        for i in 0..body.child_count() {
+                            if let Some(child) = body.child(i) {
+                                extract_from_node(
+                                    &child,
+                                    source,
+                                    file_path,
+                                    nodes,
+                                    Some(&struct_name),
+                                );
+                            }
                         }
                     }
+                    return;
                 }
-                return;
+            }
+
+            // Enum declarations
+            "enum_declaration" => {
+                if let Some(code_node) = extract_type_decl(node, source, file_path, NodeKind::Enum)
+                {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Method declarations
+            "method_declaration" => {
+                if let Some(code_node) = extract_method(node, source, file_path, context) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Constructor declarations
+            "constructor_declaration" => {
+                if let Some(code_node) = extract_constructor(node, source, file_path, context) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Property declarations
+            "property_declaration" => {
+                if let Some(code_node) = extract_property(node, source, file_path, context) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Field declarations
+            "field_declaration" => {
+                extract_fields(node, source, file_path, nodes, context);
+            }
+
+            // Using directives (imports)
+            "using_directive" => {
+                if let Some(code_node) = extract_using(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Namespace declarations
+            "namespace_declaration" | "file_scoped_namespace_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = get_text(&name_node, source);
+                    nodes.push(
+                        CodeNode::new(&name, &name, NodeKind::Module, file_path)
+                            .with_lines(
+                                node.start_position().row as u32 + 1,
+                                node.end_position().row as u32 + 1,
+                            )
+                            .with_bytes(node.start_byte() as u32, node.end_byte() as u32),
+                    );
+                }
+            }
+
+            _ => {}
+        }
+
+        // Recurse into children
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                extract_from_node(&child, source, file_path, nodes, context);
             }
         }
-
-        // Enum declarations
-        "enum_declaration" => {
-            if let Some(code_node) = extract_type_decl(node, source, file_path, NodeKind::Enum) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Method declarations
-        "method_declaration" => {
-            if let Some(code_node) = extract_method(node, source, file_path, context) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Constructor declarations
-        "constructor_declaration" => {
-            if let Some(code_node) = extract_constructor(node, source, file_path, context) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Property declarations
-        "property_declaration" => {
-            if let Some(code_node) = extract_property(node, source, file_path, context) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Field declarations
-        "field_declaration" => {
-            extract_fields(node, source, file_path, nodes, context);
-        }
-
-        // Using directives (imports)
-        "using_directive" => {
-            if let Some(code_node) = extract_using(node, source, file_path) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Namespace declarations
-        "namespace_declaration" | "file_scoped_namespace_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = get_text(&name_node, source);
-                nodes.push(
-                    CodeNode::new(&name, &name, NodeKind::Module, file_path)
-                        .with_lines(
-                            node.start_position().row as u32 + 1,
-                            node.end_position().row as u32 + 1,
-                        )
-                        .with_bytes(node.start_byte() as u32, node.end_byte() as u32),
-                );
-            }
-        }
-
-        _ => {}
-    }
-
-    // Recurse into children
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            extract_from_node(&child, source, file_path, nodes, context);
-        }
-    }
+    }); // stacker::maybe_grow
 }
 
 /// Extracts a type declaration (class, interface, struct, enum).
@@ -417,27 +441,56 @@ fn extract_call_references(node: &Node, source: &str) -> Vec<String> {
     refs
 }
 
-/// Recursively collects method call names.
-fn collect_calls(node: &Node, source: &str, refs: &mut Vec<String>) {
-    if node.kind() == "invocation_expression" {
-        if let Some(func) = node.child_by_field_name("function") {
-            match func.kind() {
-                "identifier" => {
-                    refs.push(get_text(&func, source));
-                }
-                "member_access_expression" => {
-                    if let Some(name_node) = func.child_by_field_name("name") {
-                        refs.push(get_text(&name_node, source));
+fn collect_calls(root: &Node, source: &str, refs: &mut Vec<String>) {
+    let mut cursor = root.walk();
+    'outer: loop {
+        let node = cursor.node();
+        if node.kind() == "invocation_expression" {
+            if let Some(func) = node.child_by_field_name("function") {
+                match func.kind() {
+                    "identifier" => {
+                        let range = func.byte_range();
+                        if range.end <= source.len() {
+                            refs.push(source[range].to_string());
+                        }
                     }
+                    "member_access_expression" => {
+                        // Only keep this.X / base.X calls to avoid name collision
+                        if let Some(obj) = func.child_by_field_name("expression") {
+                            let obj_range = obj.byte_range();
+                            if obj_range.end <= source.len() {
+                                let obj_text = &source[obj_range];
+                                if obj_text == "this" || obj_text == "base" {
+                                    if let Some(name_node) = func.child_by_field_name("name") {
+                                        let range = name_node.byte_range();
+                                        if range.end <= source.len() {
+                                            refs.push(source[range].to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
-    }
-
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            collect_calls(&child, source, refs);
+        if cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            continue;
+        }
+        loop {
+            if !cursor.goto_parent() {
+                break 'outer;
+            }
+            if cursor.depth() == 0 {
+                break 'outer;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 }

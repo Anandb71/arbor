@@ -16,15 +16,20 @@ jobs:
         with:
           fetch-depth: 0  # For full git history/impact
 
-      - name: Run Arbor PR Impact Analysis
-        uses: ./
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and install Arbor from source
+        run: cargo install --path crates/arbor-cli --force
+
+      - name: Run Arbor diff and capture report
+        shell: bash
         env:
           ARBOR_DIFF_BASE: ${{ github.event.pull_request.base.sha }}
           ARBOR_DIFF_HEAD: ${{ github.event.pull_request.head.sha }}
-        with:
-          command: diff . --json
-          install-from-source: true
-          working-directory: .
+          NO_COLOR: "1"
+        run: |
+          arbor diff . 2>&1 | sed 's/\x1b\[[0-9;]*[mGKHF]//g' > arbor-impact.md || true
 
       - name: Post Blast Radius Comment
         if: always()
@@ -33,25 +38,11 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            const reportPath = 'arbor-impact.md';
-            const fallback = [
-              '## 🧠 Arbor Graph Impact Report',
-              '',
-              'Impact report file was not generated in this run.',
-              '',
-              `Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`,
-              '',
-              'Likely cause: Arbor analysis step failed before writing markdown output.',
-              'Check the **Run Arbor PR Impact Analysis** step logs for details.'
-            ].join('\n');
-
-            const impact = fs.existsSync(reportPath)
-              ? (fs.readFileSync(reportPath, 'utf8') || fallback)
-              : fallback;
-
+            let impact = 'No impact report generated.';
+            try { impact = fs.readFileSync('arbor-impact.md', 'utf8'); } catch (_) {}
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `## 🧠 Arbor Graph Impact Report\n\n**Blast Radius:** High-centrality nodes affected?\n\n${impact}\n\n*Powered by Arbor graph governance for code. See https://github.com/Anandb71/arbor for details.*`
+              body: `## Arbor Graph Impact Report\n\n**Blast Radius:** High-centrality nodes affected?\n\n${impact}\n\n*Powered by [Arbor](https://github.com/${context.repo.owner}/${context.repo.repo}) — semantic code graph engine.*`
             });

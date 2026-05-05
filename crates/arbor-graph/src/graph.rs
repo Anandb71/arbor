@@ -290,6 +290,55 @@ impl ArborGraph {
     pub fn get_index(&self, id: &str) -> Option<NodeId> {
         self.id_index.get(id).copied()
     }
+
+    /// Returns all nodes detected as production entry points.
+    pub fn list_entry_points(&self) -> Vec<&CodeNode> {
+        use crate::heuristics::HeuristicsMatcher;
+        self.graph
+            .node_weights()
+            .filter(|n| HeuristicsMatcher::is_likely_entry_point(n))
+            .collect()
+    }
+
+    /// Returns all nodes in a file and the call edges between them.
+    /// Edges returned as (caller_name, callee_name, edge_kind_debug_str) triples.
+    pub fn nodes_in_file_with_edges(
+        &self,
+        file: &str,
+    ) -> (Vec<&CodeNode>, Vec<(String, String, String)>) {
+        let node_ids: std::collections::HashSet<NodeId> = self
+            .file_index
+            .get(file)
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default();
+
+        let nodes: Vec<&CodeNode> = node_ids
+            .iter()
+            .filter_map(|&id| self.graph.node_weight(id))
+            .collect();
+
+        let mut edges = Vec::new();
+        for &from in &node_ids {
+            for edge_ref in self
+                .graph
+                .edges_directed(from, petgraph::Direction::Outgoing)
+            {
+                let to = edge_ref.target();
+                if node_ids.contains(&to) {
+                    if let (Some(from_node), Some(to_node)) =
+                        (self.graph.node_weight(from), self.graph.node_weight(to))
+                    {
+                        edges.push((
+                            from_node.name.clone(),
+                            to_node.name.clone(),
+                            format!("{:?}", edge_ref.weight().kind),
+                        ));
+                    }
+                }
+            }
+        }
+        (nodes, edges)
+    }
 }
 
 /// Graph statistics for the info endpoint.
@@ -520,5 +569,75 @@ mod tests {
         g.set_centrality(scores);
 
         assert!((g.centrality(idx) - 0.75).abs() < f64::EPSILON);
+    }
+}
+
+#[cfg(test)]
+mod new_query_tests {
+    use super::*;
+    use crate::edge::{Edge, EdgeKind};
+    use arbor_core::{CodeNode, NodeKind};
+
+    fn make_node(name: &str, kind: NodeKind, file: &str) -> CodeNode {
+        CodeNode::new(name, format!("{}::{}", file, name), kind, file)
+    }
+
+    #[test]
+    fn test_list_entry_points_returns_main() {
+        let mut g = ArborGraph::new();
+        g.add_node(make_node("main", NodeKind::Function, "src/main.rs"));
+        g.add_node(make_node("helper", NodeKind::Function, "src/util.rs"));
+        let eps = g.list_entry_points();
+        assert!(
+            eps.iter().any(|n| n.name == "main"),
+            "main must be an entry point"
+        );
+        assert!(
+            !eps.iter().any(|n| n.name == "helper"),
+            "helper must not be an entry point"
+        );
+    }
+
+    #[test]
+    fn test_nodes_in_file_with_edges_returns_edges() {
+        let mut g = ArborGraph::new();
+        let a = g.add_node(make_node("foo", NodeKind::Function, "src/a.rs"));
+        let b = g.add_node(make_node("bar", NodeKind::Function, "src/a.rs"));
+        let _c = g.add_node(make_node("baz", NodeKind::Function, "src/b.rs"));
+        g.add_edge(
+            a,
+            b,
+            Edge {
+                kind: EdgeKind::Calls,
+                file: None,
+                line: None,
+            },
+        );
+        let (nodes, edges) = g.nodes_in_file_with_edges("src/a.rs");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].0, "foo");
+        assert_eq!(edges[0].1, "bar");
+    }
+
+    #[test]
+    fn test_nodes_in_file_with_edges_excludes_cross_file_edges() {
+        use crate::edge::{Edge, EdgeKind};
+        let mut g = ArborGraph::new();
+        let a = g.add_node(make_node("foo", NodeKind::Function, "src/a.rs"));
+        let c = g.add_node(make_node("baz", NodeKind::Function, "src/b.rs"));
+        // Edge from a.rs to b.rs — should NOT appear in get_file_graph for a.rs
+        g.add_edge(
+            a,
+            c,
+            Edge {
+                kind: EdgeKind::Calls,
+                file: None,
+                line: None,
+            },
+        );
+        let (nodes, edges) = g.nodes_in_file_with_edges("src/a.rs");
+        assert_eq!(nodes.len(), 1); // only foo
+        assert_eq!(edges.len(), 0); // cross-file edge excluded
     }
 }

@@ -99,6 +99,86 @@ impl HeuristicsMatcher {
             || name_lower.contains("singleton")
     }
 
+    /// Check if a node is likely a production entry point.
+    ///
+    /// Entry points are the outermost functions that receive external requests —
+    /// HTTP handlers, CLI commands, cron jobs, webhook receivers, main functions.
+    /// They're the roots of execution trees; if a changed function reaches one,
+    /// it means the change can affect real production traffic.
+    pub fn is_likely_entry_point(node: &CodeNode) -> bool {
+        if !matches!(node.kind, NodeKind::Function | NodeKind::Method) {
+            return false;
+        }
+        let name = node.name.to_lowercase();
+        let file = node.file.to_lowercase();
+
+        // Main / program entry
+        if node.name == "main" || node.name == "__main__" {
+            return true;
+        }
+
+        // HTTP route handlers (Express, Gin, axum, FastAPI, Flask, Django, Rails)
+        if name.ends_with("_view")
+            || name.ends_with("_handler")
+            || name.ends_with("_controller")
+            || name.ends_with("_endpoint")
+            || name.starts_with("handle_")
+            || name.starts_with("get_")
+            || name.starts_with("post_")
+            || name.starts_with("put_")
+            || name.starts_with("delete_")
+            || name.starts_with("patch_")
+        {
+            // Only count as entry point if in a routes/views/handlers/controllers file
+            if file.contains("route")
+                || file.contains("view")
+                || file.contains("handler")
+                || file.contains("controller")
+                || file.contains("endpoint")
+                || file.contains("api")
+            {
+                return true;
+            }
+        }
+
+        // Webhook / event receivers
+        if name.contains("webhook")
+            || name.contains("receive")
+            || name.contains("subscribe")
+            || name.starts_with("on_")
+            || (name.starts_with("handle") && !file.contains("test"))
+        {
+            return true;
+        }
+
+        // Background jobs / cron / workers
+        if (name.contains("job")
+            || name.contains("task")
+            || name.contains("worker")
+            || name.contains("cron")
+            || name.ends_with("_run")
+            || name == "run"
+            || name == "execute"
+            || name == "process")
+            && (file.contains("job")
+                || file.contains("task")
+                || file.contains("worker")
+                || file.contains("cron")
+                || file.contains("celery")
+                || file.contains("sidekiq")
+                || file.contains("background"))
+        {
+            return true;
+        }
+
+        // CLI command handlers
+        if name.contains("command") || name.ends_with("_cmd") || name == "cli" || name == "invoke" {
+            return true;
+        }
+
+        false
+    }
+
     /// Infer uncertain edges from node patterns
     pub fn infer_uncertain_edges(nodes: &[&CodeNode]) -> Vec<UncertainEdge> {
         let mut edges = Vec::new();
@@ -318,8 +398,8 @@ mod tests {
         let nodes: Vec<CodeNode> = (0..7)
             .map(|i| {
                 CodeNode::new(
-                    &format!("on_event_{}", i),
-                    &format!("on_event_{}", i),
+                    format!("on_event_{}", i),
+                    format!("on_event_{}", i),
                     NodeKind::Function,
                     "events.ts",
                 )

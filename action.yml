@@ -6,11 +6,11 @@ branding:
 
 inputs:
   command:
-    description: Arbor command to run (without leading 'arbor'). For PR bot reports, use a valid CLI command like 'diff . --json' or 'check . --json --no-fail'.
+    description: Arbor command to run (without leading 'arbor'). For example 'diff .' or 'status .'.
     required: false
     default: status .
   arbor-version:
-    description: Arbor CLI version to install (e.g. 2.0.0). Use 'latest' for newest.
+    description: Arbor CLI version to install (e.g. 1.6.2). Use 'latest' for newest.
     required: false
     default: latest
   install-from-source:
@@ -40,34 +40,9 @@ runs:
           cargo install arbor-graph-cli --version "${{ inputs.arbor-version }}" --force
         fi
 
-    - name: Run Arbor command (with PR Bot support)
+    - name: Run Arbor command
       shell: bash
       run: |
         set -euo pipefail
         cd "${{ inputs.working-directory }}"
-        if [[ "${{ inputs.command }}" == *"diff"* || "${{ inputs.command }}" == *"check"* || "${{ inputs.command }}" == *"pr-summary"* || "${{ inputs.command }}" == *"analyze-impact"* ]]; then
-          if arbor ${{ inputs.command }} > /tmp/arbor-impact.out 2>/tmp/arbor-impact.err; then
-            {
-              echo "Command: \`${{ inputs.command }}\`"
-              echo
-              echo '```json'
-              cat /tmp/arbor-impact.out || true
-              echo '```'
-            } > arbor-impact.md
-            echo "Generated impact report from CLI output."
-          else
-            {
-              echo "Unable to generate impact report."
-              echo
-              echo "Command: \`${{ inputs.command }}\`"
-              echo
-              echo "stderr:"
-              echo '```'
-              cat /tmp/arbor-impact.err || true
-              echo '```'
-            } > arbor-impact.md
-            echo "::warning::Arbor impact analysis failed; wrote fallback report to arbor-impact.md."
-          fi
-        else
-          arbor ${{ inputs.command }}
-        fi
+        arbor ${{ inputs.command }}

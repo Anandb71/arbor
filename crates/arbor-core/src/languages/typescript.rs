@@ -21,15 +21,14 @@ impl LanguageParser for TypeScriptParser {
     fn extract_nodes(&self, tree: &Tree, source: &str, file_path: &str) -> Vec<CodeNode> {
         let mut nodes = Vec::new();
         let root = tree.root_node();
-
-        // We'll do a recursive traversal to find interesting nodes
         extract_from_node(&root, source, file_path, &mut nodes, None);
-
         nodes
     }
 }
 
 /// Recursively extracts nodes from the AST.
+/// Uses stacker::maybe_grow to prevent stack overflow on deeply-nested files
+/// (e.g. TypeScript compiler's checker.ts which is 50k+ lines).
 fn extract_from_node(
     node: &Node,
     source: &str,
@@ -37,97 +36,92 @@ fn extract_from_node(
     nodes: &mut Vec<CodeNode>,
     parent_name: Option<&str>,
 ) {
-    let kind = node.kind();
+    stacker::maybe_grow(64 * 1024, 4 * 1024 * 1024, || {
+        let kind = node.kind();
 
-    match kind {
-        // Functions
-        "function_declaration" | "function" => {
-            if let Some(code_node) = extract_function(node, source, file_path, parent_name) {
-                nodes.push(code_node);
+        match kind {
+            "function_declaration" | "function" => {
+                if let Some(code_node) = extract_function(node, source, file_path, parent_name) {
+                    nodes.push(code_node);
+                }
             }
-        }
 
-        // Arrow functions assigned to variables
-        "lexical_declaration" | "variable_declaration" => {
-            if let Some(code_node) = extract_arrow_function(node, source, file_path) {
-                nodes.push(code_node);
+            "lexical_declaration" | "variable_declaration" => {
+                if let Some(code_node) = extract_arrow_function(node, source, file_path) {
+                    nodes.push(code_node);
+                }
             }
-        }
 
-        // Classes
-        "class_declaration" | "class" => {
-            if let Some(code_node) = extract_class(node, source, file_path) {
-                let class_name = code_node.name.clone();
-                nodes.push(code_node);
+            "class_declaration" | "class" => {
+                if let Some(code_node) = extract_class(node, source, file_path) {
+                    let class_name = code_node.name.clone();
+                    nodes.push(code_node);
+                    if let Some(body) = node.child_by_field_name("body") {
+                        for i in 0..body.child_count() {
+                            if let Some(child) = body.child(i) {
+                                extract_from_node(
+                                    &child,
+                                    source,
+                                    file_path,
+                                    nodes,
+                                    Some(&class_name),
+                                );
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
 
-                // Extract methods within the class
-                if let Some(body) = node.child_by_field_name("body") {
-                    for i in 0..body.child_count() {
-                        if let Some(child) = body.child(i) {
-                            extract_from_node(&child, source, file_path, nodes, Some(&class_name));
+            "method_definition" => {
+                if let Some(code_node) = extract_method(node, source, file_path, parent_name) {
+                    nodes.push(code_node);
+                }
+            }
+
+            "interface_declaration" => {
+                if let Some(code_node) = extract_interface(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            "type_alias_declaration" => {
+                if let Some(code_node) = extract_type_alias(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            "import_statement" => {
+                if let Some(code_node) = extract_import(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            "export_statement" => {
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i) {
+                        let child_kind = child.kind();
+                        if matches!(
+                            child_kind,
+                            "function_declaration" | "class_declaration" | "lexical_declaration"
+                        ) {
+                            extract_from_node(&child, source, file_path, nodes, parent_name);
                         }
                     }
                 }
-                return; // Don't recurse again, we handled children
+            }
+
+            _ => {}
+        }
+
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                extract_from_node(&child, source, file_path, nodes, parent_name);
             }
         }
-
-        // Methods inside classes
-        "method_definition" => {
-            if let Some(code_node) = extract_method(node, source, file_path, parent_name) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Interfaces
-        "interface_declaration" => {
-            if let Some(code_node) = extract_interface(node, source, file_path) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Type aliases
-        "type_alias_declaration" => {
-            if let Some(code_node) = extract_type_alias(node, source, file_path) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Import statements
-        "import_statement" => {
-            if let Some(code_node) = extract_import(node, source, file_path) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Export statements (named exports, default exports)
-        "export_statement" => {
-            // The export might wrap a function or class, extract those
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
-                    let child_kind = child.kind();
-                    if matches!(
-                        child_kind,
-                        "function_declaration" | "class_declaration" | "lexical_declaration"
-                    ) {
-                        extract_from_node(&child, source, file_path, nodes, parent_name);
-                    }
-                }
-            }
-        }
-
-        _ => {}
-    }
-
-    // Recurse into children for most node types
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            extract_from_node(&child, source, file_path, nodes, parent_name);
-        }
-    }
+    });
 }
 
-/// Extracts a function declaration.
 fn extract_function(
     node: &Node,
     source: &str,
@@ -148,16 +142,9 @@ fn extract_function(
         NodeKind::Function
     };
 
-    // Check for async keyword
     let is_async = has_modifier(node, source, "async");
-
-    // Check for export
     let is_exported = is_node_exported(node);
-
-    // Build signature
     let signature = build_function_signature(node, source);
-
-    // Extract references (function calls within the body)
     let references = extract_call_references(node, source);
 
     Some(
@@ -180,9 +167,7 @@ fn extract_function(
     )
 }
 
-/// Extracts arrow functions assigned to const/let.
 fn extract_arrow_function(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
-    // Look for pattern: const foo = () => {} or const foo = async () => {}
     for i in 0..node.child_count() {
         if let Some(declarator) = node.child(i) {
             if declarator.kind() == "variable_declarator" {
@@ -193,7 +178,6 @@ fn extract_arrow_function(node: &Node, source: &str, file_path: &str) -> Option<
                     let name = get_text(&name_node, source);
                     let is_async = has_modifier(&value_node, source, "async");
                     let is_exported = is_node_exported(node);
-
                     let signature = build_arrow_signature(&value_node, source, &name);
                     let references = extract_call_references(&value_node, source);
 
@@ -217,7 +201,6 @@ fn extract_arrow_function(node: &Node, source: &str, file_path: &str) -> Option<
     None
 }
 
-/// Extracts a class declaration.
 fn extract_class(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
     let name_node = node.child_by_field_name("name")?;
     let name = get_text(&name_node, source);
@@ -240,7 +223,6 @@ fn extract_class(node: &Node, source: &str, file_path: &str) -> Option<CodeNode>
     )
 }
 
-/// Extracts a method within a class.
 fn extract_method(
     node: &Node,
     source: &str,
@@ -259,8 +241,6 @@ fn extract_method(
     let is_static = has_modifier(node, source, "static");
     let signature = build_function_signature(node, source);
     let references = extract_call_references(node, source);
-
-    // Check visibility modifiers
     let visibility = detect_visibility(node, source);
 
     Some(
@@ -279,7 +259,6 @@ fn extract_method(
     )
 }
 
-/// Extracts an interface declaration.
 fn extract_interface(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
     let name_node = node.child_by_field_name("name")?;
     let name = get_text(&name_node, source);
@@ -302,7 +281,6 @@ fn extract_interface(node: &Node, source: &str, file_path: &str) -> Option<CodeN
     )
 }
 
-/// Extracts a type alias.
 fn extract_type_alias(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
     let name_node = node.child_by_field_name("name")?;
     let name = get_text(&name_node, source);
@@ -320,14 +298,69 @@ fn extract_type_alias(node: &Node, source: &str, file_path: &str) -> Option<Code
     )
 }
 
-/// Extracts an import statement.
+/// Extracts an import statement, capturing both the source module and what was imported.
+///
+/// The imported names are stored in `references` so the graph builder can build an
+/// import map for import-aware edge resolution. Format:
+///   - Named import  `{ X }`       → "X"
+///   - Default import `import X`   → "X"
+///   - Namespace     `* as X`      → "*as:X"  (graph builder resolves X.method() calls)
 fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
-    // Get the import source (the "from 'module'" part)
     let source_node = node.child_by_field_name("source")?;
-    let module_path = get_text(&source_node, source);
+    let raw = get_text(&source_node, source);
+    let module_path = raw.trim_matches(|c| c == '"' || c == '\'');
 
-    // Clean up quotes
-    let module_path = module_path.trim_matches(|c| c == '"' || c == '\'');
+    let mut imported_names: Vec<String> = Vec::new();
+
+    // Walk the import_clause to find what was imported
+    for i in 0..node.child_count() {
+        if let Some(clause) = node.child(i) {
+            if clause.kind() != "import_clause" {
+                continue;
+            }
+            for j in 0..clause.child_count() {
+                if let Some(child) = clause.child(j) {
+                    match child.kind() {
+                        // Default import: `import Foo from './mod'`
+                        "identifier" => {
+                            imported_names.push(get_text(&child, source));
+                        }
+                        // Named imports: `import { A, B as C } from './mod'`
+                        "named_imports" => {
+                            for k in 0..child.child_count() {
+                                if let Some(spec) = child.child(k) {
+                                    if spec.kind() == "import_specifier" {
+                                        // Use the local alias if present, otherwise the original name
+                                        let local = spec
+                                            .child_by_field_name("alias")
+                                            .or_else(|| spec.child_by_field_name("name"))
+                                            .map(|n| get_text(&n, source));
+                                        if let Some(n) = local {
+                                            imported_names.push(n);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Namespace import: `import * as types from '@babel/types'`
+                        "namespace_import" => {
+                            // Find the identifier (the alias) — it follows the `as` keyword
+                            for k in 0..child.child_count() {
+                                if let Some(ns_child) = child.child(k) {
+                                    if ns_child.kind() == "identifier" {
+                                        let alias = get_text(&ns_child, source);
+                                        imported_names.push(format!("*as:{}", alias));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            break; // only one import_clause per statement
+        }
+    }
 
     Some(
         CodeNode::new(module_path, module_path, NodeKind::Import, file_path)
@@ -335,7 +368,8 @@ fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode
                 node.start_position().row as u32 + 1,
                 node.end_position().row as u32 + 1,
             )
-            .with_bytes(node.start_byte() as u32, node.end_byte() as u32),
+            .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
+            .with_references(imported_names),
     )
 }
 
@@ -343,12 +377,10 @@ fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode
 // Helper functions
 // ============================================================================
 
-/// Gets text content of a node.
 fn get_text(node: &Node, source: &str) -> String {
     source[node.byte_range()].to_string()
 }
 
-/// Checks if a node has a specific modifier keyword.
 fn has_modifier(node: &Node, source: &str, modifier: &str) -> bool {
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
@@ -361,7 +393,6 @@ fn has_modifier(node: &Node, source: &str, modifier: &str) -> bool {
     false
 }
 
-/// Checks if a node is exported (wrapped in export_statement).
 fn is_node_exported(node: &Node) -> bool {
     if let Some(parent) = node.parent() {
         return parent.kind() == "export_statement";
@@ -369,7 +400,6 @@ fn is_node_exported(node: &Node) -> bool {
     false
 }
 
-/// Detects visibility from TypeScript/ES2022 modifiers.
 fn detect_visibility(node: &Node, source: &str) -> Visibility {
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
@@ -382,22 +412,18 @@ fn detect_visibility(node: &Node, source: &str) -> Visibility {
             }
         }
     }
-    Visibility::Public // Default for class members
+    Visibility::Public
 }
 
-/// Builds a function signature string.
 fn build_function_signature(node: &Node, source: &str) -> String {
-    // Try to extract name, params, and return type
     let name = node
         .child_by_field_name("name")
         .map(|n| get_text(&n, source))
         .unwrap_or_default();
-
     let params = node
         .child_by_field_name("parameters")
         .map(|n| get_text(&n, source))
         .unwrap_or_else(|| "()".to_string());
-
     let return_type = node
         .child_by_field_name("return_type")
         .map(|n| get_text(&n, source))
@@ -410,47 +436,82 @@ fn build_function_signature(node: &Node, source: &str) -> String {
     }
 }
 
-/// Builds an arrow function signature.
 fn build_arrow_signature(node: &Node, source: &str, name: &str) -> String {
     let params = node
         .child_by_field_name("parameters")
         .or_else(|| node.child_by_field_name("parameter"))
         .map(|n| get_text(&n, source))
         .unwrap_or_else(|| "()".to_string());
-
     format!("{}{}", name, params)
 }
 
 /// Extracts function call references from a node's body.
-fn extract_call_references(node: &Node, source: &str) -> Vec<String> {
+///
+/// Uses an iterative TreeCursor traversal to prevent stack overflow on deeply-nested
+/// ASTs (e.g. TypeScript compiler, large generated files).
+///
+/// Resolution strategy:
+///   - Direct call   `foo()`         → "foo"         (resolvable via symbol table)
+///   - this-call     `this.foo()`    → "foo"          (resolvable via same-class lookup)
+///   - super-call    `super.foo()`   → "foo"          (resolvable via parent class)
+///   - Other dotted  `arr.push()`    → DROPPED        (method on unknown object type;
+///     can't resolve without type inference,
+///     and would cause false name collisions)
+fn extract_call_references(root: &Node, source: &str) -> Vec<String> {
     let mut refs = Vec::new();
-    collect_calls(node, source, &mut refs);
-    refs.sort();
-    refs.dedup();
-    refs
-}
+    let mut cursor = root.walk();
 
-/// Recursively collects function call names.
-fn collect_calls(node: &Node, source: &str, refs: &mut Vec<String>) {
-    if node.kind() == "call_expression" {
-        // Get the function being called
-        if let Some(func_node) = node.child_by_field_name("function") {
-            let call_name = get_text(&func_node, source);
-            // Skip common built-ins and method chains on objects
-            if !call_name.contains('.') || call_name.starts_with("this.") {
-                refs.push(call_name);
-            } else if let Some(parts) = call_name.split('.').next_back() {
-                // For chains like foo.bar.baz(), we capture 'baz'
-                refs.push(parts.to_string());
+    'outer: loop {
+        let node = cursor.node();
+
+        if node.kind() == "call_expression" {
+            if let Some(func_node) = node.child_by_field_name("function") {
+                let range = func_node.byte_range();
+                if range.end <= source.len() {
+                    let call_text = &source[range];
+
+                    if !call_text.contains('.') {
+                        // Direct call: validate(x), clone(node) — always track
+                        refs.push(call_text.to_string());
+                    } else if call_text.starts_with("this.") || call_text.starts_with("super.") {
+                        // this.validate() / super.clone() — strip prefix, track method name
+                        if let Some(method) = call_text.split_once('.').map(|x| x.1) {
+                            if !method.is_empty() && !method.contains('.') {
+                                refs.push(method.to_string());
+                            }
+                        }
+                    }
+                    // All other dotted calls (arr.push, path.resolve, str.trim, obj.method)
+                    // are DROPPED. Without type inference we cannot know what type `arr`,
+                    // `path`, `str`, or `obj` are, so any edge would be a false positive.
+                }
+            }
+        }
+
+        // Iterative depth-first traversal — no recursion, no stack overflow
+        if cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            continue;
+        }
+        loop {
+            if !cursor.goto_parent() {
+                break 'outer;
+            }
+            // depth() is relative to the node root.walk() was called on, so 0 = back at root
+            if cursor.depth() == 0 {
+                break 'outer;
+            }
+            if cursor.goto_next_sibling() {
+                break;
             }
         }
     }
 
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            collect_calls(&child, source, refs);
-        }
-    }
+    refs.sort();
+    refs.dedup();
+    refs
 }
 
 // Builder pattern helpers as a trait extension
@@ -468,7 +529,6 @@ impl CodeNodeExt for CodeNode {
             self
         }
     }
-
     fn with_static_if(self, cond: bool) -> Self {
         if cond {
             self.as_static()
@@ -476,7 +536,6 @@ impl CodeNodeExt for CodeNode {
             self
         }
     }
-
     fn with_exported_if(self, cond: bool) -> Self {
         if cond {
             self.as_exported()

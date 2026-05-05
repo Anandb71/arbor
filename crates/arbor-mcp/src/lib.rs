@@ -153,6 +153,45 @@ impl McpServer {
         })
     }
 
+    fn ok_envelope(
+        tool: &str,
+        data: Value,
+        node_count: usize,
+        next_tool: &str,
+        next_args: Value,
+    ) -> Value {
+        json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "tool": tool,
+                    "arbor_version": env!("CARGO_PKG_VERSION"),
+                    "data": data,
+                    "meta": {
+                        "node_count": node_count,
+                        "suggested_next_tool": next_tool,
+                        "suggested_next_args": next_args
+                    }
+                })).unwrap_or_default()
+            }]
+        })
+    }
+
+    fn err_envelope(tool: &str, message: &str) -> Value {
+        json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string_pretty(&json!({
+                    "ok": false,
+                    "tool": tool,
+                    "arbor_version": env!("CARGO_PKG_VERSION"),
+                    "error": message
+                })).unwrap_or_default()
+            }]
+        })
+    }
+
     fn list_tools(&self) -> Result<Value, JsonRpcError> {
         Ok(json!({
             "tools": [
@@ -169,13 +208,12 @@ impl McpServer {
                 },
                 {
                     "name": "analyze_impact",
-                    "description": "Analyzes the impact (blast radius) of changing a node. Returns structured data or Markdown table report with **bold high-risk** files using ConfidenceExplanation (for PR bot).",
+                    "description": "Analyzes the impact (blast radius) of changing a node. Returns structured data with upstream/downstream affected nodes.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "node_id": { "type": "string", "description": "ID or name of the node to analyze" },
-                            "max_depth": { "type": "integer", "description": "Maximum hop distance (default: 5, 0 = unlimited)", "default": 5 },
-                            "format": { "type": "string", "description": "Output format: json (default) or markdown for PR comment table", "enum": ["json", "markdown"], "default": "json" }
+                            "max_depth": { "type": "integer", "description": "Maximum hop distance (default: 5, 0 = unlimited)", "default": 5 }
                         },
                         "required": ["node_id"]
                     }
@@ -201,6 +239,67 @@ impl McpServer {
                             "start_node": { "type": "string", "description": "Starting knowledge Section (e.g. 'Core Habits')" }
                         },
                         "required": ["start_node"]
+                    }
+                },
+                {
+                    "name": "list_entry_points",
+                    "description": "Lists all detected production entry points: HTTP handlers, main functions, webhooks, background jobs, and CLI commands. Use this first to understand the execution surface of a codebase.",
+                    "inputSchema": { "type": "object", "properties": {}, "required": [] }
+                },
+                {
+                    "name": "get_callers",
+                    "description": "Returns the direct callers of a symbol (one hop upstream). Use to answer 'what calls this function?'",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": { "type": "string", "description": "Name or ID of the symbol to look up" }
+                        },
+                        "required": ["symbol"]
+                    }
+                },
+                {
+                    "name": "get_callees",
+                    "description": "Returns the direct callees of a symbol (one hop downstream). Use to answer 'what does this function call?'",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": { "type": "string", "description": "Name or ID of the symbol to look up" }
+                        },
+                        "required": ["symbol"]
+                    }
+                },
+                {
+                    "name": "search_symbols",
+                    "description": "Fuzzy-searches symbol names across the graph. Use when you know part of a name but not the full ID.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string", "description": "Partial or full symbol name to search for" },
+                            "limit": { "type": "integer", "description": "Maximum results to return (default: 20)", "default": 20 }
+                        },
+                        "required": ["query"]
+                    }
+                },
+                {
+                    "name": "get_file_graph",
+                    "description": "Returns all symbols and internal call edges within a single file. Use to understand a file's internal structure.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": { "type": "string", "description": "Relative path to the file (e.g. 'src/auth.rs')" }
+                        },
+                        "required": ["file_path"]
+                    }
+                },
+                {
+                    "name": "get_node_detail",
+                    "description": "Returns full detail for a single symbol: file, line range, kind, role, centrality rank. Use after search_symbols or list_entry_points to inspect a specific node.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": { "type": "string", "description": "Name or ID of the symbol" }
+                        },
+                        "required": ["symbol"]
                     }
                 }
             ]
@@ -250,11 +349,6 @@ impl McpServer {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(5) as usize;
 
-                let format = arguments
-                    .get("format")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("json");
-
                 // Trigger Spotlight
                 self.trigger_spotlight(node_id).await;
 
@@ -277,104 +371,68 @@ impl McpServer {
                             arbor_graph::ConfidenceExplanation::from_analysis(&analysis);
                         let role = arbor_graph::NodeRole::from_analysis(&analysis);
 
-                        if format == "markdown" {
-                            // Polish for PR bot: professional Markdown table with **bold** high-risk using ConfidenceExplanation
-                            let mut table = format!(
-                                "## 🧠 Arbor PR Bot Impact Report for `{}`\n\n**High-Risk Changes (Centrality-Based, sorted_by_centrality=true)**\n\n| File | Node | Risk | Confidence | Explanation |\n|------|------|------|------------|-------------|\n",
-                                node_id
-                            );
-                            for u in &analysis.upstream {
-                                let risk = match u.severity.as_str() {
-                                    "high" => "**HIGH**",
-                                    _ => "Medium",
-                                };
-                                let bold = if matches!(
-                                    confidence.level,
-                                    arbor_graph::ConfidenceLevel::High
-                                ) {
-                                    "**"
-                                } else {
-                                    ""
-                                };
-                                table.push_str(&format!(
-                                    "| {} | {} | {} | {}{:?}{} | {} |\n",
-                                    u.node_info.file,
-                                    u.node_info.name,
-                                    risk,
-                                    bold,
-                                    confidence.level,
-                                    bold,
-                                    u.entry_edge
-                                ));
-                            }
-                            table.push_str(&format!("\n**Summary**: {} affected. **Review bolded high-centrality nodes**. Powered by Lattice graph (Priority 1/3).", analysis.total_affected));
-                            Ok(json!({
-                                "content": [{ "type": "text", "text": table }]
-                            }))
-                        } else {
-                            // Build structured response (default JSON for MCP)
-                            let upstream: Vec<Value> = analysis
-                                .upstream
-                                .iter()
-                                .map(|n| {
-                                    json!({
-                                        "id": n.node_info.id,
-                                        "name": n.node_info.name,
-                                        "kind": n.node_info.kind,
-                                        "file": n.node_info.file,
-                                        "severity": n.severity.as_str(),
-                                        "hop_distance": n.hop_distance,
-                                        "entry_edge": n.entry_edge.to_string()
-                                    })
+                        // Build structured response
+                        let upstream: Vec<Value> = analysis
+                            .upstream
+                            .iter()
+                            .map(|n| {
+                                json!({
+                                    "id": n.node_info.id,
+                                    "name": n.node_info.name,
+                                    "kind": n.node_info.kind,
+                                    "file": n.node_info.file,
+                                    "severity": n.severity.as_str(),
+                                    "hop_distance": n.hop_distance,
+                                    "entry_edge": n.entry_edge.to_string()
                                 })
-                                .collect();
+                            })
+                            .collect();
 
-                            let downstream: Vec<Value> = analysis
-                                .downstream
-                                .iter()
-                                .map(|n| {
-                                    json!({
-                                        "id": n.node_info.id,
-                                        "name": n.node_info.name,
-                                        "kind": n.node_info.kind,
-                                        "file": n.node_info.file,
-                                        "severity": n.severity.as_str(),
-                                        "hop_distance": n.hop_distance,
-                                        "entry_edge": n.entry_edge.to_string()
-                                    })
+                        let downstream: Vec<Value> = analysis
+                            .downstream
+                            .iter()
+                            .map(|n| {
+                                json!({
+                                    "id": n.node_info.id,
+                                    "name": n.node_info.name,
+                                    "kind": n.node_info.kind,
+                                    "file": n.node_info.file,
+                                    "severity": n.severity.as_str(),
+                                    "hop_distance": n.hop_distance,
+                                    "entry_edge": n.entry_edge.to_string()
                                 })
-                                .collect();
+                            })
+                            .collect();
 
-                            Ok(json!({
-                                "content": [{
-                                    "type": "text",
-                                    "text": serde_json::to_string_pretty(&json!({
-                                        "target": {
-                                            "id": analysis.target.id,
-                                            "name": analysis.target.name,
-                                            "kind": analysis.target.kind,
-                                            "file": analysis.target.file
-                                        },
-                                        "confidence": {
-                                            "level": confidence.level.to_string(),
-                                            "reasons": confidence.reasons
-                                        },
-                                        "role": role.to_string(),
-                                        "upstream": upstream,
-                                        "downstream": downstream,
-                                        "total_affected": analysis.total_affected,
-                                        "max_depth": analysis.max_depth,
-                                        "query_time_ms": analysis.query_time_ms,
-                                        "edges_explained": format!(
-                                            "{} upstream callers, {} downstream dependencies",
-                                            analysis.upstream.len(),
-                                            analysis.downstream.len()
-                                        ),
-                                        "sorted_by_centrality": true
-                                    })).unwrap_or_default()
-                                }]
-                            }))
-                        }
+                        Ok(json!({
+                            "content": [{
+                                "type": "text",
+                                "text": serde_json::to_string_pretty(&json!({
+                                    "target": {
+                                        "id": analysis.target.id,
+                                        "name": analysis.target.name,
+                                        "kind": analysis.target.kind,
+                                        "file": analysis.target.file
+                                    },
+                                    "confidence": {
+                                        "level": confidence.level.to_string(),
+                                        "reasons": confidence.reasons
+                                    },
+                                    "role": role.to_string(),
+                                    "upstream": upstream,
+                                    "downstream": downstream,
+                                    "total_affected": analysis.total_affected,
+                                    "max_depth": analysis.max_depth,
+                                    "query_time_ms": analysis.query_time_ms,
+                                    "edges_explained": format!(
+                                        "{} upstream callers, {} downstream dependencies",
+                                        analysis.upstream.len(),
+                                        analysis.downstream.len()
+                                    ),
+                                    "sorted_by_centrality": true
+                                })).unwrap_or_default()
+                            }]
+                        }))
                     }
                     None => Ok(json!({
                         "content": [{
@@ -453,6 +511,299 @@ impl McpServer {
                     }]
                 }))
             }
+            "list_entry_points" => {
+                let graph = self.graph.read().await;
+                let eps = graph.list_entry_points();
+                let entries: Vec<Value> = eps
+                    .iter()
+                    .map(|n| {
+                        json!({
+                            "id": n.id,
+                            "name": n.name,
+                            "kind": n.kind.to_string(),
+                            "file": n.file,
+                            "line": n.line_start
+                        })
+                    })
+                    .collect();
+                let count = entries.len();
+                let next_node_id = entries
+                    .first()
+                    .and_then(|e| e["id"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let (next_tool, next_args) = if count > 0 {
+                    ("analyze_impact", json!({ "node_id": next_node_id }))
+                } else {
+                    ("search_symbols", json!({ "query": "" }))
+                };
+                Ok(Self::ok_envelope(
+                    "list_entry_points",
+                    json!({ "entry_points": entries }),
+                    count,
+                    next_tool,
+                    next_args,
+                ))
+            }
+            "get_callers" => {
+                let symbol = arguments
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let graph = self.graph.read().await;
+                let resolved = graph
+                    .get_index(symbol)
+                    .map(|idx| (symbol.to_string(), idx))
+                    .or_else(|| {
+                        graph
+                            .find_by_name(symbol)
+                            .first()
+                            .and_then(|n| graph.get_index(&n.id).map(|idx| (n.id.clone(), idx)))
+                    });
+                match resolved {
+                    None => Ok(Self::err_envelope(
+                        "get_callers",
+                        &format!("Symbol '{}' not found", symbol),
+                    )),
+                    Some((resolved_id, idx)) => {
+                        let callers = graph.get_callers(idx);
+                        let items: Vec<Value> = callers
+                            .iter()
+                            .map(|n| {
+                                json!({
+                                    "id": n.id,
+                                    "name": n.name,
+                                    "kind": n.kind.to_string(),
+                                    "file": n.file,
+                                    "line": n.line_start
+                                })
+                            })
+                            .collect();
+                        let count = items.len();
+                        Ok(Self::ok_envelope(
+                            "get_callers",
+                            json!({ "symbol": symbol, "callers": items }),
+                            count,
+                            if count > 0 {
+                                "analyze_impact"
+                            } else {
+                                "search_symbols"
+                            },
+                            if count > 0 {
+                                json!({ "node_id": resolved_id })
+                            } else {
+                                json!({ "query": symbol })
+                            },
+                        ))
+                    }
+                }
+            }
+            "get_callees" => {
+                let symbol = arguments
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let graph = self.graph.read().await;
+                let resolved = graph
+                    .get_index(symbol)
+                    .map(|idx| (symbol.to_string(), idx))
+                    .or_else(|| {
+                        graph
+                            .find_by_name(symbol)
+                            .first()
+                            .and_then(|n| graph.get_index(&n.id).map(|idx| (n.id.clone(), idx)))
+                    });
+                match resolved {
+                    None => Ok(Self::err_envelope(
+                        "get_callees",
+                        &format!("Symbol '{}' not found", symbol),
+                    )),
+                    Some((_resolved_id, idx)) => {
+                        let callees = graph.get_callees(idx);
+                        let items: Vec<Value> = callees
+                            .iter()
+                            .map(|n| {
+                                json!({
+                                    "id": n.id,
+                                    "name": n.name,
+                                    "kind": n.kind.to_string(),
+                                    "file": n.file,
+                                    "line": n.line_start
+                                })
+                            })
+                            .collect();
+                        let count = items.len();
+                        let first_callee_id = items
+                            .first()
+                            .and_then(|e| e["id"].as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        Ok(Self::ok_envelope(
+                            "get_callees",
+                            json!({ "symbol": symbol, "callees": items }),
+                            count,
+                            if count > 0 {
+                                "get_node_detail"
+                            } else {
+                                "list_entry_points"
+                            },
+                            if count > 0 {
+                                json!({ "symbol": first_callee_id })
+                            } else {
+                                json!({})
+                            },
+                        ))
+                    }
+                }
+            }
+            "search_symbols" => {
+                let query = arguments
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let limit = arguments
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(20) as usize;
+                let graph = self.graph.read().await;
+                let results = graph.search(query);
+                let items: Vec<Value> = results
+                    .iter()
+                    .take(limit)
+                    .map(|n| {
+                        json!({
+                            "id": n.id,
+                            "name": n.name,
+                            "kind": n.kind.to_string(),
+                            "file": n.file,
+                            "line": n.line_start
+                        })
+                    })
+                    .collect();
+                let count = items.len();
+                let first = items
+                    .first()
+                    .and_then(|e| e["name"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Ok(Self::ok_envelope(
+                    "search_symbols",
+                    json!({ "query": query, "results": items }),
+                    count,
+                    "get_node_detail",
+                    json!({ "symbol": first }),
+                ))
+            }
+            "get_file_graph" => {
+                let file_path = arguments
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let graph = self.graph.read().await;
+                let (nodes, edges) = graph.nodes_in_file_with_edges(file_path);
+                let node_items: Vec<Value> = nodes
+                    .iter()
+                    .map(|n| {
+                        json!({
+                            "id": n.id,
+                            "name": n.name,
+                            "kind": n.kind.to_string(),
+                            "line": n.line_start
+                        })
+                    })
+                    .collect();
+                let edge_items: Vec<Value> = edges
+                    .iter()
+                    .map(|(from, to, kind)| {
+                        json!({
+                            "from": from,
+                            "to": to,
+                            "kind": kind
+                        })
+                    })
+                    .collect();
+                let count = node_items.len();
+                let highest = nodes
+                    .iter()
+                    .max_by_key(|n| n.line_end.saturating_sub(n.line_start))
+                    .map(|n| n.name.clone())
+                    .unwrap_or_default();
+                Ok(Self::ok_envelope(
+                    "get_file_graph",
+                    json!({ "file": file_path, "nodes": node_items, "edges": edge_items }),
+                    count,
+                    "analyze_impact",
+                    json!({ "node_id": highest }),
+                ))
+            }
+            "get_node_detail" => {
+                let symbol = arguments
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let graph = self.graph.read().await;
+                let idx = graph.get_index(symbol).or_else(|| {
+                    graph
+                        .find_by_name(symbol)
+                        .first()
+                        .and_then(|n| graph.get_index(&n.id))
+                });
+                match idx {
+                    None => Ok(Self::err_envelope(
+                        "get_node_detail",
+                        &format!("Symbol '{}' not found", symbol),
+                    )),
+                    Some(idx) => {
+                        let node = match graph.get(idx) {
+                            Some(n) => n,
+                            None => {
+                                return Ok(Self::err_envelope(
+                                    "get_node_detail",
+                                    "Node index invalid",
+                                ))
+                            }
+                        };
+                        let centrality = graph.centrality(idx);
+                        let callers = graph.get_callers(idx);
+                        let callees = graph.get_callees(idx);
+                        let is_entry = arbor_graph::HeuristicsMatcher::is_likely_entry_point(node);
+                        let role = if is_entry {
+                            "entry_point"
+                        } else if callers.is_empty() {
+                            "unreachable"
+                        } else if callees.is_empty() {
+                            "utility"
+                        } else {
+                            "internal"
+                        };
+                        let next = if callers.is_empty() {
+                            "get_callees"
+                        } else {
+                            "get_callers"
+                        };
+                        Ok(Self::ok_envelope(
+                            "get_node_detail",
+                            json!({
+                                "id": node.id,
+                                "name": node.name,
+                                "kind": node.kind.to_string(),
+                                "file": node.file,
+                                "line_start": node.line_start,
+                                "line_end": node.line_end,
+                                "signature": node.signature,
+                                "centrality": centrality,
+                                "role": role,
+                                "caller_count": callers.len(),
+                                "callee_count": callees.len(),
+                                "is_entry_point": is_entry
+                            }),
+                            1,
+                            next,
+                            json!({ "symbol": symbol }),
+                        ))
+                    }
+                }
+            }
             _ => Err(JsonRpcError {
                 code: -32601,
                 message: format!("Tool not found: {}", name),
@@ -488,18 +839,10 @@ impl McpServer {
         };
 
         // 2. Extract Data
-        let Some(node) = graph.get(node_idx) else {
-            return format!(
-                "Node '{}' resolved to index {:?} but no longer exists in graph.",
-                node_start, node_idx
-            );
-        };
-        let mut callers = graph.get_callers(node_idx);
-        let mut callees = graph.get_callees(node_idx);
+        let node = graph.get(node_idx).unwrap();
+        let callers = graph.get_callers(node_idx);
+        let callees = graph.get_callees(node_idx);
         let centrality = graph.centrality(node_idx);
-
-        callers.sort_by(|a, b| (&a.file, &a.name, &a.id).cmp(&(&b.file, &b.name, &b.id)));
-        callees.sort_by(|a, b| (&a.file, &a.name, &a.id).cmp(&(&b.file, &b.name, &b.id)));
 
         // 3. Format Output (The "Architectural Brief" with Markdown Tables)
         let mut brief = String::new();
@@ -549,5 +892,121 @@ impl McpServer {
         }
 
         brief
+    }
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+    use arbor_graph::ArborGraph;
+    use arbor_server::SharedGraph;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn empty_server() -> McpServer {
+        let graph: SharedGraph = Arc::new(RwLock::new(ArborGraph::new()));
+        McpServer::new(graph)
+    }
+
+    #[tokio::test]
+    async fn test_list_entry_points_tool_returns_envelope() {
+        let server = empty_server();
+        let result = server
+            .call_tool(serde_json::json!({ "name": "list_entry_points", "arguments": {} }))
+            .await;
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        let text = val["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["tool"], "list_entry_points");
+        assert!(envelope["data"]["entry_points"].is_array());
+        assert!(envelope["meta"]["suggested_next_tool"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_get_callers_not_found() {
+        let server = empty_server();
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "get_callers", "arguments": { "symbol": "nonexistent" }
+            }))
+            .await;
+        let val = result.unwrap();
+        let text = val["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], false);
+        assert!(envelope["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_get_callees_not_found() {
+        let server = empty_server();
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "get_callees", "arguments": { "symbol": "nonexistent" }
+            }))
+            .await;
+        let val = result.unwrap();
+        let text = val["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn test_search_symbols_returns_envelope() {
+        let server = empty_server();
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "search_symbols", "arguments": { "query": "main" }
+            }))
+            .await;
+        let val = result.unwrap();
+        let text = val["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], true);
+        assert!(envelope["data"]["results"].is_array());
+        assert!(envelope["meta"]["suggested_next_tool"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_get_file_graph_returns_envelope() {
+        let server = empty_server();
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "get_file_graph", "arguments": { "file_path": "src/nonexistent.rs" }
+            }))
+            .await;
+        let val = result.unwrap();
+        let text = val["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], true);
+        assert!(envelope["data"]["nodes"].is_array());
+        assert!(envelope["data"]["edges"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_get_node_detail_not_found() {
+        let server = empty_server();
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "get_node_detail", "arguments": { "symbol": "nonexistent" }
+            }))
+            .await;
+        let val = result.unwrap();
+        let text = val["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn test_unknown_tool_returns_error() {
+        let server = empty_server();
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "does_not_exist", "arguments": {}
+            }))
+            .await;
+        assert!(result.is_err());
     }
 }
