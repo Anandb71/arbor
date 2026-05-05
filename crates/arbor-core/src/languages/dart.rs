@@ -495,7 +495,7 @@ fn collect_calls(root: &Node, source: &str, refs: &mut Vec<String>) {
                     if !call_text.contains('.') {
                         refs.push(call_text.to_string());
                     } else if call_text.starts_with("this.") {
-                        if let Some(method) = call_text.splitn(2, '.').nth(1) {
+                        if let Some(method) = call_text.split_once('.').map(|x| x.1) {
                             if !method.is_empty() && !method.contains('.') {
                                 refs.push(method.to_string());
                             }

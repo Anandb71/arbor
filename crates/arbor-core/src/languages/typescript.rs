@@ -455,8 +455,8 @@ fn build_arrow_signature(node: &Node, source: &str, name: &str) -> String {
 ///   - this-call     `this.foo()`    → "foo"          (resolvable via same-class lookup)
 ///   - super-call    `super.foo()`   → "foo"          (resolvable via parent class)
 ///   - Other dotted  `arr.push()`    → DROPPED        (method on unknown object type;
-///                                                     can't resolve without type inference,
-///                                                     and would cause false name collisions)
+///     can't resolve without type inference,
+///     and would cause false name collisions)
 fn extract_call_references(root: &Node, source: &str) -> Vec<String> {
     let mut refs = Vec::new();
     let mut cursor = root.walk();
@@ -475,7 +475,7 @@ fn extract_call_references(root: &Node, source: &str) -> Vec<String> {
                         refs.push(call_text.to_string());
                     } else if call_text.starts_with("this.") || call_text.starts_with("super.") {
                         // this.validate() / super.clone() — strip prefix, track method name
-                        if let Some(method) = call_text.splitn(2, '.').nth(1) {
+                        if let Some(method) = call_text.split_once('.').map(|x| x.1) {
                             if !method.is_empty() && !method.contains('.') {
                                 refs.push(method.to_string());
                             }

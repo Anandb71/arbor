@@ -152,23 +152,21 @@ impl HeuristicsMatcher {
         }
 
         // Background jobs / cron / workers
-        if name.contains("job")
+        if (name.contains("job")
             || name.contains("task")
             || name.contains("worker")
             || name.contains("cron")
             || name.ends_with("_run")
-            || name == "run" || name == "execute" || name == "process"
-        {
-            if file.contains("job")
+            || name == "run" || name == "execute" || name == "process")
+            && (file.contains("job")
                 || file.contains("task")
                 || file.contains("worker")
                 || file.contains("cron")
                 || file.contains("celery")
                 || file.contains("sidekiq")
-                || file.contains("background")
-            {
-                return true;
-            }
+                || file.contains("background"))
+        {
+            return true;
         }
 
         // CLI command handlers
