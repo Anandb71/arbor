@@ -153,7 +153,13 @@ impl McpServer {
         })
     }
 
-    fn ok_envelope(tool: &str, data: Value, node_count: usize, next_tool: &str, next_args: Value) -> Value {
+    fn ok_envelope(
+        tool: &str,
+        data: Value,
+        node_count: usize,
+        next_tool: &str,
+        next_args: Value,
+    ) -> Value {
         json!({
             "content": [{
                 "type": "text",
@@ -508,15 +514,21 @@ impl McpServer {
             "list_entry_points" => {
                 let graph = self.graph.read().await;
                 let eps = graph.list_entry_points();
-                let entries: Vec<Value> = eps.iter().map(|n| json!({
-                    "id": n.id,
-                    "name": n.name,
-                    "kind": n.kind.to_string(),
-                    "file": n.file,
-                    "line": n.line_start
-                })).collect();
+                let entries: Vec<Value> = eps
+                    .iter()
+                    .map(|n| {
+                        json!({
+                            "id": n.id,
+                            "name": n.name,
+                            "kind": n.kind.to_string(),
+                            "file": n.file,
+                            "line": n.line_start
+                        })
+                    })
+                    .collect();
                 let count = entries.len();
-                let next_symbol = entries.first()
+                let next_symbol = entries
+                    .first()
                     .and_then(|e| e["name"].as_str())
                     .unwrap_or("")
                     .to_string();
@@ -534,76 +546,140 @@ impl McpServer {
                 ))
             }
             "get_callers" => {
-                let symbol = arguments.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                let symbol = arguments
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let graph = self.graph.read().await;
-                let idx = graph.get_index(symbol)
-                    .or_else(|| graph.find_by_name(symbol).first().and_then(|n| graph.get_index(&n.id)));
+                let idx = graph.get_index(symbol).or_else(|| {
+                    graph
+                        .find_by_name(symbol)
+                        .first()
+                        .and_then(|n| graph.get_index(&n.id))
+                });
                 match idx {
-                    None => Ok(Self::err_envelope("get_callers", &format!("Symbol '{}' not found", symbol))),
+                    None => Ok(Self::err_envelope(
+                        "get_callers",
+                        &format!("Symbol '{}' not found", symbol),
+                    )),
                     Some(idx) => {
                         let callers = graph.get_callers(idx);
-                        let items: Vec<Value> = callers.iter().map(|n| json!({
-                            "id": n.id,
-                            "name": n.name,
-                            "kind": n.kind.to_string(),
-                            "file": n.file,
-                            "line": n.line_start
-                        })).collect();
+                        let items: Vec<Value> = callers
+                            .iter()
+                            .map(|n| {
+                                json!({
+                                    "id": n.id,
+                                    "name": n.name,
+                                    "kind": n.kind.to_string(),
+                                    "file": n.file,
+                                    "line": n.line_start
+                                })
+                            })
+                            .collect();
                         let count = items.len();
                         Ok(Self::ok_envelope(
                             "get_callers",
                             json!({ "symbol": symbol, "callers": items }),
                             count,
-                            if count > 0 { "analyze_impact" } else { "search_symbols" },
-                            if count > 0 { json!({ "node_id": symbol }) } else { json!({ "query": symbol }) },
+                            if count > 0 {
+                                "analyze_impact"
+                            } else {
+                                "search_symbols"
+                            },
+                            if count > 0 {
+                                json!({ "node_id": symbol })
+                            } else {
+                                json!({ "query": symbol })
+                            },
                         ))
                     }
                 }
             }
             "get_callees" => {
-                let symbol = arguments.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                let symbol = arguments
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let graph = self.graph.read().await;
-                let idx = graph.get_index(symbol)
-                    .or_else(|| graph.find_by_name(symbol).first().and_then(|n| graph.get_index(&n.id)));
+                let idx = graph.get_index(symbol).or_else(|| {
+                    graph
+                        .find_by_name(symbol)
+                        .first()
+                        .and_then(|n| graph.get_index(&n.id))
+                });
                 match idx {
-                    None => Ok(Self::err_envelope("get_callees", &format!("Symbol '{}' not found", symbol))),
+                    None => Ok(Self::err_envelope(
+                        "get_callees",
+                        &format!("Symbol '{}' not found", symbol),
+                    )),
                     Some(idx) => {
                         let callees = graph.get_callees(idx);
-                        let items: Vec<Value> = callees.iter().map(|n| json!({
-                            "id": n.id,
-                            "name": n.name,
-                            "kind": n.kind.to_string(),
-                            "file": n.file,
-                            "line": n.line_start
-                        })).collect();
+                        let items: Vec<Value> = callees
+                            .iter()
+                            .map(|n| {
+                                json!({
+                                    "id": n.id,
+                                    "name": n.name,
+                                    "kind": n.kind.to_string(),
+                                    "file": n.file,
+                                    "line": n.line_start
+                                })
+                            })
+                            .collect();
                         let count = items.len();
-                        let first_callee = items.first()
+                        let first_callee = items
+                            .first()
                             .and_then(|e| e["name"].as_str())
-                            .unwrap_or("").to_string();
+                            .unwrap_or("")
+                            .to_string();
                         Ok(Self::ok_envelope(
                             "get_callees",
                             json!({ "symbol": symbol, "callees": items }),
                             count,
-                            if count > 0 { "get_node_detail" } else { "list_entry_points" },
-                            if count > 0 { json!({ "symbol": first_callee }) } else { json!({}) },
+                            if count > 0 {
+                                "get_node_detail"
+                            } else {
+                                "list_entry_points"
+                            },
+                            if count > 0 {
+                                json!({ "symbol": first_callee })
+                            } else {
+                                json!({})
+                            },
                         ))
                     }
                 }
             }
             "search_symbols" => {
-                let query = arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
-                let limit = arguments.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                let query = arguments
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let limit = arguments
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(20) as usize;
                 let graph = self.graph.read().await;
                 let results = graph.search(query);
-                let items: Vec<Value> = results.iter().take(limit).map(|n| json!({
-                    "id": n.id,
-                    "name": n.name,
-                    "kind": n.kind.to_string(),
-                    "file": n.file,
-                    "line": n.line_start
-                })).collect();
+                let items: Vec<Value> = results
+                    .iter()
+                    .take(limit)
+                    .map(|n| {
+                        json!({
+                            "id": n.id,
+                            "name": n.name,
+                            "kind": n.kind.to_string(),
+                            "file": n.file,
+                            "line": n.line_start
+                        })
+                    })
+                    .collect();
                 let count = items.len();
-                let first = items.first().and_then(|e| e["name"].as_str()).unwrap_or("").to_string();
+                let first = items
+                    .first()
+                    .and_then(|e| e["name"].as_str())
+                    .unwrap_or("")
+                    .to_string();
                 Ok(Self::ok_envelope(
                     "search_symbols",
                     json!({ "query": query, "results": items }),
@@ -613,22 +689,36 @@ impl McpServer {
                 ))
             }
             "get_file_graph" => {
-                let file_path = arguments.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+                let file_path = arguments
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let graph = self.graph.read().await;
                 let (nodes, edges) = graph.nodes_in_file_with_edges(file_path);
-                let node_items: Vec<Value> = nodes.iter().map(|n| json!({
-                    "id": n.id,
-                    "name": n.name,
-                    "kind": n.kind.to_string(),
-                    "line": n.line_start
-                })).collect();
-                let edge_items: Vec<Value> = edges.iter().map(|(from, to, kind)| json!({
-                    "from": from,
-                    "to": to,
-                    "kind": kind
-                })).collect();
+                let node_items: Vec<Value> = nodes
+                    .iter()
+                    .map(|n| {
+                        json!({
+                            "id": n.id,
+                            "name": n.name,
+                            "kind": n.kind.to_string(),
+                            "line": n.line_start
+                        })
+                    })
+                    .collect();
+                let edge_items: Vec<Value> = edges
+                    .iter()
+                    .map(|(from, to, kind)| {
+                        json!({
+                            "from": from,
+                            "to": to,
+                            "kind": kind
+                        })
+                    })
+                    .collect();
                 let count = node_items.len();
-                let highest = nodes.iter()
+                let highest = nodes
+                    .iter()
                     .max_by_key(|n| n.line_end.saturating_sub(n.line_start))
                     .map(|n| n.name.clone())
                     .unwrap_or_default();
@@ -641,26 +731,50 @@ impl McpServer {
                 ))
             }
             "get_node_detail" => {
-                let symbol = arguments.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                let symbol = arguments
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let graph = self.graph.read().await;
-                let idx = graph.get_index(symbol)
-                    .or_else(|| graph.find_by_name(symbol).first().and_then(|n| graph.get_index(&n.id)));
+                let idx = graph.get_index(symbol).or_else(|| {
+                    graph
+                        .find_by_name(symbol)
+                        .first()
+                        .and_then(|n| graph.get_index(&n.id))
+                });
                 match idx {
-                    None => Ok(Self::err_envelope("get_node_detail", &format!("Symbol '{}' not found", symbol))),
+                    None => Ok(Self::err_envelope(
+                        "get_node_detail",
+                        &format!("Symbol '{}' not found", symbol),
+                    )),
                     Some(idx) => {
                         let node = match graph.get(idx) {
                             Some(n) => n,
-                            None => return Ok(Self::err_envelope("get_node_detail", "Node index invalid")),
+                            None => {
+                                return Ok(Self::err_envelope(
+                                    "get_node_detail",
+                                    "Node index invalid",
+                                ))
+                            }
                         };
                         let centrality = graph.centrality(idx);
                         let callers = graph.get_callers(idx);
                         let callees = graph.get_callees(idx);
                         let is_entry = arbor_graph::HeuristicsMatcher::is_likely_entry_point(node);
-                        let role = if is_entry { "entry_point" }
-                            else if callers.is_empty() { "unreachable" }
-                            else if callees.is_empty() { "utility" }
-                            else { "internal" };
-                        let next = if callers.is_empty() { "get_callees" } else { "get_callers" };
+                        let role = if is_entry {
+                            "entry_point"
+                        } else if callers.is_empty() {
+                            "unreachable"
+                        } else if callees.is_empty() {
+                            "utility"
+                        } else {
+                            "internal"
+                        };
+                        let next = if callers.is_empty() {
+                            "get_callees"
+                        } else {
+                            "get_callers"
+                        };
                         Ok(Self::ok_envelope(
                             "get_node_detail",
                             json!({
@@ -807,9 +921,11 @@ mod tool_tests {
     #[tokio::test]
     async fn test_get_callers_not_found() {
         let server = empty_server();
-        let result = server.call_tool(serde_json::json!({
-            "name": "get_callers", "arguments": { "symbol": "nonexistent" }
-        })).await;
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "get_callers", "arguments": { "symbol": "nonexistent" }
+            }))
+            .await;
         let val = result.unwrap();
         let text = val["content"][0]["text"].as_str().unwrap();
         let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -820,9 +936,11 @@ mod tool_tests {
     #[tokio::test]
     async fn test_get_callees_not_found() {
         let server = empty_server();
-        let result = server.call_tool(serde_json::json!({
-            "name": "get_callees", "arguments": { "symbol": "nonexistent" }
-        })).await;
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "get_callees", "arguments": { "symbol": "nonexistent" }
+            }))
+            .await;
         let val = result.unwrap();
         let text = val["content"][0]["text"].as_str().unwrap();
         let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -832,9 +950,11 @@ mod tool_tests {
     #[tokio::test]
     async fn test_search_symbols_returns_envelope() {
         let server = empty_server();
-        let result = server.call_tool(serde_json::json!({
-            "name": "search_symbols", "arguments": { "query": "main" }
-        })).await;
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "search_symbols", "arguments": { "query": "main" }
+            }))
+            .await;
         let val = result.unwrap();
         let text = val["content"][0]["text"].as_str().unwrap();
         let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -846,9 +966,11 @@ mod tool_tests {
     #[tokio::test]
     async fn test_get_file_graph_returns_envelope() {
         let server = empty_server();
-        let result = server.call_tool(serde_json::json!({
-            "name": "get_file_graph", "arguments": { "file_path": "src/nonexistent.rs" }
-        })).await;
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "get_file_graph", "arguments": { "file_path": "src/nonexistent.rs" }
+            }))
+            .await;
         let val = result.unwrap();
         let text = val["content"][0]["text"].as_str().unwrap();
         let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -860,9 +982,11 @@ mod tool_tests {
     #[tokio::test]
     async fn test_get_node_detail_not_found() {
         let server = empty_server();
-        let result = server.call_tool(serde_json::json!({
-            "name": "get_node_detail", "arguments": { "symbol": "nonexistent" }
-        })).await;
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "get_node_detail", "arguments": { "symbol": "nonexistent" }
+            }))
+            .await;
         let val = result.unwrap();
         let text = val["content"][0]["text"].as_str().unwrap();
         let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -872,9 +996,11 @@ mod tool_tests {
     #[tokio::test]
     async fn test_unknown_tool_returns_error() {
         let server = empty_server();
-        let result = server.call_tool(serde_json::json!({
-            "name": "does_not_exist", "arguments": {}
-        })).await;
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "does_not_exist", "arguments": {}
+            }))
+            .await;
         assert!(result.is_err());
     }
 }

@@ -30,62 +30,62 @@ impl LanguageParser for CParser {
 
 fn extract_from_node(node: &Node, source: &str, file_path: &str, nodes: &mut Vec<CodeNode>) {
     stacker::maybe_grow(64 * 1024, 4 * 1024 * 1024, || {
-    let kind = node.kind();
+        let kind = node.kind();
 
-    match kind {
-        // Function definitions
-        "function_definition" => {
-            if let Some(code_node) = extract_function(node, source, file_path) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Function declarations (prototypes)
-        "declaration" => {
-            if has_function_declarator(node) {
-                if let Some(code_node) = extract_function_declaration(node, source, file_path) {
+        match kind {
+            // Function definitions
+            "function_definition" => {
+                if let Some(code_node) = extract_function(node, source, file_path) {
                     nodes.push(code_node);
                 }
             }
+
+            // Function declarations (prototypes)
+            "declaration" => {
+                if has_function_declarator(node) {
+                    if let Some(code_node) = extract_function_declaration(node, source, file_path) {
+                        nodes.push(code_node);
+                    }
+                }
+            }
+
+            // Struct definitions
+            "struct_specifier" => {
+                if let Some(code_node) = extract_struct(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Enum definitions
+            "enum_specifier" => {
+                if let Some(code_node) = extract_enum(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Typedef declarations
+            "type_definition" => {
+                if let Some(code_node) = extract_typedef(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Include directives
+            "preproc_include" => {
+                if let Some(code_node) = extract_include(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            _ => {}
         }
 
-        // Struct definitions
-        "struct_specifier" => {
-            if let Some(code_node) = extract_struct(node, source, file_path) {
-                nodes.push(code_node);
+        // Recurse into children
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                extract_from_node(&child, source, file_path, nodes);
             }
         }
-
-        // Enum definitions
-        "enum_specifier" => {
-            if let Some(code_node) = extract_enum(node, source, file_path) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Typedef declarations
-        "type_definition" => {
-            if let Some(code_node) = extract_typedef(node, source, file_path) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Include directives
-        "preproc_include" => {
-            if let Some(code_node) = extract_include(node, source, file_path) {
-                nodes.push(code_node);
-            }
-        }
-
-        _ => {}
-    }
-
-    // Recurse into children
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            extract_from_node(&child, source, file_path, nodes);
-        }
-    }
     }); // stacker::maybe_grow
 }
 
@@ -345,12 +345,22 @@ fn collect_calls(root: &Node, source: &str, refs: &mut Vec<String>) {
                 }
             }
         }
-        if cursor.goto_first_child() { continue; }
-        if cursor.goto_next_sibling() { continue; }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            continue;
+        }
         loop {
-            if !cursor.goto_parent() { break 'outer; }
-            if cursor.depth() == 0 { break 'outer; }
-            if cursor.goto_next_sibling() { break; }
+            if !cursor.goto_parent() {
+                break 'outer;
+            }
+            if cursor.depth() == 0 {
+                break 'outer;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 }

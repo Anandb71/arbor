@@ -36,126 +36,149 @@ fn extract_from_node(
     context: Option<&str>,
 ) {
     stacker::maybe_grow(64 * 1024, 4 * 1024 * 1024, || {
-    let kind = node.kind();
+        let kind = node.kind();
 
-    match kind {
-        // Class declarations
-        "class_declaration" => {
-            if let Some(code_node) = extract_type_decl(node, source, file_path, NodeKind::Class) {
-                let class_name = code_node.name.clone();
-                nodes.push(code_node);
+        match kind {
+            // Class declarations
+            "class_declaration" => {
+                if let Some(code_node) = extract_type_decl(node, source, file_path, NodeKind::Class)
+                {
+                    let class_name = code_node.name.clone();
+                    nodes.push(code_node);
 
-                // Extract class members
-                if let Some(body) = node.child_by_field_name("body") {
-                    for i in 0..body.child_count() {
-                        if let Some(child) = body.child(i) {
-                            extract_from_node(&child, source, file_path, nodes, Some(&class_name));
+                    // Extract class members
+                    if let Some(body) = node.child_by_field_name("body") {
+                        for i in 0..body.child_count() {
+                            if let Some(child) = body.child(i) {
+                                extract_from_node(
+                                    &child,
+                                    source,
+                                    file_path,
+                                    nodes,
+                                    Some(&class_name),
+                                );
+                            }
                         }
                     }
+                    return;
                 }
-                return;
             }
-        }
 
-        // Interface declarations
-        "interface_declaration" => {
-            if let Some(code_node) = extract_type_decl(node, source, file_path, NodeKind::Interface)
-            {
-                let iface_name = code_node.name.clone();
-                nodes.push(code_node);
+            // Interface declarations
+            "interface_declaration" => {
+                if let Some(code_node) =
+                    extract_type_decl(node, source, file_path, NodeKind::Interface)
+                {
+                    let iface_name = code_node.name.clone();
+                    nodes.push(code_node);
 
-                if let Some(body) = node.child_by_field_name("body") {
-                    for i in 0..body.child_count() {
-                        if let Some(child) = body.child(i) {
-                            extract_from_node(&child, source, file_path, nodes, Some(&iface_name));
+                    if let Some(body) = node.child_by_field_name("body") {
+                        for i in 0..body.child_count() {
+                            if let Some(child) = body.child(i) {
+                                extract_from_node(
+                                    &child,
+                                    source,
+                                    file_path,
+                                    nodes,
+                                    Some(&iface_name),
+                                );
+                            }
                         }
                     }
+                    return;
                 }
-                return;
             }
-        }
 
-        // Struct declarations
-        "struct_declaration" => {
-            if let Some(code_node) = extract_type_decl(node, source, file_path, NodeKind::Struct) {
-                let struct_name = code_node.name.clone();
-                nodes.push(code_node);
+            // Struct declarations
+            "struct_declaration" => {
+                if let Some(code_node) =
+                    extract_type_decl(node, source, file_path, NodeKind::Struct)
+                {
+                    let struct_name = code_node.name.clone();
+                    nodes.push(code_node);
 
-                if let Some(body) = node.child_by_field_name("body") {
-                    for i in 0..body.child_count() {
-                        if let Some(child) = body.child(i) {
-                            extract_from_node(&child, source, file_path, nodes, Some(&struct_name));
+                    if let Some(body) = node.child_by_field_name("body") {
+                        for i in 0..body.child_count() {
+                            if let Some(child) = body.child(i) {
+                                extract_from_node(
+                                    &child,
+                                    source,
+                                    file_path,
+                                    nodes,
+                                    Some(&struct_name),
+                                );
+                            }
                         }
                     }
+                    return;
                 }
-                return;
+            }
+
+            // Enum declarations
+            "enum_declaration" => {
+                if let Some(code_node) = extract_type_decl(node, source, file_path, NodeKind::Enum)
+                {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Method declarations
+            "method_declaration" => {
+                if let Some(code_node) = extract_method(node, source, file_path, context) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Constructor declarations
+            "constructor_declaration" => {
+                if let Some(code_node) = extract_constructor(node, source, file_path, context) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Property declarations
+            "property_declaration" => {
+                if let Some(code_node) = extract_property(node, source, file_path, context) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Field declarations
+            "field_declaration" => {
+                extract_fields(node, source, file_path, nodes, context);
+            }
+
+            // Using directives (imports)
+            "using_directive" => {
+                if let Some(code_node) = extract_using(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Namespace declarations
+            "namespace_declaration" | "file_scoped_namespace_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = get_text(&name_node, source);
+                    nodes.push(
+                        CodeNode::new(&name, &name, NodeKind::Module, file_path)
+                            .with_lines(
+                                node.start_position().row as u32 + 1,
+                                node.end_position().row as u32 + 1,
+                            )
+                            .with_bytes(node.start_byte() as u32, node.end_byte() as u32),
+                    );
+                }
+            }
+
+            _ => {}
+        }
+
+        // Recurse into children
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                extract_from_node(&child, source, file_path, nodes, context);
             }
         }
-
-        // Enum declarations
-        "enum_declaration" => {
-            if let Some(code_node) = extract_type_decl(node, source, file_path, NodeKind::Enum) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Method declarations
-        "method_declaration" => {
-            if let Some(code_node) = extract_method(node, source, file_path, context) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Constructor declarations
-        "constructor_declaration" => {
-            if let Some(code_node) = extract_constructor(node, source, file_path, context) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Property declarations
-        "property_declaration" => {
-            if let Some(code_node) = extract_property(node, source, file_path, context) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Field declarations
-        "field_declaration" => {
-            extract_fields(node, source, file_path, nodes, context);
-        }
-
-        // Using directives (imports)
-        "using_directive" => {
-            if let Some(code_node) = extract_using(node, source, file_path) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Namespace declarations
-        "namespace_declaration" | "file_scoped_namespace_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name = get_text(&name_node, source);
-                nodes.push(
-                    CodeNode::new(&name, &name, NodeKind::Module, file_path)
-                        .with_lines(
-                            node.start_position().row as u32 + 1,
-                            node.end_position().row as u32 + 1,
-                        )
-                        .with_bytes(node.start_byte() as u32, node.end_byte() as u32),
-                );
-            }
-        }
-
-        _ => {}
-    }
-
-    // Recurse into children
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            extract_from_node(&child, source, file_path, nodes, context);
-        }
-    }
     }); // stacker::maybe_grow
 }
 
@@ -452,12 +475,22 @@ fn collect_calls(root: &Node, source: &str, refs: &mut Vec<String>) {
                 }
             }
         }
-        if cursor.goto_first_child() { continue; }
-        if cursor.goto_next_sibling() { continue; }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            continue;
+        }
         loop {
-            if !cursor.goto_parent() { break 'outer; }
-            if cursor.depth() == 0 { break 'outer; }
-            if cursor.goto_next_sibling() { break; }
+            if !cursor.goto_parent() {
+                break 'outer;
+            }
+            if cursor.depth() == 0 {
+                break 'outer;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 }

@@ -430,10 +430,18 @@ trait CodeNodeExt {
 
 impl CodeNodeExt for CodeNode {
     fn with_async_if(self, cond: bool) -> Self {
-        if cond { self.as_async() } else { self }
+        if cond {
+            self.as_async()
+        } else {
+            self
+        }
     }
     fn with_static_if(self, cond: bool) -> Self {
-        if cond { self.as_static() } else { self }
+        if cond {
+            self.as_static()
+        } else {
+            self
+        }
     }
     fn with_docstring_if(mut self, docstring: Option<String>) -> Self {
         self.docstring = docstring;

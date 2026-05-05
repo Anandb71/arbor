@@ -256,7 +256,11 @@ mod tests {
         builder.add_nodes(vec![callee]);
         let graph = builder.build();
         assert_eq!(graph.node_count(), 2);
-        assert_eq!(graph.edge_count(), 1, "Should resolve cross-file edge via FQN");
+        assert_eq!(
+            graph.edge_count(),
+            1,
+            "Should resolve cross-file edge via FQN"
+        );
     }
 
     #[test]
@@ -267,15 +271,18 @@ mod tests {
         builder.add_nodes(vec![node]);
         let graph = builder.build();
         assert_eq!(graph.node_count(), 1);
-        assert_eq!(graph.edge_count(), 0, "Unresolved references must not create edges");
+        assert_eq!(
+            graph.edge_count(),
+            0,
+            "Unresolved references must not create edges"
+        );
     }
 
     #[test]
     fn test_import_nodes_not_added_to_graph() {
         let mut builder = GraphBuilder::new();
-        let import_node =
-            CodeNode::new("./utils", "./utils", NodeKind::Import, "main.ts")
-                .with_references(vec!["validate".to_string()]);
+        let import_node = CodeNode::new("./utils", "./utils", NodeKind::Import, "main.ts")
+            .with_references(vec!["validate".to_string()]);
         let func = CodeNode::new("main", "main", NodeKind::Function, "main.ts");
         builder.add_nodes(vec![import_node, func]);
         let graph = builder.build();
@@ -291,11 +298,17 @@ mod tests {
                 .with_references(vec!["validate".to_string(), "clone".to_string()]);
         builder.add_nodes(vec![import_node]);
         assert_eq!(
-            builder.import_map.get("file.ts").and_then(|m| m.get("validate")),
+            builder
+                .import_map
+                .get("file.ts")
+                .and_then(|m| m.get("validate")),
             Some(&"@babel/types".to_string())
         );
         assert_eq!(
-            builder.import_map.get("file.ts").and_then(|m| m.get("clone")),
+            builder
+                .import_map
+                .get("file.ts")
+                .and_then(|m| m.get("clone")),
             Some(&"@babel/types".to_string())
         );
     }

@@ -157,7 +157,9 @@ impl HeuristicsMatcher {
             || name.contains("worker")
             || name.contains("cron")
             || name.ends_with("_run")
-            || name == "run" || name == "execute" || name == "process")
+            || name == "run"
+            || name == "execute"
+            || name == "process")
             && (file.contains("job")
                 || file.contains("task")
                 || file.contains("worker")

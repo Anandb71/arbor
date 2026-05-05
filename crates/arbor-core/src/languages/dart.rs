@@ -36,135 +36,153 @@ fn extract_from_node(
     context: Option<&str>,
 ) {
     stacker::maybe_grow(64 * 1024, 4 * 1024 * 1024, || {
-    let kind = node.kind();
+        let kind = node.kind();
 
-    match kind {
-        // Class declarations
-        "class_definition" => {
-            if let Some(code_node) = extract_class(node, source, file_path) {
-                let class_name = code_node.name.clone();
-                nodes.push(code_node);
+        match kind {
+            // Class declarations
+            "class_definition" => {
+                if let Some(code_node) = extract_class(node, source, file_path) {
+                    let class_name = code_node.name.clone();
+                    nodes.push(code_node);
 
-                // Extract class members from body
-                if let Some(body) = node.child_by_field_name("body") {
-                    for i in 0..body.child_count() {
-                        if let Some(child) = body.child(i) {
-                            extract_from_node(&child, source, file_path, nodes, Some(&class_name));
+                    // Extract class members from body
+                    if let Some(body) = node.child_by_field_name("body") {
+                        for i in 0..body.child_count() {
+                            if let Some(child) = body.child(i) {
+                                extract_from_node(
+                                    &child,
+                                    source,
+                                    file_path,
+                                    nodes,
+                                    Some(&class_name),
+                                );
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+
+            // Mixin declarations
+            "mixin_declaration" => {
+                if let Some(code_node) = extract_mixin(node, source, file_path) {
+                    let mixin_name = code_node.name.clone();
+                    nodes.push(code_node);
+
+                    if let Some(body) = node.child_by_field_name("body") {
+                        for i in 0..body.child_count() {
+                            if let Some(child) = body.child(i) {
+                                extract_from_node(
+                                    &child,
+                                    source,
+                                    file_path,
+                                    nodes,
+                                    Some(&mixin_name),
+                                );
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+
+            // Extension declarations
+            "extension_declaration" => {
+                if let Some(code_node) = extract_extension(node, source, file_path) {
+                    let ext_name = code_node.name.clone();
+                    nodes.push(code_node);
+
+                    if let Some(body) = node.child_by_field_name("body") {
+                        for i in 0..body.child_count() {
+                            if let Some(child) = body.child(i) {
+                                extract_from_node(
+                                    &child,
+                                    source,
+                                    file_path,
+                                    nodes,
+                                    Some(&ext_name),
+                                );
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+
+            // Enum declarations
+            "enum_declaration" => {
+                if let Some(code_node) = extract_enum(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Function declarations (top-level)
+            "function_signature" | "function_definition" => {
+                if let Some(code_node) = extract_function(node, source, file_path, context) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Method declarations (inside class)
+            "method_signature" | "method_definition" => {
+                if let Some(code_node) = extract_method(node, source, file_path, context) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Constructor declarations
+            "constructor_signature" => {
+                if let Some(code_node) = extract_constructor(node, source, file_path, context) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Getter/Setter declarations
+            "getter_signature" | "setter_signature" => {
+                if let Some(code_node) = extract_accessor(node, source, file_path, context) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Import statements
+            "import_or_export" | "import_specification" => {
+                if let Some(code_node) = extract_import(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Library declaration
+            "library_name" => {
+                if let Some(code_node) = extract_library(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Top-level variable declarations
+            "top_level_definition" => {
+                // Check if it's a variable
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i) {
+                        if child.kind() == "initialized_variable_definition"
+                            || child.kind() == "static_final_declaration"
+                        {
+                            if let Some(code_node) = extract_variable(&child, source, file_path) {
+                                nodes.push(code_node);
+                            }
                         }
                     }
                 }
-                return;
+            }
+
+            _ => {}
+        }
+
+        // Recurse into children
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                extract_from_node(&child, source, file_path, nodes, context);
             }
         }
-
-        // Mixin declarations
-        "mixin_declaration" => {
-            if let Some(code_node) = extract_mixin(node, source, file_path) {
-                let mixin_name = code_node.name.clone();
-                nodes.push(code_node);
-
-                if let Some(body) = node.child_by_field_name("body") {
-                    for i in 0..body.child_count() {
-                        if let Some(child) = body.child(i) {
-                            extract_from_node(&child, source, file_path, nodes, Some(&mixin_name));
-                        }
-                    }
-                }
-                return;
-            }
-        }
-
-        // Extension declarations
-        "extension_declaration" => {
-            if let Some(code_node) = extract_extension(node, source, file_path) {
-                let ext_name = code_node.name.clone();
-                nodes.push(code_node);
-
-                if let Some(body) = node.child_by_field_name("body") {
-                    for i in 0..body.child_count() {
-                        if let Some(child) = body.child(i) {
-                            extract_from_node(&child, source, file_path, nodes, Some(&ext_name));
-                        }
-                    }
-                }
-                return;
-            }
-        }
-
-        // Enum declarations
-        "enum_declaration" => {
-            if let Some(code_node) = extract_enum(node, source, file_path) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Function declarations (top-level)
-        "function_signature" | "function_definition" => {
-            if let Some(code_node) = extract_function(node, source, file_path, context) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Method declarations (inside class)
-        "method_signature" | "method_definition" => {
-            if let Some(code_node) = extract_method(node, source, file_path, context) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Constructor declarations
-        "constructor_signature" => {
-            if let Some(code_node) = extract_constructor(node, source, file_path, context) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Getter/Setter declarations
-        "getter_signature" | "setter_signature" => {
-            if let Some(code_node) = extract_accessor(node, source, file_path, context) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Import statements
-        "import_or_export" | "import_specification" => {
-            if let Some(code_node) = extract_import(node, source, file_path) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Library declaration
-        "library_name" => {
-            if let Some(code_node) = extract_library(node, source, file_path) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Top-level variable declarations
-        "top_level_definition" => {
-            // Check if it's a variable
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i) {
-                    if child.kind() == "initialized_variable_definition"
-                        || child.kind() == "static_final_declaration"
-                    {
-                        if let Some(code_node) = extract_variable(&child, source, file_path) {
-                            nodes.push(code_node);
-                        }
-                    }
-                }
-            }
-        }
-
-        _ => {}
-    }
-
-    // Recurse into children
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            extract_from_node(&child, source, file_path, nodes, context);
-        }
-    }
     }); // stacker::maybe_grow
 }
 
@@ -505,12 +523,22 @@ fn collect_calls(root: &Node, source: &str, refs: &mut Vec<String>) {
                 }
             }
         }
-        if cursor.goto_first_child() { continue; }
-        if cursor.goto_next_sibling() { continue; }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            continue;
+        }
         loop {
-            if !cursor.goto_parent() { break 'outer; }
-            if cursor.depth() == 0 { break 'outer; }
-            if cursor.goto_next_sibling() { break; }
+            if !cursor.goto_parent() {
+                break 'outer;
+            }
+            if cursor.depth() == 0 {
+                break 'outer;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 }

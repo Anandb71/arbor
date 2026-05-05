@@ -101,7 +101,11 @@ pub fn compute_centrality(graph: &ArborGraph, iterations: usize, damping: f64) -
                     // Test callers contribute 10% weight — they inflate utility functions
                     // but don't represent real production blast radius
                     let caller_node = graph.get(caller_idx)?;
-                    let weight = if is_test_file(&caller_node.file) { 0.1 } else { 1.0 };
+                    let weight = if is_test_file(&caller_node.file) {
+                        0.1
+                    } else {
+                        1.0
+                    };
 
                     Some(weight * caller_score / caller_out)
                 })

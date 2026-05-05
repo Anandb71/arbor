@@ -30,59 +30,59 @@ impl LanguageParser for GoParser {
 
 fn extract_from_node(node: &Node, source: &str, file_path: &str, nodes: &mut Vec<CodeNode>) {
     stacker::maybe_grow(64 * 1024, 4 * 1024 * 1024, || {
-    let kind = node.kind();
+        let kind = node.kind();
 
-    match kind {
-        // Functions
-        "function_declaration" => {
-            if let Some(code_node) = extract_function(node, source, file_path) {
-                nodes.push(code_node);
+        match kind {
+            // Functions
+            "function_declaration" => {
+                if let Some(code_node) = extract_function(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Methods (functions with receivers)
+            "method_declaration" => {
+                if let Some(code_node) = extract_method(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Type declarations (struct, interface, type alias)
+            "type_declaration" => {
+                extract_type_declaration(node, source, file_path, nodes);
+            }
+
+            // Package declaration
+            "package_clause" => {
+                if let Some(code_node) = extract_package(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // Import declarations
+            "import_declaration" => {
+                extract_imports(node, source, file_path, nodes);
+            }
+
+            // Constants
+            "const_declaration" => {
+                extract_constants(node, source, file_path, nodes);
+            }
+
+            // Variables
+            "var_declaration" => {
+                extract_variables(node, source, file_path, nodes);
+            }
+
+            _ => {}
+        }
+
+        // Recurse into children
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                extract_from_node(&child, source, file_path, nodes);
             }
         }
-
-        // Methods (functions with receivers)
-        "method_declaration" => {
-            if let Some(code_node) = extract_method(node, source, file_path) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Type declarations (struct, interface, type alias)
-        "type_declaration" => {
-            extract_type_declaration(node, source, file_path, nodes);
-        }
-
-        // Package declaration
-        "package_clause" => {
-            if let Some(code_node) = extract_package(node, source, file_path) {
-                nodes.push(code_node);
-            }
-        }
-
-        // Import declarations
-        "import_declaration" => {
-            extract_imports(node, source, file_path, nodes);
-        }
-
-        // Constants
-        "const_declaration" => {
-            extract_constants(node, source, file_path, nodes);
-        }
-
-        // Variables
-        "var_declaration" => {
-            extract_variables(node, source, file_path, nodes);
-        }
-
-        _ => {}
-    }
-
-    // Recurse into children
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            extract_from_node(&child, source, file_path, nodes);
-        }
-    }
     }); // stacker::maybe_grow
 }
 
@@ -402,12 +402,22 @@ fn collect_calls(root: &Node, source: &str, refs: &mut Vec<String>) {
                 }
             }
         }
-        if cursor.goto_first_child() { continue; }
-        if cursor.goto_next_sibling() { continue; }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            continue;
+        }
         loop {
-            if !cursor.goto_parent() { break 'outer; }
-            if cursor.depth() == 0 { break 'outer; }
-            if cursor.goto_next_sibling() { break; }
+            if !cursor.goto_parent() {
+                break 'outer;
+            }
+            if cursor.depth() == 0 {
+                break 'outer;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 }

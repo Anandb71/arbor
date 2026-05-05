@@ -319,13 +319,15 @@ impl ArborGraph {
 
         let mut edges = Vec::new();
         for &from in &node_ids {
-            for edge_ref in self.graph.edges_directed(from, petgraph::Direction::Outgoing) {
+            for edge_ref in self
+                .graph
+                .edges_directed(from, petgraph::Direction::Outgoing)
+            {
                 let to = edge_ref.target();
                 if node_ids.contains(&to) {
-                    if let (Some(from_node), Some(to_node)) = (
-                        self.graph.node_weight(from),
-                        self.graph.node_weight(to),
-                    ) {
+                    if let (Some(from_node), Some(to_node)) =
+                        (self.graph.node_weight(from), self.graph.node_weight(to))
+                    {
                         edges.push((
                             from_node.name.clone(),
                             to_node.name.clone(),
@@ -602,7 +604,15 @@ mod new_query_tests {
         let a = g.add_node(make_node("foo", NodeKind::Function, "src/a.rs"));
         let b = g.add_node(make_node("bar", NodeKind::Function, "src/a.rs"));
         let _c = g.add_node(make_node("baz", NodeKind::Function, "src/b.rs"));
-        g.add_edge(a, b, Edge { kind: EdgeKind::Calls, file: None, line: None });
+        g.add_edge(
+            a,
+            b,
+            Edge {
+                kind: EdgeKind::Calls,
+                file: None,
+                line: None,
+            },
+        );
         let (nodes, edges) = g.nodes_in_file_with_edges("src/a.rs");
         assert_eq!(nodes.len(), 2);
         assert_eq!(edges.len(), 1);
@@ -617,7 +627,15 @@ mod new_query_tests {
         let a = g.add_node(make_node("foo", NodeKind::Function, "src/a.rs"));
         let c = g.add_node(make_node("baz", NodeKind::Function, "src/b.rs"));
         // Edge from a.rs to b.rs — should NOT appear in get_file_graph for a.rs
-        g.add_edge(a, c, Edge { kind: EdgeKind::Calls, file: None, line: None });
+        g.add_edge(
+            a,
+            c,
+            Edge {
+                kind: EdgeKind::Calls,
+                file: None,
+                line: None,
+            },
+        );
         let (nodes, edges) = g.nodes_in_file_with_edges("src/a.rs");
         assert_eq!(nodes.len(), 1); // only foo
         assert_eq!(edges.len(), 0); // cross-file edge excluded
