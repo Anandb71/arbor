@@ -6,7 +6,7 @@ branding:
 
 inputs:
   command:
-    description: Arbor command to run (without leading 'arbor'). Supports 'analyze-impact --pr=NNN' for PR Bot blast radius using graph centrality.
+    description: Arbor command to run (without leading 'arbor'). For example 'diff .' or 'status .'.
     required: false
     default: status .
   arbor-version:
@@ -40,27 +40,9 @@ runs:
           cargo install arbor-graph-cli --version "${{ inputs.arbor-version }}" --force
         fi
 
-    - name: Run Arbor command (with PR Bot support)
+    - name: Run Arbor command
       shell: bash
       run: |
         set -euo pipefail
         cd "${{ inputs.working-directory }}"
-        if [[ "${{ inputs.command }}" == *"analyze-impact"* ]]; then
-          cat > arbor-impact.md << 'EOF'
-# 🧠 Arbor PR Impact Audit Report (Professional Governance)
-
-**PR:** #${{ github.event.number || 'N/A' }} | **Graph Centrality Used:** Yes | **Sorted by Risk**
-
-| File | Risk Level | Confidence | Recommendation |
-|------|------------|------------|----------------|
-| **`core/habits.rs`** | **HIGH** | **0.92** | **Bold high-risk: Review load-bearing nodes (affects 13 downstream). Use get_knowledge_path for causality.** |
-| `notes/goals.md` | Medium | 0.78 | Check [[Core Habits]] links; medium blast radius on Sections. |
-| `lib/parser_v2.rs` | Low | 0.41 | Low centrality — safe change but verify Markdown fallback relations. |
-
-**Summary:** 1 **high-risk** file (bolded per ConfidenceExplanation). Total affected nodes: 13. Upstream/downstream explained. Prevents architectural debt via graph provenance.
-
-*Powered by Lattice (Personal AI Governance) + Arbor PR Bot. Real causality, not RAG.*
-EOF
-        else
-          arbor ${{ inputs.command }}
-        fi
+        arbor ${{ inputs.command }}
