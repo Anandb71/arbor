@@ -306,18 +306,20 @@ impl ArborGraph {
         &self,
         file: &str,
     ) -> (Vec<&CodeNode>, Vec<(String, String, String)>) {
-        let nodes = self.find_by_file(file);
-        let node_ids: std::collections::HashSet<NodeId> = nodes
+        let node_ids: std::collections::HashSet<NodeId> = self
+            .file_index
+            .get(file)
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default();
+
+        let nodes: Vec<&CodeNode> = node_ids
             .iter()
-            .filter_map(|n| self.id_index.get(&n.id).copied())
+            .filter_map(|&id| self.graph.node_weight(id))
             .collect();
 
         let mut edges = Vec::new();
         for &from in &node_ids {
-            for edge_ref in
-                self.graph
-                    .edges_directed(from, petgraph::Direction::Outgoing)
-            {
+            for edge_ref in self.graph.edges_directed(from, petgraph::Direction::Outgoing) {
                 let to = edge_ref.target();
                 if node_ids.contains(&to) {
                     if let (Some(from_node), Some(to_node)) = (
@@ -606,5 +608,18 @@ mod new_query_tests {
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].0, "foo");
         assert_eq!(edges[0].1, "bar");
+    }
+
+    #[test]
+    fn test_nodes_in_file_with_edges_excludes_cross_file_edges() {
+        use crate::edge::{Edge, EdgeKind};
+        let mut g = ArborGraph::new();
+        let a = g.add_node(make_node("foo", NodeKind::Function, "src/a.rs"));
+        let c = g.add_node(make_node("baz", NodeKind::Function, "src/b.rs"));
+        // Edge from a.rs to b.rs — should NOT appear in get_file_graph for a.rs
+        g.add_edge(a, c, Edge { kind: EdgeKind::Calls, file: None, line: None });
+        let (nodes, edges) = g.nodes_in_file_with_edges("src/a.rs");
+        assert_eq!(nodes.len(), 1); // only foo
+        assert_eq!(edges.len(), 0); // cross-file edge excluded
     }
 }

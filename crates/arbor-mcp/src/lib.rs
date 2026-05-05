@@ -520,12 +520,17 @@ impl McpServer {
                     .and_then(|e| e["name"].as_str())
                     .unwrap_or("")
                     .to_string();
+                let (next_tool, next_args) = if count > 0 {
+                    ("analyze_impact", json!({ "node_id": next_symbol }))
+                } else {
+                    ("search_symbols", json!({ "query": "" }))
+                };
                 Ok(Self::ok_envelope(
                     "list_entry_points",
                     json!({ "entry_points": entries }),
                     count,
-                    "analyze_impact",
-                    json!({ "node_id": next_symbol }),
+                    next_tool,
+                    next_args,
                 ))
             }
             "get_callers" => {
@@ -643,7 +648,10 @@ impl McpServer {
                 match idx {
                     None => Ok(Self::err_envelope("get_node_detail", &format!("Symbol '{}' not found", symbol))),
                     Some(idx) => {
-                        let node = graph.get(idx).unwrap();
+                        let node = match graph.get(idx) {
+                            Some(n) => n,
+                            None => return Ok(Self::err_envelope("get_node_detail", "Node index invalid")),
+                        };
                         let centrality = graph.centrality(idx);
                         let callers = graph.get_callers(idx);
                         let callees = graph.get_callees(idx);
