@@ -1,6 +1,6 @@
 {
   "name": "@anandb71/arbor-cli",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "description": "Graph-native intelligence for codebases — know what breaks before you break it",
   "license": "MIT",
   "repository": {
