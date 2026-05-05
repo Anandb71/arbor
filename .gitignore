@@ -95,3 +95,4 @@ server.json
 
 # Private startup scaffolding (Lattice - personal knowledge graph starter)
 lattice/
+.worktrees/
