@@ -527,13 +527,13 @@ impl McpServer {
                     })
                     .collect();
                 let count = entries.len();
-                let next_symbol = entries
+                let next_node_id = entries
                     .first()
-                    .and_then(|e| e["name"].as_str())
+                    .and_then(|e| e["id"].as_str())
                     .unwrap_or("")
                     .to_string();
                 let (next_tool, next_args) = if count > 0 {
-                    ("analyze_impact", json!({ "node_id": next_symbol }))
+                    ("analyze_impact", json!({ "node_id": next_node_id }))
                 } else {
                     ("search_symbols", json!({ "query": "" }))
                 };
@@ -551,18 +551,21 @@ impl McpServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let graph = self.graph.read().await;
-                let idx = graph.get_index(symbol).or_else(|| {
-                    graph
-                        .find_by_name(symbol)
-                        .first()
-                        .and_then(|n| graph.get_index(&n.id))
-                });
-                match idx {
+                let resolved = graph
+                    .get_index(symbol)
+                    .map(|idx| (symbol.to_string(), idx))
+                    .or_else(|| {
+                        graph
+                            .find_by_name(symbol)
+                            .first()
+                            .and_then(|n| graph.get_index(&n.id).map(|idx| (n.id.clone(), idx)))
+                    });
+                match resolved {
                     None => Ok(Self::err_envelope(
                         "get_callers",
                         &format!("Symbol '{}' not found", symbol),
                     )),
-                    Some(idx) => {
+                    Some((resolved_id, idx)) => {
                         let callers = graph.get_callers(idx);
                         let items: Vec<Value> = callers
                             .iter()
@@ -587,7 +590,7 @@ impl McpServer {
                                 "search_symbols"
                             },
                             if count > 0 {
-                                json!({ "node_id": symbol })
+                                json!({ "node_id": resolved_id })
                             } else {
                                 json!({ "query": symbol })
                             },
@@ -601,18 +604,21 @@ impl McpServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let graph = self.graph.read().await;
-                let idx = graph.get_index(symbol).or_else(|| {
-                    graph
-                        .find_by_name(symbol)
-                        .first()
-                        .and_then(|n| graph.get_index(&n.id))
-                });
-                match idx {
+                let resolved = graph
+                    .get_index(symbol)
+                    .map(|idx| (symbol.to_string(), idx))
+                    .or_else(|| {
+                        graph
+                            .find_by_name(symbol)
+                            .first()
+                            .and_then(|n| graph.get_index(&n.id).map(|idx| (n.id.clone(), idx)))
+                    });
+                match resolved {
                     None => Ok(Self::err_envelope(
                         "get_callees",
                         &format!("Symbol '{}' not found", symbol),
                     )),
-                    Some(idx) => {
+                    Some((_resolved_id, idx)) => {
                         let callees = graph.get_callees(idx);
                         let items: Vec<Value> = callees
                             .iter()
@@ -627,9 +633,9 @@ impl McpServer {
                             })
                             .collect();
                         let count = items.len();
-                        let first_callee = items
+                        let first_callee_id = items
                             .first()
-                            .and_then(|e| e["name"].as_str())
+                            .and_then(|e| e["id"].as_str())
                             .unwrap_or("")
                             .to_string();
                         Ok(Self::ok_envelope(
@@ -642,7 +648,7 @@ impl McpServer {
                                 "list_entry_points"
                             },
                             if count > 0 {
-                                json!({ "symbol": first_callee })
+                                json!({ "symbol": first_callee_id })
                             } else {
                                 json!({})
                             },

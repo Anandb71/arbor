@@ -24,7 +24,12 @@ jobs:
 
       - name: Run Arbor diff and capture report
         shell: bash
-        run: arbor diff . > arbor-impact.md 2>&1 || true
+        env:
+          ARBOR_DIFF_BASE: ${{ github.event.pull_request.base.sha }}
+          ARBOR_DIFF_HEAD: ${{ github.event.pull_request.head.sha }}
+          NO_COLOR: "1"
+        run: |
+          arbor diff . 2>&1 | sed 's/\x1b\[[0-9;]*[mGKHF]//g' > arbor-impact.md || true
 
       - name: Post Blast Radius Comment
         if: always()
