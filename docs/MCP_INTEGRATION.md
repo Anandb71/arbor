@@ -206,11 +206,59 @@ Examples:
 
 ## Available Tools
 
+All tools return a standard envelope:
+```json
+{ "ok": true, "tool": "...", "arbor_version": "2.1.0", "data": {...}, "meta": { "node_count": N, "suggested_next_tool": "...", "suggested_next_args": {...} } }
+```
+Errors return `{ "ok": false, "error": "..." }`.
+
+### Surgical tools (v2.1.0)
+
 | Tool | Description |
 |------|-------------|
-| `get_logic_path` | Traces call graph from a symbol |
-| `analyze_impact` | Returns blast radius with confidence/roles |
-| `find_path` | Finds shortest path between two symbols (when exposed by current server build) |
+| `list_entry_points` | Returns all production entry points (main, HTTP handlers, webhooks, jobs, CLI commands) |
+| `get_callers` | Returns all nodes that call a given symbol |
+| `get_callees` | Returns all nodes called by a given symbol |
+| `search_symbols` | Fuzzy search across all symbol names |
+| `get_file_graph` | Returns all nodes and intra-file edges for a given file path |
+| `get_node_detail` | Returns full detail for a node by ID or name |
+
+### Broad tools (existing)
+
+| Tool | Description |
+|------|-------------|
+| `get_logic_path` | Traces call graph from a symbol — full upstream/downstream brief |
+| `analyze_impact` | Blast radius with confidence levels and role classification |
+| `find_path` | Shortest path between two symbols |
+| `get_knowledge_path` | Knowledge graph path with wiki-link causality explanation |
+
+### Example: get_callers
+
+**Input:**
+```json
+{
+  "name": "get_callers",
+  "arguments": {
+    "symbol": "parse_file"
+  }
+}
+```
+
+**Output:**
+```json
+{
+  "ok": true,
+  "tool": "get_callers",
+  "arbor_version": "2.1.0",
+  "data": {
+    "symbol": "parse_file",
+    "callers": [
+      { "id": "arbor_core::parser_v2::parse_file", "name": "parse_file", "kind": "Function", "file": "crates/arbor-core/src/parser_v2.rs", "line": 42 }
+    ]
+  },
+  "meta": { "node_count": 1, "suggested_next_tool": "analyze_impact", "suggested_next_args": { "node_id": "arbor_core::parser_v2::parse_file" } }
+}
+```
 
 ### Example: analyze_impact
 
