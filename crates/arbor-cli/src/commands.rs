@@ -45,13 +45,13 @@ fn find_workspace_root(start: &Path) -> PathBuf {
         }
     }
 
-    let mut best = current.clone();
+    let fallback = current.clone();
     loop {
         if ROOT_MARKERS
             .iter()
             .any(|marker| current.join(marker).exists())
         {
-            best = current.clone();
+            return current;
         }
 
         match current.parent() {
@@ -60,7 +60,7 @@ fn find_workspace_root(start: &Path) -> PathBuf {
         }
     }
 
-    best
+    fallback
 }
 
 fn resolve_project_path(path: &Path) -> Result<PathBuf> {
