@@ -22,6 +22,7 @@ struct DiffSummary {
     entrypoints_affected: usize,
     files_likely_updates: usize,
     blast_radius_nodes: usize,
+    mermaid_diagram: Option<String>,
 }
 
 const ROOT_MARKERS: &[&str] = &[
@@ -421,6 +422,81 @@ fn compute_diff_summary(
         })
         .count();
 
+    // Generate Mermaid diagram for PR reports
+    let mut mermaid_lines = Vec::new();
+    mermaid_lines.push("graph TD".to_string());
+    mermaid_lines.push(
+        "  classDef changed fill:#ef4444,stroke:#333,stroke-width:2px,color:#fff;".to_string(),
+    );
+    mermaid_lines.push(
+        "  classDef caller fill:#f59e0b,stroke:#333,stroke-width:1px,color:#fff;".to_string(),
+    );
+
+    let mut added_edges = std::collections::HashSet::new();
+    let mut changed_node_names = std::collections::HashSet::new();
+    let mut direct_caller_names = std::collections::HashSet::new();
+
+    for node_id in changed_node_ids.iter().copied().take(5) {
+        if let Some(node) = graph.get(node_id) {
+            let target_name = node
+                .name
+                .replace(':', "_")
+                .replace('<', "_")
+                .replace('>', "_")
+                .replace('(', "_")
+                .replace(')', "_")
+                .replace('[', "_")
+                .replace(']', "_");
+            changed_node_names.insert(target_name.clone());
+
+            let analysis = graph.analyze_impact(node_id, max_depth);
+
+            let mut caller_count = 0;
+            for up in &analysis.upstream {
+                if up.hop_distance == 1 {
+                    let caller_name = up
+                        .node_info
+                        .name
+                        .replace(':', "_")
+                        .replace('<', "_")
+                        .replace('>', "_")
+                        .replace('(', "_")
+                        .replace(')', "_")
+                        .replace('[', "_")
+                        .replace(']', "_");
+                    direct_caller_names.insert(caller_name.clone());
+
+                    let edge = format!(
+                        "  {}[{}] --> {}[{}]",
+                        caller_name, up.node_info.name, target_name, node.name
+                    );
+                    if added_edges.insert(edge.clone()) {
+                        mermaid_lines.push(edge);
+                        caller_count += 1;
+                        if caller_count >= 3 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for name in &changed_node_names {
+        mermaid_lines.push(format!("  class {} changed;", name));
+    }
+    for name in &direct_caller_names {
+        if !changed_node_names.contains(name) {
+            mermaid_lines.push(format!("  class {} caller;", name));
+        }
+    }
+
+    let mermaid_diagram = if mermaid_lines.len() > 3 {
+        Some(mermaid_lines.join("\n"))
+    } else {
+        None
+    };
+
     DiffSummary {
         changed_files,
         changed_symbols: changed_node_ids.len(),
@@ -429,6 +505,7 @@ fn compute_diff_summary(
         entrypoints_affected,
         files_likely_updates,
         blast_radius_nodes: affected_nodes.len(),
+        mermaid_diagram,
     }
 }
 
@@ -453,6 +530,138 @@ fn print_diff_summary(summary: &DiffSummary) {
     );
     println!("  • {} impacted nodes total", summary.blast_radius_nodes);
     println!("  • {} changed symbols resolved", summary.changed_symbols);
+}
+
+fn print_diff_markdown(summary: &DiffSummary) {
+    let risk = if summary.blast_radius_nodes > 50 {
+        ("🔴", "Critical")
+    } else if summary.blast_radius_nodes > 25 {
+        ("🟠", "High")
+    } else if summary.blast_radius_nodes > 10 {
+        ("🟡", "Medium")
+    } else {
+        ("🟢", "Low")
+    };
+
+    println!("## 🌳 Arbor Impact Report\n");
+    println!(
+        "**Risk Level:** {} {} | **Blast Radius:** {} nodes | **Changed Symbols:** {}\n",
+        risk.0, risk.1, summary.blast_radius_nodes, summary.changed_symbols
+    );
+
+    // Changed files table
+    println!("### Changed Files\n");
+    println!("| File | Status |");
+    println!("|------|--------|");
+    for f in &summary.changed_files {
+        println!("| `{}` | Modified |", f);
+    }
+
+    if let Some(ref diagram) = summary.mermaid_diagram {
+        println!("\n### 📊 Visual Impact Graph\n");
+        println!("```mermaid");
+        println!("{}", diagram);
+        println!("```");
+    }
+
+    // Impact summary
+    println!("\n### Impact Summary\n");
+    println!("| Metric | Count |");
+    println!("|--------|-------|");
+    println!("| Direct callers affected | {} |", summary.direct_callers);
+    println!(
+        "| Indirect callers affected | {} |",
+        summary.indirect_callers
+    );
+    println!(
+        "| API entrypoints impacted | {} |",
+        summary.entrypoints_affected
+    );
+    println!(
+        "| Files likely requiring updates | {} |",
+        summary.files_likely_updates
+    );
+    println!("| Total blast radius | {} |", summary.blast_radius_nodes);
+
+    // Recommendations
+    if summary.entrypoints_affected > 0 {
+        println!(
+            "\n> ⚠️ **Warning:** {} API entrypoints are affected. Integration tests recommended.",
+            summary.entrypoints_affected
+        );
+    }
+    if summary.blast_radius_nodes > 25 {
+        println!("\n> 🔍 **Suggestion:** Consider breaking this change into smaller PRs.");
+    }
+
+    println!("\n---");
+    println!("*Powered by [Arbor](https://github.com/Anandb71/arbor) v{} — graph-native code intelligence*", env!("CARGO_PKG_VERSION"));
+}
+
+fn print_check_markdown(summary: &DiffSummary, risky: bool, max_blast_radius: usize) {
+    let status = if risky {
+        ("🔴", "FAIL", "High-risk change detected")
+    } else {
+        ("🟢", "PASS", "Change is within safe thresholds")
+    };
+
+    println!("## 🌳 Arbor Safety Check\n");
+    println!("**Status:** {} **{}** — {}\n", status.0, status.1, status.2);
+    println!(
+        "**Threshold:** max blast radius = {} | **Actual:** {}\n",
+        max_blast_radius, summary.blast_radius_nodes
+    );
+
+    // Changed files
+    println!("### Changed Files\n");
+    println!("| File | Status |");
+    println!("|------|--------|");
+    for f in &summary.changed_files {
+        println!("| `{}` | Modified |", f);
+    }
+
+    if let Some(ref diagram) = summary.mermaid_diagram {
+        println!("\n### 📊 Visual Impact Graph\n");
+        println!("```mermaid");
+        println!("{}", diagram);
+        println!("```");
+    }
+
+    // Impact table
+    println!("\n### Impact Summary\n");
+    println!("| Metric | Count | Status |");
+    println!("|--------|-------|--------|");
+    let br_status = if summary.blast_radius_nodes > max_blast_radius {
+        "🔴"
+    } else {
+        "🟢"
+    };
+    let ep_status = if summary.entrypoints_affected > 0 {
+        "🟡"
+    } else {
+        "🟢"
+    };
+    println!(
+        "| Blast radius | {} | {} |",
+        summary.blast_radius_nodes, br_status
+    );
+    println!("| Direct callers | {} | |", summary.direct_callers);
+    println!("| Indirect callers | {} | |", summary.indirect_callers);
+    println!(
+        "| API entrypoints | {} | {} |",
+        summary.entrypoints_affected, ep_status
+    );
+    println!(
+        "| Files needing updates | {} | |",
+        summary.files_likely_updates
+    );
+
+    if risky {
+        println!("\n> 🚨 **Action Required:** This PR exceeds the blast radius threshold. Review the impact carefully before merging.");
+    }
+
+    println!("\n---");
+    println!("*Powered by [Arbor](https://github.com/Anandb71/arbor) v{} — graph-native code intelligence*", env!("CARGO_PKG_VERSION"));
 }
 
 fn resolve_node_or_file_target(
@@ -777,7 +986,7 @@ pub fn query(query: &str, limit: usize, path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn diff(path: &Path, depth: usize, json_output: bool) -> Result<()> {
+pub fn diff(path: &Path, depth: usize, json_output: bool, markdown: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
 
@@ -794,6 +1003,11 @@ pub fn diff(path: &Path, depth: usize, json_output: bool) -> Result<()> {
     let graph = load_or_index_graph(&resolved_path)?;
     let changed_nodes = changed_node_ids(&graph, &changed_files, &resolved_path);
     let summary = compute_diff_summary(&graph, changed_files, changed_nodes, depth, &resolved_path);
+
+    if markdown {
+        print_diff_markdown(&summary);
+        return Ok(());
+    }
 
     if json_output {
         let output = serde_json::json!({
@@ -821,6 +1035,7 @@ pub fn check(
     max_blast_radius: usize,
     no_fail: bool,
     json_output: bool,
+    markdown: bool,
 ) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
@@ -837,6 +1052,14 @@ pub fn check(
     let risky = summary.blast_radius_nodes > max_blast_radius
         || summary.entrypoints_affected > 0
         || summary.indirect_callers > max_blast_radius / 2;
+
+    if markdown {
+        print_check_markdown(&summary, risky, max_blast_radius);
+        if risky && !no_fail {
+            return Err("risky change set detected".into());
+        }
+        return Ok(());
+    }
 
     if json_output {
         let output = serde_json::json!({
@@ -2171,6 +2394,179 @@ pub fn pr_summary(symbols: &str, path: &Path) -> Result<()> {
 
     println!("---");
     println!("*Generated by Arbor*");
+
+    Ok(())
+}
+
+/// Generate an auto-description for a PR based on graph changes.
+pub fn summary(path: &Path) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let _ = ensure_arbor_initialized(&resolved_path)?;
+
+    if !is_git_repo(&resolved_path) {
+        return Err("arbor summary requires a git repository".into());
+    }
+
+    let changed_files = git_changed_files(&resolved_path)?;
+    if changed_files.is_empty() {
+        println!("## 🌳 Arbor PR Summary\n");
+        println!("No changes detected in git. Working tree is clean.");
+        return Ok(());
+    }
+
+    let graph = load_or_index_graph(&resolved_path)?;
+    let changed_nodes = changed_node_ids(&graph, &changed_files, &resolved_path);
+
+    // Reuse our depth=5 summary computation
+    let summary = compute_diff_summary(
+        &graph,
+        changed_files.clone(),
+        changed_nodes,
+        5,
+        &resolved_path,
+    );
+
+    // Classify changes
+    let mut code_changes = 0;
+    let mut test_changes = 0;
+    let mut doc_changes = 0;
+    let mut infra_changes = 0;
+
+    for f in &changed_files {
+        let fl = f.to_lowercase();
+        if fl.contains("test") || fl.contains("spec") {
+            test_changes += 1;
+        } else if fl.ends_with(".md") || fl.contains("docs/") {
+            doc_changes += 1;
+        } else if fl.contains("cargo.toml") || fl.contains("dockerfile") || fl.contains(".github/")
+        {
+            infra_changes += 1;
+        } else {
+            code_changes += 1;
+        }
+    }
+
+    let primary_type = if code_changes > 0 {
+        "Code/Feature Implementation"
+    } else if test_changes > 0 {
+        "Testing & Coverage Updates"
+    } else if doc_changes > 0 {
+        "Documentation Improvements"
+    } else if infra_changes > 0 {
+        "Infrastructure & Dependency Updates"
+    } else {
+        "General Maintenance"
+    };
+
+    println!("## 🌳 Arbor PR Auto-Description\n");
+    println!("### 📝 Overview");
+    println!(
+        "This PR introduces changes primarily categorized as **{}** across {} modified file(s).\n",
+        primary_type,
+        changed_files.len()
+    );
+
+    println!("### 🔍 Scope of Changes");
+    println!("| File | Focus Area |");
+    println!("|------|------------|");
+    for f in &summary.changed_files {
+        let focus = if f.contains("crates/arbor-cli") {
+            "CLI Interface"
+        } else if f.contains("crates/arbor-core") {
+            "Core Intelligence Layer"
+        } else if f.contains("crates/arbor-graph") {
+            "Graph Modeling Engine"
+        } else if f.contains("crates/arbor-server") {
+            "LSP/Server Host"
+        } else if f.contains("crates/arbor-mcp") {
+            "Model Context Protocol integration"
+        } else if f.contains(".github/") {
+            "CI Workflows"
+        } else {
+            "General Codebase"
+        };
+        println!("| `{}` | {} |", f, focus);
+    }
+    println!();
+
+    if let Some(ref diagram) = summary.mermaid_diagram {
+        println!("### 📊 Visual Impact Graph\n");
+        println!("```mermaid");
+        println!("{}", diagram);
+        println!("```\n");
+    }
+
+    println!("### ⚡ Impact & Blast Radius");
+    println!("Our graph analysis resolved **{}** specific symbol changes with the following downstream impact:", summary.changed_symbols);
+    println!(
+        "- **Direct Callers Affected:** {} callers will need direct integration review.",
+        summary.direct_callers
+    );
+    println!("- **Indirect Callers Affected:** {} secondary callers are in the downstream dependency path.", summary.indirect_callers);
+    println!(
+        "- **API Entrypoints Affected:** {} public-facing entrypoints are impacted.",
+        summary.entrypoints_affected
+    );
+    println!(
+        "- **Total Blast Radius:** {} nodes total in the impact graph.",
+        summary.blast_radius_nodes
+    );
+    println!();
+
+    // Risk classification
+    let risk_emoji = if summary.blast_radius_nodes > 50 {
+        "🔴 Critical Impact risk"
+    } else if summary.blast_radius_nodes > 25 {
+        "🟠 High Impact risk"
+    } else if summary.blast_radius_nodes > 10 {
+        "🟡 Medium Impact risk"
+    } else {
+        "🟢 Low Impact risk"
+    };
+    println!("**Risk Classification:** {}\n", risk_emoji);
+
+    // Suggested reviewers based on files modified
+    println!("### 👥 Suggested Reviewers");
+    let mut reviewers = std::collections::HashSet::new();
+    for f in &changed_files {
+        if f.contains("crates/arbor-core") || f.contains("crates/arbor-graph") {
+            reviewers.insert("@Anandb71 (Core Engine)");
+        }
+        if f.contains("crates/arbor-cli") || f.contains("crates/arbor-mcp") {
+            reviewers.insert("@Anandb71 (CLI / MCP)");
+        }
+        if f.contains(".github/") || f.contains("Cargo.toml") {
+            reviewers.insert("@Anandb71 (DevOps / Build)");
+        }
+    }
+    if reviewers.is_empty() {
+        reviewers.insert("@Anandb71 (Maintainer)");
+    }
+    for r in reviewers {
+        println!("- {}", r);
+    }
+    println!();
+
+    // Verification Checklist
+    println!("### ✅ Recommended Verification Checklist");
+    println!("- [ ] Execute `cargo test --workspace` to ensure all 185+ unit and integration tests pass.");
+    if summary.blast_radius_nodes > 0 {
+        println!(
+            "- [ ] Manually verify the blast radius of {} impacted nodes.",
+            summary.blast_radius_nodes
+        );
+    }
+    if summary.entrypoints_affected > 0 {
+        println!(
+            "- [ ] Run end-to-end integration tests for the {} affected API entrypoint(s).",
+            summary.entrypoints_affected
+        );
+    }
+    println!("- [ ] Run `cargo clippy --workspace --all-targets` to catch any lint warnings.");
+    println!();
+
+    println!("---");
+    println!("*Generated automatically by [Arbor](https://github.com/Anandb71/arbor) v{} — Graph-Native Code Intelligence*", env!("CARGO_PKG_VERSION"));
 
     Ok(())
 }
