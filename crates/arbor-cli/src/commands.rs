@@ -438,15 +438,7 @@ fn compute_diff_summary(
 
     for node_id in changed_node_ids.iter().copied().take(5) {
         if let Some(node) = graph.get(node_id) {
-            let target_name = node
-                .name
-                .replace(':', "_")
-                .replace('<', "_")
-                .replace('>', "_")
-                .replace('(', "_")
-                .replace(')', "_")
-                .replace('[', "_")
-                .replace(']', "_");
+            let target_name = node.name.replace([':', '<', '>', '(', ')', '[', ']'], "_");
             changed_node_names.insert(target_name.clone());
 
             let analysis = graph.analyze_impact(node_id, max_depth);
@@ -457,13 +449,7 @@ fn compute_diff_summary(
                     let caller_name = up
                         .node_info
                         .name
-                        .replace(':', "_")
-                        .replace('<', "_")
-                        .replace('>', "_")
-                        .replace('(', "_")
-                        .replace(')', "_")
-                        .replace('[', "_")
-                        .replace(']', "_");
+                        .replace([':', '<', '>', '(', ')', '[', ']'], "_");
                     direct_caller_names.insert(caller_name.clone());
 
                     let edge = format!(
@@ -687,6 +673,18 @@ fn resolve_node_or_file_target(
 }
 
 fn command_exists(cmd: &str) -> bool {
+    // Input validation to prevent command injection (CWE-78)
+    if cmd.is_empty() || cmd.len() > 255 {
+        return false;
+    }
+    // Only allow alphanumeric, hyphen, underscore, dot, slash, and backslash
+    if !cmd
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/' || c == '\\')
+    {
+        return false;
+    }
+
     Command::new(cmd)
         .arg("--version")
         .output()
