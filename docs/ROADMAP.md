@@ -4,29 +4,26 @@
 
 ---
 
-## ✅ Current Execution Status (2026-03-25)
+## ✅ Current Execution Status (2026-05-30)
 
 This section tracks what is already shipped versus what remains strategic work.
 
-### Shipped / In-Progress Foundation (as of 2026-04-20)
+### Shipped / In-Progress Foundation (as of 2026-05-30)
 
+- [x] **PR Intelligence & Automation (v2.2.0):** Native markdown output formatting for impact reports (`arbor diff/check --markdown`), automatic PR auto-descriptions (`arbor summary`), upgraded composite GitHub Action with automatic comment deduplication/in-place editing, and comprehensive sponsors payments structure (`.github/payments.yml` + `.github/FUNDING.yml`).
+- [x] **v2.1.0 Agent-Native MCP:** 6 new surgical tools (`list_entry_points`, `get_callers`, `get_callees`, `search_symbols`, `get_file_graph`, `get_node_detail`) with standard JSON envelope and `suggested_next_tool` routing hints. Total: 10 MCP tools.
 - [x] **Agent Bridge (MCP):** Operational with expanded tools (`get_knowledge_path` with logic paths/Markdown links + explanations, `analyze_impact` with markdown table format for PR bot, `find_path`, sorted_by_centrality + ConfidenceExplanation)
-- [x] **PR Bot polish:** Action + workflow + MCP markdown tables with **bold high-risk** using ConfidenceExplanation (professional audit reports)
 - [x] **Tauri Pivot/Lattice:** Desktop shell with system tray (Personal OS feel), integrated graph/MCP (companion starter startup in Arbor v2/)
 - [x] **`arbor audit` + impact workflows:** Git-aware, with blast radius for code PRs
 - [x] **Language expansion:** Full with fallback_parser for Markdown (NodeKind::Section), Dart fixes, all tests passing
-- [x] **Persistent store:** Sled in GraphStore with incremental updates, centrality precompute (Priority 2)
-- [x] **Local-first air-gapped:** All core + Lattice MVP offline
+- [x] **Persistent store:** Sled in GraphStore with incremental updates, centrality precompute
 - [x] **VS Code extension, releases, distribution:** Updated with PR bot foundation
-- [x] **Eat own dog food:** Parser_v2 registry, Markdown support for Lattice/visualizer
-- [x] **v2.1.0 Agent-Native MCP:** 6 new surgical tools (`list_entry_points`, `get_callers`, `get_callees`, `search_symbols`, `get_file_graph`, `get_node_detail`) with standard JSON envelope and `suggested_next_tool` routing hints. Total: 10 MCP tools.
 
 ### Still Outstanding (Major Epics)
 
 - [ ] Full write-mode visualizer + 4D time-travel (Priority for 4 features)
 - [ ] Plugin/WASM system for parsers
 - [ ] Enterprise RBAC, compliance reports, learning loop
-- [ ] Monetization for Lattice (sponsors, pro sync) + full GTM launch
 - [ ] Deeper monorepo integration for Tauri + arbor crates
 
 ---

@@ -5,6 +5,26 @@ All notable changes to Arbor will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-05-30 "PR Intelligence & Sponsorships"
+
+### Added
+- **arbor diff --markdown**: Native markdown formatting option for impact analysis reports. Perfect for PR comments, presenting a color-coded risk assessment, changed files list, direct/indirect caller metrics, affected API entrypoints, and actionable suggestions.
+- **arbor check --markdown**: Markdown safety check output. Validates change impact against maximum blast radius thresholds and prints color-coded PASS/FAIL status.
+- **arbor summary**: Auto-generates structured markdown Pull Request descriptions based on graph diff analysis, classifying changes, mapping scope areas, analyzing blast radius, and automatically recommending relevant reviewers.
+- **Upgraded GitHub Action composite steps**: Updated `action.yml` with a new `comment-on-pr` parameter. When running in a PR workflow, it automatically executes the impact analysis, posts a markdown comment, and deduplicates comments by editing previous reports.
+- **Payments & Sponsorship configuration**: Added `.github/payments.yml` defining backers, professional sponsors, and enterprise sponsors tiers with corresponding perks, Stripe billing integrations, Ko-fi, and Open Collective paths. Sync'd `.github/FUNDING.yml` to support these funding channels.
+
+### Changed
+- Aligned workspace and all package manager manifests to **v2.2.0** (Cargo, npm wrapper, VS Code extension, Scoop, Homebrew).
+- Simplified `.github/workflows/arbor-pr-bot.yml` to reference the local upgraded composite action directly, reducing boilerplate logic.
+- Ignored `.claude/` locally via `.gitignore`.
+
+## [2.1.0] - 2026-05-15 "Agent-Native MCP Ecosystem Expansion"
+
+### Added
+- **MCP Server Upgrade**: Re-engineered model context protocol server to expose **10+ advanced agent-native tools** directly to AI clients.
+- Added comprehensive tool schema declarations for AI engine integration.
+
 ## [2.0.1] - 2026-04-20 "Patch Stability & Automation Fixes"
 
 ### Fixed

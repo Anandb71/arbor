@@ -16,33 +16,10 @@ jobs:
         with:
           fetch-depth: 0  # For full git history/impact
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build and install Arbor from source
-        run: cargo install --path crates/arbor-cli --force
-
-      - name: Run Arbor diff and capture report
-        shell: bash
-        env:
-          ARBOR_DIFF_BASE: ${{ github.event.pull_request.base.sha }}
-          ARBOR_DIFF_HEAD: ${{ github.event.pull_request.head.sha }}
-          NO_COLOR: "1"
-        run: |
-          arbor diff . 2>&1 | sed 's/\x1b\[[0-9;]*[mGKHF]//g' > arbor-impact.md || true
-
-      - name: Post Blast Radius Comment
-        if: always()
-        uses: actions/github-script@v7
+      - name: Run Arbor Action
+        uses: ./
         with:
+          install-from-source: "true"
+          command: "diff . --markdown"
+          comment-on-pr: "true"
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const fs = require('fs');
-            let impact = 'No impact report generated.';
-            try { impact = fs.readFileSync('arbor-impact.md', 'utf8'); } catch (_) {}
-            await github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: `## Arbor Graph Impact Report\n\n**Blast Radius:** High-centrality nodes affected?\n\n${impact}\n\n*Powered by [Arbor](https://github.com/${context.repo.owner}/${context.repo.repo}) — semantic code graph engine.*`
-            });

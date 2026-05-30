@@ -224,9 +224,9 @@ Start here when you need deeper internals:
 Arbor supports pre-merge risk checks and change gating:
 
 ```bash
-arbor diff
-arbor check --max-blast-radius 30
-arbor open <symbol>
+arbor diff --markdown
+arbor check --max-blast-radius 30 --markdown
+arbor summary
 ```
 
 Use the repository GitHub Action for CI integration:
@@ -240,9 +240,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: Anandb71/arbor@v2.0.1
         with:
-          command: check . --max-blast-radius 30
+          fetch-depth: 0 # needed for full diff comparison
+      
+      - uses: Anandb71/arbor@v2.2.0
+        with:
+          command: check . --max-blast-radius 30 --markdown
+          comment-on-pr: true # posts/updates report directly on the PR
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
 ---

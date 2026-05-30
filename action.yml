@@ -21,6 +21,14 @@ inputs:
     description: Directory where the Arbor command should run.
     required: false
     default: .
+  comment-on-pr:
+    description: "Post the impact report as a comment on the Pull Request when running in a PR workflow."
+    required: false
+    default: "true"
+  github-token:
+    description: "The GITHUB_TOKEN secret, needed to post PR comments."
+    required: false
+    default: "${{ github.token }}"
 
 runs:
   using: composite
@@ -40,9 +48,47 @@ runs:
           cargo install arbor-graph-cli --version "${{ inputs.arbor-version }}" --force
         fi
 
-    - name: Run Arbor command
+    - name: Run Arbor and Comment on PR
       shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
       run: |
         set -euo pipefail
         cd "${{ inputs.working-directory }}"
+        
+        # 1. Run the normal user-supplied command
+        echo "Running: arbor ${{ inputs.command }}"
         arbor ${{ inputs.command }}
+        
+        # 2. Check if we should post a PR comment
+        if [[ "${{ inputs.comment-on-pr }}" == "true" && "${{ github.event_name }}" == "pull_request" ]]; then
+          echo "Generating Arbor Impact Report for PR comment..."
+          
+          # Initialize Arbor if needed to ensure we have a valid index
+          arbor init . || true
+          arbor index . || true
+          
+          # Run diff with markdown and capture output
+          arbor diff . --markdown > arbor_report.md || true
+          
+          if [ -f arbor_report.md ] && [ -s arbor_report.md ]; then
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            echo "Looking for existing Arbor comments on PR #$PR_NUMBER..."
+            
+            # Find existing comment from Arbor using GH CLI
+            COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/$PR_NUMBER/comments \
+              --jq '.[] | select(.body | contains("## 🌳 Arbor Impact Report") or contains("## 🌳 Arbor Safety Check")) | .id' | head -n 1 2>/dev/null || true)
+              
+            if [ -n "$COMMENT_ID" ]; then
+              echo "Updating existing PR comment #$COMMENT_ID..."
+              gh api -X PATCH repos/${{ github.repository }}/issues/comments/$COMMENT_ID -F body=@arbor_report.md > /dev/null || echo "Warning: Failed to update existing PR comment."
+            else
+              echo "Creating a new PR comment..."
+              gh pr comment "$PR_NUMBER" --body-file arbor_report.md > /dev/null || echo "Warning: Failed to create new PR comment."
+            fi
+            
+            rm -f arbor_report.md
+          else
+            echo "No impact report generated or file was empty."
+          fi
+        fi

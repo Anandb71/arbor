@@ -74,7 +74,11 @@ arbor-core  →  arbor-graph  →  arbor-watcher
 
 All new tools emit a standard JSON envelope: `{ok, tool, arbor_version, data, meta: {node_count, suggested_next_tool, suggested_next_args}}`. Error responses use `{ok: false, error}`. Run via `arbor bridge`.
 
-**`arbor-cli`** — Clap CLI with ~20 subcommands. All command logic lives in `src/commands.rs` (~83KB). Entry point: `src/main.rs`. Dispatches to the other crates. Binary name: `arbor` (crate name: `arbor-graph-cli`).
+**`arbor-cli`** — Clap CLI with ~20 subcommands. All command logic lives in `src/commands.rs`. Entry point: `src/main.rs`. Dispatches to the other crates. Binary name: `arbor` (crate name: `arbor-graph-cli`).
+Key features:
+- `diff . --markdown`: formats impact analysis report as color-coded Markdown.
+- `check . --markdown`: executes safety threshold validation and prints Markdown PASS/FAIL status.
+- `summary .`: auto-generates structured Pull Request descriptions based on graph diff analysis.
 
 **`arbor-gui`** — egui immediate-mode desktop UI. Standalone binary.
 

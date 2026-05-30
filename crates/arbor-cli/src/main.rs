@@ -99,6 +99,10 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Output as Markdown (for PR comments)
+        #[arg(long)]
+        markdown: bool,
     },
 
     /// CI safety mode for changed code paths
@@ -122,6 +126,10 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Output as Markdown (for PR comments)
+        #[arg(long)]
+        markdown: bool,
     },
 
     /// Start the Arbor server
@@ -270,6 +278,13 @@ enum Commands {
         path: PathBuf,
     },
 
+    /// Generate an auto-description for a PR based on graph changes
+    Summary {
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+
     /// Watch for file changes and re-index automatically
     Watch {
         /// Path to watch (defaults to current directory)
@@ -333,14 +348,20 @@ async fn main() {
             changed_only,
         ),
         Commands::Query { query, path, limit } => commands::query(&query, limit, &path),
-        Commands::Diff { path, depth, json } => commands::diff(&path, depth, json),
+        Commands::Diff {
+            path,
+            depth,
+            json,
+            markdown,
+        } => commands::diff(&path, depth, json, markdown),
         Commands::Check {
             path,
             depth,
             max_blast_radius,
             no_fail,
             json,
-        } => commands::check(&path, depth, max_blast_radius, no_fail, json),
+            markdown,
+        } => commands::check(&path, depth, max_blast_radius, no_fail, json, markdown),
         Commands::Serve {
             port,
             headless,
@@ -376,6 +397,7 @@ async fn main() {
         Commands::Open { symbol, path } => commands::open(&symbol, &path),
         Commands::Gui { path } => commands::gui(&path),
         Commands::PrSummary { symbols, path } => commands::pr_summary(&symbols, &path),
+        Commands::Summary { path } => commands::summary(&path),
         Commands::Watch { path } => commands::watch(&path).await,
         Commands::Audit {
             sink,
