@@ -2735,6 +2735,32 @@ mod tests {
         assert!(is_generated_or_internal_path("pkg/generated/client.rs"));
         assert!(!is_generated_or_internal_path("src/lib.rs"));
     }
+
+    #[test]
+    fn test_command_exists_validation() {
+        use super::command_exists;
+
+        // Valid, safe command strings should be allowed through validation
+        // (they might not exist on the system, which returns false, but they must not panic or be rejected because of input validation)
+        assert!(!command_exists("nonexistent-editor-binary-name"));
+        assert!(!command_exists("sub-dir/another-editor"));
+        assert!(!command_exists("bin\\editor.exe"));
+
+        // Malicious or malformed inputs containing shell injection meta-characters must be completely blocked
+        assert!(!command_exists("code; rm -rf /"));
+        assert!(!command_exists("cursor & echo pwned"));
+        assert!(!command_exists("nvim | cat /etc/passwd"));
+        assert!(!command_exists("vim && whoami"));
+        assert!(!command_exists("code $(rm -rf)"));
+        assert!(!command_exists("code `rm -rf`"));
+        assert!(!command_exists("code > file.txt"));
+        assert!(!command_exists("code < file.txt"));
+        assert!(!command_exists("code 2>&1"));
+
+        // Exceeding length limits
+        let long_input = "a".repeat(300);
+        assert!(!command_exists(&long_input));
+    }
 }
 
 /// Perform a security audit to find paths to a sensitive sink.
