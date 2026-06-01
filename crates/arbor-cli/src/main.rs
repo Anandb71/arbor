@@ -84,6 +84,10 @@ enum Commands {
         /// Maximum results to return
         #[arg(short, long, default_value = "10")]
         limit: usize,
+
+        /// Exclude test/spec/fixture/mock files from results
+        #[arg(long)]
+        exclude_test: bool,
     },
 
     /// Analyze git changes and preview impact blast radius
@@ -309,6 +313,91 @@ enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+
+    /// Show direct callers of a symbol (who calls this?)
+    Callers {
+        /// The symbol to look up (function name, class name, or qualified path)
+        symbol: String,
+
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show direct callees of a symbol (what does this call?)
+    Callees {
+        /// The symbol to look up
+        symbol: String,
+
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List all detected entry points (HTTP handlers, main, webhooks, jobs, CLI commands)
+    EntryPoints {
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show symbols and call edges within a single file
+    FileGraph {
+        /// Relative path to the file (e.g., 'src/auth.rs')
+        file: String,
+
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show full detail for a single symbol
+    Inspect {
+        /// Name or ID of the symbol
+        symbol: String,
+
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Find the shortest path between two symbols in the call graph
+    #[command(name = "path")]
+    FindPath {
+        /// Start symbol (name or ID)
+        start: String,
+
+        /// End symbol (name or ID)
+        end: String,
+
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -347,7 +436,12 @@ async fn main() {
             no_cache,
             changed_only,
         ),
-        Commands::Query { query, path, limit } => commands::query(&query, limit, &path),
+        Commands::Query {
+            query,
+            path,
+            limit,
+            exclude_test,
+        } => commands::query(&query, limit, &path, exclude_test),
         Commands::Diff {
             path,
             depth,
@@ -405,6 +499,17 @@ async fn main() {
             format,
             path,
         } => commands::audit(&sink, depth, &format, &path),
+        Commands::Callers { symbol, path, json } => commands::callers(&symbol, &path, json),
+        Commands::Callees { symbol, path, json } => commands::callees(&symbol, &path, json),
+        Commands::EntryPoints { path, json } => commands::entry_points(&path, json),
+        Commands::FileGraph { file, path, json } => commands::file_graph(&file, &path, json),
+        Commands::Inspect { symbol, path, json } => commands::inspect(&symbol, &path, json),
+        Commands::FindPath {
+            start,
+            end,
+            path,
+            json,
+        } => commands::find_path_cmd(&start, &end, &path, json),
     };
 
     if let Err(e) = result {

@@ -1,7 +1,7 @@
 //! CLI command implementations.
 
 use arbor_core::parse_file;
-use arbor_graph::compute_centrality;
+use arbor_graph::{compute_centrality, HeuristicsMatcher};
 use arbor_server::{ArborServer, ServerConfig};
 use arbor_watcher::{index_directory, IndexOptions};
 use colored::Colorize;
@@ -123,9 +123,11 @@ fn save_graph_snapshot(path: &Path, graph: &arbor_graph::ArborGraph) -> Result<(
         fs::create_dir_all(parent)?;
     }
 
-    let file = std::fs::File::create(&graph_path)?;
+    let tmp_path = graph_path.with_extension("json.tmp");
+    let file = std::fs::File::create(&tmp_path)?;
     let writer = std::io::BufWriter::new(file);
     serde_json::to_writer_pretty(writer, graph)?;
+    fs::rename(&tmp_path, &graph_path)?;
     Ok(())
 }
 
@@ -135,8 +137,10 @@ fn save_graph_binary(path: &Path, graph: &arbor_graph::ArborGraph) -> Result<()>
         fs::create_dir_all(parent)?;
     }
 
+    let tmp_path = graph_path.with_extension("bin.tmp");
     let bytes = bincode::serialize(graph)?;
-    fs::write(graph_path, bytes)?;
+    fs::write(&tmp_path, bytes)?;
+    fs::rename(&tmp_path, &graph_path)?;
     Ok(())
 }
 
@@ -153,7 +157,8 @@ fn load_graph_snapshot(path: &Path) -> Result<arbor_graph::ArborGraph> {
 
     let file = std::fs::File::open(&graph_path)?;
     let reader = std::io::BufReader::new(file);
-    let graph: arbor_graph::ArborGraph = serde_json::from_reader(reader)?;
+    let mut graph: arbor_graph::ArborGraph = serde_json::from_reader(reader)?;
+    graph.rebuild_search_index();
     Ok(graph)
 }
 
@@ -164,7 +169,8 @@ fn load_graph_binary(path: &Path) -> Result<arbor_graph::ArborGraph> {
     }
 
     let bytes = fs::read(graph_path)?;
-    let graph: arbor_graph::ArborGraph = bincode::deserialize(&bytes)?;
+    let mut graph: arbor_graph::ArborGraph = bincode::deserialize(&bytes)?;
+    graph.rebuild_search_index();
     Ok(graph)
 }
 
@@ -177,7 +183,7 @@ fn load_graph_from_store(path: &Path) -> Result<arbor_graph::ArborGraph> {
     let store = arbor_graph::GraphStore::open_or_reset(&store_path)
         .map_err(|e| format!("Failed to open graph store: {}", e))?;
 
-    let graph = store
+    let mut graph = store
         .load_graph()
         .map_err(|e| format!("Failed to load graph from store: {}", e))?;
 
@@ -185,6 +191,7 @@ fn load_graph_from_store(path: &Path) -> Result<arbor_graph::ArborGraph> {
         return Err("Graph store was empty".into());
     }
 
+    graph.rebuild_search_index();
     Ok(graph)
 }
 
@@ -197,11 +204,20 @@ fn load_or_index_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
         return Ok(graph);
     }
 
-    if let Ok(graph) = load_graph_from_store(path) {
-        // Materialize JSON snapshot for faster future warm starts.
-        let _ = save_graph_snapshot(path, &graph);
-        let _ = save_graph_binary(path, &graph);
-        return Ok(graph);
+    // Only try sled store if no snapshot files exist AND no bridge/server
+    // could be holding a lock. Sled locks are exclusive — a running bridge
+    // will cause CLI calls to block indefinitely.
+    let store_path = graph_store_path(path);
+    let has_snapshot_files =
+        graph_binary_path(path).exists() || graph_snapshot_path(path).exists();
+    let bridge_may_be_running = store_path.join("db").exists();
+
+    if !has_snapshot_files && !bridge_may_be_running {
+        if let Ok(graph) = load_graph_from_store(path) {
+            let _ = save_graph_snapshot(path, &graph);
+            let _ = save_graph_binary(path, &graph);
+            return Ok(graph);
+        }
     }
 
     let result = index_directory(path, IndexOptions::default())?;
@@ -276,6 +292,25 @@ fn is_generated_or_internal_path(path: &str) -> bool {
             .any(|suffix| normalized.ends_with(suffix))
 }
 
+fn parse_numstat_files(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 3 {
+                return None;
+            }
+            let path = if parts[2].contains(" => ") || !parts[2].is_empty() {
+                parts[2]
+            } else {
+                parts.get(2).copied().unwrap_or("")
+            };
+            let normalized = normalize_slashes(path.trim());
+            if normalized.is_empty() { None } else { Some(normalized) }
+        })
+        .collect()
+}
+
 fn git_changed_files(path: &Path) -> Result<Vec<String>> {
     if !is_git_repo(path) {
         return Ok(Vec::new());
@@ -295,6 +330,15 @@ fn git_changed_files(path: &Path) -> Result<Vec<String>> {
             )?;
 
             let mut files = parse_git_name_status_output(&ranged);
+
+            let numstat = run_git(
+                path,
+                &["diff", "-w", "--numstat", "--find-renames", base, head],
+            )?;
+            let has_real_diff: std::collections::HashSet<String> =
+                parse_numstat_files(&numstat).into_iter().collect();
+            files.retain(|f| has_real_diff.contains(f));
+
             files.retain(|path| !is_generated_or_internal_path(path));
             files.sort();
             files.dedup();
@@ -323,6 +367,20 @@ fn git_changed_files(path: &Path) -> Result<Vec<String>> {
         ],
     )?;
     files.extend(parse_git_name_status_output(&staged));
+
+    let numstat_unstaged = run_git(
+        path,
+        &["diff", "-w", "--numstat", "--find-renames", "HEAD"],
+    )?;
+    let numstat_staged = run_git(
+        path,
+        &["diff", "--cached", "-w", "--numstat", "--find-renames", "HEAD"],
+    )?;
+    let has_real_diff: std::collections::HashSet<String> = parse_numstat_files(&numstat_unstaged)
+        .into_iter()
+        .chain(parse_numstat_files(&numstat_staged))
+        .collect();
+    files.retain(|f| has_real_diff.contains(f));
 
     let untracked = run_git(path, &["ls-files", "--others", "--exclude-standard"])?;
     files.extend(
@@ -955,15 +1013,75 @@ fn export_graph(graph: &arbor_graph::ArborGraph, path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn query(query: &str, limit: usize, path: &Path) -> Result<()> {
+fn is_test_file(file_path: &str) -> bool {
+    let lower = file_path.to_lowercase();
+    let segments: Vec<&str> = lower.split('/').collect();
+    let filename = segments.last().copied().unwrap_or("");
+
+    segments.iter().any(|s| {
+        *s == "test"
+            || *s == "tests"
+            || *s == "spec"
+            || *s == "specs"
+            || *s == "fixture"
+            || *s == "fixtures"
+            || *s == "mock"
+            || *s == "mocks"
+            || *s == "__tests__"
+            || *s == "__mocks__"
+            || *s == "testfixtures"
+    }) || lower.ends_with("test.java")
+        || lower.ends_with("tests.java")
+        || lower.ends_with("test.rs")
+        || lower.ends_with("test.ts")
+        || lower.ends_with("test.tsx")
+        || lower.ends_with("test.js")
+        || lower.ends_with("test.jsx")
+        || lower.ends_with("test.py")
+        || lower.ends_with("test.go")
+        || lower.ends_with("_test.go")
+        || lower.ends_with("tests.cs")
+        || lower.ends_with("test.cs")
+        || lower.ends_with("_test.dart")
+        || lower.contains(".spec.")
+        || lower.contains(".test.")
+        || filename.starts_with("test_")
+        || filename == "conftest.py"
+}
+
+pub fn query(query: &str, limit: usize, path: &Path, exclude_test: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
     let graph = load_or_index_graph(&resolved_path)?;
 
-    let matches: Vec<_> = graph.search(query).into_iter().take(limit).collect();
+    let terms: Vec<&str> = query.split('|').map(str::trim).filter(|s| !s.is_empty()).collect();
+
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut matches = Vec::new();
+
+    for term in &terms {
+        for node in graph.search(term) {
+            if exclude_test && is_test_file(&node.file) {
+                continue;
+            }
+            if seen_ids.insert(&node.id) {
+                matches.push(node);
+            }
+            if matches.len() >= limit {
+                break;
+            }
+        }
+        if matches.len() >= limit {
+            break;
+        }
+    }
 
     if matches.is_empty() {
-        println!("No matches found for \"{}\"", query);
+        if exclude_test {
+            println!("No matches found for \"{}\" (excluding test files)", query);
+        } else {
+            println!("No matches found for \"{}\"", query);
+        }
         return Ok(());
     }
 
@@ -2908,6 +3026,362 @@ pub fn audit(sink: &str, depth: usize, format: &str, path: &Path) -> Result<()> 
         "arbor audit".bold(),
         sink
     );
+
+    Ok(())
+}
+
+fn resolve_symbol(graph: &arbor_graph::ArborGraph, symbol: &str) -> Result<arbor_graph::NodeId> {
+    graph
+        .get_index(symbol)
+        .or_else(|| {
+            graph
+                .find_by_name(symbol)
+                .first()
+                .and_then(|n| graph.get_index(&n.id))
+        })
+        .ok_or_else(|| format!("Symbol '{}' not found", symbol).into())
+}
+
+pub fn callers(symbol: &str, path: &Path, json_output: bool) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
+
+    let idx = resolve_symbol(&graph, symbol)?;
+    let callers = graph.get_callers(idx);
+
+    if json_output {
+        let items: Vec<serde_json::Value> = callers
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "name": n.name,
+                    "kind": n.kind.to_string(),
+                    "file": n.file,
+                    "line": n.line_start
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "symbol": symbol,
+                "callers": items
+            }))?
+        );
+    } else if callers.is_empty() {
+        println!("No callers found for '{}'", symbol);
+    } else {
+        println!("Callers of '{}' ({}):\n", symbol, callers.len());
+        for n in &callers {
+            println!(
+                "  {} {} {}",
+                n.kind.to_string().yellow(),
+                n.qualified_name.cyan(),
+                format!("({}:{})", n.file, n.line_start).dimmed()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub fn callees(symbol: &str, path: &Path, json_output: bool) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
+
+    let idx = resolve_symbol(&graph, symbol)?;
+    let callees = graph.get_callees(idx);
+
+    if json_output {
+        let items: Vec<serde_json::Value> = callees
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "name": n.name,
+                    "kind": n.kind.to_string(),
+                    "file": n.file,
+                    "line": n.line_start
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "symbol": symbol,
+                "callees": items
+            }))?
+        );
+    } else if callees.is_empty() {
+        println!("No callees found for '{}'", symbol);
+    } else {
+        println!("Callees of '{}' ({}):\n", symbol, callees.len());
+        for n in &callees {
+            println!(
+                "  {} {} {}",
+                n.kind.to_string().yellow(),
+                n.qualified_name.cyan(),
+                format!("({}:{})", n.file, n.line_start).dimmed()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub fn entry_points(path: &Path, json_output: bool) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
+
+    let eps = graph.list_entry_points();
+
+    if json_output {
+        let items: Vec<serde_json::Value> = eps
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "name": n.name,
+                    "kind": n.kind.to_string(),
+                    "file": n.file,
+                    "line": n.line_start
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "entry_points": items
+            }))?
+        );
+    } else if eps.is_empty() {
+        println!("No entry points detected.");
+    } else {
+        println!("Entry points ({}):\n", eps.len());
+        for n in &eps {
+            println!(
+                "  {} {} {}",
+                n.kind.to_string().yellow(),
+                n.qualified_name.cyan(),
+                format!("({}:{})", n.file, n.line_start).dimmed()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub fn file_graph(file: &str, path: &Path, json_output: bool) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
+
+    let candidates = [
+        file.to_string(),
+        file.replace('\\', "/"),
+        resolved_path.join(file).to_string_lossy().to_string(),
+        resolved_path
+            .join(file.replace('\\', "/"))
+            .to_string_lossy()
+            .to_string(),
+    ];
+
+    for candidate in &candidates {
+        let (nodes, edges) = graph.nodes_in_file_with_edges(candidate);
+        if !nodes.is_empty() {
+            return print_file_graph_output(candidate, &nodes, &edges, json_output);
+        }
+    }
+
+    Err(format!("No symbols found in file '{}'", file).into())
+}
+
+fn print_file_graph_output(
+    file: &str,
+    nodes: &[&arbor_core::CodeNode],
+    edges: &[(String, String, String)],
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        let node_items: Vec<serde_json::Value> = nodes
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "name": n.name,
+                    "kind": n.kind.to_string(),
+                    "line": n.line_start
+                })
+            })
+            .collect();
+        let edge_items: Vec<serde_json::Value> = edges
+            .iter()
+            .map(|(from, to, kind)| {
+                serde_json::json!({
+                    "from": from,
+                    "to": to,
+                    "kind": kind
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "file": file,
+                "nodes": node_items,
+                "edges": edge_items
+            }))?
+        );
+    } else {
+        println!("Symbols in '{}' ({}):\n", file, nodes.len());
+        for n in nodes {
+            println!(
+                "  {} {} {}",
+                n.kind.to_string().yellow(),
+                n.qualified_name.cyan(),
+                format!("(L{}–{})", n.line_start, n.line_end).dimmed()
+            );
+        }
+        if !edges.is_empty() {
+            println!("\nInternal edges ({}):\n", edges.len());
+            for (from, to, kind) in edges {
+                println!("  {} {} {}", from.cyan(), "→".dimmed(), format!("{} ({})", to, kind).dimmed());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn inspect(symbol: &str, path: &Path, json_output: bool) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
+
+    let idx = resolve_symbol(&graph, symbol)?;
+    let node = graph
+        .get(idx)
+        .ok_or_else(|| format!("Node index invalid for '{}'", symbol))?;
+    let centrality = graph.centrality(idx);
+    let callers = graph.get_callers(idx);
+    let callees = graph.get_callees(idx);
+    let is_entry = HeuristicsMatcher::is_likely_entry_point(node);
+    let role = if is_entry {
+        "entry_point"
+    } else if callers.is_empty() {
+        "unreachable"
+    } else if callees.is_empty() {
+        "utility"
+    } else {
+        "internal"
+    };
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": node.id,
+                "name": node.name,
+                "kind": node.kind.to_string(),
+                "file": node.file,
+                "line_start": node.line_start,
+                "line_end": node.line_end,
+                "signature": node.signature,
+                "centrality": centrality,
+                "role": role,
+                "caller_count": callers.len(),
+                "callee_count": callees.len(),
+                "is_entry_point": is_entry
+            }))?
+        );
+    } else {
+        println!("  {}:    {}", "Name".bold(), node.name);
+        println!("  {}:    {}", "Kind".bold(), node.kind.to_string().yellow());
+        println!(
+            "  {}:    {}:{}-{}",
+            "File".bold(),
+            node.file,
+            node.line_start,
+            node.line_end
+        );
+        if let Some(ref sig) = node.signature {
+            println!("  {}:     {}", "Sig".bold(), sig.dimmed());
+        }
+        println!("  {}:    {}", "Role".bold(), role.cyan());
+        println!("  {}:     {:.4}", "Rank".bold(), centrality);
+        println!("  {}:  {}", "Callers".bold(), callers.len());
+        println!("  {}:  {}", "Callees".bold(), callees.len());
+    }
+
+    Ok(())
+}
+
+pub fn find_path_cmd(start: &str, end: &str, path: &Path, json_output: bool) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
+
+    let start_idx = resolve_symbol(&graph, start)?;
+    let end_idx = resolve_symbol(&graph, end)?;
+
+    let found = graph.find_path(start_idx, end_idx);
+
+    if json_output {
+        match &found {
+            Some(nodes) => {
+                let items: Vec<serde_json::Value> = nodes
+                    .iter()
+                    .map(|n| {
+                        serde_json::json!({
+                            "id": n.id,
+                            "name": n.name,
+                            "kind": n.kind.to_string(),
+                            "file": n.file,
+                            "line": n.line_start
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "start": start,
+                        "end": end,
+                        "path": items,
+                        "hops": items.len().saturating_sub(1)
+                    }))?
+                );
+            }
+            None => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "start": start,
+                        "end": end,
+                        "path": null,
+                        "message": "No path found"
+                    }))?
+                );
+            }
+        }
+    } else {
+        match &found {
+            Some(nodes) => {
+                println!("Path ({} hops):\n", nodes.len().saturating_sub(1));
+                for (i, n) in nodes.iter().enumerate() {
+                    if i > 0 {
+                        println!("    {}", "↓".dimmed());
+                    }
+                    println!(
+                        "  {} {} {}",
+                        n.kind.to_string().yellow(),
+                        n.qualified_name.cyan(),
+                        format!("({}:{})", n.file, n.line_start).dimmed()
+                    );
+                }
+            }
+            None => {
+                println!("No path found between '{}' and '{}'", start, end);
+            }
+        }
+    }
 
     Ok(())
 }

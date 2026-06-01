@@ -59,6 +59,17 @@ impl ArborGraph {
         }
     }
 
+    /// Rebuilds the search index from existing graph nodes.
+    /// Call after deserialization since search_index is not serialized.
+    pub fn rebuild_search_index(&mut self) {
+        self.search_index = SearchIndex::new();
+        for index in self.graph.node_indices() {
+            if let Some(node) = self.graph.node_weight(index) {
+                self.search_index.insert(&node.name, index);
+            }
+        }
+    }
+
     /// Adds a code node to the graph.
     ///
     /// Returns the node's index for adding edges later.
