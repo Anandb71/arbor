@@ -398,6 +398,37 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Output a ranked, token-budgeted skeleton of the codebase
+    Map {
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Token budget (output will not exceed this estimate)
+        #[arg(long, default_value = "1024")]
+        tokens: usize,
+
+        /// Exclude test/spec/fixture/mock files
+        #[arg(long)]
+        exclude_test: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Show full relative paths (disable path compression)
+        #[arg(long)]
+        verbose: bool,
+
+        /// Boost symbols in files changed vs HEAD
+        #[arg(long)]
+        focus_changed: bool,
+
+        /// Boost symbols in files matching this glob pattern (e.g. "*/service/*")
+        #[arg(long)]
+        focus: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -510,6 +541,23 @@ async fn main() {
             path,
             json,
         } => commands::find_path_cmd(&start, &end, &path, json),
+        Commands::Map {
+            path,
+            tokens,
+            exclude_test,
+            json,
+            verbose,
+            focus_changed,
+            focus,
+        } => commands::map(
+            &path,
+            tokens,
+            exclude_test,
+            json,
+            verbose,
+            focus_changed,
+            focus.as_deref(),
+        ),
     };
 
     if let Err(e) = result {

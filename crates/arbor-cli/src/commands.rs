@@ -208,8 +208,7 @@ fn load_or_index_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
     // could be holding a lock. Sled locks are exclusive — a running bridge
     // will cause CLI calls to block indefinitely.
     let store_path = graph_store_path(path);
-    let has_snapshot_files =
-        graph_binary_path(path).exists() || graph_snapshot_path(path).exists();
+    let has_snapshot_files = graph_binary_path(path).exists() || graph_snapshot_path(path).exists();
     let bridge_may_be_running = store_path.join("db").exists();
 
     if !has_snapshot_files && !bridge_may_be_running {
@@ -306,7 +305,11 @@ fn parse_numstat_files(output: &str) -> Vec<String> {
                 parts.get(2).copied().unwrap_or("")
             };
             let normalized = normalize_slashes(path.trim());
-            if normalized.is_empty() { None } else { Some(normalized) }
+            if normalized.is_empty() {
+                None
+            } else {
+                Some(normalized)
+            }
         })
         .collect()
 }
@@ -368,13 +371,17 @@ fn git_changed_files(path: &Path) -> Result<Vec<String>> {
     )?;
     files.extend(parse_git_name_status_output(&staged));
 
-    let numstat_unstaged = run_git(
-        path,
-        &["diff", "-w", "--numstat", "--find-renames", "HEAD"],
-    )?;
+    let numstat_unstaged = run_git(path, &["diff", "-w", "--numstat", "--find-renames", "HEAD"])?;
     let numstat_staged = run_git(
         path,
-        &["diff", "--cached", "-w", "--numstat", "--find-renames", "HEAD"],
+        &[
+            "diff",
+            "--cached",
+            "-w",
+            "--numstat",
+            "--find-renames",
+            "HEAD",
+        ],
     )?;
     let has_real_diff: std::collections::HashSet<String> = parse_numstat_files(&numstat_unstaged)
         .into_iter()
@@ -1054,7 +1061,11 @@ pub fn query(query: &str, limit: usize, path: &Path, exclude_test: bool) -> Resu
     let _ = ensure_arbor_initialized(&resolved_path)?;
     let graph = load_or_index_graph(&resolved_path)?;
 
-    let terms: Vec<&str> = query.split('|').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let terms: Vec<&str> = query
+        .split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
 
     let mut seen_ids = std::collections::HashSet::new();
     let mut matches = Vec::new();
@@ -3245,7 +3256,12 @@ fn print_file_graph_output(
         if !edges.is_empty() {
             println!("\nInternal edges ({}):\n", edges.len());
             for (from, to, kind) in edges {
-                println!("  {} {} {}", from.cyan(), "→".dimmed(), format!("{} ({})", to, kind).dimmed());
+                println!(
+                    "  {} {} {}",
+                    from.cyan(),
+                    "→".dimmed(),
+                    format!("{} ({})", to, kind).dimmed()
+                );
             }
         }
     }
@@ -3384,4 +3400,429 @@ pub fn find_path_cmd(start: &str, end: &str, path: &Path, json_output: bool) -> 
     }
 
     Ok(())
+}
+
+pub fn map(
+    path: &Path,
+    token_budget: usize,
+    exclude_test: bool,
+    json_output: bool,
+    verbose: bool,
+    focus_changed: bool,
+    focus_glob: Option<&str>,
+) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let _ = ensure_arbor_initialized(&resolved_path)?;
+    let mut graph = load_or_index_graph(&resolved_path)?;
+
+    // Compute centrality if not already present, then persist for future calls
+    let has_centrality = graph.node_indexes().any(|idx| graph.centrality(idx) > 0.0);
+    if !has_centrality {
+        eprintln!("Computing centrality...");
+        let scores = compute_centrality(&graph, 20, 0.85);
+        graph.set_centrality(scores.into_map());
+        let _ = save_graph_binary(&resolved_path, &graph);
+    }
+
+    // Build set of changed files for --focus-changed
+    let changed_files: std::collections::HashSet<String> =
+        if focus_changed && is_git_repo(&resolved_path) {
+            git_changed_files(&resolved_path)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|f| resolved_path.join(&f).to_string_lossy().to_string())
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+    struct ScoredNode {
+        name: String,
+        kind: String,
+        file: String,
+        line_start: u32,
+        line_end: u32,
+        signature: Option<String>,
+        score: f64,
+        is_entry_point: bool,
+        callers: usize,
+    }
+
+    let mut scored: Vec<ScoredNode> = Vec::new();
+    for idx in graph.node_indexes() {
+        let node = match graph.get(idx) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        if exclude_test && is_test_file(&node.file) {
+            continue;
+        }
+
+        // Skip minified/generated files
+        if is_minified_or_generated(&node.file) {
+            continue;
+        }
+
+        let kind_str = node.kind.to_string();
+        if kind_str == "import" || kind_str == "export" || kind_str == "module" {
+            continue;
+        }
+
+        let centrality = graph.centrality(idx);
+        let is_entry = HeuristicsMatcher::is_likely_entry_point(node);
+        let caller_count = graph.get_callers(idx).len();
+
+        let kind_boost = match kind_str.as_str() {
+            "class" | "interface" | "struct" => 0.1,
+            "constructor" => -0.1,
+            "field" | "constant" => -0.2,
+            _ => 0.0,
+        };
+        let entry_boost = if is_entry { 0.3 } else { 0.0 };
+        let changed_boost = if changed_files.contains(&node.file) {
+            0.3
+        } else {
+            0.0
+        };
+        let glob_boost = match focus_glob {
+            Some(pattern) if node.file.contains(pattern.trim_matches('*')) => 0.3,
+            _ => 0.0,
+        };
+        let score = centrality + entry_boost + kind_boost + changed_boost + glob_boost;
+
+        scored.push(ScoredNode {
+            name: node.name.clone(),
+            kind: kind_str,
+            file: node.file.clone(),
+            line_start: node.line_start,
+            line_end: node.line_end,
+            signature: node.signature.clone(),
+            score,
+            is_entry_point: is_entry,
+            callers: caller_count,
+        });
+    }
+
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let total_symbols = scored.len();
+
+    // Group by file, preserving rank order of first appearance.
+    // Cap symbols per file to force breadth across the project.
+    let max_per_file: usize = if token_budget <= 1024 {
+        5
+    } else if token_budget <= 2048 {
+        8
+    } else {
+        12
+    };
+
+    let mut file_order: Vec<String> = Vec::new();
+    let mut file_groups: std::collections::HashMap<String, Vec<&ScoredNode>> =
+        std::collections::HashMap::new();
+    for node in &scored {
+        let group = file_groups.entry(node.file.clone()).or_default();
+        if group.len() >= max_per_file {
+            continue;
+        }
+        if group.is_empty() {
+            file_order.push(node.file.clone());
+        }
+        group.push(node);
+    }
+
+    let root_str = resolved_path.to_string_lossy().to_string();
+    let budget_chars = token_budget * 4;
+
+    if json_output {
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+        let mut json_symbols_shown = 0;
+        let mut json_chars = 0;
+
+        for file_path in &file_order {
+            let symbols = match file_groups.get(file_path) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let rel_path = map_make_relative(file_path, &root_str);
+            let short_path = map_compress_path(file_path, &root_str);
+
+            let mut sym_items: Vec<serde_json::Value> = Vec::new();
+            for node in symbols {
+                let sig_short = node
+                    .signature
+                    .as_deref()
+                    .map(map_shorten_signature)
+                    .unwrap_or_else(|| node.name.clone());
+
+                let item_cost = sig_short.len() + 50;
+                if json_chars + item_cost > budget_chars && json_symbols_shown > 0 {
+                    break;
+                }
+
+                sym_items.push(serde_json::json!({
+                    "name": node.name,
+                    "kind": node.kind,
+                    "line": node.line_start,
+                    "centrality": (node.score * 100.0).round() / 100.0,
+                    "callers": node.callers,
+                    "is_entry_point": node.is_entry_point,
+                    "signature_short": sig_short,
+                }));
+                json_symbols_shown += 1;
+                json_chars += item_cost;
+            }
+
+            if !sym_items.is_empty() {
+                entries.push(serde_json::json!({
+                    "file": rel_path,
+                    "file_short": short_path,
+                    "symbols": sym_items,
+                }));
+            }
+
+            if json_chars >= budget_chars {
+                break;
+            }
+        }
+
+        let output = serde_json::json!({
+            "schema": "arbor.map.v1",
+            "token_estimate": json_chars / 4,
+            "symbols_shown": json_symbols_shown,
+            "symbols_total": total_symbols,
+            "files_shown": entries.len(),
+            "files_total": file_order.len(),
+            "entries": entries,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        let mut output_lines: Vec<String> = Vec::new();
+        let mut token_chars: usize = 0;
+        let mut symbols_shown: usize = 0;
+        let mut files_shown: usize = 0;
+        let mut budget_hit = false;
+
+        for file_path in &file_order {
+            if budget_hit {
+                break;
+            }
+
+            let symbols = match file_groups.get(file_path) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let display_path = if verbose {
+                map_make_relative(file_path, &root_str)
+            } else {
+                map_compress_path(file_path, &root_str)
+            };
+
+            let header = format!("{}:", display_path);
+            let header_cost = header.len() + 1;
+
+            if token_chars + header_cost > budget_chars && files_shown > 0 {
+                break;
+            }
+
+            output_lines.push(header);
+            token_chars += header_cost;
+            files_shown += 1;
+
+            for node in symbols {
+                let entry_marker = if node.is_entry_point { " ★" } else { "" };
+                let line_info =
+                    if node.kind == "class" || node.kind == "interface" || node.kind == "struct" {
+                        format!("[L{}-{}]", node.line_start, node.line_end)
+                    } else {
+                        format!("L{}", node.line_start)
+                    };
+
+                let line =
+                    if node.kind == "class" || node.kind == "interface" || node.kind == "struct" {
+                        format!(
+                            "  {} {} {}{}",
+                            node.kind, node.name, line_info, entry_marker
+                        )
+                    } else {
+                        let sig_short = node
+                            .signature
+                            .as_deref()
+                            .map(map_shorten_signature)
+                            .unwrap_or_else(|| node.name.clone());
+                        format!("    {}  {}{}", sig_short, line_info, entry_marker)
+                    };
+
+                let line_cost = line.len() + 1;
+                if token_chars + line_cost > budget_chars && symbols_shown > 0 {
+                    let remaining_symbols = total_symbols - symbols_shown;
+                    let remaining_files = file_order.len() - files_shown;
+                    output_lines.push(format!(
+                        "\n⋮... {} more symbols across {} files (use --tokens {} to see more)",
+                        remaining_symbols,
+                        remaining_files,
+                        token_budget * 2
+                    ));
+                    budget_hit = true;
+                    break;
+                }
+
+                output_lines.push(line);
+                token_chars += line_cost;
+                symbols_shown += 1;
+            }
+
+            if !budget_hit {
+                output_lines.push(String::new());
+                token_chars += 1;
+            }
+        }
+
+        println!(
+            "# arbor map ({} symbols, {} files, budget: {} tokens)\n",
+            symbols_shown, files_shown, token_budget,
+        );
+        for line in &output_lines {
+            println!("{}", line);
+        }
+    }
+
+    Ok(())
+}
+
+fn is_minified_or_generated(file_path: &str) -> bool {
+    let lower = file_path.to_lowercase();
+    lower.ends_with(".min.js")
+        || lower.ends_with(".min.css")
+        || lower.contains(".chunk.")
+        || lower.contains(".bundle.")
+        || lower.contains("/dist/")
+        || lower.contains("/build/")
+        || lower.contains("/resources/monitor/")
+        || lower.contains("/resources/static/")
+        || lower.contains("/generated/")
+        // Hashed filenames (e.g. main.d094b1b69ba24b63.js)
+        || {
+            let filename = lower.rsplit('/').next().unwrap_or("");
+            let parts: Vec<&str> = filename.split('.').collect();
+            parts.len() >= 3 && parts[1].len() >= 8 && parts[1].chars().all(|c| c.is_ascii_hexdigit())
+        }
+}
+
+fn map_make_relative(file_path: &str, root: &str) -> String {
+    file_path
+        .strip_prefix(root)
+        .unwrap_or(file_path)
+        .trim_start_matches('/')
+        .to_string()
+}
+
+fn map_compress_path(file_path: &str, root: &str) -> String {
+    let relative = map_make_relative(file_path, root);
+    let parts: Vec<&str> = relative.split('/').collect();
+
+    if parts.len() <= 4 {
+        return relative;
+    }
+
+    let first = parts[0];
+    let filename = parts[parts.len() - 1];
+    let parent = parts[parts.len() - 2];
+    let grandparent = parts[parts.len() - 3];
+
+    format!("{}/.../{}/{}/{}", first, grandparent, parent, filename)
+}
+
+fn map_shorten_signature(sig: &str) -> String {
+    let sig = sig.trim();
+
+    let paren_start = match sig.find('(') {
+        Some(i) => i,
+        None => {
+            if sig.len() <= 80 {
+                return sig.to_string();
+            } else {
+                return format!("{}...", &sig[..77]);
+            }
+        }
+    };
+
+    // Extract name: last word before the opening paren
+    let before_paren = &sig[..paren_start];
+    let name = before_paren
+        .split_whitespace()
+        .last()
+        .unwrap_or(before_paren)
+        .trim();
+
+    let paren_end = match sig.rfind(')') {
+        Some(i) => i,
+        None => return format!("{}(...)", name),
+    };
+
+    let params_str = &sig[paren_start + 1..paren_end];
+    let param_names = map_extract_param_names(params_str);
+
+    let result = if param_names.is_empty() {
+        format!("{}()", name)
+    } else {
+        format!("{}({})", name, param_names.join(", "))
+    };
+
+    if result.len() > 80 {
+        format!("{}(...)", name)
+    } else {
+        result
+    }
+}
+
+fn map_extract_param_names(params_str: &str) -> Vec<&str> {
+    if params_str.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut names = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0;
+
+    let bytes = params_str.as_bytes();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'<' | b'(' => depth += 1,
+            b'>' | b')' => depth -= 1,
+            b',' if depth == 0 => {
+                if let Some(name) = map_last_word_of_param(&params_str[start..i]) {
+                    names.push(name);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if let Some(name) = map_last_word_of_param(&params_str[start..]) {
+        names.push(name);
+    }
+
+    names
+}
+
+fn map_last_word_of_param(param: &str) -> Option<&str> {
+    let trimmed = param.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Rust-style: name before the colon
+    if let Some(colon_pos) = trimmed.find(':') {
+        let before_colon = trimmed[..colon_pos].trim();
+        return before_colon.split_whitespace().last();
+    }
+    // Java/TS-style: name is last word
+    trimmed.split_whitespace().last()
 }
