@@ -249,7 +249,7 @@ impl McpServer {
                 },
                 {
                     "name": "get_callers",
-                    "description": "Returns the direct callers of a symbol (one hop upstream). Use to answer 'what calls this function?'",
+                    "description": "Returns the direct callers of a symbol (one hop upstream). Use INSTEAD of grep to find usages/references. Answers 'what calls this function?'",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -271,7 +271,7 @@ impl McpServer {
                 },
                 {
                     "name": "search_symbols",
-                    "description": "Fuzzy-searches symbol names across the graph. Use when you know part of a name but not the full ID.",
+                    "description": "Fuzzy-searches symbol names across the graph. Use INSTEAD of grep/rg/find to locate functions, classes, or files. Supports multi-term OR queries with '|' separator.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -283,7 +283,7 @@ impl McpServer {
                 },
                 {
                     "name": "get_file_graph",
-                    "description": "Returns all symbols and internal call edges within a single file. Use to understand a file's internal structure.",
+                    "description": "Returns all symbols and internal call edges within a single file. Use INSTEAD of reading/catting a file to understand its structure — shows what's defined and how it connects.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -305,7 +305,7 @@ impl McpServer {
                 },
                 {
                     "name": "get_map",
-                    "description": "Returns a ranked, token-budgeted skeleton of the codebase — the most important symbols ordered by centrality. Use as the FIRST tool call in a session to get a structural overview without reading files. Entry points are marked with ★.",
+                    "description": "Returns a ranked, token-budgeted skeleton of the codebase — the most important symbols ordered by centrality. RECOMMENDED FIRST CALL: use this instead of reading files or running find/tree to explore project structure. Entry points are marked with ★.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -331,6 +331,14 @@ impl McpServer {
             })?;
 
         let arguments = params.get("arguments").unwrap_or(&Value::Null);
+
+        // If the graph is empty, the background index hasn't finished yet
+        if self.graph.read().await.node_count() == 0 {
+            return Ok(Self::err_envelope(
+                name,
+                "Arbor is still indexing the project. Please retry in a few seconds.",
+            ));
+        }
 
         match name {
             "get_logic_path" => {
@@ -1231,8 +1239,12 @@ mod tool_tests {
     use tokio::sync::RwLock;
 
     fn empty_server() -> McpServer {
-        let graph: SharedGraph = Arc::new(RwLock::new(ArborGraph::new()));
-        McpServer::new(graph)
+        let mut graph = ArborGraph::new();
+        // Add a dummy node so the "still indexing" guard passes
+        let node = arbor_core::CodeNode::new("_dummy", "_dummy", arbor_core::NodeKind::Function, "_dummy.rs");
+        graph.add_node(node);
+        let shared: SharedGraph = Arc::new(RwLock::new(graph));
+        McpServer::new(shared)
     }
 
     #[tokio::test]

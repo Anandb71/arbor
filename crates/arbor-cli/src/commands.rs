@@ -1540,42 +1540,37 @@ pub async fn bridge(path: &Path, launch_viz: bool, follow_symlinks: bool) -> Res
     let graph = arbor_graph::ArborGraph::new();
     let shared_graph = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-    // 2. Run Initial Index (Blocking)
+    // 2. Index in background so MCP stdio starts immediately (prevents client timeout)
     let index_path = resolved_path.to_path_buf();
     let options = IndexOptions {
         follow_symlinks,
         cache_path: Some(resolved_path.join(".arbor").join("cache")),
     };
-    eprintln!("{} Starting initial index...", "⏳".yellow());
+    eprintln!("{} Starting initial index (background)...", "⏳".yellow());
 
-    // Run blocking indexer
-    let result = tokio::task::spawn_blocking(move || index_directory(&index_path, options)).await?;
+    let index_graph = shared_graph.clone();
+    tokio::spawn(async move {
+        let result =
+            tokio::task::spawn_blocking(move || index_directory(&index_path, options)).await;
+        match result {
+            Ok(Ok(index_result)) => {
+                let mut guard = index_graph.write().await;
+                *guard = index_result.graph;
 
-    match result {
-        Ok(index_result) => {
-            let mut guard = shared_graph.write().await;
-            *guard = index_result.graph;
+                let scores = compute_centrality(&guard, 20, 0.85);
+                guard.set_centrality(scores.into_map());
 
-            // Compute centrality
-            let scores = compute_centrality(&guard, 20, 0.85);
-            guard.set_centrality(scores.into_map());
-
-            eprintln!(
-                "{} Index Ready: {} files, {} nodes",
-                "✓".green(),
-                index_result.files_indexed,
-                index_result.nodes_extracted
-            );
+                eprintln!(
+                    "{} Index Ready: {} files, {} nodes",
+                    "✓".green(),
+                    index_result.files_indexed,
+                    index_result.nodes_extracted
+                );
+            }
+            Ok(Err(e)) => eprintln!("{} Indexing failed: {}", "⚠".red(), e),
+            Err(e) => eprintln!("{} Index task panicked: {}", "⚠".red(), e),
         }
-        Err(e) => eprintln!("{} Indexing failed: {}", "⚠".red(), e),
-    }
-
-    // Pass a clone to the background watcher/indexer (which we should start separately if we want continuous updates)
-    // Actually, SyncServer handles the continuous watching!
-    // The previous code had a separate background indexer that seemingly did nothing after the initial index?
-    // No, wait. The previous code ONLY did the initial index.
-    // The SyncServer (lines 355) is what handles *subsequent* file updates via its own watcher.
-    // So this change is strictly correct.
+    });
 
     // 3. Start Servers (Background)
     let rpc_port = 7433;
