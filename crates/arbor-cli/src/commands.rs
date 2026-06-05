@@ -73,7 +73,60 @@ fn resolve_project_path(path: &Path) -> Result<PathBuf> {
     Ok(find_workspace_root(&base))
 }
 
+/// Whether Arbor may index a project that has no `.arbor/` directory yet.
+///
+/// Off by default so commands run against an un-indexed project (e.g. a
+/// different repo) don't silently create a `.arbor/` and write a cache into it.
+/// Resolution order: `ARBOR_AUTO_INDEX` env var, then `auto_index` in the
+/// global config (`~/.arbor/config.json`), then `false`.
+fn auto_index_enabled() -> bool {
+    if let Ok(val) = std::env::var("ARBOR_AUTO_INDEX") {
+        return matches!(val.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    global_config_auto_index().unwrap_or(false)
+}
+
+/// Reads `auto_index` from the global config at `~/.arbor/config.json`.
+fn global_config_auto_index() -> Option<bool> {
+    let config_path = dirs::home_dir()?.join(".arbor").join("config.json");
+    let text = fs::read_to_string(config_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    json.get("auto_index").and_then(|v| v.as_bool())
+}
+
+/// Returns true if `path` has already been indexed (has a `.arbor/` directory).
+fn project_is_indexed(path: &Path) -> bool {
+    path.join(".arbor").exists()
+}
+
+/// Error returned when a command needs an indexed project but the project is
+/// un-indexed and auto-indexing is disabled.
+fn not_indexed_error(path: &Path) -> Box<dyn std::error::Error> {
+    format!(
+        "Project at {} is not indexed and auto-indexing is disabled.\n  \
+         Run 'arbor index {}' to index it, or enable auto-indexing with \
+         ARBOR_AUTO_INDEX=1 (or \"auto_index\": true in ~/.arbor/config.json).",
+        path.display(),
+        path.display()
+    )
+    .into()
+}
+
+/// Ensures `.arbor/` exists for an *implicit* (non-`index`/`init`) command.
+///
+/// If the project is already indexed, this is a no-op create. If it is NOT
+/// indexed, it only creates `.arbor/` when auto-indexing is enabled; otherwise
+/// it errors rather than mutating the project.
 fn ensure_arbor_initialized(path: &Path) -> Result<bool> {
+    if !project_is_indexed(path) && !auto_index_enabled() {
+        return Err(not_indexed_error(path));
+    }
+    init_arbor_dir(path)
+}
+
+/// Creates and populates `.arbor/` unconditionally. Used by the explicit
+/// `init`/`index`/`setup` commands, which always opt the user into indexing.
+fn init_arbor_dir(path: &Path) -> Result<bool> {
     let arbor_dir = path.join(".arbor");
     let config_path = arbor_dir.join("config.json");
 
@@ -221,6 +274,14 @@ fn cache_is_stale(path: &Path) -> bool {
 }
 
 fn load_or_index_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
+    // Refuse to index an un-indexed project unless auto-indexing is enabled —
+    // this is the choke point for read commands that don't call
+    // ensure_arbor_initialized first, and prevents writing a cache into a
+    // project the user never opted in to.
+    if !project_is_indexed(path) && !auto_index_enabled() {
+        return Err(not_indexed_error(path));
+    }
+
     // When a bridge is running it keeps graph.bin fresh via its own persister —
     // skip the staleness check to avoid a redundant re-index that races with
     // the bridge's writes.
@@ -841,7 +902,7 @@ pub fn init(path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let _ = ensure_arbor_initialized(&resolved_path)?;
+    let _ = init_arbor_dir(&resolved_path)?;
 
     println!(
         "{} Initialized Arbor in {}",
@@ -862,7 +923,7 @@ pub fn index(
     changed_only: bool,
 ) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
-    let was_initialized = ensure_arbor_initialized(&resolved_path)?;
+    let was_initialized = init_arbor_dir(&resolved_path)?;
     if was_initialized {
         println!(
             "{} Created {} for first-time setup",
