@@ -334,6 +334,7 @@ dependencies = [
  "clap",
  "colored",
  "dirs",
+ "fs2",
  "indicatif",
  "petgraph",
  "serde",

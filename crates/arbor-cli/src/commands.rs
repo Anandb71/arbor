@@ -195,21 +195,53 @@ fn load_graph_from_store(path: &Path) -> Result<arbor_graph::ArborGraph> {
     Ok(graph)
 }
 
-fn load_or_index_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
-    if let Ok(graph) = load_graph_binary(path) {
-        return Ok(graph);
-    }
+/// Returns the modified time of a cache file in seconds since the UNIX epoch.
+fn cache_mtime_secs(cache_path: &Path) -> Option<u64> {
+    fs::metadata(cache_path)
+        .and_then(|m| m.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
 
-    if let Ok(graph) = load_graph_snapshot(path) {
-        return Ok(graph);
+/// Returns true if a source file is newer than the freshest cache file,
+/// meaning the cached graph is stale and should be rebuilt from source.
+fn cache_is_stale(path: &Path) -> bool {
+    // Compare against the freshest of the two cache files — a running bridge's
+    // periodic writer keeps graph.bin current, so prefer whichever is newer.
+    let newest = [graph_binary_path(path), graph_snapshot_path(path)]
+        .iter()
+        .filter_map(|p| cache_mtime_secs(p))
+        .max();
+    match newest {
+        Some(cache_mtime) => arbor_watcher::sources_newer_than(path, cache_mtime, false),
+        None => false, // no cache yet; nothing to call stale
+    }
+}
+
+fn load_or_index_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
+    // When a bridge is running it keeps graph.bin fresh via its own persister —
+    // skip the staleness check to avoid a redundant re-index that races with
+    // the bridge's writes.
+    let store_path = graph_store_path(path);
+    let bridge_may_be_running = store_path.join("db").exists();
+
+    let stale = !bridge_may_be_running && cache_is_stale(path);
+    if !stale {
+        if let Ok(graph) = load_graph_binary(path) {
+            return Ok(graph);
+        }
+
+        if let Ok(graph) = load_graph_snapshot(path) {
+            return Ok(graph);
+        }
     }
 
     // Only try sled store if no snapshot files exist AND no bridge/server
     // could be holding a lock. Sled locks are exclusive — a running bridge
     // will cause CLI calls to block indefinitely.
-    let store_path = graph_store_path(path);
     let has_snapshot_files = graph_binary_path(path).exists() || graph_snapshot_path(path).exists();
-    let bridge_may_be_running = store_path.join("db").exists();
 
     if !has_snapshot_files && !bridge_may_be_running {
         if let Ok(graph) = load_graph_from_store(path) {
@@ -1619,6 +1651,16 @@ pub async fn bridge(path: &Path, launch_viz: bool, follow_symlinks: bool) -> Res
     let sync_server = arbor_server::SyncServer::new_with_shared(sync_config, shared_graph.clone());
     let spotlight_handle = sync_server.handle();
 
+    // Persist the live graph to disk so cold `arbor map`/`query` reads stay fast
+    // and fresh. The background indexer broadcasts on every patch; we debounce
+    // those into at most one graph.bin write every few seconds.
+    let persist_rx = sync_server.subscribe();
+    let persist_graph = shared_graph.clone();
+    let persist_path = resolved_path.to_path_buf();
+    tokio::spawn(async move {
+        run_graph_persister(persist_rx, persist_graph, persist_path).await;
+    });
+
     tokio::spawn(async move {
         if let Err(e) = arbor_server.run().await {
             eprintln!("RPC Server error: {}", e);
@@ -2691,6 +2733,63 @@ pub fn summary(path: &Path) -> Result<()> {
     println!("*Generated automatically by [Arbor](https://github.com/Anandb71/arbor) v{} — Graph-Native Code Intelligence*", env!("CARGO_PKG_VERSION"));
 
     Ok(())
+}
+
+/// Periodically persists the live graph to `graph.bin` while a bridge runs.
+///
+/// Only one bridge per project wins the persist lock — additional bridges for
+/// the same project skip disk writes (their in-memory graph + MCP are still
+/// fully functional). This prevents multiple bridges from stomping each other.
+async fn run_graph_persister(
+    mut rx: tokio::sync::broadcast::Receiver<arbor_server::BroadcastMessage>,
+    graph: std::sync::Arc<tokio::sync::RwLock<arbor_graph::ArborGraph>>,
+    path: PathBuf,
+) {
+    use arbor_server::BroadcastMessage;
+    use fs2::FileExt;
+    use tokio::sync::broadcast::error::RecvError;
+    use tokio::time::{interval, Duration};
+
+    // Acquire an exclusive advisory lock — only one persister per project.
+    let lock_path = path.join(".arbor").join("persist.lock");
+    let lock_file = match fs::File::create(&lock_path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    if lock_file.try_lock_exclusive().is_err() {
+        eprintln!(
+            "{} Another bridge is persisting for this project — skipping disk writes",
+            "ℹ".cyan()
+        );
+        return;
+    }
+
+    const FLUSH_SECS: u64 = 5;
+    let mut dirty = false;
+    let mut tick = interval(Duration::from_secs(FLUSH_SECS));
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Ok(BroadcastMessage::GraphUpdate(_)) => dirty = true,
+                Ok(_) => {}
+                Err(RecvError::Lagged(_)) => dirty = true,
+                Err(RecvError::Closed) => break,
+            },
+            _ = tick.tick() => {
+                if dirty {
+                    let guard = graph.read().await;
+                    if let Err(e) = save_graph_binary(&path, &guard) {
+                        eprintln!("{} Failed to persist graph cache: {}", "⚠".yellow(), e);
+                    }
+                    dirty = false;
+                }
+            }
+        }
+    }
+
+    // Lock released when lock_file drops (process exit or loop break).
+    drop(lock_file);
 }
 
 /// Watch for file changes and re-index automatically.
