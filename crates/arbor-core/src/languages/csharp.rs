@@ -455,18 +455,23 @@ fn collect_calls(root: &Node, source: &str, refs: &mut Vec<String>) {
                         }
                     }
                     "member_access_expression" => {
-                        // Only keep this.X / base.X calls to avoid name collision
-                        if let Some(obj) = func.child_by_field_name("expression") {
+                        if let (Some(obj), Some(name_node)) = (
+                            func.child_by_field_name("expression"),
+                            func.child_by_field_name("name"),
+                        ) {
                             let obj_range = obj.byte_range();
-                            if obj_range.end <= source.len() {
+                            let name_range = name_node.byte_range();
+                            if obj_range.end <= source.len() && name_range.end <= source.len() {
                                 let obj_text = &source[obj_range];
+                                let method = &source[name_range];
                                 if obj_text == "this" || obj_text == "base" {
-                                    if let Some(name_node) = func.child_by_field_name("name") {
-                                        let range = name_node.byte_range();
-                                        if range.end <= source.len() {
-                                            refs.push(source[range].to_string());
-                                        }
-                                    }
+                                    // Same-class / parent call — track bare method name.
+                                    refs.push(method.to_string());
+                                } else {
+                                    // `MathUtils.Add` for a static/type-qualified call.
+                                    // Instance calls (`obj.Add`) capture as `obj.Add`, which
+                                    // simply fails to resolve in the builder — no false edge.
+                                    refs.push(format!("{}.{}", obj_text, method));
                                 }
                             }
                         }

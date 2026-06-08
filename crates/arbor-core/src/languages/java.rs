@@ -399,9 +399,30 @@ fn collect_calls(root: &Node, source: &str, refs: &mut Vec<String>) {
         let node = cursor.node();
         if node.kind() == "method_invocation" {
             if let Some(name_node) = node.child_by_field_name("name") {
-                let range = name_node.byte_range();
-                if range.end <= source.len() {
-                    refs.push(source[range].to_string());
+                let name_range = name_node.byte_range();
+                if name_range.end <= source.len() {
+                    let method = &source[name_range];
+                    // The `object` field is the receiver: `MathUtils` in `MathUtils.add()`.
+                    // Keep it so a static call resolves to the right class FQN (`MathUtils.add`)
+                    // instead of colliding with any same-named method in the repo.
+                    match node.child_by_field_name("object") {
+                        None => refs.push(method.to_string()),
+                        Some(obj) => {
+                            let obj_range = obj.byte_range();
+                            if obj_range.end <= source.len() {
+                                let obj_text = &source[obj_range];
+                                if obj_text == "this" || obj_text == "super" {
+                                    // Same-class / parent call — track bare method name.
+                                    refs.push(method.to_string());
+                                } else {
+                                    // `MathUtils.add` for a static/type-qualified call.
+                                    // Instance calls (`obj.add`) capture as `obj.add`, which
+                                    // simply fails to resolve in the builder — no false edge.
+                                    refs.push(format!("{}.{}", obj_text, method));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -480,6 +501,40 @@ public interface Greeting {
         assert!(nodes
             .iter()
             .any(|n| n.name == "greet" && matches!(n.kind, NodeKind::Method)));
+    }
+
+    #[test]
+    fn test_static_call_keeps_class_qualifier() {
+        // A static call `MathUtils.add(...)` must be recorded as `MathUtils.add`,
+        // not the bare `add` — otherwise it collides with any same-named method.
+        let source = r#"
+public class Calc {
+    public int compute() {
+        return MathUtils.add(1, 2);
+    }
+    public int self() {
+        return this.helper() + super.base();
+    }
+    private int helper() { return 0; }
+}
+"#;
+        let parser = JavaParser;
+        let mut ts = tree_sitter::Parser::new();
+        ts.set_language(&parser.language()).unwrap();
+        let tree = ts.parse(source, None).unwrap();
+        let nodes = parser.extract_nodes(&tree, source, "Calc.java");
+
+        let compute = nodes.iter().find(|n| n.name == "compute").unwrap();
+        assert!(
+            compute.references.contains(&"MathUtils.add".to_string()),
+            "expected qualified static ref, got {:?}",
+            compute.references
+        );
+
+        let self_method = nodes.iter().find(|n| n.name == "self").unwrap();
+        // this./super. calls strip to the bare method name (same-class / parent resolution)
+        assert!(self_method.references.contains(&"helper".to_string()));
+        assert!(self_method.references.contains(&"base".to_string()));
     }
 
     #[test]
