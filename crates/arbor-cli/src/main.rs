@@ -10,6 +10,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod audit;
 mod commands;
+mod hook;
 
 #[derive(Parser)]
 #[command(name = "arbor")]
@@ -399,6 +400,21 @@ enum Commands {
         json: bool,
     },
 
+    /// Install Arbor directives + hooks into a coding-agent harness
+    Hook {
+        /// Harness to wire up (currently: claude)
+        #[arg(default_value = "claude")]
+        harness: String,
+
+        /// Project path to install into (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Install into the user's global config instead of the project
+        #[arg(long)]
+        global: bool,
+    },
+
     /// Output a ranked, token-budgeted skeleton of the codebase
     Map {
         /// Path to analyze (defaults to current directory)
@@ -541,6 +557,11 @@ async fn main() {
             path,
             json,
         } => commands::find_path_cmd(&start, &end, &path, json),
+        Commands::Hook {
+            harness,
+            path,
+            global,
+        } => hook::run(&harness, &path, global),
         Commands::Map {
             path,
             tokens,

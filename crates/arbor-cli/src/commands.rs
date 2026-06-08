@@ -64,7 +64,7 @@ fn find_workspace_root(start: &Path) -> PathBuf {
     fallback
 }
 
-fn resolve_project_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_project_path(path: &Path) -> Result<PathBuf> {
     let base = if path == Path::new(".") {
         std::env::current_dir()?
     } else {
@@ -81,7 +81,10 @@ fn resolve_project_path(path: &Path) -> Result<PathBuf> {
 /// global config (`~/.arbor/config.json`), then `false`.
 fn auto_index_enabled() -> bool {
     if let Ok(val) = std::env::var("ARBOR_AUTO_INDEX") {
-        return matches!(val.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        return matches!(
+            val.trim().to_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
     }
     global_config_auto_index().unwrap_or(false)
 }
