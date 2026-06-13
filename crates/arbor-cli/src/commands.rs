@@ -183,7 +183,15 @@ fn save_graph_snapshot(path: &Path, graph: &arbor_graph::ArborGraph) -> Result<(
     let file = std::fs::File::create(&tmp_path)?;
     let writer = std::io::BufWriter::new(file);
     serde_json::to_writer_pretty(writer, graph)?;
-    fs::rename(&tmp_path, &graph_path)?;
+    if let Err(e) = fs::rename(&tmp_path, &graph_path) {
+        // `rename` may fail to overwrite an existing destination on some platforms (e.g. Windows).
+        if graph_path.exists() {
+            fs::remove_file(&graph_path)?;
+            fs::rename(&tmp_path, &graph_path)?;
+        } else {
+            return Err(e.into());
+        }
+    }
     Ok(())
 }
 
