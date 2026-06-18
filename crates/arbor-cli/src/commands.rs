@@ -1,7 +1,7 @@
 //! CLI command implementations.
 
 use arbor_core::parse_file;
-use arbor_graph::compute_centrality;
+use arbor_graph::{compute_centrality, HeuristicsMatcher};
 use arbor_server::{ArborServer, ServerConfig};
 use arbor_watcher::{index_directory, IndexOptions};
 use colored::Colorize;
@@ -64,7 +64,7 @@ fn find_workspace_root(start: &Path) -> PathBuf {
     fallback
 }
 
-fn resolve_project_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_project_path(path: &Path) -> Result<PathBuf> {
     let base = if path == Path::new(".") {
         std::env::current_dir()?
     } else {
@@ -73,7 +73,63 @@ fn resolve_project_path(path: &Path) -> Result<PathBuf> {
     Ok(find_workspace_root(&base))
 }
 
+/// Whether Arbor may index a project that has no `.arbor/` directory yet.
+///
+/// Off by default so commands run against an un-indexed project (e.g. a
+/// different repo) don't silently create a `.arbor/` and write a cache into it.
+/// Resolution order: `ARBOR_AUTO_INDEX` env var, then `auto_index` in the
+/// global config (`~/.arbor/config.json`), then `false`.
+fn auto_index_enabled() -> bool {
+    if let Ok(val) = std::env::var("ARBOR_AUTO_INDEX") {
+        return matches!(
+            val.trim().to_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    global_config_auto_index().unwrap_or(false)
+}
+
+/// Reads `auto_index` from the global config at `~/.arbor/config.json`.
+fn global_config_auto_index() -> Option<bool> {
+    let config_path = dirs::home_dir()?.join(".arbor").join("config.json");
+    let text = fs::read_to_string(config_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    json.get("auto_index").and_then(|v| v.as_bool())
+}
+
+/// Returns true if `path` has already been indexed (has a `.arbor/` directory).
+fn project_is_indexed(path: &Path) -> bool {
+    path.join(".arbor").exists()
+}
+
+/// Error returned when a command needs an indexed project but the project is
+/// un-indexed and auto-indexing is disabled.
+fn not_indexed_error(path: &Path) -> Box<dyn std::error::Error> {
+    format!(
+        "Project at {} is not indexed and auto-indexing is disabled.\n  \
+         Run 'arbor index {}' to index it, or enable auto-indexing with \
+         ARBOR_AUTO_INDEX=1 (or \"auto_index\": true in ~/.arbor/config.json).",
+        path.display(),
+        path.display()
+    )
+    .into()
+}
+
+/// Ensures `.arbor/` exists for an *implicit* (non-`index`/`init`) command.
+///
+/// If the project is already indexed, this is a no-op create. If it is NOT
+/// indexed, it only creates `.arbor/` when auto-indexing is enabled; otherwise
+/// it errors rather than mutating the project.
 fn ensure_arbor_initialized(path: &Path) -> Result<bool> {
+    if !project_is_indexed(path) && !auto_index_enabled() {
+        return Err(not_indexed_error(path));
+    }
+    init_arbor_dir(path)
+}
+
+/// Creates and populates `.arbor/` unconditionally. Used by the explicit
+/// `init`/`index`/`setup` commands, which always opt the user into indexing.
+fn init_arbor_dir(path: &Path) -> Result<bool> {
     let arbor_dir = path.join(".arbor");
     let config_path = arbor_dir.join("config.json");
 
@@ -123,9 +179,19 @@ fn save_graph_snapshot(path: &Path, graph: &arbor_graph::ArborGraph) -> Result<(
         fs::create_dir_all(parent)?;
     }
 
-    let file = std::fs::File::create(&graph_path)?;
+    let tmp_path = graph_path.with_extension("json.tmp");
+    let file = std::fs::File::create(&tmp_path)?;
     let writer = std::io::BufWriter::new(file);
     serde_json::to_writer_pretty(writer, graph)?;
+    if let Err(e) = fs::rename(&tmp_path, &graph_path) {
+        // `rename` may fail to overwrite an existing destination on some platforms (e.g. Windows).
+        if graph_path.exists() {
+            fs::remove_file(&graph_path)?;
+            fs::rename(&tmp_path, &graph_path)?;
+        } else {
+            return Err(e.into());
+        }
+    }
     Ok(())
 }
 
@@ -135,8 +201,10 @@ fn save_graph_binary(path: &Path, graph: &arbor_graph::ArborGraph) -> Result<()>
         fs::create_dir_all(parent)?;
     }
 
+    let tmp_path = graph_path.with_extension("bin.tmp");
     let bytes = bincode::serialize(graph)?;
-    fs::write(graph_path, bytes)?;
+    fs::write(&tmp_path, bytes)?;
+    fs::rename(&tmp_path, &graph_path)?;
     Ok(())
 }
 
@@ -153,7 +221,8 @@ fn load_graph_snapshot(path: &Path) -> Result<arbor_graph::ArborGraph> {
 
     let file = std::fs::File::open(&graph_path)?;
     let reader = std::io::BufReader::new(file);
-    let graph: arbor_graph::ArborGraph = serde_json::from_reader(reader)?;
+    let mut graph: arbor_graph::ArborGraph = serde_json::from_reader(reader)?;
+    graph.rebuild_search_index();
     Ok(graph)
 }
 
@@ -164,7 +233,8 @@ fn load_graph_binary(path: &Path) -> Result<arbor_graph::ArborGraph> {
     }
 
     let bytes = fs::read(graph_path)?;
-    let graph: arbor_graph::ArborGraph = bincode::deserialize(&bytes)?;
+    let mut graph: arbor_graph::ArborGraph = bincode::deserialize(&bytes)?;
+    graph.rebuild_search_index();
     Ok(graph)
 }
 
@@ -177,7 +247,7 @@ fn load_graph_from_store(path: &Path) -> Result<arbor_graph::ArborGraph> {
     let store = arbor_graph::GraphStore::open_or_reset(&store_path)
         .map_err(|e| format!("Failed to open graph store: {}", e))?;
 
-    let graph = store
+    let mut graph = store
         .load_graph()
         .map_err(|e| format!("Failed to load graph from store: {}", e))?;
 
@@ -185,23 +255,72 @@ fn load_graph_from_store(path: &Path) -> Result<arbor_graph::ArborGraph> {
         return Err("Graph store was empty".into());
     }
 
+    graph.rebuild_search_index();
     Ok(graph)
 }
 
+/// Returns the modified time of a cache file in seconds since the UNIX epoch.
+fn cache_mtime_secs(cache_path: &Path) -> Option<u64> {
+    fs::metadata(cache_path)
+        .and_then(|m| m.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Returns true if a source file is newer than the freshest cache file,
+/// meaning the cached graph is stale and should be rebuilt from source.
+fn cache_is_stale(path: &Path) -> bool {
+    // Compare against the freshest of the two cache files — a running bridge's
+    // periodic writer keeps graph.bin current, so prefer whichever is newer.
+    let newest = [graph_binary_path(path), graph_snapshot_path(path)]
+        .iter()
+        .filter_map(|p| cache_mtime_secs(p))
+        .max();
+    match newest {
+        Some(cache_mtime) => arbor_watcher::sources_newer_than(path, cache_mtime, false),
+        None => false, // no cache yet; nothing to call stale
+    }
+}
+
 fn load_or_index_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
-    if let Ok(graph) = load_graph_binary(path) {
-        return Ok(graph);
+    // Refuse to index an un-indexed project unless auto-indexing is enabled —
+    // this is the choke point for read commands that don't call
+    // ensure_arbor_initialized first, and prevents writing a cache into a
+    // project the user never opted in to.
+    if !project_is_indexed(path) && !auto_index_enabled() {
+        return Err(not_indexed_error(path));
     }
 
-    if let Ok(graph) = load_graph_snapshot(path) {
-        return Ok(graph);
+    // When a bridge is running it keeps graph.bin fresh via its own persister —
+    // skip the staleness check to avoid a redundant re-index that races with
+    // the bridge's writes.
+    let store_path = graph_store_path(path);
+    let bridge_may_be_running = store_path.join("db").exists();
+
+    let stale = !bridge_may_be_running && cache_is_stale(path);
+    if !stale {
+        if let Ok(graph) = load_graph_binary(path) {
+            return Ok(graph);
+        }
+
+        if let Ok(graph) = load_graph_snapshot(path) {
+            return Ok(graph);
+        }
     }
 
-    if let Ok(graph) = load_graph_from_store(path) {
-        // Materialize JSON snapshot for faster future warm starts.
-        let _ = save_graph_snapshot(path, &graph);
-        let _ = save_graph_binary(path, &graph);
-        return Ok(graph);
+    // Only try sled store if no snapshot files exist AND no bridge/server
+    // could be holding a lock. Sled locks are exclusive — a running bridge
+    // will cause CLI calls to block indefinitely.
+    let has_snapshot_files = graph_binary_path(path).exists() || graph_snapshot_path(path).exists();
+
+    if !has_snapshot_files && !bridge_may_be_running {
+        if let Ok(graph) = load_graph_from_store(path) {
+            let _ = save_graph_snapshot(path, &graph);
+            let _ = save_graph_binary(path, &graph);
+            return Ok(graph);
+        }
     }
 
     let result = index_directory(path, IndexOptions::default())?;
@@ -276,6 +395,29 @@ fn is_generated_or_internal_path(path: &str) -> bool {
             .any(|suffix| normalized.ends_with(suffix))
 }
 
+fn parse_numstat_files(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 3 {
+                return None;
+            }
+            let path = if parts[2].contains(" => ") || !parts[2].is_empty() {
+                parts[2]
+            } else {
+                parts.get(2).copied().unwrap_or("")
+            };
+            let normalized = normalize_slashes(path.trim());
+            if normalized.is_empty() {
+                None
+            } else {
+                Some(normalized)
+            }
+        })
+        .collect()
+}
+
 fn git_changed_files(path: &Path) -> Result<Vec<String>> {
     if !is_git_repo(path) {
         return Ok(Vec::new());
@@ -295,6 +437,15 @@ fn git_changed_files(path: &Path) -> Result<Vec<String>> {
             )?;
 
             let mut files = parse_git_name_status_output(&ranged);
+
+            let numstat = run_git(
+                path,
+                &["diff", "-w", "--numstat", "--find-renames", base, head],
+            )?;
+            let has_real_diff: std::collections::HashSet<String> =
+                parse_numstat_files(&numstat).into_iter().collect();
+            files.retain(|f| has_real_diff.contains(f));
+
             files.retain(|path| !is_generated_or_internal_path(path));
             files.sort();
             files.dedup();
@@ -323,6 +474,24 @@ fn git_changed_files(path: &Path) -> Result<Vec<String>> {
         ],
     )?;
     files.extend(parse_git_name_status_output(&staged));
+
+    let numstat_unstaged = run_git(path, &["diff", "-w", "--numstat", "--find-renames", "HEAD"])?;
+    let numstat_staged = run_git(
+        path,
+        &[
+            "diff",
+            "--cached",
+            "-w",
+            "--numstat",
+            "--find-renames",
+            "HEAD",
+        ],
+    )?;
+    let has_real_diff: std::collections::HashSet<String> = parse_numstat_files(&numstat_unstaged)
+        .into_iter()
+        .chain(parse_numstat_files(&numstat_staged))
+        .collect();
+    files.retain(|f| has_real_diff.contains(f));
 
     let untracked = run_git(path, &["ls-files", "--others", "--exclude-standard"])?;
     files.extend(
@@ -744,7 +913,7 @@ pub fn init(path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let _ = ensure_arbor_initialized(&resolved_path)?;
+    let _ = init_arbor_dir(&resolved_path)?;
 
     println!(
         "{} Initialized Arbor in {}",
@@ -765,7 +934,7 @@ pub fn index(
     changed_only: bool,
 ) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
-    let was_initialized = ensure_arbor_initialized(&resolved_path)?;
+    let was_initialized = init_arbor_dir(&resolved_path)?;
     if was_initialized {
         println!(
             "{} Created {} for first-time setup",
@@ -955,15 +1124,79 @@ fn export_graph(graph: &arbor_graph::ArborGraph, path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn query(query: &str, limit: usize, path: &Path) -> Result<()> {
+fn is_test_file(file_path: &str) -> bool {
+    let lower = file_path.to_lowercase().replace('\\', "/");
+    let segments: Vec<&str> = lower.split('/').collect();
+    let filename = segments.last().copied().unwrap_or("");
+
+    segments.iter().any(|s| {
+        *s == "test"
+            || *s == "tests"
+            || *s == "spec"
+            || *s == "specs"
+            || *s == "fixture"
+            || *s == "fixtures"
+            || *s == "mock"
+            || *s == "mocks"
+            || *s == "__tests__"
+            || *s == "__mocks__"
+            || *s == "testfixtures"
+    }) || lower.ends_with("test.java")
+        || lower.ends_with("tests.java")
+        || lower.ends_with("test.rs")
+        || lower.ends_with("test.ts")
+        || lower.ends_with("test.tsx")
+        || lower.ends_with("test.js")
+        || lower.ends_with("test.jsx")
+        || lower.ends_with("test.py")
+        || lower.ends_with("test.go")
+        || lower.ends_with("_test.go")
+        || lower.ends_with("tests.cs")
+        || lower.ends_with("test.cs")
+        || lower.ends_with("_test.dart")
+        || lower.contains(".spec.")
+        || lower.contains(".test.")
+        || filename.starts_with("test_")
+        || filename == "conftest.py"
+}
+
+pub fn query(query: &str, limit: usize, path: &Path, exclude_test: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
     let graph = load_or_index_graph(&resolved_path)?;
 
-    let matches: Vec<_> = graph.search(query).into_iter().take(limit).collect();
+    let terms: Vec<&str> = query
+        .split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut matches = Vec::new();
+
+    for term in &terms {
+        for node in graph.search(term) {
+            if exclude_test && is_test_file(&node.file) {
+                continue;
+            }
+            if seen_ids.insert(&node.id) {
+                matches.push(node);
+            }
+            if matches.len() >= limit {
+                break;
+            }
+        }
+        if matches.len() >= limit {
+            break;
+        }
+    }
 
     if matches.is_empty() {
-        println!("No matches found for \"{}\"", query);
+        if exclude_test {
+            println!("No matches found for \"{}\" (excluding test files)", query);
+        } else {
+            println!("No matches found for \"{}\"", query);
+        }
         return Ok(());
     }
 
@@ -1411,42 +1644,37 @@ pub async fn bridge(path: &Path, launch_viz: bool, follow_symlinks: bool) -> Res
     let graph = arbor_graph::ArborGraph::new();
     let shared_graph = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-    // 2. Run Initial Index (Blocking)
+    // 2. Index in background so MCP stdio starts immediately (prevents client timeout)
     let index_path = resolved_path.to_path_buf();
     let options = IndexOptions {
         follow_symlinks,
         cache_path: Some(resolved_path.join(".arbor").join("cache")),
     };
-    eprintln!("{} Starting initial index...", "⏳".yellow());
+    eprintln!("{} Starting initial index (background)...", "⏳".yellow());
 
-    // Run blocking indexer
-    let result = tokio::task::spawn_blocking(move || index_directory(&index_path, options)).await?;
+    let index_graph = shared_graph.clone();
+    tokio::spawn(async move {
+        let result =
+            tokio::task::spawn_blocking(move || index_directory(&index_path, options)).await;
+        match result {
+            Ok(Ok(index_result)) => {
+                let mut guard = index_graph.write().await;
+                *guard = index_result.graph;
 
-    match result {
-        Ok(index_result) => {
-            let mut guard = shared_graph.write().await;
-            *guard = index_result.graph;
+                let scores = compute_centrality(&guard, 20, 0.85);
+                guard.set_centrality(scores.into_map());
 
-            // Compute centrality
-            let scores = compute_centrality(&guard, 20, 0.85);
-            guard.set_centrality(scores.into_map());
-
-            eprintln!(
-                "{} Index Ready: {} files, {} nodes",
-                "✓".green(),
-                index_result.files_indexed,
-                index_result.nodes_extracted
-            );
+                eprintln!(
+                    "{} Index Ready: {} files, {} nodes",
+                    "✓".green(),
+                    index_result.files_indexed,
+                    index_result.nodes_extracted
+                );
+            }
+            Ok(Err(e)) => eprintln!("{} Indexing failed: {}", "⚠".red(), e),
+            Err(e) => eprintln!("{} Index task panicked: {}", "⚠".red(), e),
         }
-        Err(e) => eprintln!("{} Indexing failed: {}", "⚠".red(), e),
-    }
-
-    // Pass a clone to the background watcher/indexer (which we should start separately if we want continuous updates)
-    // Actually, SyncServer handles the continuous watching!
-    // The previous code had a separate background indexer that seemingly did nothing after the initial index?
-    // No, wait. The previous code ONLY did the initial index.
-    // The SyncServer (lines 355) is what handles *subsequent* file updates via its own watcher.
-    // So this change is strictly correct.
+    });
 
     // 3. Start Servers (Background)
     let rpc_port = 7433;
@@ -1494,6 +1722,16 @@ pub async fn bridge(path: &Path, launch_viz: bool, follow_symlinks: bool) -> Res
 
     let sync_server = arbor_server::SyncServer::new_with_shared(sync_config, shared_graph.clone());
     let spotlight_handle = sync_server.handle();
+
+    // Persist the live graph to disk so cold `arbor map`/`query` reads stay fast
+    // and fresh. The background indexer broadcasts on every patch; we debounce
+    // those into at most one graph.bin write every few seconds.
+    let persist_rx = sync_server.subscribe();
+    let persist_graph = shared_graph.clone();
+    let persist_path = resolved_path.to_path_buf();
+    tokio::spawn(async move {
+        run_graph_persister(persist_rx, persist_graph, persist_path).await;
+    });
 
     tokio::spawn(async move {
         if let Err(e) = arbor_server.run().await {
@@ -2569,6 +2807,63 @@ pub fn summary(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Periodically persists the live graph to `graph.bin` while a bridge runs.
+///
+/// Only one bridge per project wins the persist lock — additional bridges for
+/// the same project skip disk writes (their in-memory graph + MCP are still
+/// fully functional). This prevents multiple bridges from stomping each other.
+async fn run_graph_persister(
+    mut rx: tokio::sync::broadcast::Receiver<arbor_server::BroadcastMessage>,
+    graph: std::sync::Arc<tokio::sync::RwLock<arbor_graph::ArborGraph>>,
+    path: PathBuf,
+) {
+    use arbor_server::BroadcastMessage;
+    use fs2::FileExt;
+    use tokio::sync::broadcast::error::RecvError;
+    use tokio::time::{interval, Duration};
+
+    // Acquire an exclusive advisory lock — only one persister per project.
+    let lock_path = path.join(".arbor").join("persist.lock");
+    let lock_file = match fs::File::create(&lock_path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    if lock_file.try_lock_exclusive().is_err() {
+        eprintln!(
+            "{} Another bridge is persisting for this project — skipping disk writes",
+            "ℹ".cyan()
+        );
+        return;
+    }
+
+    const FLUSH_SECS: u64 = 5;
+    let mut dirty = false;
+    let mut tick = interval(Duration::from_secs(FLUSH_SECS));
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Ok(BroadcastMessage::GraphUpdate(_)) => dirty = true,
+                Ok(_) => {}
+                Err(RecvError::Lagged(_)) => dirty = true,
+                Err(RecvError::Closed) => break,
+            },
+            _ = tick.tick() => {
+                if dirty {
+                    let guard = graph.read().await;
+                    if let Err(e) = save_graph_binary(&path, &guard) {
+                        eprintln!("{} Failed to persist graph cache: {}", "⚠".yellow(), e);
+                    }
+                    dirty = false;
+                }
+            }
+        }
+    }
+
+    // Lock released when lock_file drops (process exit or loop break).
+    drop(lock_file);
+}
+
 /// Watch for file changes and re-index automatically.
 pub async fn watch(path: &Path) -> Result<()> {
     use std::time::Duration;
@@ -2910,4 +3205,790 @@ pub fn audit(sink: &str, depth: usize, format: &str, path: &Path) -> Result<()> 
     );
 
     Ok(())
+}
+
+fn resolve_symbol(graph: &arbor_graph::ArborGraph, symbol: &str) -> Result<arbor_graph::NodeId> {
+    graph
+        .get_index(symbol)
+        .or_else(|| {
+            graph
+                .find_by_name(symbol)
+                .first()
+                .and_then(|n| graph.get_index(&n.id))
+        })
+        .ok_or_else(|| format!("Symbol '{}' not found", symbol).into())
+}
+
+pub fn callers(symbol: &str, path: &Path, json_output: bool) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
+
+    let idx = resolve_symbol(&graph, symbol)?;
+    let callers = graph.get_callers(idx);
+
+    if json_output {
+        let items: Vec<serde_json::Value> = callers
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "name": n.name,
+                    "kind": n.kind.to_string(),
+                    "file": n.file,
+                    "line": n.line_start
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "symbol": symbol,
+                "callers": items
+            }))?
+        );
+    } else if callers.is_empty() {
+        println!("No callers found for '{}'", symbol);
+    } else {
+        println!("Callers of '{}' ({}):\n", symbol, callers.len());
+        for n in &callers {
+            println!(
+                "  {} {} {}",
+                n.kind.to_string().yellow(),
+                n.qualified_name.cyan(),
+                format!("({}:{})", n.file, n.line_start).dimmed()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub fn callees(symbol: &str, path: &Path, json_output: bool) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
+
+    let idx = resolve_symbol(&graph, symbol)?;
+    let callees = graph.get_callees(idx);
+
+    if json_output {
+        let items: Vec<serde_json::Value> = callees
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "name": n.name,
+                    "kind": n.kind.to_string(),
+                    "file": n.file,
+                    "line": n.line_start
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "symbol": symbol,
+                "callees": items
+            }))?
+        );
+    } else if callees.is_empty() {
+        println!("No callees found for '{}'", symbol);
+    } else {
+        println!("Callees of '{}' ({}):\n", symbol, callees.len());
+        for n in &callees {
+            println!(
+                "  {} {} {}",
+                n.kind.to_string().yellow(),
+                n.qualified_name.cyan(),
+                format!("({}:{})", n.file, n.line_start).dimmed()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub fn entry_points(path: &Path, json_output: bool) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
+
+    let eps = graph.list_entry_points();
+
+    if json_output {
+        let items: Vec<serde_json::Value> = eps
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "name": n.name,
+                    "kind": n.kind.to_string(),
+                    "file": n.file,
+                    "line": n.line_start
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "entry_points": items
+            }))?
+        );
+    } else if eps.is_empty() {
+        println!("No entry points detected.");
+    } else {
+        println!("Entry points ({}):\n", eps.len());
+        for n in &eps {
+            println!(
+                "  {} {} {}",
+                n.kind.to_string().yellow(),
+                n.qualified_name.cyan(),
+                format!("({}:{})", n.file, n.line_start).dimmed()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub fn file_graph(file: &str, path: &Path, json_output: bool) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
+
+    let candidates = [
+        file.to_string(),
+        file.replace('\\', "/"),
+        resolved_path.join(file).to_string_lossy().to_string(),
+        resolved_path
+            .join(file.replace('\\', "/"))
+            .to_string_lossy()
+            .to_string(),
+    ];
+
+    for candidate in &candidates {
+        let (nodes, edges) = graph.nodes_in_file_with_edges(candidate);
+        if !nodes.is_empty() {
+            return print_file_graph_output(candidate, &nodes, &edges, json_output);
+        }
+    }
+
+    Err(format!("No symbols found in file '{}'", file).into())
+}
+
+fn print_file_graph_output(
+    file: &str,
+    nodes: &[&arbor_core::CodeNode],
+    edges: &[(String, String, String)],
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        let node_items: Vec<serde_json::Value> = nodes
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "name": n.name,
+                    "kind": n.kind.to_string(),
+                    "line": n.line_start
+                })
+            })
+            .collect();
+        let edge_items: Vec<serde_json::Value> = edges
+            .iter()
+            .map(|(from, to, kind)| {
+                serde_json::json!({
+                    "from": from,
+                    "to": to,
+                    "kind": kind
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "file": file,
+                "nodes": node_items,
+                "edges": edge_items
+            }))?
+        );
+    } else {
+        println!("Symbols in '{}' ({}):\n", file, nodes.len());
+        for n in nodes {
+            println!(
+                "  {} {} {}",
+                n.kind.to_string().yellow(),
+                n.qualified_name.cyan(),
+                format!("(L{}–{})", n.line_start, n.line_end).dimmed()
+            );
+        }
+        if !edges.is_empty() {
+            println!("\nInternal edges ({}):\n", edges.len());
+            for (from, to, kind) in edges {
+                println!(
+                    "  {} {} {}",
+                    from.cyan(),
+                    "→".dimmed(),
+                    format!("{} ({})", to, kind).dimmed()
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn inspect(symbol: &str, path: &Path, json_output: bool) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
+
+    let idx = resolve_symbol(&graph, symbol)?;
+    let node = graph
+        .get(idx)
+        .ok_or_else(|| format!("Node index invalid for '{}'", symbol))?;
+    let centrality = graph.centrality(idx);
+    let callers = graph.get_callers(idx);
+    let callees = graph.get_callees(idx);
+    let is_entry = HeuristicsMatcher::is_likely_entry_point(node);
+    let role = if is_entry {
+        "entry_point"
+    } else if callers.is_empty() {
+        "unreachable"
+    } else if callees.is_empty() {
+        "utility"
+    } else {
+        "internal"
+    };
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": node.id,
+                "name": node.name,
+                "kind": node.kind.to_string(),
+                "file": node.file,
+                "line_start": node.line_start,
+                "line_end": node.line_end,
+                "signature": node.signature,
+                "centrality": centrality,
+                "role": role,
+                "caller_count": callers.len(),
+                "callee_count": callees.len(),
+                "is_entry_point": is_entry
+            }))?
+        );
+    } else {
+        println!("  {}:    {}", "Name".bold(), node.name);
+        println!("  {}:    {}", "Kind".bold(), node.kind.to_string().yellow());
+        println!(
+            "  {}:    {}:{}-{}",
+            "File".bold(),
+            node.file,
+            node.line_start,
+            node.line_end
+        );
+        if let Some(ref sig) = node.signature {
+            println!("  {}:     {}", "Sig".bold(), sig.dimmed());
+        }
+        println!("  {}:    {}", "Role".bold(), role.cyan());
+        println!("  {}:     {:.4}", "Rank".bold(), centrality);
+        println!("  {}:  {}", "Callers".bold(), callers.len());
+        println!("  {}:  {}", "Callees".bold(), callees.len());
+    }
+
+    Ok(())
+}
+
+pub fn find_path_cmd(start: &str, end: &str, path: &Path, json_output: bool) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let graph = load_or_index_graph(&resolved_path)?;
+
+    let start_idx = resolve_symbol(&graph, start)?;
+    let end_idx = resolve_symbol(&graph, end)?;
+
+    let found = graph.find_path(start_idx, end_idx);
+
+    if json_output {
+        match &found {
+            Some(nodes) => {
+                let items: Vec<serde_json::Value> = nodes
+                    .iter()
+                    .map(|n| {
+                        serde_json::json!({
+                            "id": n.id,
+                            "name": n.name,
+                            "kind": n.kind.to_string(),
+                            "file": n.file,
+                            "line": n.line_start
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "start": start,
+                        "end": end,
+                        "path": items,
+                        "hops": items.len().saturating_sub(1)
+                    }))?
+                );
+            }
+            None => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "start": start,
+                        "end": end,
+                        "path": null,
+                        "message": "No path found"
+                    }))?
+                );
+            }
+        }
+    } else {
+        match &found {
+            Some(nodes) => {
+                println!("Path ({} hops):\n", nodes.len().saturating_sub(1));
+                for (i, n) in nodes.iter().enumerate() {
+                    if i > 0 {
+                        println!("    {}", "↓".dimmed());
+                    }
+                    println!(
+                        "  {} {} {}",
+                        n.kind.to_string().yellow(),
+                        n.qualified_name.cyan(),
+                        format!("({}:{})", n.file, n.line_start).dimmed()
+                    );
+                }
+            }
+            None => {
+                println!("No path found between '{}' and '{}'", start, end);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn map(
+    path: &Path,
+    token_budget: usize,
+    exclude_test: bool,
+    json_output: bool,
+    verbose: bool,
+    focus_changed: bool,
+    focus_glob: Option<&str>,
+) -> Result<()> {
+    let resolved_path = resolve_project_path(path)?;
+    let _ = ensure_arbor_initialized(&resolved_path)?;
+    let mut graph = load_or_index_graph(&resolved_path)?;
+
+    // Compute centrality if not already present, then persist for future calls
+    let has_centrality = graph.node_indexes().any(|idx| graph.centrality(idx) > 0.0);
+    if !has_centrality {
+        eprintln!("Computing centrality...");
+        let scores = compute_centrality(&graph, 20, 0.85);
+        graph.set_centrality(scores.into_map());
+        let _ = save_graph_binary(&resolved_path, &graph);
+    }
+
+    // Build set of changed files for --focus-changed
+    let changed_files: std::collections::HashSet<String> =
+        if focus_changed && is_git_repo(&resolved_path) {
+            git_changed_files(&resolved_path)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|f| resolved_path.join(&f).to_string_lossy().to_string())
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+    struct ScoredNode {
+        name: String,
+        kind: String,
+        file: String,
+        line_start: u32,
+        line_end: u32,
+        signature: Option<String>,
+        score: f64,
+        is_entry_point: bool,
+        callers: usize,
+    }
+
+    let mut scored: Vec<ScoredNode> = Vec::new();
+    for idx in graph.node_indexes() {
+        let node = match graph.get(idx) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        if exclude_test && is_test_file(&node.file) {
+            continue;
+        }
+
+        // Skip minified/generated files
+        if is_minified_or_generated(&node.file) {
+            continue;
+        }
+
+        let kind_str = node.kind.to_string();
+        if kind_str == "import" || kind_str == "export" || kind_str == "module" {
+            continue;
+        }
+
+        let centrality = graph.centrality(idx);
+        let is_entry = HeuristicsMatcher::is_likely_entry_point(node);
+        let caller_count = graph.get_callers(idx).len();
+
+        let kind_boost = match kind_str.as_str() {
+            "class" | "interface" | "struct" => 0.1,
+            "constructor" => -0.1,
+            "field" | "constant" => -0.2,
+            _ => 0.0,
+        };
+        let entry_boost = if is_entry { 0.3 } else { 0.0 };
+        let changed_boost = if changed_files.contains(&node.file) {
+            0.3
+        } else {
+            0.0
+        };
+        let glob_boost = match focus_glob {
+            Some(pattern) if node.file.contains(pattern.trim_matches('*')) => 0.3,
+            _ => 0.0,
+        };
+        let score = centrality + entry_boost + kind_boost + changed_boost + glob_boost;
+
+        scored.push(ScoredNode {
+            name: node.name.clone(),
+            kind: kind_str,
+            file: node.file.clone(),
+            line_start: node.line_start,
+            line_end: node.line_end,
+            signature: node.signature.clone(),
+            score,
+            is_entry_point: is_entry,
+            callers: caller_count,
+        });
+    }
+
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let total_symbols = scored.len();
+
+    // Group by file, preserving rank order of first appearance.
+    // Cap symbols per file to force breadth across the project.
+    let max_per_file: usize = if token_budget <= 1024 {
+        5
+    } else if token_budget <= 2048 {
+        8
+    } else {
+        12
+    };
+
+    let mut file_order: Vec<String> = Vec::new();
+    let mut file_groups: std::collections::HashMap<String, Vec<&ScoredNode>> =
+        std::collections::HashMap::new();
+    for node in &scored {
+        let group = file_groups.entry(node.file.clone()).or_default();
+        if group.len() >= max_per_file {
+            continue;
+        }
+        if group.is_empty() {
+            file_order.push(node.file.clone());
+        }
+        group.push(node);
+    }
+
+    let root_str = resolved_path.to_string_lossy().to_string();
+    let budget_chars = token_budget * 4;
+
+    if json_output {
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+        let mut json_symbols_shown = 0;
+        let mut json_chars = 0;
+
+        for file_path in &file_order {
+            let symbols = match file_groups.get(file_path) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let rel_path = map_make_relative(file_path, &root_str);
+            let short_path = map_compress_path(file_path, &root_str);
+
+            let mut sym_items: Vec<serde_json::Value> = Vec::new();
+            for node in symbols {
+                let sig_short = node
+                    .signature
+                    .as_deref()
+                    .map(map_shorten_signature)
+                    .unwrap_or_else(|| node.name.clone());
+
+                let item_cost = sig_short.len() + 50;
+                if json_chars + item_cost > budget_chars && json_symbols_shown > 0 {
+                    break;
+                }
+
+                sym_items.push(serde_json::json!({
+                    "name": node.name,
+                    "kind": node.kind,
+                    "line": node.line_start,
+                    "centrality": (node.score * 100.0).round() / 100.0,
+                    "callers": node.callers,
+                    "is_entry_point": node.is_entry_point,
+                    "signature_short": sig_short,
+                }));
+                json_symbols_shown += 1;
+                json_chars += item_cost;
+            }
+
+            if !sym_items.is_empty() {
+                entries.push(serde_json::json!({
+                    "file": rel_path,
+                    "file_short": short_path,
+                    "symbols": sym_items,
+                }));
+            }
+
+            if json_chars >= budget_chars {
+                break;
+            }
+        }
+
+        let output = serde_json::json!({
+            "schema": "arbor.map.v1",
+            "token_estimate": json_chars / 4,
+            "symbols_shown": json_symbols_shown,
+            "symbols_total": total_symbols,
+            "files_shown": entries.len(),
+            "files_total": file_order.len(),
+            "entries": entries,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        let mut output_lines: Vec<String> = Vec::new();
+        let mut token_chars: usize = 0;
+        let mut symbols_shown: usize = 0;
+        let mut files_shown: usize = 0;
+        let mut budget_hit = false;
+
+        for file_path in &file_order {
+            if budget_hit {
+                break;
+            }
+
+            let symbols = match file_groups.get(file_path) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let display_path = if verbose {
+                map_make_relative(file_path, &root_str)
+            } else {
+                map_compress_path(file_path, &root_str)
+            };
+
+            let header = format!("{}:", display_path);
+            let header_cost = header.len() + 1;
+
+            if token_chars + header_cost > budget_chars && files_shown > 0 {
+                break;
+            }
+
+            output_lines.push(header);
+            token_chars += header_cost;
+            files_shown += 1;
+
+            for node in symbols {
+                let entry_marker = if node.is_entry_point { " ★" } else { "" };
+                let line_info =
+                    if node.kind == "class" || node.kind == "interface" || node.kind == "struct" {
+                        format!("[L{}-{}]", node.line_start, node.line_end)
+                    } else {
+                        format!("L{}", node.line_start)
+                    };
+
+                let line =
+                    if node.kind == "class" || node.kind == "interface" || node.kind == "struct" {
+                        format!(
+                            "  {} {} {}{}",
+                            node.kind, node.name, line_info, entry_marker
+                        )
+                    } else {
+                        let sig_short = node
+                            .signature
+                            .as_deref()
+                            .map(map_shorten_signature)
+                            .unwrap_or_else(|| node.name.clone());
+                        format!("    {}  {}{}", sig_short, line_info, entry_marker)
+                    };
+
+                let line_cost = line.len() + 1;
+                if token_chars + line_cost > budget_chars && symbols_shown > 0 {
+                    let remaining_symbols = total_symbols - symbols_shown;
+                    let remaining_files = file_order.len() - files_shown;
+                    output_lines.push(format!(
+                        "\n⋮... {} more symbols across {} files (use --tokens {} to see more)",
+                        remaining_symbols,
+                        remaining_files,
+                        token_budget * 2
+                    ));
+                    budget_hit = true;
+                    break;
+                }
+
+                output_lines.push(line);
+                token_chars += line_cost;
+                symbols_shown += 1;
+            }
+
+            if !budget_hit {
+                output_lines.push(String::new());
+                token_chars += 1;
+            }
+        }
+
+        println!(
+            "# arbor map ({} symbols, {} files, budget: {} tokens)\n",
+            symbols_shown, files_shown, token_budget,
+        );
+        for line in &output_lines {
+            println!("{}", line);
+        }
+    }
+
+    Ok(())
+}
+
+fn is_minified_or_generated(file_path: &str) -> bool {
+    let lower = file_path.to_lowercase();
+    lower.ends_with(".min.js")
+        || lower.ends_with(".min.css")
+        || lower.contains(".chunk.")
+        || lower.contains(".bundle.")
+        || lower.contains("/dist/")
+        || lower.contains("/build/")
+        || lower.contains("/resources/monitor/")
+        || lower.contains("/resources/static/")
+        || lower.contains("/generated/")
+        // Hashed filenames (e.g. main.d094b1b69ba24b63.js)
+        || {
+            let filename = lower.rsplit('/').next().unwrap_or("");
+            let parts: Vec<&str> = filename.split('.').collect();
+            parts.len() >= 3 && parts[1].len() >= 8 && parts[1].chars().all(|c| c.is_ascii_hexdigit())
+        }
+}
+
+fn map_make_relative(file_path: &str, root: &str) -> String {
+    file_path
+        .strip_prefix(root)
+        .unwrap_or(file_path)
+        .trim_start_matches('/')
+        .to_string()
+}
+
+fn map_compress_path(file_path: &str, root: &str) -> String {
+    let relative = map_make_relative(file_path, root);
+    let parts: Vec<&str> = relative.split('/').collect();
+
+    if parts.len() <= 4 {
+        return relative;
+    }
+
+    let first = parts[0];
+    let filename = parts[parts.len() - 1];
+    let parent = parts[parts.len() - 2];
+    let grandparent = parts[parts.len() - 3];
+
+    format!("{}/.../{}/{}/{}", first, grandparent, parent, filename)
+}
+
+fn map_shorten_signature(sig: &str) -> String {
+    let sig = sig.trim();
+
+    let paren_start = match sig.find('(') {
+        Some(i) => i,
+        None => {
+            if sig.len() <= 80 {
+                return sig.to_string();
+            } else {
+                return format!("{}...", &sig[..77]);
+            }
+        }
+    };
+
+    // Extract name: last word before the opening paren
+    let before_paren = &sig[..paren_start];
+    let name = before_paren
+        .split_whitespace()
+        .last()
+        .unwrap_or(before_paren)
+        .trim();
+
+    let paren_end = match sig.rfind(')') {
+        Some(i) => i,
+        None => return format!("{}(...)", name),
+    };
+
+    let params_str = &sig[paren_start + 1..paren_end];
+    let param_names = map_extract_param_names(params_str);
+
+    let result = if param_names.is_empty() {
+        format!("{}()", name)
+    } else {
+        format!("{}({})", name, param_names.join(", "))
+    };
+
+    if result.len() > 80 {
+        format!("{}(...)", name)
+    } else {
+        result
+    }
+}
+
+fn map_extract_param_names(params_str: &str) -> Vec<&str> {
+    if params_str.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut names = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0;
+
+    let bytes = params_str.as_bytes();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'<' | b'(' => depth += 1,
+            b'>' | b')' => depth -= 1,
+            b',' if depth == 0 => {
+                if let Some(name) = map_last_word_of_param(&params_str[start..i]) {
+                    names.push(name);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if let Some(name) = map_last_word_of_param(&params_str[start..]) {
+        names.push(name);
+    }
+
+    names
+}
+
+fn map_last_word_of_param(param: &str) -> Option<&str> {
+    let trimmed = param.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Rust-style: name before the colon
+    if let Some(colon_pos) = trimmed.find(':') {
+        let before_colon = trimmed[..colon_pos].trim();
+        return before_colon.split_whitespace().last();
+    }
+    // Java/TS-style: name is last word
+    trimmed.split_whitespace().last()
 }

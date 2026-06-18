@@ -54,6 +54,7 @@ runs:
         GITHUB_TOKEN: ${{ inputs.github-token }}
         PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        ARBOR_AUTO_INDEX: "1"
       run: |
         set -euo pipefail
         cd "${{ inputs.working-directory }}"
