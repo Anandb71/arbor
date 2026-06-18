@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 
+use arbor_graph::{compute_centrality, HeuristicsMatcher};
 use arbor_server::{SharedGraph, SyncServerHandle};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -248,7 +249,7 @@ impl McpServer {
                 },
                 {
                     "name": "get_callers",
-                    "description": "Returns the direct callers of a symbol (one hop upstream). Use to answer 'what calls this function?'",
+                    "description": "Returns the direct callers of a symbol (one hop upstream). Use INSTEAD of grep to find usages/references. Answers 'what calls this function?'",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -270,7 +271,7 @@ impl McpServer {
                 },
                 {
                     "name": "search_symbols",
-                    "description": "Fuzzy-searches symbol names across the graph. Use when you know part of a name but not the full ID.",
+                    "description": "Fuzzy-searches symbol names across the graph. Use INSTEAD of grep/rg/find to locate functions, classes, or files. Supports multi-term OR queries with '|' separator.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -282,7 +283,7 @@ impl McpServer {
                 },
                 {
                     "name": "get_file_graph",
-                    "description": "Returns all symbols and internal call edges within a single file. Use to understand a file's internal structure.",
+                    "description": "Returns all symbols and internal call edges within a single file. Use INSTEAD of reading/catting a file to understand its structure — shows what's defined and how it connects.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -301,6 +302,19 @@ impl McpServer {
                         },
                         "required": ["symbol"]
                     }
+                },
+                {
+                    "name": "get_map",
+                    "description": "Returns a ranked, token-budgeted skeleton of the codebase — the most important symbols ordered by centrality. RECOMMENDED FIRST CALL: use this instead of reading files or running find/tree to explore project structure. Entry points are marked with ★.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "tokens": { "type": "integer", "description": "Maximum token budget for output (default: 1024)", "default": 1024 },
+                            "exclude_test": { "type": "boolean", "description": "Exclude test/spec/fixture files (default: true)", "default": true },
+                            "focus": { "type": "string", "description": "Boost symbols in files matching this pattern (e.g. 'service', 'pipeline')" }
+                        },
+                        "required": []
+                    }
                 }
             ]
         }))
@@ -317,6 +331,14 @@ impl McpServer {
             })?;
 
         let arguments = params.get("arguments").unwrap_or(&Value::Null);
+
+        // If the graph is empty, the background index hasn't finished yet
+        if self.graph.read().await.node_count() == 0 {
+            return Ok(Self::err_envelope(
+                name,
+                "Arbor is still indexing the project. Please retry in a few seconds.",
+            ));
+        }
 
         match name {
             "get_logic_path" => {
@@ -804,12 +826,325 @@ impl McpServer {
                     }
                 }
             }
+            "get_map" => {
+                let token_budget = arguments
+                    .get("tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1024) as usize;
+                let exclude_test = arguments
+                    .get("exclude_test")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let focus_pattern = arguments
+                    .get("focus")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let graph = self.graph.read().await;
+
+                // Check if centrality is computed
+                let has_centrality = graph.node_indexes().any(|idx| graph.centrality(idx) > 0.0);
+
+                // If no centrality, we need a mutable graph — drop read, acquire write
+                drop(graph);
+                if !has_centrality {
+                    let mut graph = self.graph.write().await;
+                    let scores = compute_centrality(&graph, 20, 0.85);
+                    graph.set_centrality(scores.into_map());
+                }
+
+                let graph = self.graph.read().await;
+                let result = self.build_map(&graph, token_budget, exclude_test, focus_pattern);
+
+                Ok(Self::ok_envelope(
+                    "get_map",
+                    result,
+                    token_budget,
+                    "search_symbols",
+                    json!({ "query": "" }),
+                ))
+            }
             _ => Err(JsonRpcError {
                 code: -32601,
                 message: format!("Tool not found: {}", name),
                 data: None,
             }),
         }
+    }
+
+    fn build_map(
+        &self,
+        graph: &arbor_graph::ArborGraph,
+        token_budget: usize,
+        exclude_test: bool,
+        focus_pattern: &str,
+    ) -> Value {
+        let max_per_file: usize = if token_budget <= 1024 {
+            5
+        } else if token_budget <= 2048 {
+            8
+        } else {
+            12
+        };
+
+        struct ScoredNode {
+            name: String,
+            kind: String,
+            file: String,
+            line_start: u32,
+            signature: Option<String>,
+            score: f64,
+            is_entry_point: bool,
+            callers: usize,
+        }
+
+        let mut scored: Vec<ScoredNode> = Vec::new();
+        for idx in graph.node_indexes() {
+            let node = match graph.get(idx) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            let kind_str = node.kind.to_string();
+            if kind_str == "import" || kind_str == "export" || kind_str == "module" {
+                continue;
+            }
+
+            if exclude_test && self.is_test_file(&node.file) {
+                continue;
+            }
+
+            if Self::is_minified_or_generated(&node.file) {
+                continue;
+            }
+
+            let centrality = graph.centrality(idx);
+            let is_entry = HeuristicsMatcher::is_likely_entry_point(node);
+            let caller_count = graph.get_callers(idx).len();
+
+            let kind_boost = match kind_str.as_str() {
+                "class" | "interface" | "struct" => 0.1,
+                "constructor" => -0.1,
+                "field" | "constant" => -0.2,
+                _ => 0.0,
+            };
+            let entry_boost = if is_entry { 0.3 } else { 0.0 };
+            let focus_boost = if !focus_pattern.is_empty() && node.file.contains(focus_pattern) {
+                0.3
+            } else {
+                0.0
+            };
+            let score = centrality + entry_boost + kind_boost + focus_boost;
+
+            scored.push(ScoredNode {
+                name: node.name.clone(),
+                kind: kind_str,
+                file: node.file.clone(),
+                line_start: node.line_start,
+                signature: node.signature.clone(),
+                score,
+                is_entry_point: is_entry,
+                callers: caller_count,
+            });
+        }
+
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let total_symbols = scored.len();
+
+        // Group by file with per-file cap
+        let mut file_order: Vec<String> = Vec::new();
+        let mut file_groups: std::collections::HashMap<String, Vec<&ScoredNode>> =
+            std::collections::HashMap::new();
+        for node in &scored {
+            let group = file_groups.entry(node.file.clone()).or_default();
+            if group.len() >= max_per_file {
+                continue;
+            }
+            if group.is_empty() {
+                file_order.push(node.file.clone());
+            }
+            group.push(node);
+        }
+
+        // Build JSON entries within budget
+        let budget_chars = token_budget * 4;
+        let mut entries: Vec<Value> = Vec::new();
+        let mut symbols_shown = 0;
+        let mut chars_used = 0;
+
+        for file_path in &file_order {
+            let symbols = match file_groups.get(file_path) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let mut sym_items: Vec<Value> = Vec::new();
+            for node in symbols {
+                let sig_short = node
+                    .signature
+                    .as_deref()
+                    .map(|s| self.shorten_signature(s))
+                    .unwrap_or_else(|| node.name.clone());
+
+                let item_cost = sig_short.len() + 50;
+                if chars_used + item_cost > budget_chars && symbols_shown > 0 {
+                    break;
+                }
+
+                sym_items.push(json!({
+                    "name": node.name,
+                    "kind": node.kind,
+                    "line": node.line_start,
+                    "centrality": (node.score * 100.0).round() / 100.0,
+                    "callers": node.callers,
+                    "is_entry_point": node.is_entry_point,
+                    "signature_short": sig_short,
+                }));
+                symbols_shown += 1;
+                chars_used += item_cost;
+            }
+
+            if !sym_items.is_empty() {
+                entries.push(json!({
+                    "file": file_path,
+                    "symbols": sym_items,
+                }));
+            }
+
+            if chars_used >= budget_chars {
+                break;
+            }
+        }
+
+        json!({
+            "schema": "arbor.map.v1",
+            "token_estimate": chars_used / 4,
+            "symbols_shown": symbols_shown,
+            "symbols_total": total_symbols,
+            "files_shown": entries.len(),
+            "files_total": file_order.len(),
+            "entries": entries,
+        })
+    }
+
+    fn is_test_file(&self, file_path: &str) -> bool {
+        let lower = file_path.to_lowercase().replace('\\', "/");
+        lower.contains("/test")
+            || lower.contains("/spec")
+            || lower.contains("/fixture")
+            || lower.contains("/mock")
+            || lower.contains("__tests__")
+            || lower.contains(".test.")
+            || lower.contains(".spec.")
+            || lower.contains("_test.")
+    }
+
+    fn is_minified_or_generated(file_path: &str) -> bool {
+        let lower = file_path.to_lowercase().replace('\\', "/");
+        lower.ends_with(".min.js")
+            || lower.ends_with(".min.css")
+            || lower.contains(".chunk.")
+            || lower.contains(".bundle.")
+            || lower.contains("/dist/")
+            || lower.contains("/build/")
+            || lower.contains("/resources/monitor/")
+            || lower.contains("/resources/static/")
+            || lower.contains("/generated/")
+            || {
+                let filename = lower.rsplit('/').next().unwrap_or("");
+                let parts: Vec<&str> = filename.split('.').collect();
+                parts.len() >= 3
+                    && parts[1].len() >= 8
+                    && parts[1].chars().all(|c| c.is_ascii_hexdigit())
+            }
+    }
+
+    fn shorten_signature(&self, sig: &str) -> String {
+        let sig = sig.trim();
+        let paren_start = match sig.find('(') {
+            Some(i) => i,
+            None => {
+                if sig.len() <= 80 {
+                    return sig.to_string();
+                } else {
+                    return format!("{}...", &sig[..77]);
+                }
+            }
+        };
+
+        let before_paren = &sig[..paren_start];
+        let name = before_paren
+            .split_whitespace()
+            .last()
+            .unwrap_or(before_paren)
+            .trim();
+
+        let paren_end = match sig.rfind(')') {
+            Some(i) => i,
+            None => return format!("{}(...)", name),
+        };
+
+        let params_str = &sig[paren_start + 1..paren_end];
+        let param_names = self.extract_param_names(params_str);
+
+        let result = if param_names.is_empty() {
+            format!("{}()", name)
+        } else {
+            format!("{}({})", name, param_names.join(", "))
+        };
+
+        if result.len() > 80 {
+            format!("{}(...)", name)
+        } else {
+            result
+        }
+    }
+
+    fn extract_param_names<'a>(&self, params_str: &'a str) -> Vec<&'a str> {
+        if params_str.trim().is_empty() {
+            return Vec::new();
+        }
+
+        let mut names = Vec::new();
+        let mut depth: i32 = 0;
+        let mut start = 0;
+
+        let bytes = params_str.as_bytes();
+        for i in 0..bytes.len() {
+            match bytes[i] {
+                b'<' | b'(' => depth += 1,
+                b'>' | b')' => depth -= 1,
+                b',' if depth == 0 => {
+                    if let Some(name) = Self::last_word_of_param(&params_str[start..i]) {
+                        names.push(name);
+                    }
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        if let Some(name) = Self::last_word_of_param(&params_str[start..]) {
+            names.push(name);
+        }
+
+        names
+    }
+
+    fn last_word_of_param(param: &str) -> Option<&str> {
+        let trimmed = param.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Some(colon_pos) = trimmed.find(':') {
+            let before_colon = trimmed[..colon_pos].trim();
+            return before_colon.split_whitespace().last();
+        }
+        trimmed.split_whitespace().last()
     }
 
     async fn generate_context(&self, node_start: &str) -> String {
@@ -904,8 +1239,17 @@ mod tool_tests {
     use tokio::sync::RwLock;
 
     fn empty_server() -> McpServer {
-        let graph: SharedGraph = Arc::new(RwLock::new(ArborGraph::new()));
-        McpServer::new(graph)
+        let mut graph = ArborGraph::new();
+        // Add a dummy node so the "still indexing" guard passes
+        let node = arbor_core::CodeNode::new(
+            "_dummy",
+            "_dummy",
+            arbor_core::NodeKind::Function,
+            "_dummy.rs",
+        );
+        graph.add_node(node);
+        let shared: SharedGraph = Arc::new(RwLock::new(graph));
+        McpServer::new(shared)
     }
 
     #[tokio::test]
@@ -1008,5 +1352,67 @@ mod tool_tests {
             }))
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_map_returns_envelope() {
+        let server = empty_server();
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "get_map", "arguments": { "tokens": 1024 }
+            }))
+            .await;
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        let text = val["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["tool"], "get_map");
+        assert_eq!(envelope["data"]["schema"], "arbor.map.v1");
+        assert!(envelope["data"]["symbols_total"].is_number());
+        assert!(envelope["data"]["entries"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_get_map_with_populated_graph() {
+        use arbor_core::{CodeNode, NodeKind};
+
+        let graph = ArborGraph::new();
+        let shared: SharedGraph = Arc::new(RwLock::new(graph));
+
+        // Add some nodes
+        {
+            let mut g = shared.write().await;
+            let mut n1 = CodeNode::new("main", "main", NodeKind::Function, "src/main.rs");
+            n1.line_start = 1;
+            n1.line_end = 10;
+            let mut n2 = CodeNode::new("helper", "helper", NodeKind::Function, "src/lib.rs");
+            n2.line_start = 5;
+            n2.line_end = 15;
+            n2.signature = Some("fn helper(x: i32) -> i32".to_string());
+            let idx1 = g.add_node(n1);
+            let idx2 = g.add_node(n2);
+            g.add_edge(
+                idx1,
+                idx2,
+                arbor_graph::Edge::new(arbor_graph::EdgeKind::Calls),
+            );
+        }
+
+        let server = McpServer::new(shared);
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "get_map", "arguments": { "tokens": 1024, "exclude_test": false }
+            }))
+            .await;
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        let text = val["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["data"]["symbols_total"], 2);
+        assert!(envelope["data"]["symbols_shown"].as_u64().unwrap() >= 2);
+
+        let entries = envelope["data"]["entries"].as_array().unwrap();
+        assert!(!entries.is_empty());
     }
 }

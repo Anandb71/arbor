@@ -41,6 +41,9 @@ fn run_arbor(repo: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_arbor"))
         .args(args)
         .current_dir(repo)
+        // These tests run against fresh temp repos with no .arbor/; opt them
+        // into auto-indexing (off by default to avoid mutating other projects).
+        .env("ARBOR_AUTO_INDEX", "1")
         .output()
         .expect("failed to run arbor")
 }
@@ -192,6 +195,7 @@ fn diff_uses_env_commit_range_when_provided() {
         .current_dir(repo)
         .env("ARBOR_DIFF_BASE", &base_sha)
         .env("ARBOR_DIFF_HEAD", &head_sha)
+        .env("ARBOR_AUTO_INDEX", "1")
         .output()
         .expect("failed to run arbor with env range");
 

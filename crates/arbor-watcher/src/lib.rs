@@ -10,5 +10,5 @@
 mod indexer;
 mod watcher;
 
-pub use indexer::{index_directory, IndexOptions, IndexResult};
+pub use indexer::{index_directory, sources_newer_than, IndexOptions, IndexResult};
 pub use watcher::{FileChange, FileWatcher};

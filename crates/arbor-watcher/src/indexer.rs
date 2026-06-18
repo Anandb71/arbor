@@ -215,6 +215,47 @@ pub fn parse_single_file(path: &Path) -> Result<Vec<CodeNode>, arbor_core::Parse
     parse_file(path)
 }
 
+/// Returns true if any supported source file under `root` is newer than `cache_mtime`.
+///
+/// Used by read commands to detect a stale `graph.bin` before trusting it.
+/// Walks the same gitignore-respecting tree as [`index_directory`] but only
+/// stats files — no parsing — and early-exits on the first newer file.
+///
+/// `cache_mtime` is the modified time of the cache file, in seconds since the
+/// UNIX epoch. Catches edits and additions; a lone deletion leaves no newer
+/// file, so it is picked up on the next edit instead.
+pub fn sources_newer_than(root: &Path, cache_mtime: u64, follow_symlinks: bool) -> bool {
+    let walker = WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .follow_links(follow_symlinks)
+        .build();
+
+    for entry in walker.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        match path.extension().and_then(|e| e.to_str()) {
+            Some(ext) if arbor_core::languages::is_supported(ext) => {}
+            _ => continue,
+        }
+        let mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
+            Ok(t) => t
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            Err(_) => continue,
+        };
+        if mtime > cache_mtime {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +268,27 @@ mod tests {
         let result = index_directory(dir.path(), IndexOptions::default()).unwrap();
         assert_eq!(result.files_indexed, 0);
         assert_eq!(result.nodes_extracted, 0);
+    }
+
+    #[test]
+    fn test_sources_newer_than_detects_fresh_edit() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "pub fn a() {}").unwrap();
+
+        // Cache mtime far in the past → the source file is newer → stale.
+        assert!(sources_newer_than(dir.path(), 0, false));
+
+        // Cache mtime far in the future → nothing newer → fresh.
+        let far_future = u64::MAX;
+        assert!(!sources_newer_than(dir.path(), far_future, false));
+    }
+
+    #[test]
+    fn test_sources_newer_than_ignores_unsupported_files() {
+        let dir = tempdir().unwrap();
+        // Only an unsupported file exists; it must not mark the cache stale.
+        fs::write(dir.path().join("notes.txt"), "hello").unwrap();
+        assert!(!sources_newer_than(dir.path(), 0, false));
     }
 
     #[test]

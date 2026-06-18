@@ -336,4 +336,35 @@ mod tests {
         assert_eq!(graph.node_count(), 0);
         assert_eq!(graph.edge_count(), 0);
     }
+
+    #[test]
+    fn test_qualified_static_call_resolves_to_correct_class() {
+        // Regression: `MathUtils.add()` in Calc must link to MathUtils.add, NOT to a
+        // same-named `add` on a sibling class. Relies on the parser keeping the class
+        // qualifier so the builder gets an exact FQN match.
+        let mut b = GraphBuilder::new();
+        let caller = CodeNode::new("compute", "Calc.compute", NodeKind::Method, "src/Calc.java")
+            .with_references(vec!["MathUtils.add".to_string()]);
+        // Same-dir sibling with a colliding bare name — the old bug linked here.
+        let sibling = CodeNode::new("add", "Sibling.add", NodeKind::Method, "src/Sibling.java");
+        let target = CodeNode::new(
+            "add",
+            "MathUtils.add",
+            NodeKind::Method,
+            "src/util/MathUtils.java",
+        );
+        b.add_nodes(vec![caller, sibling, target]);
+        let graph = b.build();
+
+        let compute_idx = graph
+            .node_indexes()
+            .find(|&i| graph.get(i).unwrap().name == "compute")
+            .unwrap();
+        let callees = graph.get_callees(compute_idx);
+        assert_eq!(callees.len(), 1, "exactly one resolved callee");
+        assert_eq!(
+            callees[0].qualified_name, "MathUtils.add",
+            "static call must resolve to the qualified class, not a same-named sibling"
+        );
+    }
 }

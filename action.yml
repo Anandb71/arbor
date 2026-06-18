@@ -52,15 +52,35 @@ runs:
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        ARBOR_AUTO_INDEX: "1"
       run: |
         set -euo pipefail
         cd "${{ inputs.working-directory }}"
         
-        # 1. Run the normal user-supplied command
+        # 1. Set environment variables for pull requests to specify diff range
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          export ARBOR_DIFF_BASE="$PR_BASE_SHA"
+          export ARBOR_DIFF_HEAD="$PR_HEAD_SHA"
+          echo "PR environment detected. Range set: $ARBOR_DIFF_BASE ... $ARBOR_DIFF_HEAD"
+          
+          # Ensure base and head SHAs are fetched and accessible locally for git diff
+          if ! git rev-parse --verify "$ARBOR_DIFF_BASE" >/dev/null 2>&1; then
+            echo "Fetching base SHA: $ARBOR_DIFF_BASE"
+            git fetch --depth=100 origin "$ARBOR_DIFF_BASE" || git fetch origin "$ARBOR_DIFF_BASE" || true
+          fi
+          if ! git rev-parse --verify "$ARBOR_DIFF_HEAD" >/dev/null 2>&1; then
+            echo "Fetching head SHA: $ARBOR_DIFF_HEAD"
+            git fetch --depth=100 origin "$ARBOR_DIFF_HEAD" || git fetch origin "$ARBOR_DIFF_HEAD" || true
+          fi
+        fi
+
+        # 2. Run the normal user-supplied command
         echo "Running: arbor ${{ inputs.command }}"
         arbor ${{ inputs.command }}
         
-        # 2. Check if we should post a PR comment
+        # 3. Check if we should post a PR comment
         if [[ "${{ inputs.comment-on-pr }}" == "true" && "${{ github.event_name }}" == "pull_request" ]]; then
           echo "Generating Arbor Impact Report for PR comment..."
           

@@ -83,6 +83,7 @@ v1_release_checklist.md
 HANDOFF_FOR_NEW_LAPTOP.md
 /package-lock.json
 /arbor-logo.png
+.updates/
 
 # MCP Publisher (never commit)
 .mcpregistry_*
