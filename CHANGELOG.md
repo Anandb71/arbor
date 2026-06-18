@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **arbor check --markdown**: Markdown safety check output. Validates change impact against maximum blast radius thresholds and prints color-coded PASS/FAIL status.
 - **arbor summary**: Auto-generates structured markdown Pull Request descriptions based on graph diff analysis, classifying changes, mapping scope areas, analyzing blast radius, and automatically recommending relevant reviewers.
 - **Upgraded GitHub Action composite steps**: Updated `action.yml` with a new `comment-on-pr` parameter. When running in a PR workflow, it automatically executes the impact analysis, posts a markdown comment, and deduplicates comments by editing previous reports.
-- **Payments & Sponsorship configuration**: Added `.github/payments.yml` defining backers, professional sponsors, and enterprise sponsors tiers with corresponding perks, Stripe billing integrations, Ko-fi, and Open Collective paths. Sync'd `.github/FUNDING.yml` to support these funding channels.
+- **GitHub Native Sponsorships**: Configured standard `.github/FUNDING.yml` to support GitHub Sponsors, Ko-fi, and custom Stripe billing channels.
 
 ### Changed
 - Aligned workspace and all package manager manifests to **v2.2.0** (Cargo, npm wrapper, VS Code extension, Scoop, Homebrew).

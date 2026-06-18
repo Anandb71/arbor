@@ -3,6 +3,10 @@ name = "arbor-watcher"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
 description = "File watching and incremental indexing for Arbor"
 
 [dependencies]
@@ -12,8 +16,8 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 
-arbor-core = { path = "../arbor-core", version = "2.0.1" }
-arbor-graph = { path = "../arbor-graph", version = "2.0.1" }
+arbor-core = { path = "../arbor-core", version = "2.2.0" }
+arbor-graph = { path = "../arbor-graph", version = "2.2.0" }
 
 notify = "6.0"
 notify-debouncer-mini = "0.4"
@@ -22,4 +26,3 @@ ignore = "0.4"
 
 [dev-dependencies]
 tempfile = "3.10"
-

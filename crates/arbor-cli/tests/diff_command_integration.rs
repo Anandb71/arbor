@@ -214,3 +214,83 @@ fn diff_uses_env_commit_range_when_provided() {
     assert!(changed_values.iter().any(|f| f == "src/range.rs"));
     assert!(changed_values.iter().any(|f| f == "src/extra.rs"));
 }
+
+#[test]
+fn diff_markdown_and_summary_use_env_commit_range() {
+    let temp = init_repo();
+    let repo = temp.path();
+
+    fs::write(
+        repo.join("src").join("range.rs"),
+        "fn alpha() {}\nfn beta() { alpha(); }\n",
+    )
+    .expect("write file");
+
+    run_git(repo, &["add", "."]);
+    run_git(repo, &["commit", "-m", "base"]);
+
+    let base_sha = run_git_stdout(repo, &["rev-parse", "HEAD"]);
+
+    fs::write(
+        repo.join("src").join("range.rs"),
+        "fn alpha() {}\nfn beta() { alpha(); }\nfn gamma() { beta(); }\n",
+    )
+    .expect("rewrite file");
+
+    run_git(repo, &["add", "."]);
+    run_git(repo, &["commit", "-m", "head"]);
+
+    let head_sha = run_git_stdout(repo, &["rev-parse", "HEAD"]);
+
+    // Test arbor diff --markdown
+    let diff_output = Command::new(env!("CARGO_BIN_EXE_arbor"))
+        .args(["diff", "--markdown", "."])
+        .current_dir(repo)
+        .env("ARBOR_DIFF_BASE", &base_sha)
+        .env("ARBOR_DIFF_HEAD", &head_sha)
+        .output()
+        .expect("failed to run arbor diff --markdown with env range");
+
+    assert!(
+        diff_output.status.success(),
+        "arbor diff --markdown with env range failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&diff_output.stdout),
+        String::from_utf8_lossy(&diff_output.stderr)
+    );
+
+    let diff_stdout = String::from_utf8_lossy(&diff_output.stdout);
+    assert!(
+        diff_stdout.contains("## 🌳 Arbor Impact Report"),
+        "expected markdown report header, got: {diff_stdout}"
+    );
+    assert!(
+        diff_stdout.contains("`src/range.rs`"),
+        "expected file src/range.rs in markdown report, got: {diff_stdout}"
+    );
+
+    // Test arbor summary
+    let summary_output = Command::new(env!("CARGO_BIN_EXE_arbor"))
+        .args(["summary", "."])
+        .current_dir(repo)
+        .env("ARBOR_DIFF_BASE", &base_sha)
+        .env("ARBOR_DIFF_HEAD", &head_sha)
+        .output()
+        .expect("failed to run arbor summary with env range");
+
+    assert!(
+        summary_output.status.success(),
+        "arbor summary with env range failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&summary_output.stdout),
+        String::from_utf8_lossy(&summary_output.stderr)
+    );
+
+    let summary_stdout = String::from_utf8_lossy(&summary_output.stdout);
+    assert!(
+        summary_stdout.contains("## 🌳 Arbor PR Auto-Description"),
+        "expected auto-description header, got: {summary_stdout}"
+    );
+    assert!(
+        summary_stdout.contains("`src/range.rs`"),
+        "expected file src/range.rs in summary, got: {summary_stdout}"
+    );
+}

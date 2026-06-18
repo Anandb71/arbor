@@ -94,11 +94,11 @@ docker run --rm -i ghcr.io/anandb71/arbor:latest
 
 Download prebuilt binaries directly from GitHub Releases:
 
-- `arbor-windows-x64.exe`
-- `arbor-linux-x64`
-- `arbor-linux-arm64`
-- `arbor-macos-x64`
-- `arbor-macos-arm64`
+- `arbor-windows-x86_64.zip`
+- `arbor-linux-x86_64.tar.gz`
+- `arbor-linux-aarch64.tar.gz`
+- `arbor-macos-x86_64.tar.gz`
+- `arbor-macos-aarch64.tar.gz`
 
 Release page:
 

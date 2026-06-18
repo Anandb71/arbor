@@ -208,7 +208,7 @@ Examples:
 
 All tools return a standard envelope:
 ```json
-{ "ok": true, "tool": "...", "arbor_version": "2.1.0", "data": {...}, "meta": { "node_count": N, "suggested_next_tool": "...", "suggested_next_args": {...} } }
+{ "ok": true, "tool": "...", "arbor_version": "2.2.0", "data": {...}, "meta": { "node_count": N, "suggested_next_tool": "...", "suggested_next_args": {...} } }
 ```
 Errors return `{ "ok": false, "error": "..." }`.
 
@@ -249,7 +249,7 @@ Errors return `{ "ok": false, "error": "..." }`.
 {
   "ok": true,
   "tool": "get_callers",
-  "arbor_version": "2.1.0",
+  "arbor_version": "2.2.0",
   "data": {
     "symbol": "parse_file",
     "callers": [

@@ -16,6 +16,9 @@ version = "2.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Anandb71/arbor"
+homepage = "https://github.com/Anandb71/arbor"
+documentation = "https://github.com/Anandb71/arbor"
+readme = "README.md"
 authors = ["Arbor Contributors"]
 
 [workspace.dependencies]
