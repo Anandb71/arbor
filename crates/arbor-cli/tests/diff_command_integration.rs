@@ -252,6 +252,7 @@ fn diff_markdown_and_summary_use_env_commit_range() {
         .current_dir(repo)
         .env("ARBOR_DIFF_BASE", &base_sha)
         .env("ARBOR_DIFF_HEAD", &head_sha)
+        .env("ARBOR_AUTO_INDEX", "1")
         .output()
         .expect("failed to run arbor diff --markdown with env range");
 
@@ -278,6 +279,7 @@ fn diff_markdown_and_summary_use_env_commit_range() {
         .current_dir(repo)
         .env("ARBOR_DIFF_BASE", &base_sha)
         .env("ARBOR_DIFF_HEAD", &head_sha)
+        .env("ARBOR_AUTO_INDEX", "1")
         .output()
         .expect("failed to run arbor summary with env range");
 
