@@ -56,15 +56,15 @@ asset_name=""
 case "$os" in
   Linux)
     case "$arch" in
-      x86_64|amd64) asset_name="arbor-linux-x64" ;;
-      aarch64|arm64) asset_name="arbor-linux-arm64" ;;
+      x86_64|amd64) asset_name="arbor-linux-x86_64.tar.gz" ;;
+      aarch64|arm64) asset_name="arbor-linux-aarch64.tar.gz" ;;
       *) echo "Unsupported Linux architecture: $arch" >&2; exit 1 ;;
     esac
     ;;
   Darwin)
     case "$arch" in
-      x86_64) asset_name="arbor-macos-x64" ;;
-      arm64|aarch64) asset_name="arbor-macos-arm64" ;;
+      x86_64) asset_name="arbor-macos-x86_64.tar.gz" ;;
+      arm64|aarch64) asset_name="arbor-macos-aarch64.tar.gz" ;;
       *) echo "Unsupported macOS architecture: $arch" >&2; exit 1 ;;
     esac
     ;;
@@ -116,7 +116,8 @@ fi
 mkdir -p "$target_dir"
 
 tmp_file="$(mktemp)"
-trap 'rm -f "$tmp_file"' EXIT
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir" "$tmp_file"' EXIT
 
 step "Downloading ${asset_name} ..."
 if command -v curl >/dev/null 2>&1; then
@@ -125,8 +126,11 @@ else
   wget -qO "$tmp_file" "$asset_url"
 fi
 
-chmod +x "$tmp_file"
-mv "$tmp_file" "$target_bin"
+step "Extracting ${asset_name} ..."
+tar -xzf "$tmp_file" -C "$tmp_dir"
+
+chmod +x "${tmp_dir}/arbor"
+mv "${tmp_dir}/arbor" "$target_bin"
 
 step "Installed to ${target_bin}"
 

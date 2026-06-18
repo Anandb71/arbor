@@ -3,16 +3,20 @@ name = "arbor-gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
 description = "Arbor GUI - Impact-first code analysis interface"
 
 [dependencies]
-arbor-core = { path = "../arbor-core", version = "2.0.1" }
-arbor-graph = { path = "../arbor-graph", version = "2.0.1" }
-arbor-watcher = { path = "../arbor-watcher", version = "2.0.1" }
+arbor-core = { path = "../arbor-core", version = "2.2.0" }
+arbor-graph = { path = "../arbor-graph", version = "2.2.0" }
+arbor-watcher = { path = "../arbor-watcher", version = "2.2.0" }
 eframe = "0.31"
 egui = "0.31"
 egui_extras = { version = "0.31", features = ["all_loaders"] }
-image = { version = "0.25", features = ["jpeg", "png"] } # Required for image loading
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] } # Required for image loading, disabled default-features to avoid yanked core2 dependency chain
 arboard = "3.4"  # Clipboard support
 resvg = "0.44"
 

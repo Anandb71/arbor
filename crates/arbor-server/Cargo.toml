@@ -3,6 +3,10 @@ name = "arbor-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
 description = "WebSocket server implementing the Arbor Protocol"
 
 [dependencies]
@@ -12,9 +16,9 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 
-arbor-core = { path = "../arbor-core", version = "2.0.1" }
-arbor-graph = { path = "../arbor-graph", version = "2.0.1" }
-arbor-watcher = { path = "../arbor-watcher", version = "2.0.1" }
+arbor-core = { path = "../arbor-core", version = "2.2.0" }
+arbor-graph = { path = "../arbor-graph", version = "2.2.0" }
+arbor-watcher = { path = "../arbor-watcher", version = "2.2.0" }
 
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
@@ -22,4 +26,3 @@ uuid = { version = "1.0", features = ["v4"] }
 chrono = "0.4"
 notify = "6.1"
 bincode = "1.3"
-

@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import WebSocket from 'ws';
-import { execSync, spawn } from 'child_process';
+import { execFileSync, execSync, spawn } from 'child_process';
 
 let ws: WebSocket | null = null;
 let statusBarItem: vscode.StatusBarItem;
@@ -66,11 +66,36 @@ function runArborCommand(args: string[], cwd?: string): string | null {
     }
 
     try {
-        const result = execSync(`arbor ${args.join(' ')}`, {
-            cwd: workDir,
-            encoding: 'utf-8',
-            timeout: 60000,
-        });
+        let result: string;
+        try {
+            result = execFileSync('arbor', args, {
+                cwd: workDir,
+                encoding: 'utf-8',
+                timeout: 60000,
+            });
+        } catch (err: any) {
+            if (err.code === 'ENOENT' && process.platform === 'win32') {
+                try {
+                    result = execFileSync('arbor.cmd', args, {
+                        cwd: workDir,
+                        encoding: 'utf-8',
+                        timeout: 60000,
+                    });
+                } catch (err2: any) {
+                    if (err2.code === 'ENOENT') {
+                        result = execFileSync('arbor.exe', args, {
+                            cwd: workDir,
+                            encoding: 'utf-8',
+                            timeout: 60000,
+                        });
+                    } else {
+                        throw err2;
+                    }
+                }
+            } else {
+                throw err;
+            }
+        }
         return result;
     } catch (err: any) {
         const stderr = err.stderr?.toString() || err.message;

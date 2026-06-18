@@ -17,7 +17,7 @@ function Resolve-AssetName {
     $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
 
     switch ($arch) {
-        "X64" { return "arbor-windows-x64.exe" }
+        "X64" { return "arbor-windows-x86_64.zip" }
         default {
             throw "Unsupported Windows architecture '$arch'. Expected X64."
         }
@@ -81,12 +81,29 @@ try {
         exit 0
     }
 
-    $tmpFile = Join-Path ([System.IO.Path]::GetTempPath()) "arbor-installer-$([Guid]::NewGuid()).exe"
-    Write-Step "Downloading $assetName ..."
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tmpFile -UseBasicParsing
+    $tmpFile = Join-Path ([System.IO.Path]::GetTempPath()) "arbor-installer-$([Guid]::NewGuid()).zip"
+    $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "arbor-extraction-$([Guid]::NewGuid())"
+    New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 
-    Write-Step "Installing to $targetExe"
-    Move-Item -Path $tmpFile -Destination $targetExe -Force
+    try {
+        Write-Step "Downloading $assetName ..."
+        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tmpFile -UseBasicParsing
+
+        Write-Step "Extracting $assetName ..."
+        Expand-Archive -Path $tmpFile -DestinationPath $tmpDir -Force
+
+        $extractedExe = Join-Path $tmpDir "arbor.exe"
+        if (-not (Test-Path $extractedExe)) {
+            throw "Could not find 'arbor.exe' in the extracted archive."
+        }
+
+        Write-Step "Installing to $targetExe"
+        Move-Item -Path $extractedExe -Destination $targetExe -Force
+    }
+    finally {
+        if (Test-Path $tmpFile) { Remove-Item -Path $tmpFile -Force }
+        if (Test-Path $tmpDir) { Remove-Item -Path $tmpDir -Recurse -Force }
+    }
 
     Add-ToPathIfMissing -Dir $targetDir
 
