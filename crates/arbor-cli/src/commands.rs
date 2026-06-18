@@ -1125,7 +1125,7 @@ fn export_graph(graph: &arbor_graph::ArborGraph, path: &Path) -> Result<()> {
 }
 
 fn is_test_file(file_path: &str) -> bool {
-    let lower = file_path.to_lowercase();
+    let lower = file_path.to_lowercase().replace('\\', "/");
     let segments: Vec<&str> = lower.split('/').collect();
     let filename = segments.last().copied().unwrap_or("");
 

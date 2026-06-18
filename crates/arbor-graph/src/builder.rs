@@ -347,8 +347,12 @@ mod tests {
             .with_references(vec!["MathUtils.add".to_string()]);
         // Same-dir sibling with a colliding bare name — the old bug linked here.
         let sibling = CodeNode::new("add", "Sibling.add", NodeKind::Method, "src/Sibling.java");
-        let target =
-            CodeNode::new("add", "MathUtils.add", NodeKind::Method, "src/util/MathUtils.java");
+        let target = CodeNode::new(
+            "add",
+            "MathUtils.add",
+            NodeKind::Method,
+            "src/util/MathUtils.java",
+        );
         b.add_nodes(vec![caller, sibling, target]);
         let graph = b.build();
 

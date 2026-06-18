@@ -1033,7 +1033,7 @@ impl McpServer {
     }
 
     fn is_test_file(&self, file_path: &str) -> bool {
-        let lower = file_path.to_lowercase();
+        let lower = file_path.to_lowercase().replace('\\', "/");
         lower.contains("/test")
             || lower.contains("/spec")
             || lower.contains("/fixture")
@@ -1045,7 +1045,7 @@ impl McpServer {
     }
 
     fn is_minified_or_generated(file_path: &str) -> bool {
-        let lower = file_path.to_lowercase();
+        let lower = file_path.to_lowercase().replace('\\', "/");
         lower.ends_with(".min.js")
             || lower.ends_with(".min.css")
             || lower.contains(".chunk.")
@@ -1241,7 +1241,12 @@ mod tool_tests {
     fn empty_server() -> McpServer {
         let mut graph = ArborGraph::new();
         // Add a dummy node so the "still indexing" guard passes
-        let node = arbor_core::CodeNode::new("_dummy", "_dummy", arbor_core::NodeKind::Function, "_dummy.rs");
+        let node = arbor_core::CodeNode::new(
+            "_dummy",
+            "_dummy",
+            arbor_core::NodeKind::Function,
+            "_dummy.rs",
+        );
         graph.add_node(node);
         let shared: SharedGraph = Arc::new(RwLock::new(graph));
         McpServer::new(shared)
