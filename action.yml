@@ -36,16 +36,82 @@ runs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
+    - name: Cache Cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-registry-
+
     - name: Install Arbor CLI
       shell: bash
       run: |
         set -euo pipefail
         if [[ "${{ inputs.install-from-source }}" == "true" ]]; then
           cargo install --path crates/arbor-cli --force
-        elif [[ "${{ inputs.arbor-version }}" == "latest" ]]; then
-          cargo install arbor-graph-cli --force
         else
-          cargo install arbor-graph-cli --version "${{ inputs.arbor-version }}" --force
+          VERSION="${{ inputs.arbor-version }}"
+          if [[ "$VERSION" == "latest" ]]; then
+            VERSION=$(curl -s https://api.github.com/repos/Anandb71/arbor/releases/latest | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/' || echo "")
+          fi
+          VERSION="${VERSION#v}"
+          
+          DOWNLOADED=false
+          if [[ -n "$VERSION" ]]; then
+            ARCH=$(uname -m || echo "x86_64")
+            OS="unknown-linux-gnu"
+            if [[ "$OSTYPE" == "darwin"* ]]; then
+              OS="apple-darwin"
+            elif [[ "$OSTYPE" == "msys"* || "$OSTYPE" == "win32"* ]]; then
+              OS="pc-windows-msvc"
+            fi
+            
+            TARBALL="arbor-${ARCH}-${OS}.tar.gz"
+            if [[ "$OS" == "pc-windows-msvc" ]]; then
+              TARBALL="arbor-${ARCH}-${OS}.zip"
+            fi
+            
+            DOWNLOAD_URL="https://github.com/Anandb71/arbor/releases/download/v${VERSION}/${TARBALL}"
+            echo "Attempting to download pre-built binary: $DOWNLOAD_URL"
+            
+            if curl -fsSL -o "$TARBALL" "$DOWNLOAD_URL"; then
+              echo "Extracting..."
+              if [[ "$TARBALL" == *.zip ]]; then
+                unzip -q "$TARBALL" || true
+              else
+                tar -xzf "$TARBALL" || true
+              fi
+              
+              BINARY="arbor"
+              if [[ "$OS" == "pc-windows-msvc" ]]; then
+                BINARY="arbor.exe"
+              fi
+              
+              if [[ -f "$BINARY" ]]; then
+                mkdir -p "$HOME/.arbor-bin"
+                mv "$BINARY" "$HOME/.arbor-bin/"
+                echo "Adding $HOME/.arbor-bin to GITHUB_PATH"
+                echo "$HOME/.arbor-bin" >> $GITHUB_PATH
+                export PATH="$HOME/.arbor-bin:$PATH"
+                rm -f "$TARBALL"
+                DOWNLOADED=true
+                echo "Pre-built binary installed successfully!"
+              fi
+            fi
+          fi
+          
+          if [[ "$DOWNLOADED" == "false" ]]; then
+            echo "Could not download pre-built binary. Installing via cargo instead (this might take a few minutes)..."
+            if [[ "${{ inputs.arbor-version }}" == "latest" ]]; then
+              cargo install arbor-graph-cli --force
+            else
+              cargo install arbor-graph-cli --version "${{ inputs.arbor-version }}" --force
+            fi
+          fi
         fi
 
     - name: Run Arbor and Comment on PR
