@@ -1,6 +1,6 @@
-# Arbor v2.2.3 "Agent Brain" Launch Plan
+# Arbor v2.3.0 "Agent Brain" Launch Plan
 
-This document outlines the strategy for launching Arbor v2.2.3 and growing our GitHub presence from ~120 to 1000+ stars by targeting AI agent developers and open-source contributors.
+This document outlines the strategy for launching Arbor v2.3.0 and growing our GitHub presence from ~120 to 1000+ stars by targeting AI agent developers and open-source contributors.
 
 ## Strategic Focus: "The Agent's Second Brain"
 
@@ -17,7 +17,7 @@ We position Arbor not just as an AST visualizer or impact checker, but as **the 
 
 ```mermaid
 gantt
-    title v2.2.3 Launch Calendar
+    title v2.3.0 Launch Calendar
     dateFormat  YYYY-MM-DD
     section Pre-Launch
     Record Demo Video & GIFs   :a1, 2026-06-29, 3d
@@ -56,7 +56,7 @@ gantt
 > 
 > Arbor runs locally, indexes 10,000 lines of code in ~140ms using Tree-sitter, and builds a dependency graph (via petgraph). It exposes a Model Context Protocol (MCP) server so tools like Claude Code or Cursor can query exact execution paths, direct/indirect callers, and centrality ranks.
 >
-> In v2.2.3, we added:
+> In v2.3.0, we added:
 > 1. **Explain Symbol**: Agent-optimized context slices that describe a function's role, callers, and callees.
 > 2. **Blast Radius Analysis**: Lets agents predict what will break before they modify a function.
 > 3. **HTTP Transport**: Allows remote MCP client connections.

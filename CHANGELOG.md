@@ -5,7 +5,7 @@ All notable changes to Arbor will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.2.3] - 2026-06-28 "Agent Brain"
+## [2.3.0] - 2026-06-28 "Agent Brain"
 
 ### Added
 - **5 New MCP Tools (10 → 15 total):**
@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **MCP Protocol Version:** Bumped from `2024-11-05` → `2025-03-26`
-- Workspace version bumped to **2.2.3** across all manifests
+- Workspace version bumped to **2.3.0** across all manifests
 
 ## [2.2.0] - 2026-05-30 "PR Intelligence & Sponsorships"
 

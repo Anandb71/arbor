@@ -69,7 +69,7 @@ You get deterministic, explainable impact analysis instead of approximate keywor
 
 - **Blast radius analysis**: See exactly which files and modules will be affected by a change (complete with depth confidence levels) before you ever press save.
 - **Graph-backed symbol resolution**: Accurately tracks dependencies across files and entire language boundaries automatically.
-- **Agent-native MCP (v2.2.3)**: 15 MCP tools — surgical traversal, security auditing, and architectural explanation tools. Exposes graph resources (`arbor://graph/stats`, `arbor://graph/entry-points`, `arbor://graph/hotspots`) and standard spec compliance annotations for zero-reprompt agent chaining.
+- **Agent-native MCP (v2.3.0)**: 15 MCP tools — surgical traversal, security auditing, and architectural explanation tools. Exposes graph resources (`arbor://graph/stats`, `arbor://graph/entry-points`, `arbor://graph/hotspots`) and standard spec compliance annotations for zero-reprompt agent chaining.
 - **Built-in Agent Workflows (`arbor agent`)**: Local autonomous agents for PR reviews, codebase onboarding guides, and architectural guardrail checks.
 - **Unified Tooling (CLI + GUI + MCP)**: Native desktop GUI, a blazing fast CLI, and Claude/AI Model Context Protocol integration all utilizing the exact same core analytical reasoning engine.
 - **Git-aware risk gating**: Block pull-requests automatically in your CI/CD if a PR introduces a dangerously high architectural blast radius.
@@ -249,7 +249,7 @@ jobs:
         with:
           fetch-depth: 0 # needed for full diff comparison
       
-      - uses: Anandb71/arbor@v2.2.3
+      - uses: Anandb71/arbor@v2.3.0
         with:
           command: check . --max-blast-radius 30 --markdown
           comment-on-pr: true # posts/updates report directly on the PR
