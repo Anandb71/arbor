@@ -981,7 +981,7 @@ impl McpServer {
                     for ep in entry_points.iter().take(10) {
                         markdown.push_str(&format!(
                             "| `{}` | {} | `{}` |\n",
-                            ep.name, ep.kind.to_string(), ep.file
+                            ep.name, ep.kind, ep.file
                         ));
                     }
                     markdown.push_str("\n> [!NOTE]\n> To run a full git-diff-aware impact analysis, use the `arbor diff` command in your terminal.");
@@ -1032,7 +1032,7 @@ impl McpServer {
                         let callers = graph.get_callers(idx);
                         let callees = graph.get_callees(idx);
                         let is_entry = arbor_graph::HeuristicsMatcher::is_likely_entry_point(node);
-                        
+
                         let role = if is_entry {
                             "entry_point"
                         } else if callers.is_empty() {
@@ -1054,16 +1054,26 @@ impl McpServer {
                             #### Callees (Direct Dependencies Downstream): {}\n\
                             {}",
                             node.name,
-                            node.kind.to_string(),
+                            node.kind,
                             node.file,
                             node.line_start,
                             node.line_end,
                             centrality,
                             role,
                             callers.len(),
-                            callers.iter().take(5).map(|n| format!("- `{}` (`{}`)", n.name, n.file)).collect::<Vec<_>>().join("\n"),
+                            callers
+                                .iter()
+                                .take(5)
+                                .map(|n| format!("- `{}` (`{}`)", n.name, n.file))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
                             callees.len(),
-                            callees.iter().take(5).map(|n| format!("- `{}` (`{}`)", n.name, n.file)).collect::<Vec<_>>().join("\n")
+                            callees
+                                .iter()
+                                .take(5)
+                                .map(|n| format!("- `{}` (`{}`)", n.name, n.file))
+                                .collect::<Vec<_>>()
+                                .join("\n")
                         );
 
                         Ok(json!({
@@ -1106,18 +1116,36 @@ impl McpServer {
                     )),
                     Some(idx) => {
                         let dependents = graph.get_dependents(idx, max_depth);
-                        
+
                         let sensitive_patterns = [
-                            "query", "exec", "eval", "write", "delete", "connect", 
-                            "send", "request", "fetch", "open", "read_file", "spawn", 
-                            "database", "sql", "db", "auth", "login", "password"
+                            "query",
+                            "exec",
+                            "eval",
+                            "write",
+                            "delete",
+                            "connect",
+                            "send",
+                            "request",
+                            "fetch",
+                            "open",
+                            "read_file",
+                            "spawn",
+                            "database",
+                            "sql",
+                            "db",
+                            "auth",
+                            "login",
+                            "password",
                         ];
 
                         let mut flagged_paths = Vec::new();
                         for (dep_idx, hop_distance) in dependents {
                             let dep_node = graph.get(dep_idx).unwrap();
                             let name_lower = dep_node.name.to_lowercase();
-                            if sensitive_patterns.iter().any(|pat| name_lower.contains(pat)) {
+                            if sensitive_patterns
+                                .iter()
+                                .any(|pat| name_lower.contains(pat))
+                            {
                                 flagged_paths.push(json!({
                                     "symbol": dep_node.name,
                                     "kind": dep_node.kind.to_string(),
@@ -1141,7 +1169,7 @@ impl McpServer {
                                 json!({ "symbol": flagged_paths[0]["symbol"].as_str().unwrap() })
                             } else {
                                 json!({ "symbol": source })
-                            }
+                            },
                         ))
                     }
                 }
@@ -1164,7 +1192,8 @@ impl McpServer {
                     }
                 }
 
-                nodes_with_centrality.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                nodes_with_centrality
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
                 let hotspots: Vec<Value> = nodes_with_centrality
                     .iter()
@@ -1302,7 +1331,7 @@ impl McpServer {
                         json!({ "node_id": results[0]["id"].as_str().unwrap() })
                     } else {
                         json!({})
-                    }
+                    },
                 ))
             }
             _ => Err(JsonRpcError {
@@ -1739,7 +1768,8 @@ impl McpServer {
                         nodes_with_centrality.push((node, centrality));
                     }
                 }
-                nodes_with_centrality.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                nodes_with_centrality
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let hotspots: Vec<Value> = nodes_with_centrality
                     .iter()
                     .take(20)

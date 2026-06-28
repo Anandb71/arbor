@@ -3881,7 +3881,13 @@ pub fn agent_review(path: &Path, json: bool) -> Result<()> {
 
     let graph = load_or_index_graph(&resolved_path)?;
     let changed_nodes = changed_node_ids(&graph, &changed_files, &resolved_path);
-    let summary = compute_diff_summary(&graph, changed_files.clone(), changed_nodes.clone(), 5, &resolved_path);
+    let summary = compute_diff_summary(
+        &graph,
+        changed_files.clone(),
+        changed_nodes.clone(),
+        5,
+        &resolved_path,
+    );
 
     let mut high_risk_changes = Vec::new();
     let mut recommendations = Vec::new();
@@ -3914,7 +3920,12 @@ pub fn agent_review(path: &Path, json: bool) -> Result<()> {
                 } else if centrality > 0.3 {
                     recommendations.push(format!("⚠️ `{}` in `{}` is a highly connected hotspot (centrality {:.2}). Run all integration tests.", node.name, node.file, centrality));
                 } else {
-                    recommendations.push(format!("ℹ️ `{}` in `{}` has {} callers. Check for call-site breakages.", node.name, node.file, callers.len()));
+                    recommendations.push(format!(
+                        "ℹ️ `{}` in `{}` has {} callers. Check for call-site breakages.",
+                        node.name,
+                        node.file,
+                        callers.len()
+                    ));
                 }
             }
         }
@@ -3942,7 +3953,10 @@ pub fn agent_review(path: &Path, json: bool) -> Result<()> {
         println!("## Risk Summary");
         println!("- **Risk Level**: {}", risk_level);
         println!("- **Changed Symbols**: {}", summary.changed_symbols);
-        println!("- **Blast Radius**: {} nodes affected\n", summary.blast_radius_nodes);
+        println!(
+            "- **Blast Radius**: {} nodes affected\n",
+            summary.blast_radius_nodes
+        );
 
         if !high_risk_changes.is_empty() {
             println!("## High-Risk Changes");
@@ -4135,7 +4149,8 @@ pub fn agent_onboard(path: &Path, json: bool) -> Result<()> {
             nodes_with_centrality.push((node, centrality));
         }
     }
-    nodes_with_centrality.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    nodes_with_centrality
+        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     if json {
         let hotspots_json: Vec<serde_json::Value> = nodes_with_centrality
@@ -4182,7 +4197,7 @@ pub fn agent_onboard(path: &Path, json: bool) -> Result<()> {
         println!("| Name | Type | File |");
         println!("|------|------|------|");
         for ep in entry_points.iter().take(10) {
-            println!("| `{}` | {} | `{}` |", ep.name, ep.kind.to_string(), ep.file);
+            println!("| `{}` | {} | `{}` |", ep.name, ep.kind, ep.file);
         }
         println!();
 
@@ -4190,7 +4205,13 @@ pub fn agent_onboard(path: &Path, json: bool) -> Result<()> {
         println!("| Rank | Symbol | Centrality | File |");
         println!("|------|--------|------------|------|");
         for (i, (node, centrality)) in nodes_with_centrality.iter().take(15).enumerate() {
-            println!("| {} | `{}` | {:.4} | `{}` |", i + 1, node.name, centrality, node.file);
+            println!(
+                "| {} | `{}` | {:.4} | `{}` |",
+                i + 1,
+                node.name,
+                centrality,
+                node.file
+            );
         }
         println!();
 
@@ -4213,22 +4234,37 @@ pub fn agent_guard(path: &Path, max_blast_radius: usize) -> Result<()> {
 
     let changed_files = git_changed_files(&resolved_path)?;
     if changed_files.is_empty() {
-        println!("{} No changes detected. Architecture guard PASS.", "✓".green());
+        println!(
+            "{} No changes detected. Architecture guard PASS.",
+            "✓".green()
+        );
         return Ok(());
     }
 
     let graph = load_or_index_graph(&resolved_path)?;
     let changed_nodes = changed_node_ids(&graph, &changed_files, &resolved_path);
-    let summary = compute_diff_summary(&graph, changed_files.clone(), changed_nodes.clone(), 5, &resolved_path);
+    let summary = compute_diff_summary(
+        &graph,
+        changed_files.clone(),
+        changed_nodes.clone(),
+        5,
+        &resolved_path,
+    );
 
     let mut failed = false;
     let mut checks = Vec::new();
 
     if summary.blast_radius_nodes > max_blast_radius {
-        checks.push(format!("❌ Blast radius of {} nodes exceeds limit of {}", summary.blast_radius_nodes, max_blast_radius));
+        checks.push(format!(
+            "❌ Blast radius of {} nodes exceeds limit of {}",
+            summary.blast_radius_nodes, max_blast_radius
+        ));
         failed = true;
     } else {
-        checks.push(format!("✅ Blast radius within limit ({} / {})", summary.blast_radius_nodes, max_blast_radius));
+        checks.push(format!(
+            "✅ Blast radius within limit ({} / {})",
+            summary.blast_radius_nodes, max_blast_radius
+        ));
     }
 
     let mut changed_entries = Vec::new();
@@ -4241,7 +4277,10 @@ pub fn agent_guard(path: &Path, max_blast_radius: usize) -> Result<()> {
     }
 
     if !changed_entries.is_empty() {
-        checks.push(format!("❌ Modified public entry point(s): {}", changed_entries.join(", ")));
+        checks.push(format!(
+            "❌ Modified public entry point(s): {}",
+            changed_entries.join(", ")
+        ));
         failed = true;
     } else {
         checks.push("✅ No public entry points modified".to_string());
@@ -4257,7 +4296,10 @@ pub fn agent_guard(path: &Path, max_blast_radius: usize) -> Result<()> {
     }
 
     if !changed_hubs.is_empty() {
-        checks.push(format!("❌ Modified high-centrality hub(s): {}", changed_hubs.join(", ")));
+        checks.push(format!(
+            "❌ Modified high-centrality hub(s): {}",
+            changed_hubs.join(", ")
+        ));
         failed = true;
     } else {
         checks.push("✅ No high-centrality hubs modified".to_string());

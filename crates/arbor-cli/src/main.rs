@@ -624,7 +624,10 @@ async fn main() {
         Commands::Agent { action } => match action {
             AgentAction::Review { path, json } => commands::agent_review(&path, json),
             AgentAction::Onboard { path, json } => commands::agent_onboard(&path, json),
-            AgentAction::Guard { path, max_blast_radius } => commands::agent_guard(&path, max_blast_radius),
+            AgentAction::Guard {
+                path,
+                max_blast_radius,
+            } => commands::agent_guard(&path, max_blast_radius),
         },
     };
 
