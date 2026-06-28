@@ -69,7 +69,8 @@ You get deterministic, explainable impact analysis instead of approximate keywor
 
 - **Blast radius analysis**: See exactly which files and modules will be affected by a change (complete with depth confidence levels) before you ever press save.
 - **Graph-backed symbol resolution**: Accurately tracks dependencies across files and entire language boundaries automatically.
-- **Agent-native MCP (v2.1.0)**: 10 MCP tools — surgical traversal (`get_callers`, `get_callees`, `list_entry_points`, `search_symbols`, `get_file_graph`, `get_node_detail`) plus broad analysis tools, all returning a `suggested_next_tool` hint for zero-reprompt agent chaining.
+- **Agent-native MCP (v2.3.0)**: 15 MCP tools — surgical traversal, security auditing, and architectural explanation tools. Exposes graph resources (`arbor://graph/stats`, `arbor://graph/entry-points`, `arbor://graph/hotspots`) and standard spec compliance annotations for zero-reprompt agent chaining.
+- **Built-in Agent Workflows (`arbor agent`)**: Local autonomous agents for PR reviews, codebase onboarding guides, and architectural guardrail checks.
 - **Unified Tooling (CLI + GUI + MCP)**: Native desktop GUI, a blazing fast CLI, and Claude/AI Model Context Protocol integration all utilizing the exact same core analytical reasoning engine.
 - **Git-aware risk gating**: Block pull-requests automatically in your CI/CD if a PR introduces a dangerously high architectural blast radius.
 - **Lightning fast incremental indexing**: Sub-second background cache updates instantly tracking your code edits in real-time.
@@ -107,7 +108,12 @@ arbor refactor <symbol-name>
 arbor diff  # See what your uncommitted git changes impact
 arbor check --max-blast-radius 30  # Fail the checks if your changes break more than 30 nodes
 
-# 5) Launch the visual interface to intuitively explore your code's architecture
+# 5) Run autonomous agent workflows
+arbor agent review   # Analyze git changes for architecture and risk violations
+arbor agent onboard  # Generate a codebase onboarding guide for new developers
+arbor agent guard    # Real-time architectural safety gate
+
+# 6) Launch the visual interface to intuitively explore your code's architecture
 arbor gui
 ```
 
@@ -243,7 +249,7 @@ jobs:
         with:
           fetch-depth: 0 # needed for full diff comparison
       
-      - uses: Anandb71/arbor@v2.2.0
+      - uses: Anandb71/arbor@v2.3.0
         with:
           command: check . --max-blast-radius 30 --markdown
           comment-on-pr: true # posts/updates report directly on the PR
