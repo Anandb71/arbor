@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "arbor-core"
-version = "2.2.0"
+version = "2.2.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "arbor-graph"
-version = "2.2.0"
+version = "2.2.3"
 dependencies = [
  "arbor-core",
  "bincode",
@@ -298,7 +298,7 @@ dependencies = [
 
 [[package]]
 name = "arbor-graph-cli"
-version = "2.2.0"
+version = "2.2.3"
 dependencies = [
  "anyhow",
  "arbor-core",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "arbor-gui"
-version = "2.2.0"
+version = "2.2.3"
 dependencies = [
  "arboard",
  "arbor-core",
@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "arbor-mcp"
-version = "2.2.0"
+version = "2.2.3"
 dependencies = [
  "anyhow",
  "arbor-core",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "arbor-server"
-version = "2.2.0"
+version = "2.2.3"
 dependencies = [
  "arbor-core",
  "arbor-graph",
@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "arbor-watcher"
-version = "2.2.0"
+version = "2.2.3"
 dependencies = [
  "arbor-core",
  "arbor-graph",
