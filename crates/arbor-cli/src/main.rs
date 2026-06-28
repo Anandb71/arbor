@@ -445,6 +445,48 @@ enum Commands {
         #[arg(long)]
         focus: Option<String>,
     },
+
+    /// Built-in agent workflows for autonomous code analysis
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentAction {
+    /// Autonomous PR review — analyzes git changes for risks, untested paths, and architecture violations
+    Review {
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Codebase onboarding — generates an architectural guide for new contributors
+    Onboard {
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Architecture guard — checks for violations in current changes
+    Guard {
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Maximum blast radius threshold (default: 25)
+        #[arg(long, default_value = "25")]
+        max_blast_radius: usize,
+    },
 }
 
 #[tokio::main]
@@ -579,6 +621,11 @@ async fn main() {
             focus_changed,
             focus.as_deref(),
         ),
+        Commands::Agent { action } => match action {
+            AgentAction::Review { path, json } => commands::agent_review(&path, json),
+            AgentAction::Onboard { path, json } => commands::agent_onboard(&path, json),
+            AgentAction::Guard { path, max_blast_radius } => commands::agent_guard(&path, max_blast_radius),
+        },
     };
 
     if let Err(e) = result {
