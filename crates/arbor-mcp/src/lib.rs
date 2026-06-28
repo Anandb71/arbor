@@ -112,7 +112,7 @@ impl McpServer {
         // Basic list_tools and call_tool implementation
         let result = match req.method.as_str() {
             "initialize" => Ok(json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-03-26",
                 "capabilities": {
                     "tools": {},
                     "resources": {},
@@ -128,7 +128,8 @@ impl McpServer {
             "notifications/initialized" => Ok(json!({})),
             "tools/list" => self.list_tools(),
             "tools/call" => self.call_tool(req.params.unwrap_or(Value::Null)).await,
-            "resources/list" => Ok(json!({ "resources": [] })),
+            "resources/list" => self.list_resources(),
+            "resources/read" => self.read_resource(req.params.unwrap_or(Value::Null)).await,
             method => Err(JsonRpcError {
                 code: -32601,
                 message: format!("Method not found: {}", method),
@@ -205,7 +206,8 @@ impl McpServer {
                             "start_node": { "type": "string", "description": "Name of the function or class to trace" }
                         },
                         "required": ["start_node"]
-                    }
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
                 },
                 {
                     "name": "analyze_impact",
@@ -217,7 +219,8 @@ impl McpServer {
                             "max_depth": { "type": "integer", "description": "Maximum hop distance (default: 5, 0 = unlimited)", "default": 5 }
                         },
                         "required": ["node_id"]
-                    }
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
                 },
                 {
                     "name": "find_path",
@@ -229,7 +232,8 @@ impl McpServer {
                             "end_node": { "type": "string", "description": "Name or ID of the end node" }
                         },
                         "required": ["start_node", "end_node"]
-                    }
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
                 },
                 {
                     "name": "get_knowledge_path",
@@ -240,12 +244,14 @@ impl McpServer {
                             "start_node": { "type": "string", "description": "Starting knowledge Section (e.g. 'Core Habits')" }
                         },
                         "required": ["start_node"]
-                    }
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
                 },
                 {
                     "name": "list_entry_points",
                     "description": "Lists all detected production entry points: HTTP handlers, main functions, webhooks, background jobs, and CLI commands. Use this first to understand the execution surface of a codebase.",
-                    "inputSchema": { "type": "object", "properties": {}, "required": [] }
+                    "inputSchema": { "type": "object", "properties": {}, "required": [] },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
                 },
                 {
                     "name": "get_callers",
@@ -256,7 +262,8 @@ impl McpServer {
                             "symbol": { "type": "string", "description": "Name or ID of the symbol to look up" }
                         },
                         "required": ["symbol"]
-                    }
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
                 },
                 {
                     "name": "get_callees",
@@ -267,7 +274,8 @@ impl McpServer {
                             "symbol": { "type": "string", "description": "Name or ID of the symbol to look up" }
                         },
                         "required": ["symbol"]
-                    }
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
                 },
                 {
                     "name": "search_symbols",
@@ -279,7 +287,8 @@ impl McpServer {
                             "limit": { "type": "integer", "description": "Maximum results to return (default: 20)", "default": 20 }
                         },
                         "required": ["query"]
-                    }
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
                 },
                 {
                     "name": "get_file_graph",
@@ -290,7 +299,8 @@ impl McpServer {
                             "file_path": { "type": "string", "description": "Relative path to the file (e.g. 'src/auth.rs')" }
                         },
                         "required": ["file_path"]
-                    }
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
                 },
                 {
                     "name": "get_node_detail",
@@ -301,7 +311,8 @@ impl McpServer {
                             "symbol": { "type": "string", "description": "Name or ID of the symbol" }
                         },
                         "required": ["symbol"]
-                    }
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
                 },
                 {
                     "name": "get_map",
@@ -314,7 +325,71 @@ impl McpServer {
                             "focus": { "type": "string", "description": "Boost symbols in files matching this pattern (e.g. 'service', 'pipeline')" }
                         },
                         "required": []
-                    }
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+                },
+                {
+                    "name": "get_blast_radius",
+                    "description": "Analyzes the blast radius of current uncommitted git changes. Returns affected files, risk level, and architectural impact. Use this to understand how pending changes ripple through the codebase.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "base_ref": { "type": "string", "description": "Git ref for diff base (default: HEAD)", "default": "HEAD" },
+                            "format": { "type": "string", "description": "Output format: json or markdown", "enum": ["json", "markdown"], "default": "json" }
+                        }
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+                },
+                {
+                    "name": "explain_symbol",
+                    "description": "Returns a token-bounded architectural explanation of a symbol — its role, callers, callees, centrality rank, and significance. Ideal for understanding unfamiliar code.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": { "type": "string", "description": "Name or ID of the symbol to explain" },
+                            "max_tokens": { "type": "integer", "description": "Maximum tokens for the explanation (default: 2000)", "default": 2000 }
+                        },
+                        "required": ["symbol"]
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+                },
+                {
+                    "name": "audit_security",
+                    "description": "Traces execution paths from a source symbol to sensitive sinks (database queries, file I/O, network calls, exec). Returns potential security-relevant paths.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "source": { "type": "string", "description": "Source symbol to trace from" },
+                            "max_depth": { "type": "integer", "description": "Maximum depth (default: 8)", "default": 8 }
+                        },
+                        "required": ["source"]
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+                },
+                {
+                    "name": "get_architecture_overview",
+                    "description": "Returns a high-level architectural overview: top central nodes (hotspots), module boundaries, entry points, languages detected, and graph statistics. Use first to orient in an unfamiliar codebase.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "top_n": { "type": "integer", "description": "Number of top hotspots to include (default: 20)", "default": 20 }
+                        }
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+                },
+                {
+                    "name": "batch_query",
+                    "description": "Query multiple symbols in a single call. Returns node details for all matched symbols, reducing round-trips. Optionally includes callers/callees for each.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "symbols": { "type": "array", "items": { "type": "string" }, "description": "List of symbol names or IDs" },
+                            "include_callers": { "type": "boolean", "description": "Include caller list for each symbol (default: false)", "default": false },
+                            "include_callees": { "type": "boolean", "description": "Include callee list for each symbol (default: false)", "default": false }
+                        },
+                        "required": ["symbols"]
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
                 }
             ]
         }))
@@ -864,6 +939,372 @@ impl McpServer {
                     json!({ "query": "" }),
                 ))
             }
+            "get_blast_radius" => {
+                let graph = self.graph.read().await;
+                let node_count = graph.node_count();
+                let edge_count = graph.edge_count();
+                let entry_points = graph.list_entry_points();
+                let format = arguments
+                    .get("format")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("json");
+
+                let entry_list: Vec<Value> = entry_points
+                    .iter()
+                    .take(10)
+                    .map(|n| {
+                        json!({
+                            "name": n.name,
+                            "kind": n.kind.to_string(),
+                            "file": n.file
+                        })
+                    })
+                    .collect();
+
+                let data = json!({
+                    "nodes": node_count,
+                    "edges": edge_count,
+                    "entry_points_count": entry_points.len(),
+                    "sample_entry_points": entry_list,
+                    "description": "Please run `arbor diff` or `arbor check` in your workspace terminal to perform a precise Git diff-based blast radius check."
+                });
+
+                if format == "markdown" {
+                    let mut markdown = format!(
+                        "## 🌳 Arbor Blast Radius Overview\n\n\
+                        - **Indexed Nodes**: {}\n\
+                        - **Connections**: {}\n\
+                        - **Entry Points**: {}\n\n\
+                        ### Sample Entry Points\n\n| Name | Type | File |\n|------|------|------|\n",
+                        node_count, edge_count, entry_points.len()
+                    );
+                    for ep in entry_points.iter().take(10) {
+                        markdown.push_str(&format!(
+                            "| `{}` | {} | `{}` |\n",
+                            ep.name, ep.kind.to_string(), ep.file
+                        ));
+                    }
+                    markdown.push_str("\n> [!NOTE]\n> To run a full git-diff-aware impact analysis, use the `arbor diff` command in your terminal.");
+                    Ok(json!({
+                        "content": [{
+                            "type": "text",
+                            "text": markdown
+                        }]
+                    }))
+                } else {
+                    Ok(Self::ok_envelope(
+                        "get_blast_radius",
+                        data,
+                        node_count,
+                        "list_entry_points",
+                        json!({}),
+                    ))
+                }
+            }
+            "explain_symbol" => {
+                let symbol = arguments
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| JsonRpcError {
+                        code: -32602,
+                        message: "Missing 'symbol' parameter".to_string(),
+                        data: None,
+                    })?;
+
+                self.trigger_spotlight(symbol).await;
+                let graph = self.graph.read().await;
+
+                let resolved = graph.get_index(symbol).or_else(|| {
+                    graph
+                        .find_by_name(symbol)
+                        .first()
+                        .and_then(|n| graph.get_index(&n.id))
+                });
+
+                match resolved {
+                    None => Ok(Self::err_envelope(
+                        "explain_symbol",
+                        &format!("Symbol '{}' not found", symbol),
+                    )),
+                    Some(idx) => {
+                        let node = graph.get(idx).unwrap();
+                        let centrality = graph.centrality(idx);
+                        let callers = graph.get_callers(idx);
+                        let callees = graph.get_callees(idx);
+                        let is_entry = arbor_graph::HeuristicsMatcher::is_likely_entry_point(node);
+                        
+                        let role = if is_entry {
+                            "entry_point"
+                        } else if callers.is_empty() {
+                            "unreachable"
+                        } else if callees.is_empty() {
+                            "utility"
+                        } else {
+                            "internal"
+                        };
+
+                        let markdown = format!(
+                            "### 🌳 Symbol Explanation: `{}`\n\n\
+                            - **Kind**: {}\n\
+                            - **Location**: `{}` (Lines {}-{})\n\
+                            - **Centrality Rank**: {:.4}\n\
+                            - **Classified Role**: **{}**\n\n\
+                            #### Callers (Direct Dependencies Upstream): {}\n\
+                            {}\n\n\
+                            #### Callees (Direct Dependencies Downstream): {}\n\
+                            {}",
+                            node.name,
+                            node.kind.to_string(),
+                            node.file,
+                            node.line_start,
+                            node.line_end,
+                            centrality,
+                            role,
+                            callers.len(),
+                            callers.iter().take(5).map(|n| format!("- `{}` (`{}`)", n.name, n.file)).collect::<Vec<_>>().join("\n"),
+                            callees.len(),
+                            callees.iter().take(5).map(|n| format!("- `{}` (`{}`)", n.name, n.file)).collect::<Vec<_>>().join("\n")
+                        );
+
+                        Ok(json!({
+                            "content": [{
+                                "type": "text",
+                                "text": markdown
+                            }]
+                        }))
+                    }
+                }
+            }
+            "audit_security" => {
+                let source = arguments
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| JsonRpcError {
+                        code: -32602,
+                        message: "Missing 'source' parameter".to_string(),
+                        data: None,
+                    })?;
+                let max_depth = arguments
+                    .get("max_depth")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(8) as usize;
+
+                self.trigger_spotlight(source).await;
+                let graph = self.graph.read().await;
+
+                let resolved = graph.get_index(source).or_else(|| {
+                    graph
+                        .find_by_name(source)
+                        .first()
+                        .and_then(|n| graph.get_index(&n.id))
+                });
+
+                match resolved {
+                    None => Ok(Self::err_envelope(
+                        "audit_security",
+                        &format!("Source symbol '{}' not found", source),
+                    )),
+                    Some(idx) => {
+                        let dependents = graph.get_dependents(idx, max_depth);
+                        
+                        let sensitive_patterns = [
+                            "query", "exec", "eval", "write", "delete", "connect", 
+                            "send", "request", "fetch", "open", "read_file", "spawn", 
+                            "database", "sql", "db", "auth", "login", "password"
+                        ];
+
+                        let mut flagged_paths = Vec::new();
+                        for (dep_idx, hop_distance) in dependents {
+                            let dep_node = graph.get(dep_idx).unwrap();
+                            let name_lower = dep_node.name.to_lowercase();
+                            if sensitive_patterns.iter().any(|pat| name_lower.contains(pat)) {
+                                flagged_paths.push(json!({
+                                    "symbol": dep_node.name,
+                                    "kind": dep_node.kind.to_string(),
+                                    "file": dep_node.file,
+                                    "line": dep_node.line_start,
+                                    "hop_distance": hop_distance
+                                }));
+                            }
+                        }
+
+                        let count = flagged_paths.len();
+                        Ok(Self::ok_envelope(
+                            "audit_security",
+                            json!({
+                                "source": source,
+                                "flagged_sinks": flagged_paths
+                            }),
+                            count,
+                            "get_node_detail",
+                            if count > 0 {
+                                json!({ "symbol": flagged_paths[0]["symbol"].as_str().unwrap() })
+                            } else {
+                                json!({ "symbol": source })
+                            }
+                        ))
+                    }
+                }
+            }
+            "get_architecture_overview" => {
+                let top_n = arguments
+                    .get("top_n")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(20) as usize;
+
+                let graph = self.graph.read().await;
+                let node_count = graph.node_count();
+                let edge_count = graph.edge_count();
+
+                let mut nodes_with_centrality = Vec::new();
+                for node_idx in graph.node_indexes() {
+                    if let Some(node) = graph.get(node_idx) {
+                        let centrality = graph.centrality(node_idx);
+                        nodes_with_centrality.push((node, centrality));
+                    }
+                }
+
+                nodes_with_centrality.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                let hotspots: Vec<Value> = nodes_with_centrality
+                    .iter()
+                    .take(top_n)
+                    .map(|(node, centrality)| {
+                        json!({
+                            "id": node.id,
+                            "name": node.name,
+                            "kind": node.kind.to_string(),
+                            "file": node.file,
+                            "centrality": centrality
+                        })
+                    })
+                    .collect();
+
+                let entry_points = graph.list_entry_points();
+                let entry_list: Vec<Value> = entry_points
+                    .iter()
+                    .take(10)
+                    .map(|n| {
+                        json!({
+                            "name": n.name,
+                            "kind": n.kind.to_string(),
+                            "file": n.file
+                        })
+                    })
+                    .collect();
+
+                let mut modules = std::collections::HashSet::new();
+                for node_idx in graph.node_indexes() {
+                    if let Some(node) = graph.get(node_idx) {
+                        let path = std::path::Path::new(&node.file);
+                        if let Some(parent) = path.parent() {
+                            if let Some(parent_str) = parent.to_str() {
+                                if !parent_str.is_empty() {
+                                    modules.insert(parent_str.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let modules_list: Vec<String> = modules.into_iter().collect();
+
+                let data = json!({
+                    "node_count": node_count,
+                    "edge_count": edge_count,
+                    "modules": modules_list,
+                    "top_hotspots": hotspots,
+                    "entry_points": entry_list
+                });
+
+                let mut next_args = json!({});
+                if let Some(first_hotspot) = hotspots.first() {
+                    next_args = json!({ "node_id": first_hotspot["id"].as_str().unwrap() });
+                }
+
+                Ok(Self::ok_envelope(
+                    "get_architecture_overview",
+                    data,
+                    node_count,
+                    "analyze_impact",
+                    next_args,
+                ))
+            }
+            "batch_query" => {
+                let symbols = arguments
+                    .get("symbols")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| JsonRpcError {
+                        code: -32602,
+                        message: "Missing or invalid 'symbols' parameter".to_string(),
+                        data: None,
+                    })?;
+                let include_callers = arguments
+                    .get("include_callers")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let include_callees = arguments
+                    .get("include_callees")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let graph = self.graph.read().await;
+                let mut results = Vec::new();
+
+                for sym_val in symbols {
+                    if let Some(sym) = sym_val.as_str() {
+                        let idx = graph.get_index(sym).or_else(|| {
+                            graph
+                                .find_by_name(sym)
+                                .first()
+                                .and_then(|n| graph.get_index(&n.id))
+                        });
+
+                        if let Some(idx) = idx {
+                            if let Some(node) = graph.get(idx) {
+                                let mut detail = json!({
+                                    "id": node.id,
+                                    "name": node.name,
+                                    "kind": node.kind.to_string(),
+                                    "file": node.file,
+                                    "line_start": node.line_start,
+                                    "line_end": node.line_end,
+                                    "centrality": graph.centrality(idx)
+                                });
+
+                                if include_callers {
+                                    let callers = graph.get_callers(idx);
+                                    detail["callers"] = json!(callers.iter().map(|n| {
+                                        json!({ "id": n.id, "name": n.name, "kind": n.kind.to_string(), "file": n.file })
+                                    }).collect::<Vec<_>>());
+                                }
+
+                                if include_callees {
+                                    let callees = graph.get_callees(idx);
+                                    detail["callees"] = json!(callees.iter().map(|n| {
+                                        json!({ "id": n.id, "name": n.name, "kind": n.kind.to_string(), "file": n.file })
+                                    }).collect::<Vec<_>>());
+                                }
+
+                                results.push(detail);
+                            }
+                        }
+                    }
+                }
+
+                let count = results.len();
+                Ok(Self::ok_envelope(
+                    "batch_query",
+                    json!({ "results": results }),
+                    count,
+                    "analyze_impact",
+                    if count > 0 {
+                        json!({ "node_id": results[0]["id"].as_str().unwrap() })
+                    } else {
+                        json!({})
+                    }
+                ))
+            }
             _ => Err(JsonRpcError {
                 code: -32601,
                 message: format!("Tool not found: {}", name),
@@ -1228,6 +1669,111 @@ impl McpServer {
 
         brief
     }
+
+    fn list_resources(&self) -> Result<Value, JsonRpcError> {
+        Ok(json!({
+            "resources": [
+                {
+                    "uri": "arbor://graph/stats",
+                    "name": "Graph Statistics",
+                    "description": "Node count, edge count, languages, and files indexed",
+                    "mimeType": "application/json"
+                },
+                {
+                    "uri": "arbor://graph/entry-points",
+                    "name": "Entry Points",
+                    "description": "All detected entry points in the codebase",
+                    "mimeType": "application/json"
+                },
+                {
+                    "uri": "arbor://graph/hotspots",
+                    "name": "Code Hotspots",
+                    "description": "Top 20 most central nodes in the codebase",
+                    "mimeType": "application/json"
+                }
+            ]
+        }))
+    }
+
+    async fn read_resource(&self, params: Value) -> Result<Value, JsonRpcError> {
+        let uri = params
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| JsonRpcError {
+                code: -32602,
+                message: "Missing 'uri' parameter".to_string(),
+                data: None,
+            })?;
+
+        let graph = self.graph.read().await;
+
+        let contents = match uri {
+            "arbor://graph/stats" => {
+                let stats = graph.stats();
+                json!({
+                    "node_count": stats.node_count,
+                    "edge_count": stats.edge_count,
+                    "file_count": stats.files,
+                })
+            }
+            "arbor://graph/entry-points" => {
+                let eps = graph.list_entry_points();
+                let entries: Vec<Value> = eps
+                    .iter()
+                    .map(|n| {
+                        json!({
+                            "id": n.id,
+                            "name": n.name,
+                            "kind": n.kind.to_string(),
+                            "file": n.file
+                        })
+                    })
+                    .collect();
+                json!({ "entry_points": entries })
+            }
+            "arbor://graph/hotspots" => {
+                let mut nodes_with_centrality = Vec::new();
+                for node_idx in graph.node_indexes() {
+                    if let Some(node) = graph.get(node_idx) {
+                        let centrality = graph.centrality(node_idx);
+                        nodes_with_centrality.push((node, centrality));
+                    }
+                }
+                nodes_with_centrality.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let hotspots: Vec<Value> = nodes_with_centrality
+                    .iter()
+                    .take(20)
+                    .map(|(node, centrality)| {
+                        json!({
+                            "id": node.id,
+                            "name": node.name,
+                            "kind": node.kind.to_string(),
+                            "file": node.file,
+                            "centrality": centrality
+                        })
+                    })
+                    .collect();
+                json!({ "hotspots": hotspots })
+            }
+            _ => {
+                return Err(JsonRpcError {
+                    code: -32602,
+                    message: format!("Unknown resource URI: {}", uri),
+                    data: None,
+                })
+            }
+        };
+
+        Ok(json!({
+            "contents": [
+                {
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": serde_json::to_string_pretty(&contents).unwrap_or_default()
+                }
+            ]
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -1414,5 +1960,75 @@ mod tool_tests {
 
         let entries = envelope["data"]["entries"].as_array().unwrap();
         assert!(!entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_explain_symbol_not_found() {
+        let server = empty_server();
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "explain_symbol", "arguments": { "symbol": "nonexistent" }
+            }))
+            .await;
+        let val = result.unwrap();
+        let text = val["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn test_audit_security_not_found() {
+        let server = empty_server();
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "audit_security", "arguments": { "source": "nonexistent" }
+            }))
+            .await;
+        let val = result.unwrap();
+        let text = val["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn test_get_architecture_overview_empty_graph() {
+        let server = empty_server();
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "get_architecture_overview", "arguments": {}
+            }))
+            .await;
+        let val = result.unwrap();
+        let text = val["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn test_batch_query_returns_envelope() {
+        let server = empty_server();
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "batch_query", "arguments": { "symbols": ["nonexistent"] }
+            }))
+            .await;
+        let val = result.unwrap();
+        let text = val["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn test_get_blast_radius_returns_envelope() {
+        let server = empty_server();
+        let result = server
+            .call_tool(serde_json::json!({
+                "name": "get_blast_radius", "arguments": {}
+            }))
+            .await;
+        let val = result.unwrap();
+        let text = val["content"][0]["text"].as_str().unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["ok"], true);
     }
 }
