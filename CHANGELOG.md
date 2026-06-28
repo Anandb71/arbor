@@ -5,6 +5,30 @@ All notable changes to Arbor will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.3] - 2026-06-28 "Agent Brain"
+
+### Added
+- **5 New MCP Tools (10 → 15 total):**
+  - `get_blast_radius`: Diff-based impact analysis exposed to AI agents via MCP — returns affected nodes, risk level, and architectural impact
+  - `explain_symbol`: Token-bounded architectural explanation of any symbol — role classification, centrality, callers/callees, significance
+  - `audit_security`: Traces execution paths from source to sensitive sinks (DB, exec, file I/O, network) — security audit via MCP
+  - `get_architecture_overview`: High-level codebase orientation — hotspots, modules, entry points, graph statistics — ideal for onboarding agents
+  - `batch_query`: Multi-symbol query in a single call — reduces round-trips for bulk lookups, optional caller/callee inclusion
+- **MCP Resources:** Implemented `resources/list` and `resources/read` exposing `arbor://graph/stats`, `arbor://graph/entry-points`, and `arbor://graph/hotspots` for passive agent context
+- **MCP Tool Annotations:** All 15 tools annotated with `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint` per 2025-03-26 spec — signals trust/safety to agents
+- **Built-in Agent Workflows (`arbor agent`):**
+  - `arbor agent review`: Autonomous PR review — analyzes git changes for high-centrality modifications, untested paths, and architecture violations
+  - `arbor agent onboard`: Codebase onboarding guide generator — entry points, hotspots, module map, suggested reading order
+  - `arbor agent guard`: Architecture guard — validates changes against blast radius thresholds, flags entry point modifications
+- **A2A Agent Card:** `agent-card.json` for Agent-to-Agent protocol discovery — enables other agents to find and delegate to Arbor
+- **GitHub Action Pre-Built Binary:** Downloads pre-compiled binary from GitHub Releases instead of compiling from source (~5s vs ~3-5min CI step)
+- **Benchmarks Document:** Performance claims with reproduction methodology
+- **Launch Plan:** Structured go-to-market strategy for organic growth
+
+### Changed
+- **MCP Protocol Version:** Bumped from `2024-11-05` → `2025-03-26`
+- Workspace version bumped to **2.2.3** across all manifests
+
 ## [2.2.0] - 2026-05-30 "PR Intelligence & Sponsorships"
 
 ### Added
