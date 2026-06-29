@@ -49,10 +49,10 @@ jobs:
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ github.token }}
-          commit-message: docs(readme): refresh contributors list
+          commit-message: "docs(readme): refresh contributors list"
           branch: chore/refresh-contributors
           base: main
-          title: docs(readme): refresh contributors list
+          title: "docs(readme): refresh contributors list"
           body: |
             Automated contributors refresh.
 
