@@ -120,6 +120,8 @@ jobs:
     needs: [prepare, verify-version-sync]
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Skip on tag releases — main-branch Rust CI already validated this commit.
+    if: github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -130,11 +132,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install Linux dependencies
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libdbus-1-dev libssl-dev cmake
+        run: bash scripts/ci/install-linux-deps.sh pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libdbus-1-dev libssl-dev cmake build-essential
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -147,7 +145,7 @@ jobs:
 
   build:
     name: Build (${{ matrix.target }})
-    needs: [prepare, verify-version-sync, qa-gate]
+    needs: [prepare, verify-version-sync]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -181,17 +179,11 @@ jobs:
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+        run: bash scripts/ci/install-linux-deps.sh pkg-config libssl-dev build-essential cmake
 
       - name: Install Linux aarch64 cross toolchain
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+        run: bash scripts/ci/install-linux-deps.sh gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       - name: Configure aarch64 linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -229,7 +221,7 @@ jobs:
 
   publish-crates:
     name: Publish crates to crates.io
-    needs: [prepare, qa-gate, build]
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -239,11 +231,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Linux dependencies
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libdbus-1-dev libssl-dev cmake
+        run: bash scripts/ci/install-linux-deps.sh pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libdbus-1-dev libssl-dev cmake build-essential
 
       - name: Publish crates in dependency order
         env:
