@@ -2,13 +2,12 @@
   <img src="docs/assets/arbor-logo.svg" alt="Arbor logo" width="120" height="120" />
 </p>
 
-# Arbor
+<h1 align="center">Arbor</h1>
 
-**Graph-native intelligence for codebases.**
-
-Know what breaks *before* you break it.
-
-> **v2.4.0 — The Agent-Native Leap:** First code-graph MCP server built for MCP `2026-07-28` — stateless HTTP, Tasks extension, interactive MCP Apps, and ~95% token savings vs file-reading agents.
+<p align="center">
+  <strong>Graph-native intelligence for codebases.</strong><br>
+  Know what breaks <em>before</em> you break it.
+</p>
 
 <p align="center">
   <a href="https://github.com/Anandb71/arbor/actions"><img src="https://img.shields.io/github/actions/workflow/status/Anandb71/arbor/rust.yml?style=flat-square&label=Rust%20CI" alt="Rust CI" /></a>
@@ -19,63 +18,128 @@ Know what breaks *before* you break it.
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License" />
 </p>
 
----
-
-## Table of Contents
-
-- [The Arbor Philosophy](#the-arbor-philosophy)
-- [Why Arbor](#why-arbor)
-- [What you get](#what-you-get)
-- [Visual tour](#visual-tour)
-- [Quickstart](#quickstart)
-- [Installation options](#installation-options)
-- [MCP integration](#mcp-integration)
-- [Language support](#language-support)
-- [Architecture and docs](#architecture-and-docs)
-- [Git-aware CI workflows](#git-aware-ci-workflows)
-- [Release channels](#release-channels)
-- [Contributing](#contributing)
-- [Contributors](#contributors)
-- [Security](#security)
-- [License](#license)
-
----
-
-## The Arbor Philosophy
-
-Arbor is rooted in three unwavering principles, listed in strict order of priority. Every architectural decision is measured against this hierarchy:
-
-1. **Consumer First**: Tooling must be beautiful, intuitive, and instantly useful out of the box. The developer experience triumphs over all other metrics.
-2. **Accessibility Second**: Deep AI intelligence and graph analysis should never be gatekept. Our tooling is built to work seamlessly across language ecosystems and run deterministically on any machine.
-3. **Affordability Next**: We ruthlessly optimize for minimal computational overhead. From edge laptops to giant monoliths, graph exploration should have zero-friction adoption.
-
-For comprehensive details on our approach, read our [PHILOSOPHY.md](PHILOSOPHY.md).
+> **v2.4.0 — The Agent-Native Leap** · First code-graph MCP server built for MCP `2026-07-28`. Stateless HTTP, Tasks extension, interactive MCP Apps, real git-diff blast radius, and ~95% fewer tokens than file-reading agents. [Release notes →](docs/RELEASE_NOTES_v2.4.0.md)
 
 ---
 
 ## Why Arbor
 
-Most AI code tooling treats code as text retrieval.
+Most AI coding tools treat code as text. Arbor builds a **semantic dependency graph** — functions, classes, and modules as nodes; calls, imports, and inheritance as edges — then answers execution-aware questions with deterministic precision:
 
-Arbor builds a **semantic dependency graph** and answers execution-aware questions:
+| Question | Arbor answer |
+|----------|--------------|
+| *If I change this symbol, what breaks?* | Blast radius with depth, confidence, and risk level |
+| *Who calls this — directly and transitively?* | Caller/callee traversal on the call graph |
+| *What's the shortest path between A and B?* | A* path through real dependencies |
+| *Is this PR too risky to merge?* | CI gate on blast-radius thresholds |
 
-- *If I change this symbol, what breaks?*
-- *Who calls this function, directly and transitively?*
-- *What is the shortest architectural path between these two nodes?*
-
-You get deterministic, explainable impact analysis instead of approximate keyword matches.
+No keyword guessing. No embedding hallucinations. One graph, every interface.
 
 ---
 
-## What you get
+## What's new in v2.4.0
 
-- **Blast radius analysis**: See exactly which files and modules will be affected by a change (complete with depth confidence levels) before you ever press save.
-- **Graph-backed symbol resolution**: Accurately tracks dependencies across files and entire language boundaries automatically.
-- **Agent-native MCP (v2.4.0)**: MCP `2026-07-28` with Tasks extension, MCP Apps (interactive blast-radius graph inside agent hosts), stateless HTTP transport (`arbor bridge --http`), 15 tools with pagination, and real git-diff `get_blast_radius`.
-- **Built-in Agent Workflows (`arbor agent`)**: Local autonomous agents for PR reviews, codebase onboarding guides, and architectural guardrail checks.
-- **Unified Tooling (CLI + GUI + MCP)**: Native desktop GUI, a blazing fast CLI, and Claude/AI Model Context Protocol integration all utilizing the exact same core analytical reasoning engine.
-- **Git-aware risk gating**: Block pull-requests automatically in your CI/CD if a PR introduces a dangerously high architectural blast radius.
-- **Lightning fast incremental indexing**: Sub-second background cache updates instantly tracking your code edits in real-time.
+| Feature | What it does |
+|---------|--------------|
+| **MCP `2026-07-28`** | Stateless `server/discover`, response caching (`ttlMs`/`cacheScope`), dual-version fallback for `2025-03-26` clients |
+| **Tasks extension** | `tasks/get` · `tasks/update` · `tasks/cancel` — cold-start indexing returns task handles, not errors |
+| **MCP Apps** | Interactive blast-radius graph (`ui://arbor/blast-radius`) and architecture map (`ui://arbor/architecture-map`) inside agent hosts |
+| **HTTP transport** | `arbor bridge --http --port 3333` — stateless MCP behind load balancers |
+| **Real `get_blast_radius`** | Git-diff-aware impact analysis via shared `arbor-graph::compute_blast_radius` |
+| **Pagination** | `offset` / `limit` / `hasMore` on `search_symbols` and `get_map` |
+| **Benchmarks** | Criterion suite + CI regression gate — see [BENCHMARKS.md](docs/BENCHMARKS.md) |
+
+---
+
+## Quickstart
+
+```bash
+# Install
+cargo install arbor-graph-cli
+
+# Index your project (one command)
+cd your-project && arbor setup
+
+# Explore before you edit
+arbor map . --exclude-test          # ranked project skeleton (~1k tokens)
+arbor refactor parse_file           # blast radius of changing a symbol
+arbor diff                          # impact of uncommitted git changes
+
+# Wire up your AI agent
+claude mcp add --transport stdio --scope project arbor -- arbor bridge
+```
+
+**Agent workflow:** call `get_map` first → `search_symbols` / `get_file_graph` to locate code → `Read` only the target file. [Full MCP guide →](docs/MCP_INTEGRATION.md)
+
+---
+
+## For AI agents (MCP)
+
+Arbor ships a production MCP server via `arbor bridge`. Stdio is the default; HTTP is opt-in for remote/enterprise.
+
+```bash
+# Stdio (Claude, Cursor, VS Code)
+arbor bridge
+
+# HTTP (MCP 2026-07-28)
+arbor bridge --http --port 3333
+```
+
+### Cursor / VS Code
+
+```json
+{
+  "mcpServers": {
+    "arbor": {
+      "type": "stdio",
+      "command": "arbor",
+      "args": ["bridge"]
+    }
+  }
+}
+```
+
+Templates: [`templates/mcp/`](templates/mcp/) · Setup scripts: `scripts/setup-mcp.sh` · `scripts/setup-mcp.ps1`
+
+### 16 MCP tools
+
+| Tier | Tools | Use when |
+|------|-------|----------|
+| **Orientation** | `get_map` | First call — token-budgeted project skeleton ranked by PageRank |
+| **Surgical** | `list_entry_points` · `get_callers` · `get_callees` · `search_symbols` · `get_file_graph` · `get_node_detail` | Navigate to a specific symbol or file |
+| **Broad** | `get_logic_path` · `analyze_impact` · `find_path` · `get_knowledge_path` | Trace dependencies, blast radius, paths |
+| **Agent-native** | `get_blast_radius` · `explain_symbol` · `audit_security` · `get_architecture_overview` · `batch_query` | PR impact, onboarding, security audit, bulk lookup |
+
+Every tool returns `{ ok, tool, data, meta: { suggested_next_tool, suggested_next_args } }` so agents chain calls without re-prompting.
+
+**Registry:** `io.github.Anandb71/arbor` · [Official API lookup](https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.Anandb71/arbor) · [Glama listing](https://glama.ai/mcp/servers/@Anandb71/arbor)
+
+---
+
+## CLI reference
+
+| Command | Description |
+|---------|-------------|
+| `arbor setup` | One-shot init + index |
+| `arbor map` | Ranked, token-budgeted project skeleton |
+| `arbor query <term>` | Fuzzy symbol search (supports `\|` OR) |
+| `arbor callers / callees <sym>` | One-hop graph traversal |
+| `arbor entry-points` | HTTP handlers, main, jobs, webhooks |
+| `arbor file-graph <path>` | Symbols + edges in one file |
+| `arbor inspect <sym>` | Full symbol detail |
+| `arbor path <a> <b>` | Shortest call-graph path |
+| `arbor refactor <sym>` | Blast radius before refactoring |
+| `arbor diff` | Git-change impact report |
+| `arbor check` | CI safety gate (`--max-blast-radius N`) |
+| `arbor summary` | Auto-generate PR description |
+| `arbor agent review` | Autonomous PR architecture review |
+| `arbor agent onboard` | Codebase onboarding guide |
+| `arbor agent guard` | Real-time architectural safety gate |
+| `arbor bridge` | MCP server (add `--http` for HTTP transport) |
+| `arbor watch` | Live re-index on file changes |
+| `arbor gui` | Native desktop UI |
+
+All query commands support `--json`. `map` additionally supports `--tokens N`, `--focus "pattern"`, `--focus-changed`.
 
 ---
 
@@ -89,41 +153,11 @@ You get deterministic, explainable impact analysis instead of approximate keywor
   <img src="docs/assets/visualizer-screenshot.png" alt="Arbor visualizer screenshot" width="760" />
 </p>
 
-For a full-screen recording of the workflow, see [media/recording-2026-01-13.mp4](media/recording-2026-01-13.mp4).
+Full recording: [media/recording-2026-01-13.mp4](media/recording-2026-01-13.mp4)
 
 ---
 
-## Quickstart
-
-```bash
-# 1) Install the Arbor CLI globally via Cargo
-cargo install arbor-graph-cli
-
-# 2) Initialize Arbor and build the dependency graph for your codebase
-cd your-project
-arbor setup
-
-# 3) See EVERYTHING a function touches before you break it
-arbor refactor <symbol-name>
-
-# 4) Run safety checks (Great for CI/CD or before committing)
-arbor diff  # See what your uncommitted git changes impact
-arbor check --max-blast-radius 30  # Fail the checks if your changes break more than 30 nodes
-
-# 5) Run autonomous agent workflows
-arbor agent review   # Analyze git changes for architecture and risk violations
-arbor agent onboard  # Generate a codebase onboarding guide for new developers
-arbor agent guard    # Real-time architectural safety gate
-
-# 6) Launch the visual interface to intuitively explore your code's architecture
-arbor gui
-```
-
----
-
-## Installation options
-
-Use whichever channel fits your environment:
+## Installation
 
 ```bash
 # Rust / Cargo
@@ -133,8 +167,7 @@ cargo install arbor-graph-cli
 brew install Anandb71/tap/arbor
 
 # Scoop (Windows)
-scoop bucket add arbor https://github.com/Anandb71/arbor
-scoop install arbor
+scoop bucket add arbor https://github.com/Anandb71/arbor && scoop install arbor
 
 # npm wrapper (cross-platform)
 npx @anandb71/arbor-cli
@@ -146,93 +179,23 @@ docker pull ghcr.io/anandb71/arbor:latest
 No-Rust installers:
 
 - macOS/Linux: `curl -fsSL https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.sh | bash`
-- Windows PowerShell: `irm https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.ps1 | iex`
+- Windows: `irm https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.ps1 | iex`
 
-For pinned/versioned installs, see [docs/INSTALL.md](docs/INSTALL.md).
-
----
-
-## MCP integration
-
-Arbor includes a real MCP server via `arbor bridge` (stdio + optional HTTP). **v2.4.0 ships day-one MCP `2026-07-28` support** — Tasks extension, MCP Apps with interactive graphs, and stateless HTTP for remote deployment.
-
-### Claude Code quick install
-
-```bash
-claude mcp add --transport stdio --scope project arbor -- arbor bridge
-claude mcp list
-
-# Optional: HTTP transport for remote/enterprise (MCP 2026-07-28)
-arbor bridge --http --port 3333
-```
-
-### Available tools
-
-**Surgical (v2.1.0):** `list_entry_points` · `get_callers` · `get_callees` · `search_symbols` · `get_file_graph` · `get_node_detail`
-
-**Broad:** `get_logic_path` · `analyze_impact` · `find_path` · `get_knowledge_path`
-
-All tools return a standard envelope with `suggested_next_tool` + `suggested_next_args` so agents can chain calls without re-prompting.
-
-### Multi-client setup
-
-- Full guide: [docs/MCP_INTEGRATION.md](docs/MCP_INTEGRATION.md)
-- Ready templates: [`templates/mcp/`](templates/mcp/)
-- Bootstrap scripts:
-  - `scripts/setup-mcp.sh`
-  - `scripts/setup-mcp.ps1`
-
-### Registry verification (authoritative)
-
-- Registry name: `io.github.Anandb71/arbor`
-- Official API lookup: https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.Anandb71/arbor
-
-> [!NOTE]
-> `github.com/mcp` search UI may lag indexing. Use the official registry API lookup above as source of truth.
+Pinned installs: [docs/INSTALL.md](docs/INSTALL.md)
 
 ---
 
 ## Language support
 
-Arbor supports production parsing and graph analysis across major ecosystems:
+**Production parsers:** Rust · TypeScript / JavaScript · Python · Go · Java · C / C++ · C# · Dart
 
-- Rust
-- TypeScript / JavaScript
-- Python
-- Go
-- Java
-- C / C++
-- C# (Native Tree-sitter)
-- Dart
-- Kotlin (fallback parser)
-- Swift (fallback parser)
-- Ruby (fallback parser)
-- PHP (fallback parser)
-- Shell (fallback parser)
+**Fallback parsers:** Kotlin · Swift · Ruby · PHP · Shell
 
-Detailed parser notes and expansion guidance:
-
-- [docs/ADDING_LANGUAGES.md](docs/ADDING_LANGUAGES.md)
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+[Adding languages →](docs/ADDING_LANGUAGES.md)
 
 ---
 
-## Architecture and docs
-
-Start here when you need deeper internals:
-
-- [docs/QUICKSTART.md](docs/QUICKSTART.md)
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- [docs/GRAPH_SCHEMA.md](docs/GRAPH_SCHEMA.md)
-- [docs/PROTOCOL.md](docs/PROTOCOL.md)
-- [docs/MCP_INTEGRATION.md](docs/MCP_INTEGRATION.md)
-- [docs/ROADMAP.md](docs/ROADMAP.md)
-
----
-
-## Git-aware CI workflows
-
-Arbor supports pre-merge risk checks and change gating:
+## CI & pull requests
 
 ```bash
 arbor diff --markdown
@@ -240,7 +203,7 @@ arbor check --max-blast-radius 30 --markdown
 arbor summary
 ```
 
-Use the repository GitHub Action for CI integration:
+GitHub Action (pre-built binary, ~5s vs ~3–5min compile):
 
 ```yaml
 name: Arbor Check
@@ -252,47 +215,54 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # needed for full diff comparison
-      
+          fetch-depth: 0
+
       - uses: Anandb71/arbor@v2.4.0
         with:
           command: check . --max-blast-radius 30 --markdown
-          comment-on-pr: true # posts/updates report directly on the PR
+          comment-on-pr: true
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
 ---
 
-## Release channels
+## Architecture
 
-Automated release distribution includes:
+```
+arbor-core (Tree-sitter parsing)
+    └── arbor-graph (petgraph + PageRank + impact analysis)
+            ├── arbor-cli      — CLI + MCP bridge
+            ├── arbor-mcp      — MCP protocol server
+            ├── arbor-server   — WebSocket JSON-RPC
+            ├── arbor-watcher  — incremental file watcher
+            └── arbor-gui      — desktop UI
+```
 
-- GitHub Releases (platform binaries)
-- crates.io
-- GHCR container images
-- npm wrapper package
-- VS Code Marketplace / Open VSX extension channels
-- Homebrew + Scoop
+**Docs:** [Quickstart](docs/QUICKSTART.md) · [Architecture](docs/ARCHITECTURE.md) · [Graph schema](docs/GRAPH_SCHEMA.md) · [MCP integration](docs/MCP_INTEGRATION.md) · [Benchmarks](docs/BENCHMARKS.md) · [Roadmap](docs/ROADMAP.md) · [Philosophy](PHILOSOPHY.md)
 
-Runbook: [docs/RELEASING.md](docs/RELEASING.md)
+**Release channels:** GitHub Releases · crates.io · GHCR · npm · VS Code / Open VSX · Homebrew · Scoop — [Releasing guide](docs/RELEASING.md)
+
+---
+
+## Philosophy
+
+1. **Consumer first** — beautiful, intuitive, instantly useful
+2. **Accessibility second** — works across ecosystems, runs anywhere
+3. **Affordability next** — minimal overhead, from laptops to monoliths
+
+Arbor is **local-first**: no mandatory data exfiltration, offline-capable, open source. [Security policy →](SECURITY.md)
 
 ---
 
 ## Contributing
 
-Contributions are welcome.
-
-- Start with: [CONTRIBUTING.md](CONTRIBUTING.md)
-- Code of conduct: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
-- Security policy: [SECURITY.md](SECURITY.md)
-- Good first tasks: [docs/GOOD_FIRST_ISSUES.md](docs/GOOD_FIRST_ISSUES.md)
-
-For local development:
-
 ```bash
 cargo build --workspace
 cargo test --workspace
+cargo clippy --workspace --all-targets --all-features
 ```
+
+[CONTRIBUTING.md](CONTRIBUTING.md) · [Good first issues](docs/GOOD_FIRST_ISSUES.md) · [Code of conduct](CODE_OF_CONDUCT.md)
 
 ---
 
@@ -325,18 +295,6 @@ cargo test --workspace
 <p align="center"><sub><strong>7 contributors</strong> | <a href="https://github.com/Anandb71/arbor/graphs/contributors">View all</a></sub></p>
 
 <!-- CONTRIBUTORS:END -->
-
----
-
-## Security
-
-Arbor is local-first by design:
-
-- No mandatory data exfiltration
-- Offline-capable workflows
-- Open-source code paths
-
-Report vulnerabilities via [SECURITY.md](SECURITY.md).
 
 ---
 

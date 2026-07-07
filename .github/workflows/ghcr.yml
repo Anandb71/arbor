@@ -1,21 +1,23 @@
 name: Publish GHCR Image
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Optional explicit image tag (e.g. v2.0.0)"
+        description: "Release tag (e.g. v2.4.0). Required for manual retry."
         required: false
         type: string
 
 permissions:
+  actions: read
   contents: read
   packages: write
 
 concurrency:
-  group: ghcr-${{ github.ref }}
+  group: ghcr-${{ github.event.workflow_run.head_branch || github.event.inputs.tag || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -25,10 +27,52 @@ jobs:
   docker:
     name: Build and publish container image
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Resolve release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          else
+            TAG="$(gh release view --json tagName -q .tagName 2>/dev/null || true)"
+          fi
+
+          if [ -z "$TAG" ] || ! echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Could not resolve a valid release tag (got: '${TAG:-empty}')"
+            exit 1
+          fi
+
+          echo "value=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Publishing GHCR image for $TAG"
+
+      - name: Verify release binaries exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.value }}"
+          COUNT="$(gh release view "$TAG" --json assets -q '.assets | length')"
+          if [ "$COUNT" -lt 5 ]; then
+            echo "::error::Release $TAG has $COUNT binary assets (expected 5). Run the Release workflow first."
+            exit 1
+          fi
+          echo "Release $TAG has $COUNT assets — OK"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -40,17 +84,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve release tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag }}" ]; then
-            echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event_name }}" = "release" ]; then
-            echo "value=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -58,7 +91,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ github.repository }}
           tags: |
             type=raw,value=${{ steps.tag.outputs.value }}
-            type=raw,value=latest,enable=${{ github.event_name == 'release' }}
+            type=raw,value=latest
 
       - name: Build and push image
         uses: docker/build-push-action@v6

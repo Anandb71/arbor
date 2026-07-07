@@ -348,6 +348,8 @@ jobs:
           fail_on_unmatched_files: true
           generate_release_notes: true
           append_body: true
+          overwrite_files: true
+          make_latest: true
 
   update-checksums:
     name: Update Homebrew & Scoop checksums
