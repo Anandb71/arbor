@@ -136,14 +136,20 @@ jobs:
 
       - name: Publish to Open VSX
         if: steps.version.outputs.skip != 'true'
+        continue-on-error: true
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: |
           if [ -z "$OVSX_PAT" ]; then
-            echo "OVSX_PAT not set; skipping Open VSX publish."
+            echo "::warning::OVSX_PAT not set; skipping Open VSX publish."
             exit 0
           fi
 
           PUBLISHER="$(node -p "require('./package.json').publisher")"
           ovsx create-namespace "$PUBLISHER" --pat "$OVSX_PAT" || true
-          ovsx publish arbor-vscode.vsix --pat "$OVSX_PAT"
+          if ovsx publish arbor-vscode.vsix --pat "$OVSX_PAT"; then
+            echo "Open VSX publish succeeded."
+          else
+            echo "::warning::Open VSX publish failed (non-blocking). VS Code Marketplace is the primary channel."
+            exit 0
+          fi
