@@ -1,13 +1,16 @@
 {
   "name": "Arbor Code Intelligence",
   "description": "Graph-native code intelligence — blast radius analysis, impact prediction, architecture mapping, and security audit tracing for AI coding agents.",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "url": "https://github.com/Anandb71/arbor",
   "capabilities": {
     "tools": true,
     "resources": true,
     "prompts": false,
-    "streaming": false
+    "streaming": false,
+    "tasks": true,
+    "apps": true,
+    "protocol": "2026-07-28"
   },
   "skills": [
     "code-impact-analysis",

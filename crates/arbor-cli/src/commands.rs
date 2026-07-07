@@ -1632,8 +1632,15 @@ pub fn status(path: &Path, show_files: bool) -> Result<()> {
 }
 
 /// Start the Agentic Bridge (MCP + Viz).
-pub async fn bridge(path: &Path, launch_viz: bool, follow_symlinks: bool) -> Result<()> {
-    use arbor_mcp::McpServer;
+pub async fn bridge(
+    path: &Path,
+    launch_viz: bool,
+    follow_symlinks: bool,
+    http: bool,
+    http_port: u16,
+) -> Result<()> {
+    use arbor_mcp::{run_http_server, McpServer};
+    use std::sync::Arc;
 
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
@@ -1795,10 +1802,32 @@ pub async fn bridge(path: &Path, launch_viz: bool, follow_symlinks: bool) -> Res
 
     eprintln!("🚀 Starting MCP Server on Stdio... (Press Ctrl+C to stop)");
 
-    // 3. Start MCP Server (Main Thread) WITH Spotlight capability
+    // 4. Start MCP Server (Main Thread) WITH Spotlight capability
     // IMPORTANT: All logging MUST be to stderr from here on.
-    let mcp = McpServer::with_spotlight(shared_graph, spotlight_handle);
-    mcp.run_stdio().await?;
+    let mcp = McpServer::with_spotlight_and_project(
+        shared_graph,
+        spotlight_handle,
+        resolved_path.clone(),
+    );
+
+    if http {
+        let mcp_http = Arc::new(mcp);
+        let port = http_port;
+        let http_mcp = mcp_http.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_http_server(http_mcp, port).await {
+                eprintln!("MCP HTTP server error: {}", e);
+            }
+        });
+        eprintln!(
+            "{} MCP HTTP transport enabled on port {} (2026-07-28)",
+            "✓".green(),
+            http_port
+        );
+        mcp_http.run_stdio().await?;
+    } else {
+        mcp.run_stdio().await?;
+    }
 
     Ok(())
 }

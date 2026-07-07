@@ -5,6 +5,23 @@ All notable changes to Arbor will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-07-08 "The Agent-Native Leap"
+
+### Added
+- **MCP 2026-07-28 Protocol:** Stateless core with `server/discover`, `_meta` parsing, response caching (`ttlMs`/`cacheScope`), and dual-version fallback for `2025-03-26` clients
+- **Tasks Extension:** `tasks/get`, `tasks/update`, `tasks/cancel` — long-running index/audit operations return task handles; fixes cold-start race during background indexing
+- **MCP Apps (SEP-1865):** Interactive blast-radius graph (`ui://arbor/blast-radius`) and architecture map (`ui://arbor/architecture-map`) HTML templates rendered inside agent hosts
+- **Streamable HTTP Transport:** `arbor bridge --http [--port 3333]` — stateless MCP over HTTP with `Mcp-Method`/`Mcp-Name` header routing, alongside stdio
+- **Real `get_blast_radius`:** Git-diff-aware blast radius via shared `arbor-graph::compute_blast_radius` (replaces stub)
+- **Pagination:** `offset`/`limit`/`hasMore` on `search_symbols` and `get_map`
+- **Criterion Benchmarks:** `cargo bench -p arbor-graph` with CI workflow (`benchmarks.yml`)
+- **Release docs:** `docs/ROADMAP_v2.4.0.md`, `docs/RELEASE_NOTES_v2.4.0.md`
+
+### Changed
+- **Async MCP stdio:** Replaced blocking `stdin.lock().lines()` with tokio async I/O
+- **MCP tool annotations:** `analyze_impact` and `get_architecture_overview` declare `_meta.ui` for MCP Apps
+- Workspace version bumped to **2.4.0** across all manifests
+
 ## [2.3.0] - 2026-06-28 "Agent Brain"
 
 ### Added

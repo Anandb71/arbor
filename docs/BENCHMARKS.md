@@ -1,62 +1,64 @@
 # Arbor Performance & Token Benchmarks
 
-This document records the performance characteristics of Arbor's indexing engine, query latency, and token reduction metrics when integrated with AI coding agents.
+This document records reproducible performance characteristics of Arbor's graph engine and token reduction when integrated with AI coding agents.
+
+> **v2.4.0** adds a Criterion benchmark suite. Run `cargo bench -p arbor-graph` for machine-measured numbers.
+
+## Measured Benchmarks (Criterion)
+
+Run on developer hardware via:
+
+```bash
+cargo bench -p arbor-graph --bench graph_bench
+```
+
+| Benchmark | What it measures |
+|-----------|------------------|
+| `search_symbols_500` | N-gram symbol search on 500-node chain graph |
+| `analyze_impact_depth5_200` | BFS blast-radius on 200-node chain |
+| `compute_centrality_100` | PageRank (20 iter) on 100-node graph |
+| `graph_query_bundle` | Combined search + impact (simulates one MCP agent turn) |
 
 ## Expected Performance Claims
 
 | Metric | Arbor | Grep / Ripgrep | Embedding RAG | Sourcegraph (SCIP) |
 |--------|-------|----------------|---------------|---------------------|
-| **10k Loc Indexing** | **~144ms** | N/A | ~12 seconds | ~3 seconds |
-| **Call Path Resolution** | **< 1ms** | Heuristic/Slow | Probabilistic/Hallucinated | ~50ms (remote) |
+| **10k LOC Indexing** | **~144ms** | N/A | ~12 seconds | ~3 seconds |
+| **Call Path Resolution** | **< 1ms** | Heuristic/Slow | Probabilistic | ~50ms (remote) |
 | **Token Usage (Refactor)** | **~400 tokens** | ~2,500 tokens | ~8,000 tokens | ~2,000 tokens |
 | **Precision** | **100% Deterministic** | Heuristic | Probabilistic | 100% Deterministic |
 
----
+## Token Savings Methodology
 
-## 1. Indexing Performance (Tree-sitter + Sled)
+When an AI agent is asked: *"What functions will be affected if we change `parse_file`?"*
 
-Measured on a standard developer machine (Apple M2 / Intel i7, SSD):
+### Standard File-Reading Agent
+1. Read function signature (~150 tokens)
+2. Grep codebase for references (~1,500 tokens)
+3. Read 5 calling files for transitives (~8,000 tokens)
+**Total: ~9,650 tokens**
 
-- **Small Codebase (10k lines)**: ~144ms
-- **Medium Codebase (100k lines)**: ~1.2 seconds
-- **Large Codebase (500k lines)**: ~5.8 seconds
-- **Incremental Indexing**: ~22ms (sub-100ms background watches)
+### Arbor Graph-Enabled Agent (MCP `analyze_impact`)
+1. Single tool call with node_id (~100 tokens)
+2. Deterministic upstream/downstream summary (~300 tokens)
+**Total: ~400 tokens (95.8% reduction)**
 
----
+The `graph_query_bundle` Criterion benchmark measures the CPU cost of the graph path; token savings come from avoiding file reads entirely.
 
-## 2. Token Reduction Benchmarks (vs. Standard RAG)
+## Indexing Performance
 
-When an AI agent is asked: *"What functions will be affected if we change the signature of `arbor_core::parse_file`?"*
-
-### Standard File-Reading Agent:
-1. Agent reads `parse_file` signature (~150 tokens)
-2. Agent searches codebase for `parse_file` using grep (~1,500 tokens)
-3. Agent reads 5 calling files to trace transitives (~8,000 tokens)
-*Total context consumed: ~9,650 tokens*
-
-### Arbor Graph-Enabled Agent:
-1. Agent runs `analyze_impact` on `parse_file` (~100 tokens)
-2. Arbor returns deterministic downstream node references with Hop 1 and Hop 2 caller summaries (~300 tokens)
-*Total context consumed: ~400 tokens (95.8% reduction)*
-
----
-
-## How to Reproduce Benchmarks
-
-### 1. Run Indexing Benchmarks
 ```bash
-# Clear existing sled store
 rm -rf .arbor/
-
-# Run full index with timing
 arbor index --no-cache
 ```
 
-### 2. Measure Query Latency
-```bash
-# Export the graph stats
-arbor status
+| Codebase size | Expected time |
+|---------------|---------------|
+| 10k LOC | ~144ms |
+| 100k LOC | ~1.2s |
+| 500k LOC | ~5.8s |
+| Incremental | ~22ms |
 
-# Measure specific impact command
-Measure-Command { arbor refactor parse_file }
-```
+## CI Regression Gate
+
+The `benchmarks.yml` workflow runs `cargo bench -p arbor-graph` on every PR to main and fails on >20% regression (when baseline is established).
