@@ -375,12 +375,17 @@ jobs:
           SCOOP="packaging/scoop/arbor.json"
 
           sed -i "s|version \".*\"|version \"${VERSION}\"|" "$FILE"
+          sed -i "s|REPLACE_WITH_MACOS_AARCH64_SHA256|${MAC_ARM_SHA}|g" "$FILE"
+          sed -i "s|REPLACE_WITH_MACOS_X86_64_SHA256|${MAC_X64_SHA}|g" "$FILE"
+          sed -i "s|REPLACE_WITH_LINUX_AARCH64_SHA256|${LINUX_ARM_SHA}|g" "$FILE"
+          sed -i "s|REPLACE_WITH_LINUX_X86_64_SHA256|${LINUX_X64_SHA}|g" "$FILE"
           sed -i "/arbor-macos-aarch64.tar.gz/!b;n;s|sha256 \".*\"|sha256 \"${MAC_ARM_SHA}\"|" "$FILE"
           sed -i "/arbor-macos-x86_64.tar.gz/!b;n;s|sha256 \".*\"|sha256 \"${MAC_X64_SHA}\"|" "$FILE"
           sed -i "/arbor-linux-aarch64.tar.gz/!b;n;s|sha256 \".*\"|sha256 \"${LINUX_ARM_SHA}\"|" "$FILE"
           sed -i "/arbor-linux-x86_64.tar.gz/!b;n;s|sha256 \".*\"|sha256 \"${LINUX_X64_SHA}\"|" "$FILE"
 
           sed -i "s|\"version\": \".*\"|\"version\": \"${VERSION}\"|" "$SCOOP"
+          sed -i "s|REPLACE_WITH_WINDOWS_X86_64_SHA256|${WIN_X64_SHA}|g" "$SCOOP"
           sed -i "s|\"hash\": \".*\"|\"hash\": \"${WIN_X64_SHA}\"|" "$SCOOP"
 
       - name: Commit and push manifest updates
