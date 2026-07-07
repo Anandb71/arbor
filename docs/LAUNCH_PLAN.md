@@ -1,4 +1,47 @@
-# Arbor v2.3.0 "Agent Brain" Launch Plan
+# Arbor v2.4.0 "The Agent-Native Leap" Launch Plan
+
+> **Previous:** [v2.3.0 Launch Plan](LAUNCH_PLAN.md) (archived below)
+
+This document outlines the go-to-market strategy for Arbor v2.4.0, timed with the MCP `2026-07-28` spec release (July 28, 2026).
+
+## Positioning
+
+**"The first code-graph MCP server built for MCP 2026-07-28"**
+
+Unique differentiators:
+1. Interactive blast-radius graph rendered **inside** Claude/Cursor via MCP Apps
+2. Tasks extension — agents poll indexing progress instead of erroring
+3. Stateless HTTP — deploy behind load balancers for enterprise
+4. ~95% token savings vs file-reading agents (see `docs/BENCHMARKS.md`)
+
+## Launch Calendar
+
+| Day | Action |
+|-----|--------|
+| D-7 | Record demo GIF: MCP App graph in agent host |
+| D-3 | Publish release notes, update Glama/MCP registry |
+| D-0 | Tag `v2.4.0`, post HN/Reddit/X aligned with MCP spec RC |
+| D+1 | Follow-up thread with benchmark numbers and token savings |
+
+## Demo Script (60 seconds)
+
+1. `arbor bridge` in project directory
+2. Ask agent: "What breaks if I change `parse_file`?"
+3. Agent calls `analyze_impact` → **interactive graph appears inline**
+4. Ask agent: "What's my blast radius on uncommitted changes?"
+5. Agent calls `get_blast_radius` → real git-diff report
+
+## Target Channels
+
+- Hacker News (Show HN)
+- r/rust, r/LocalLLaMA, r/programming
+- X/Twitter AI tooling community
+- MCP Discord / Glama directory
+- Dev.to technical deep-dive on token savings
+
+---
+
+# Arbor v2.3.0 "Agent Brain" Launch Plan (Archive)
 
 This document outlines the strategy for launching Arbor v2.3.0 and growing our GitHub presence from ~120 to 1000+ stars by targeting AI agent developers and open-source contributors.
 
