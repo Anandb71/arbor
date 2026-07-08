@@ -63,7 +63,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # ubuntu is covered by build-test-linux; macOS + Windows only here
+        os: [macos-latest, windows-latest]
 
     steps:
       - name: Checkout
@@ -81,7 +82,8 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev build-essential cmake
 
       - name: Build release CLI
         run: cargo build --locked --release -p arbor-graph-cli
