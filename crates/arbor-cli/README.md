@@ -23,7 +23,7 @@ Arbor is the **graph-native intelligence layer for code**. It parses your codeba
 
 This CLI is the primary interface for indexing, querying, and connecting your code to AI via the Model Context Protocol (MCP).
 
-> Release status (March 2026): stable maintenance and feature delivery on `release/v1.6` (`v1.6.2`).
+> Release status (July 2026): **v2.4.0** — MCP `2026-07-28`, Tasks extension, MCP Apps, and `arbor bridge --http`.
 
 ## Installation
 
@@ -65,6 +65,7 @@ arbor bridge --viz
 | `arbor status` | Show index statistics |
 | `arbor watch` | Continuous re-index on file changes |
 | `arbor bridge` | Start MCP server for AI integration |
+| `arbor bridge --http` | MCP over stateless HTTP (port 3333) |
 | `arbor bridge --viz` | MCP + Visualizer together |
 | `arbor viz` | Launch the Logic Forest visualizer |
 | `arbor gui` | Launch native Arbor GUI |
