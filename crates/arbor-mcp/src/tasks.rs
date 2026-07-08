@@ -95,10 +95,7 @@ impl TaskManager {
     pub async fn cancel(&self, id: &str) -> bool {
         let mut tasks = self.tasks.write().await;
         if let Some(t) = tasks.get_mut(id) {
-            if matches!(
-                t.status,
-                TaskStatus::Pending | TaskStatus::Running
-            ) {
+            if matches!(t.status, TaskStatus::Pending | TaskStatus::Running) {
                 t.status = TaskStatus::Cancelled;
                 t.message = "Cancelled by client".to_string();
                 t.updated_at = now_ms();

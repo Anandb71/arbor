@@ -25,6 +25,7 @@ jobs:
   prepare:
     name: Prepare release metadata
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
@@ -55,6 +56,7 @@ jobs:
     name: Verify version sync across manifests
     needs: prepare
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -94,6 +96,10 @@ jobs:
           if scoop_version != expected:
               mismatches.append(("packaging/scoop/arbor.json version", scoop_version, expected))
 
+          agent_card = json.loads((root / 'agent-card.json').read_text(encoding='utf-8')).get('version')
+          if agent_card != expected:
+              mismatches.append(("agent-card.json version", agent_card, expected))
+
           homebrew_text = (root / 'packaging' / 'homebrew' / 'arbor.rb').read_text(encoding='utf-8')
           m = re.search(r'^\s*version\s+"([^"]+)"\s*$', homebrew_text, flags=re.MULTILINE)
           homebrew_version = m.group(1) if m else None
@@ -109,10 +115,41 @@ jobs:
           print(f"All manifest versions match release tag: {expected}")
           PY
 
+  qa-gate:
+    name: QA gate (fmt/clippy/test)
+    needs: [prepare, verify-version-sync]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Linux dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgtk-3-dev libfontconfig1-dev libasound2-dev libdbus-1-dev libssl-dev cmake
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace
+
   build:
     name: Build (${{ matrix.target }})
-    needs: [prepare, verify-version-sync]
+    needs: [prepare, verify-version-sync, qa-gate]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -192,7 +229,7 @@ jobs:
 
   publish-crates:
     name: Publish crates to crates.io
-    needs: [prepare, build]
+    needs: [prepare, qa-gate, build]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

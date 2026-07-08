@@ -209,10 +209,7 @@ impl McpServer {
                 let progress = ((i + 1) * 100 / 120).min(95) as u8;
                 if count > 0 {
                     tasks
-                        .complete(
-                            &tid,
-                            json!({ "indexed": true, "node_count": count }),
-                        )
+                        .complete(&tid, json!({ "indexed": true, "node_count": count }))
                         .await;
                     return;
                 }
@@ -1180,12 +1177,8 @@ impl McpServer {
 
                 if let Some(entries) = result.get_mut("entries").and_then(|v| v.as_array()) {
                     let total = entries.len();
-                    let page: Vec<Value> = entries
-                        .iter()
-                        .skip(offset)
-                        .take(limit)
-                        .cloned()
-                        .collect();
+                    let page: Vec<Value> =
+                        entries.iter().skip(offset).take(limit).cloned().collect();
                     let has_more = offset + page.len() < total;
                     if let Some(obj) = result.as_object_mut() {
                         obj.insert("entries".to_string(), json!(page));
@@ -2405,10 +2398,7 @@ mod tool_tests {
             })
             .await
             .unwrap();
-        assert_eq!(
-            resp.result.unwrap()["protocolVersion"],
-            "2026-07-28"
-        );
+        assert_eq!(resp.result.unwrap()["protocolVersion"], "2026-07-28");
     }
 
     #[tokio::test]

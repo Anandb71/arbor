@@ -134,7 +134,10 @@ pub fn list_changed_files(project_root: &Path) -> Result<Vec<String>, String> {
     )?;
     files.extend(parse_git_name_status_output(&staged));
 
-    let numstat_unstaged = run_git(project_root, &["diff", "-w", "--numstat", "--find-renames", "HEAD"])?;
+    let numstat_unstaged = run_git(
+        project_root,
+        &["diff", "-w", "--numstat", "--find-renames", "HEAD"],
+    )?;
     let numstat_staged = run_git(
         project_root,
         &[
@@ -152,7 +155,10 @@ pub fn list_changed_files(project_root: &Path) -> Result<Vec<String>, String> {
         .collect();
     files.retain(|f| has_real_diff.contains(f));
 
-    let untracked = run_git(project_root, &["ls-files", "--others", "--exclude-standard"])?;
+    let untracked = run_git(
+        project_root,
+        &["ls-files", "--others", "--exclude-standard"],
+    )?;
     files.extend(
         untracked
             .lines()

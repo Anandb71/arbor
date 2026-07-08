@@ -23,10 +23,7 @@ pub async fn run_http_server(server: Arc<McpServer>, port: u16) -> Result<()> {
     }
 }
 
-async fn handle_connection(
-    stream: &mut tokio::net::TcpStream,
-    server: &McpServer,
-) -> Result<()> {
+async fn handle_connection(stream: &mut tokio::net::TcpStream, server: &McpServer) -> Result<()> {
     let mut buf = vec![0u8; 65536];
     let n = stream.read(&mut buf).await?;
     if n == 0 {
@@ -67,7 +64,14 @@ async fn handle_connection(
     Ok(())
 }
 
-fn parse_http_request(request: &str) -> (String, String, std::collections::HashMap<String, String>, String) {
+fn parse_http_request(
+    request: &str,
+) -> (
+    String,
+    String,
+    std::collections::HashMap<String, String>,
+    String,
+) {
     let mut lines = request.split("\r\n");
     let request_line = lines.next().unwrap_or("");
     let parts: Vec<&str> = request_line.split_whitespace().collect();
