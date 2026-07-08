@@ -1,16 +1,22 @@
 name: Publish VS Code Extension
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
   workflow_dispatch:
     inputs:
+      tag:
+        description: "Release tag (e.g. v2.4.0). Required for manual retry."
+        required: false
+        type: string
       version:
-        description: "Optional version bump (patch | minor | major | x.y.z). Leave empty to publish current package.json version."
+        description: "Optional version bump (patch | minor | major | x.y.z). Leave empty to use release tag."
         required: false
         type: string
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -22,6 +28,10 @@ jobs:
     name: Publish extension registries
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
 
     defaults:
       run:
@@ -30,6 +40,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -60,22 +72,29 @@ jobs:
 
       - name: Resolve publish version
         id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           INPUT_VERSION="${{ github.event.inputs.version }}"
-          RELEASE_TAG="${{ github.event.release.tag_name }}"
+          DISPATCH_TAG="${{ github.event.inputs.tag }}"
 
           if [ -n "$INPUT_VERSION" ]; then
             VERSION="$INPUT_VERSION"
             SKIP="false"
-          elif [ "${{ github.event_name }}" = "release" ]; then
-            RELEASE_VERSION="${RELEASE_TAG#v}"
+          elif [ -n "$DISPATCH_TAG" ]; then
+            VERSION="${DISPATCH_TAG#v}"
+            SKIP="false"
+          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+            RELEASE_VERSION="${{ github.event.workflow_run.head_branch }}"
+            RELEASE_VERSION="${RELEASE_VERSION#v}"
             if echo "$RELEASE_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
               VERSION="$RELEASE_VERSION"
               SKIP="false"
             else
               VERSION=""
               SKIP="true"
-              echo "::warning::Skipping VS Code publish because release tag '$RELEASE_VERSION' is not a 3-part semver version."
+              echo "::warning::Skipping VS Code publish because tag '$RELEASE_VERSION' is not semver."
             fi
           else
             VERSION=""

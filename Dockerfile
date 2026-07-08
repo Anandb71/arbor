@@ -1,23 +1,26 @@
 # Stage 1: Build
-FROM rust:1.85-slim AS builder
+FROM rust:1-bookworm AS builder
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
+# tree-sitter + tiktoken-rs need a C toolchain; openssl for HTTPS/git
+RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
+    build-essential \
+    cmake \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 
-RUN cargo build --release --manifest-path crates/arbor-cli/Cargo.toml --bin arbor
+# CLI only (no GUI) — matches release.yml artifact build
+RUN cargo build --release --locked -p arbor-graph-cli
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     ca-certificates \
     git \
