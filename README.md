@@ -8,6 +8,8 @@
 
 Know what breaks *before* you break it.
 
+> **v2.4.0 — The Agent-Native Leap:** First code-graph MCP server built for MCP `2026-07-28` — stateless HTTP, Tasks extension, interactive MCP Apps, and ~95% token savings vs file-reading agents.
+
 <p align="center">
   <a href="https://github.com/Anandb71/arbor/actions"><img src="https://img.shields.io/github/actions/workflow/status/Anandb71/arbor/rust.yml?style=flat-square&label=Rust%20CI" alt="Rust CI" /></a>
   <a href="https://crates.io/crates/arbor-graph-cli"><img src="https://img.shields.io/crates/v/arbor-graph-cli?style=flat-square&label=crates.io" alt="Crates.io" /></a>
@@ -69,7 +71,7 @@ You get deterministic, explainable impact analysis instead of approximate keywor
 
 - **Blast radius analysis**: See exactly which files and modules will be affected by a change (complete with depth confidence levels) before you ever press save.
 - **Graph-backed symbol resolution**: Accurately tracks dependencies across files and entire language boundaries automatically.
-- **Agent-native MCP (v2.3.0)**: 15 MCP tools — surgical traversal, security auditing, and architectural explanation tools. Exposes graph resources (`arbor://graph/stats`, `arbor://graph/entry-points`, `arbor://graph/hotspots`) and standard spec compliance annotations for zero-reprompt agent chaining.
+- **Agent-native MCP (v2.4.0)**: MCP `2026-07-28` with Tasks extension, MCP Apps (interactive blast-radius graph inside agent hosts), stateless HTTP transport (`arbor bridge --http`), 15 tools with pagination, and real git-diff `get_blast_radius`.
 - **Built-in Agent Workflows (`arbor agent`)**: Local autonomous agents for PR reviews, codebase onboarding guides, and architectural guardrail checks.
 - **Unified Tooling (CLI + GUI + MCP)**: Native desktop GUI, a blazing fast CLI, and Claude/AI Model Context Protocol integration all utilizing the exact same core analytical reasoning engine.
 - **Git-aware risk gating**: Block pull-requests automatically in your CI/CD if a PR introduces a dangerously high architectural blast radius.
@@ -152,13 +154,16 @@ For pinned/versioned installs, see [docs/INSTALL.md](docs/INSTALL.md).
 
 ## MCP integration
 
-Arbor includes a real MCP server via `arbor bridge` (stdio transport). **v2.1.0 adds 10 tools** — 6 surgical tools for precise graph traversal and 4 broad tools for architectural analysis.
+Arbor includes a real MCP server via `arbor bridge` (stdio + optional HTTP). **v2.4.0 ships day-one MCP `2026-07-28` support** — Tasks extension, MCP Apps with interactive graphs, and stateless HTTP for remote deployment.
 
 ### Claude Code quick install
 
 ```bash
 claude mcp add --transport stdio --scope project arbor -- arbor bridge
 claude mcp list
+
+# Optional: HTTP transport for remote/enterprise (MCP 2026-07-28)
+arbor bridge --http --port 3333
 ```
 
 ### Available tools
@@ -249,7 +254,7 @@ jobs:
         with:
           fetch-depth: 0 # needed for full diff comparison
       
-      - uses: Anandb71/arbor@v2.3.0
+      - uses: Anandb71/arbor@v2.4.0
         with:
           command: check . --max-blast-radius 30 --markdown
           comment-on-pr: true # posts/updates report directly on the PR
