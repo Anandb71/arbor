@@ -1,10 +1,25 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use arbor_graph::{compute_centrality, HeuristicsMatcher};
+use arbor_graph::{changed_node_ids, compute_blast_radius, compute_centrality, HeuristicsMatcher};
 use arbor_server::{SharedGraph, SyncServerHandle};
+
+mod apps;
+mod git;
+mod http;
+mod protocol;
+mod tasks;
+
+pub use http::run_http_server;
+use protocol::{
+    discover_response, legacy_capabilities, parse_request_meta, resolve_protocol_version,
+    server_capabilities, with_cache_meta, DEFAULT_TTL_MS, PROTOCOL_VERSION_LATEST,
+    PROTOCOL_VERSION_LEGACY,
+};
+use tasks::TaskManager;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct JsonRpcRequest {
@@ -34,6 +49,9 @@ struct JsonRpcError {
 pub struct McpServer {
     graph: SharedGraph,
     spotlight_handle: Option<SyncServerHandle>,
+    project_root: PathBuf,
+    tasks: Arc<TaskManager>,
+    negotiated_protocol: Arc<tokio::sync::RwLock<Option<String>>>,
 }
 
 impl McpServer {
@@ -41,6 +59,20 @@ impl McpServer {
         Self {
             graph,
             spotlight_handle: None,
+            project_root: PathBuf::from("."),
+            tasks: Arc::new(TaskManager::new()),
+            negotiated_protocol: Arc::new(tokio::sync::RwLock::new(None)),
+        }
+    }
+
+    /// Creates an MCP server with project root for git-diff blast radius.
+    pub fn with_project(graph: SharedGraph, project_root: PathBuf) -> Self {
+        Self {
+            graph,
+            spotlight_handle: None,
+            project_root,
+            tasks: Arc::new(TaskManager::new()),
+            negotiated_protocol: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -49,7 +81,29 @@ impl McpServer {
         Self {
             graph,
             spotlight_handle: Some(handle),
+            project_root: PathBuf::from("."),
+            tasks: Arc::new(TaskManager::new()),
+            negotiated_protocol: Arc::new(tokio::sync::RwLock::new(None)),
         }
+    }
+
+    /// Creates an MCP server with spotlight and project root.
+    pub fn with_spotlight_and_project(
+        graph: SharedGraph,
+        handle: SyncServerHandle,
+        project_root: PathBuf,
+    ) -> Self {
+        Self {
+            graph,
+            spotlight_handle: Some(handle),
+            project_root,
+            tasks: Arc::new(TaskManager::new()),
+            negotiated_protocol: Arc::new(tokio::sync::RwLock::new(None)),
+        }
+    }
+
+    pub fn task_manager(&self) -> Arc<TaskManager> {
+        self.tasks.clone()
     }
 
     /// Triggers a spotlight on the visualizer for the given node.
@@ -73,20 +127,23 @@ impl McpServer {
     }
 
     pub async fn run_stdio(&self) -> Result<()> {
-        let stdin = io::stdin();
-        let mut stdout = io::stdout();
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-        // Use blocking iterator for simplicity on stdin with lines
-        // In a real async CLI, we might use tokio::io::stdin
-        let lines = stdin.lock().lines();
+        let stdin = tokio::io::stdin();
+        let mut stdout = tokio::io::stdout();
+        let mut reader = BufReader::new(stdin);
+        let mut line = String::new();
 
-        for line in lines {
-            let line = line?;
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                break;
+            }
             if line.trim().is_empty() {
                 continue;
             }
 
-            // Parse request
             let req: JsonRpcRequest = match serde_json::from_str(&line) {
                 Ok(r) => r,
                 Err(e) => {
@@ -95,41 +152,151 @@ impl McpServer {
                 }
             };
 
-            // Handle method
             if let Some(response) = self.handle_request(req).await {
-                // Serialize and write
                 let json = serde_json::to_string(&response)?;
-                writeln!(stdout, "{}", json)?;
-                stdout.flush()?;
+                stdout.write_all(json.as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
             }
         }
         Ok(())
     }
 
+    /// Handle a raw JSON-RPC body over HTTP transport.
+    pub async fn handle_http_body(&self, body: &str) -> String {
+        let req: JsonRpcRequest = match serde_json::from_str(body) {
+            Ok(r) => r,
+            Err(e) => {
+                return serde_json::to_string(&JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32700,
+                        message: format!("Parse error: {}", e),
+                        data: None,
+                    }),
+                    id: None,
+                })
+                .unwrap_or_default();
+            }
+        };
+
+        match self.handle_request(req).await {
+            Some(resp) => serde_json::to_string(&resp).unwrap_or_default(),
+            None => "{}".to_string(),
+        }
+    }
+
+    /// If graph is empty, spawn a background wait task and return task handle.
+    async fn maybe_wait_for_index(&self, tool_name: &str) -> Option<Value> {
+        if self.graph.read().await.node_count() > 0 {
+            return None;
+        }
+
+        let task_id = self
+            .tasks
+            .create(tool_name, "Waiting for background index to complete")
+            .await;
+        let graph = self.graph.clone();
+        let tasks = self.tasks.clone();
+        let tid = task_id.clone();
+
+        tokio::spawn(async move {
+            tasks.set_running(&tid, "Indexing project...", 10).await;
+            for i in 0..120 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let count = graph.read().await.node_count();
+                let progress = ((i + 1) * 100 / 120).min(95) as u8;
+                if count > 0 {
+                    tasks
+                        .complete(
+                            &tid,
+                            json!({ "indexed": true, "node_count": count }),
+                        )
+                        .await;
+                    return;
+                }
+                tasks
+                    .set_running(&tid, &format!("Indexing... ({}s)", (i + 1) / 2), progress)
+                    .await;
+            }
+            tasks
+                .fail(&tid, "Indexing timed out after 60 seconds")
+                .await;
+        });
+
+        Some(tasks::TaskManager::task_handle_response(&task_id))
+    }
+
     async fn handle_request(&self, req: JsonRpcRequest) -> Option<JsonRpcResponse> {
         let id = req.id.clone();
+        let params = req.params.clone().unwrap_or(Value::Null);
+        let meta = parse_request_meta(&params);
+        let negotiated = self.negotiated_protocol.read().await.clone();
+        let protocol = resolve_protocol_version(&meta, negotiated.as_deref());
 
-        // Basic list_tools and call_tool implementation
         let result = match req.method.as_str() {
-            "initialize" => Ok(json!({
-                "protocolVersion": "2025-03-26",
-                "capabilities": {
-                    "tools": {},
-                    "resources": {},
-                    "streaming": false,
-                    "pagination": false,
-                    "json": true
-                },
-                "serverInfo": {
-                    "name": "arbor-mcp",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            })),
+            "initialize" => {
+                let client_version = params
+                    .get("protocolVersion")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(PROTOCOL_VERSION_LEGACY);
+                *self.negotiated_protocol.write().await = Some(client_version.to_string());
+
+                let caps = if client_version == PROTOCOL_VERSION_LATEST
+                    || client_version.starts_with("2026-")
+                {
+                    server_capabilities()
+                } else {
+                    legacy_capabilities()
+                };
+
+                Ok(json!({
+                    "protocolVersion": if client_version.starts_with("2026-") {
+                        PROTOCOL_VERSION_LATEST
+                    } else {
+                        PROTOCOL_VERSION_LEGACY
+                    },
+                    "capabilities": caps,
+                    "serverInfo": {
+                        "name": "arbor-mcp",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }))
+            }
+            "server/discover" => Ok(discover_response()),
             "notifications/initialized" => Ok(json!({})),
-            "tools/list" => self.list_tools(),
-            "tools/call" => self.call_tool(req.params.unwrap_or(Value::Null)).await,
-            "resources/list" => self.list_resources(),
-            "resources/read" => self.read_resource(req.params.unwrap_or(Value::Null)).await,
+            "tools/list" => match self.list_tools() {
+                Ok(mut result) => {
+                    if protocol == PROTOCOL_VERSION_LATEST {
+                        result = with_cache_meta(result, DEFAULT_TTL_MS);
+                    }
+                    Ok(result)
+                }
+                Err(e) => Err(e),
+            },
+            "tools/call" => self.call_tool(params).await,
+            "resources/list" => match self.list_resources() {
+                Ok(mut result) => {
+                    if protocol == PROTOCOL_VERSION_LATEST {
+                        result = with_cache_meta(result, DEFAULT_TTL_MS);
+                    }
+                    Ok(result)
+                }
+                Err(e) => Err(e),
+            },
+            "resources/read" => match self.read_resource(params).await {
+                Ok(mut result) => {
+                    if protocol == PROTOCOL_VERSION_LATEST {
+                        result = with_cache_meta(result, DEFAULT_TTL_MS);
+                    }
+                    Ok(result)
+                }
+                Err(e) => Err(e),
+            },
+            "tasks/get" => self.tasks_get(params).await,
+            "tasks/update" => self.tasks_update(params).await,
+            "tasks/cancel" => self.tasks_cancel(params).await,
             method => Err(JsonRpcError {
                 code: -32601,
                 message: format!("Method not found: {}", method),
@@ -153,6 +320,60 @@ impl McpServer {
                 id,
             },
         })
+    }
+
+    async fn tasks_get(&self, params: Value) -> Result<Value, JsonRpcError> {
+        let task_id = params
+            .get("taskId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| JsonRpcError {
+                code: -32602,
+                message: "Missing 'taskId' parameter".to_string(),
+                data: None,
+            })?;
+
+        self.tasks
+            .get_response(task_id)
+            .await
+            .ok_or_else(|| JsonRpcError {
+                code: -32602,
+                message: format!("Task not found: {}", task_id),
+                data: None,
+            })
+    }
+
+    async fn tasks_update(&self, params: Value) -> Result<Value, JsonRpcError> {
+        let task_id = params
+            .get("taskId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| JsonRpcError {
+                code: -32602,
+                message: "Missing 'taskId' parameter".to_string(),
+                data: None,
+            })?;
+
+        self.tasks
+            .update_response(task_id)
+            .await
+            .ok_or_else(|| JsonRpcError {
+                code: -32602,
+                message: format!("Task not found: {}", task_id),
+                data: None,
+            })
+    }
+
+    async fn tasks_cancel(&self, params: Value) -> Result<Value, JsonRpcError> {
+        let task_id = params
+            .get("taskId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| JsonRpcError {
+                code: -32602,
+                message: "Missing 'taskId' parameter".to_string(),
+                data: None,
+            })?;
+
+        let cancelled = self.tasks.cancel(task_id).await;
+        Ok(json!({ "taskId": task_id, "cancelled": cancelled }))
     }
 
     fn ok_envelope(
@@ -220,7 +441,8 @@ impl McpServer {
                         },
                         "required": ["node_id"]
                     },
-                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+                    "_meta": apps::ui_meta(apps::UI_BLAST_RADIUS)
                 },
                 {
                     "name": "find_path",
@@ -284,7 +506,8 @@ impl McpServer {
                         "type": "object",
                         "properties": {
                             "query": { "type": "string", "description": "Partial or full symbol name to search for" },
-                            "limit": { "type": "integer", "description": "Maximum results to return (default: 20)", "default": 20 }
+                            "limit": { "type": "integer", "description": "Maximum results to return (default: 20)", "default": 20 },
+                            "offset": { "type": "integer", "description": "Pagination offset (default: 0)", "default": 0 }
                         },
                         "required": ["query"]
                     },
@@ -322,7 +545,9 @@ impl McpServer {
                         "properties": {
                             "tokens": { "type": "integer", "description": "Maximum token budget for output (default: 1024)", "default": 1024 },
                             "exclude_test": { "type": "boolean", "description": "Exclude test/spec/fixture files (default: true)", "default": true },
-                            "focus": { "type": "string", "description": "Boost symbols in files matching this pattern (e.g. 'service', 'pipeline')" }
+                            "focus": { "type": "string", "description": "Boost symbols in files matching this pattern (e.g. 'service', 'pipeline')" },
+                            "offset": { "type": "integer", "description": "Pagination offset for entries (default: 0)", "default": 0 },
+                            "limit": { "type": "integer", "description": "Max entries per page (default: 50)", "default": 50 }
                         },
                         "required": []
                     },
@@ -375,7 +600,8 @@ impl McpServer {
                             "top_n": { "type": "integer", "description": "Number of top hotspots to include (default: 20)", "default": 20 }
                         }
                     },
-                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
+                    "_meta": apps::ui_meta(apps::UI_ARCHITECTURE_MAP)
                 },
                 {
                     "name": "batch_query",
@@ -407,12 +633,11 @@ impl McpServer {
 
         let arguments = params.get("arguments").unwrap_or(&Value::Null);
 
-        // If the graph is empty, the background index hasn't finished yet
+        // If the graph is empty, return a task handle instead of erroring (Tasks extension)
         if self.graph.read().await.node_count() == 0 {
-            return Ok(Self::err_envelope(
-                name,
-                "Arbor is still indexing the project. Please retry in a few seconds.",
-            ));
+            if let Some(task_resp) = self.maybe_wait_for_index(name).await {
+                return Ok(task_resp);
+            }
         }
 
         match name {
@@ -762,11 +987,16 @@ impl McpServer {
                     .get("limit")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(20) as usize;
+                let offset = arguments
+                    .get("offset")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
                 let graph = self.graph.read().await;
-                let results = graph.search(query);
-                let items: Vec<Value> = results
+                let all_results = graph.search(query);
+                let total = all_results.len();
+                let page_results: Vec<_> = all_results.iter().skip(offset).take(limit).collect();
+                let items: Vec<Value> = page_results
                     .iter()
-                    .take(limit)
                     .map(|n| {
                         json!({
                             "id": n.id,
@@ -783,9 +1013,20 @@ impl McpServer {
                     .and_then(|e| e["name"].as_str())
                     .unwrap_or("")
                     .to_string();
+                let has_more = offset + count < total;
                 Ok(Self::ok_envelope(
                     "search_symbols",
-                    json!({ "query": query, "results": items }),
+                    json!({
+                        "query": query,
+                        "results": items,
+                        "pagination": {
+                            "offset": offset,
+                            "limit": limit,
+                            "total": total,
+                            "hasMore": has_more,
+                            "nextOffset": if has_more { json!(offset + count) } else { Value::Null }
+                        }
+                    }),
                     count,
                     "get_node_detail",
                     json!({ "symbol": first }),
@@ -914,13 +1155,19 @@ impl McpServer {
                     .get("focus")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                let offset = arguments
+                    .get("offset")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let limit = arguments
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(50) as usize;
 
                 let graph = self.graph.read().await;
 
-                // Check if centrality is computed
                 let has_centrality = graph.node_indexes().any(|idx| graph.centrality(idx) > 0.0);
 
-                // If no centrality, we need a mutable graph — drop read, acquire write
                 drop(graph);
                 if !has_centrality {
                     let mut graph = self.graph.write().await;
@@ -929,7 +1176,31 @@ impl McpServer {
                 }
 
                 let graph = self.graph.read().await;
-                let result = self.build_map(&graph, token_budget, exclude_test, focus_pattern);
+                let mut result = self.build_map(&graph, token_budget, exclude_test, focus_pattern);
+
+                if let Some(entries) = result.get_mut("entries").and_then(|v| v.as_array()) {
+                    let total = entries.len();
+                    let page: Vec<Value> = entries
+                        .iter()
+                        .skip(offset)
+                        .take(limit)
+                        .cloned()
+                        .collect();
+                    let has_more = offset + page.len() < total;
+                    if let Some(obj) = result.as_object_mut() {
+                        obj.insert("entries".to_string(), json!(page));
+                        obj.insert(
+                            "pagination".to_string(),
+                            json!({
+                                "offset": offset,
+                                "limit": limit,
+                                "total": total,
+                                "hasMore": has_more,
+                                "nextOffset": if has_more { json!(offset + page.len()) } else { Value::Null }
+                            }),
+                        );
+                    }
+                }
 
                 Ok(Self::ok_envelope(
                     "get_map",
@@ -940,65 +1211,101 @@ impl McpServer {
                 ))
             }
             "get_blast_radius" => {
-                let graph = self.graph.read().await;
-                let node_count = graph.node_count();
-                let edge_count = graph.edge_count();
-                let entry_points = graph.list_entry_points();
+                let depth = arguments
+                    .get("max_depth")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(5) as usize;
                 let format = arguments
                     .get("format")
                     .and_then(|v| v.as_str())
                     .unwrap_or("json");
 
-                let entry_list: Vec<Value> = entry_points
-                    .iter()
-                    .take(10)
-                    .map(|n| {
-                        json!({
-                            "name": n.name,
-                            "kind": n.kind.to_string(),
-                            "file": n.file
-                        })
-                    })
-                    .collect();
+                let graph = self.graph.read().await;
+                let node_count = graph.node_count();
 
-                let data = json!({
-                    "nodes": node_count,
-                    "edges": edge_count,
-                    "entry_points_count": entry_points.len(),
-                    "sample_entry_points": entry_list,
-                    "description": "Please run `arbor diff` or `arbor check` in your workspace terminal to perform a precise Git diff-based blast radius check."
-                });
-
-                if format == "markdown" {
-                    let mut markdown = format!(
-                        "## 🌳 Arbor Blast Radius Overview\n\n\
-                        - **Indexed Nodes**: {}\n\
-                        - **Connections**: {}\n\
-                        - **Entry Points**: {}\n\n\
-                        ### Sample Entry Points\n\n| Name | Type | File |\n|------|------|------|\n",
-                        node_count, edge_count, entry_points.len()
-                    );
-                    for ep in entry_points.iter().take(10) {
-                        markdown.push_str(&format!(
-                            "| `{}` | {} | `{}` |\n",
-                            ep.name, ep.kind, ep.file
-                        ));
-                    }
-                    markdown.push_str("\n> [!NOTE]\n> To run a full git-diff-aware impact analysis, use the `arbor diff` command in your terminal.");
-                    Ok(json!({
-                        "content": [{
-                            "type": "text",
-                            "text": markdown
-                        }]
-                    }))
-                } else {
-                    Ok(Self::ok_envelope(
+                match git::list_changed_files(&self.project_root) {
+                    Err(e) => Ok(Self::err_envelope(
                         "get_blast_radius",
-                        data,
-                        node_count,
-                        "list_entry_points",
-                        json!({}),
-                    ))
+                        &format!("Git diff failed: {}", e),
+                    )),
+                    Ok(changed_files) => {
+                        if changed_files.is_empty() {
+                            let data = json!({
+                                "changed_files": [],
+                                "blast_radius_nodes": 0,
+                                "risk_level": "low",
+                                "message": "No uncommitted changes detected"
+                            });
+                            return Ok(Self::ok_envelope(
+                                "get_blast_radius",
+                                data,
+                                node_count,
+                                "list_entry_points",
+                                json!({}),
+                            ));
+                        }
+
+                        let changed_ids =
+                            changed_node_ids(&graph, &changed_files, &self.project_root);
+                        let summary = compute_blast_radius(
+                            &graph,
+                            changed_files,
+                            changed_ids,
+                            depth,
+                            &self.project_root,
+                        );
+
+                        if format == "markdown" {
+                            let mut markdown = format!(
+                                "## 🌳 Arbor Blast Radius Report\n\n\
+                                **Risk Level:** {} | **Blast Radius:** {} nodes | **Changed Symbols:** {}\n\n\
+                                ### Changed Files\n\n| File |\n|------|\n",
+                                summary.risk_level,
+                                summary.blast_radius_nodes,
+                                summary.changed_symbols
+                            );
+                            for f in &summary.changed_files {
+                                markdown.push_str(&format!("| `{}` |\n", f));
+                            }
+                            if let Some(ref diagram) = summary.mermaid_diagram {
+                                markdown.push_str("\n### Impact Graph\n\n```mermaid\n");
+                                markdown.push_str(diagram);
+                                markdown.push_str("\n```\n");
+                            }
+                            markdown.push_str(&format!(
+                                "\n### Impact Summary\n\n\
+                                - Direct callers: {}\n\
+                                - Indirect callers: {}\n\
+                                - Entry points affected: {}\n\
+                                - Files likely requiring updates: {}\n",
+                                summary.direct_callers,
+                                summary.indirect_callers,
+                                summary.entrypoints_affected,
+                                summary.files_likely_updates
+                            ));
+                            Ok(json!({
+                                "content": [{ "type": "text", "text": markdown }]
+                            }))
+                        } else {
+                            Ok(Self::ok_envelope(
+                                "get_blast_radius",
+                                json!({
+                                    "changed_files": summary.changed_files,
+                                    "changed_symbols": summary.changed_symbols,
+                                    "direct_callers": summary.direct_callers,
+                                    "indirect_callers": summary.indirect_callers,
+                                    "entrypoints_affected": summary.entrypoints_affected,
+                                    "files_likely_updates": summary.files_likely_updates,
+                                    "blast_radius_nodes": summary.blast_radius_nodes,
+                                    "risk_level": summary.risk_level,
+                                    "mermaid_diagram": summary.mermaid_diagram
+                                }),
+                                node_count,
+                                "analyze_impact",
+                                json!({}),
+                            ))
+                        }
+                    }
                 }
             }
             "explain_symbol" => {
@@ -1700,28 +2007,28 @@ impl McpServer {
     }
 
     fn list_resources(&self) -> Result<Value, JsonRpcError> {
-        Ok(json!({
-            "resources": [
-                {
-                    "uri": "arbor://graph/stats",
-                    "name": "Graph Statistics",
-                    "description": "Node count, edge count, languages, and files indexed",
-                    "mimeType": "application/json"
-                },
-                {
-                    "uri": "arbor://graph/entry-points",
-                    "name": "Entry Points",
-                    "description": "All detected entry points in the codebase",
-                    "mimeType": "application/json"
-                },
-                {
-                    "uri": "arbor://graph/hotspots",
-                    "name": "Code Hotspots",
-                    "description": "Top 20 most central nodes in the codebase",
-                    "mimeType": "application/json"
-                }
-            ]
-        }))
+        let mut resources = vec![
+            json!({
+                "uri": "arbor://graph/stats",
+                "name": "Graph Statistics",
+                "description": "Node count, edge count, languages, and files indexed",
+                "mimeType": "application/json"
+            }),
+            json!({
+                "uri": "arbor://graph/entry-points",
+                "name": "Entry Points",
+                "description": "All detected entry points in the codebase",
+                "mimeType": "application/json"
+            }),
+            json!({
+                "uri": "arbor://graph/hotspots",
+                "name": "Code Hotspots",
+                "description": "Top 20 most central nodes in the codebase",
+                "mimeType": "application/json"
+            }),
+        ];
+        resources.extend(apps::list_app_resources());
+        Ok(json!({ "resources": resources }))
     }
 
     async fn read_resource(&self, params: Value) -> Result<Value, JsonRpcError> {
@@ -1785,6 +2092,22 @@ impl McpServer {
                     .collect();
                 json!({ "hotspots": hotspots })
             }
+            uri if uri.starts_with("ui://") => {
+                if let Some(html) = apps::read_app_template(uri) {
+                    return Ok(json!({
+                        "contents": [{
+                            "uri": uri,
+                            "mimeType": "text/html",
+                            "text": html
+                        }]
+                    }));
+                }
+                return Err(JsonRpcError {
+                    code: -32602,
+                    message: format!("Unknown UI template: {}", uri),
+                    data: None,
+                });
+            }
             _ => {
                 return Err(JsonRpcError {
                     code: -32602,
@@ -1811,6 +2134,7 @@ mod tool_tests {
     use super::*;
     use arbor_graph::ArborGraph;
     use arbor_server::SharedGraph;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -1825,7 +2149,13 @@ mod tool_tests {
         );
         graph.add_node(node);
         let shared: SharedGraph = Arc::new(RwLock::new(graph));
-        McpServer::new(shared)
+        // Use repo root so git-diff blast radius works in tests
+        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        McpServer::with_project(shared, project_root)
     }
 
     #[tokio::test]
@@ -2060,5 +2390,35 @@ mod tool_tests {
         let text = val["content"][0]["text"].as_str().unwrap();
         let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(envelope["ok"], true);
+        assert!(envelope["data"]["risk_level"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_server_discover() {
+        let server = empty_server();
+        let resp = server
+            .handle_request(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "server/discover".to_string(),
+                params: None,
+                id: Some(json!(1)),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.result.unwrap()["protocolVersion"],
+            "2026-07-28"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_ui_template_resource() {
+        let server = empty_server();
+        let result = server
+            .read_resource(json!({ "uri": apps::UI_BLAST_RADIUS }))
+            .await
+            .unwrap();
+        let text = result["contents"][0]["text"].as_str().unwrap();
+        assert!(text.contains("canvas"));
     }
 }
