@@ -202,6 +202,14 @@ enum Commands {
         /// Follow symbolic links when walking directories
         #[arg(long)]
         follow_symlinks: bool,
+
+        /// Also serve MCP over stateless HTTP (MCP 2026-07-28)
+        #[arg(long)]
+        http: bool,
+
+        /// HTTP port for MCP transport (default: 3333)
+        #[arg(long, default_value = "3333")]
+        port: u16,
     },
 
     /// Check system health and environment
@@ -561,7 +569,9 @@ async fn main() {
             path,
             viz,
             follow_symlinks,
-        } => commands::bridge(&path, viz, follow_symlinks).await,
+            http,
+            port,
+        } => commands::bridge(&path, viz, follow_symlinks, http, port).await,
         Commands::Doctor { path } => commands::check_health(Some(&path)).await,
         Commands::Refactor {
             target,
