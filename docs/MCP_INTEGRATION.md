@@ -12,7 +12,9 @@ Arbor's MCP (Model Context Protocol) bridge allows AI agents like Claude and Cur
 - **Analyze impact** — see blast radius before refactoring
 - **Find paths** — trace connections between any two symbols
 
-The bridge communicates over **stdio** using JSON-RPC, following the [MCP specification](https://modelcontextprotocol.io/).
+The bridge communicates over **stdio** (default) or **stateless HTTP** (`arbor bridge --http`), using JSON-RPC following MCP `2026-07-28` with fallback for `2025-03-26` clients.
+
+**v2.4.0 highlights:** Tasks extension, MCP Apps (interactive graphs), real git-diff `get_blast_radius`, pagination, `server/discover`.
 
 **Directory listing:** [Glama MCP Directory — Arbor](https://glama.ai/mcp/servers/@Anandb71/arbor)
 
@@ -285,24 +287,38 @@ Errors return `{ "ok": false, "error": "..." }`.
 
 ## Capabilities
 
-The bridge advertises these capabilities to clients:
+The bridge advertises these capabilities to clients (MCP `2026-07-28`):
 
 ```json
 {
+  "protocolVersion": "2026-07-28",
   "streaming": false,
-  "pagination": false,
-  "json": true
+  "pagination": true,
+  "json": true,
+  "extensions": {
+    "io.modelcontextprotocol/tasks": { "version": "1.0.0" },
+    "io.modelcontextprotocol/apps": { "version": "1.0.0" }
+  }
 }
 ```
+
+### HTTP Transport (v2.4.0)
+
+```bash
+arbor bridge --http --port 3333
+```
+
+POST JSON-RPC to `http://127.0.0.1:3333/mcp` with headers:
+- `Mcp-Method`: e.g. `tools/call`
+- `Mcp-Name`: e.g. `analyze_impact`
 
 ---
 
 ## Known Limitations
 
-1. **stdio only** — No WebSocket transport currently
+1. **Performance** — Large monorepos index single-threaded (v2.5.0 will add parallelism)
 2. **Single project** — Point `cwd` to your target project
-3. **No hot reload** — Re-index after major changes (`arbor index`)
-4. **Static analysis** — Dynamic dispatch marked as uncertain
+3. **Static analysis** — Dynamic dispatch marked as uncertain
 
 ---
 
