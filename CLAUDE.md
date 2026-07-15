@@ -27,6 +27,9 @@ cargo fmt --all -- --check
 # Format fix
 cargo fmt --all
 
+# Benchmarks (criterion; CI regression gate in .github/workflows/benchmarks.yml)
+cargo bench -p arbor-graph
+
 # Release build (CLI binary)
 cargo build --locked --release -p arbor-graph-cli
 
@@ -68,14 +71,16 @@ arbor-core  →  arbor-graph  →  arbor-watcher
 
 **`arbor-server`** — Tokio WebSocket server on `ws://localhost:7432`. JSON-RPC methods: `discover`, `impact`, `context`, `graph.subscribe`, `spotlight`. RwLock-protected shared graph state.
 
-**`arbor-mcp`** — MCP stdio bridge for AI agents. Eleven tools in three tiers:
-- **Orientation**: `get_map` — ranked, token-budgeted skeleton of the codebase (recommended first call)
-- **Surgical**: `list_entry_points`, `get_callers`, `get_callees`, `search_symbols`, `get_file_graph`, `get_node_detail`
-- **Broad**: `get_logic_path`, `get_knowledge_path`, `find_path`, `analyze_impact`
+**`arbor-mcp`** — MCP bridge for AI agents (stdio by default, stateless HTTP via `arbor bridge --http --port 3333`). Speaks MCP `2026-07-28` with fallback for `2025-03-26` clients. Sixteen tools:
+- **Orientation**: `get_map` — ranked, token-budgeted skeleton of the codebase (recommended first call), `get_architecture_overview`
+- **Surgical**: `list_entry_points`, `get_callers`, `get_callees`, `search_symbols`, `get_file_graph`, `get_node_detail`, `explain_symbol`
+- **Broad**: `get_logic_path`, `get_knowledge_path`, `find_path`, `analyze_impact`, `get_blast_radius` (git-diff based), `audit_security`, `batch_query`
 
-All tools emit a standard JSON envelope: `{ok, tool, arbor_version, data, meta: {node_count, suggested_next_tool, suggested_next_args}}`. Error responses use `{ok: false, error}`. Run via `arbor bridge`.
+Module layout: `lib.rs` (tool dispatch + `tools/list`), `protocol.rs` (version negotiation, caching metadata), `tasks.rs` (Tasks extension — background indexing returns task handles agents can poll during cold start), `apps.rs` (MCP Apps — interactive blast-radius and architecture-map UIs via `ui://arbor/*` resources), `http.rs` (HTTP transport with `Mcp-Method`/`Mcp-Name` header routing), `git.rs`.
 
-**`arbor-cli`** — Clap CLI with ~25 subcommands. All command logic lives in `src/commands.rs`. Entry point: `src/main.rs`. Dispatches to the other crates. Binary name: `arbor` (crate name: `arbor-graph-cli`).
+All tools emit a standard JSON envelope: `{ok, tool, arbor_version, data, meta: {node_count, suggested_next_tool, suggested_next_args}}`. Error responses use `{ok: false, error}`. `search_symbols` and `get_map` support pagination (`offset`, `limit`, `hasMore`).
+
+**`arbor-cli`** — Clap CLI with ~30 subcommands. Most command logic lives in `src/commands.rs`; `src/audit/` implements the security audit and `src/hook/` implements agent-harness installation (`arbor hook claude`). Entry point: `src/main.rs`. Dispatches to the other crates. Binary name: `arbor` (crate name: `arbor-graph-cli`).
 Key features:
 - `map . --exclude-test`: ranked, token-budgeted project skeleton (PageRank + entry point detection). Supports `--tokens N`, `--focus "pattern"`, `--focus-changed`, `--json`, `--verbose`.
 - `callers`/`callees`/`entry-points`/`file-graph`/`inspect`/`path`: graph query commands matching MCP tools.
@@ -83,6 +88,10 @@ Key features:
 - `diff . --markdown`: formats impact analysis report as color-coded Markdown.
 - `check . --markdown`: executes safety threshold validation and prints Markdown PASS/FAIL status.
 - `summary .`: auto-generates structured Pull Request descriptions based on graph diff analysis.
+- `agent review`/`agent onboard`/`agent guard`: built-in autonomous workflows (PR risk review, contributor onboarding guide, architecture violation check with `--max-blast-radius`).
+- `audit "sink"`: traces call paths to sensitive sinks (e.g. `db_query`, `exec`).
+- `explain "question"`: graph-backed context slicing for a question (`--tokens`, `--why`).
+- `hook claude [--global]`: installs Arbor directives + hooks into Claude Code settings.
 
 **`arbor-gui`** — egui immediate-mode desktop UI. Standalone binary.
 
@@ -130,7 +139,16 @@ Local cache created by `arbor init`/`arbor setup`. Contains `config.json` with d
 | `check .` | CI safety threshold check |
 | `refactor "sym" .` | Blast radius of changing a symbol |
 | `summary .` | Auto-generate PR description |
-| `bridge .` | Start MCP stdio server |
+| `audit "sink" .` | Trace call paths to a sensitive sink |
+| `explain "question" .` | Graph-backed context for a question |
+| `agent review .` | Autonomous PR risk review |
+| `agent onboard .` | Generate contributor onboarding guide |
+| `agent guard .` | Architecture violation check |
+| `hook claude` | Install hooks into Claude Code settings |
+| `doctor .` | System health / environment check |
+| `status .` | Index status and statistics |
+| `export .` | Export graph to JSON |
+| `bridge .` | Start MCP server (stdio; `--http --port 3333` for HTTP) |
 | `serve .` | Start WebSocket server |
 | `watch .` | File watcher + auto re-index |
 
@@ -207,10 +225,12 @@ To integrate arbor into a target project for AI agent use:
 
 Document the workflow: map is auto-injected, use `arbor query`/`callers`/`callees`/`file-graph` for navigation, only `Read` after arbor identifies the target file+line.
 
-## Active Development Areas
+## Sub-Projects Outside the Workspace
 
-- `cli-enhancements` branch: map command, CLI parity with MCP, concurrency fixes
-- `arborv2/` — Tauri v2 desktop companion (in progress, excluded from workspace)
-- `lattice/` — Lattice Personal OS integration (excluded from workspace)
 - `extensions/arbor-vscode/` — VS Code extension (separate npm project)
-- `visualizer/` — Flutter visualizer (separate Dart project)
+- `visualizer/` — Flutter visualizer (separate Dart project, launched by `arbor viz`)
+- `packaging/` — Homebrew/Scoop manifests; checksums are pinned per release
+
+## Releasing
+
+Release process is documented in `docs/RELEASING.md`. Releases are driven by tag push through `.github/workflows/release.yml`; separate workflows publish to npm, the VS Code Marketplace, and GHCR. Version lives in `[workspace.package]` in the root `Cargo.toml`.
