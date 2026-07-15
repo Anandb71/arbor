@@ -16,13 +16,14 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 
-arbor-core = { path = "../arbor-core", version = "2.4.0" }
-arbor-graph = { path = "../arbor-graph", version = "2.4.0" }
+arbor-core = { path = "../arbor-core", version = "2.5.0" }
+arbor-graph = { path = "../arbor-graph", version = "2.5.0" }
 
 notify = "6.0"
 notify-debouncer-mini = "0.4"
 walkdir = "2.4"
 ignore = "0.4"
+rayon.workspace = true
 
 [dev-dependencies]
 tempfile = "3.10"

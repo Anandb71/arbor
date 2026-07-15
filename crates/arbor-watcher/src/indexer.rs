@@ -6,6 +6,7 @@
 use arbor_core::{parse_file, CodeNode};
 use arbor_graph::{ArborGraph, GraphBuilder, GraphStore};
 use ignore::WalkBuilder;
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -83,10 +84,7 @@ pub fn index_directory(root: &Path, options: IndexOptions) -> Result<IndexResult
                 }
             });
 
-    // Track files we've seen (for detecting deleted files)
-    let mut seen_files: HashSet<String> = HashSet::new();
-
-    // Walk the directory, respecting .gitignore
+    // Walk the directory, respecting .gitignore, collecting supported files
     let walker = WalkBuilder::new(root)
         .hidden(true) // Skip hidden files
         .git_ignore(true) // Respect .gitignore
@@ -95,30 +93,40 @@ pub fn index_directory(root: &Path, options: IndexOptions) -> Result<IndexResult
         .follow_links(options.follow_symlinks)
         .build();
 
-    for entry in walker.filter_map(Result::ok) {
-        let path = entry.path();
+    let candidates: Vec<PathBuf> = walker
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                return false;
+            }
+            match path.extension().and_then(|e| e.to_str()) {
+                Some(ext) => arbor_core::languages::is_supported(ext),
+                None => false,
+            }
+        })
+        .map(|entry| entry.into_path())
+        .collect();
 
-        // Skip directories
-        if path.is_dir() {
-            continue;
-        }
+    // Track files we've seen (for detecting deleted files)
+    let seen_files: HashSet<String> = candidates.iter().map(|p| p.display().to_string()).collect();
 
-        // Check if it's a supported file type
-        let extension = match path.extension().and_then(|e| e.to_str()) {
-            Some(ext) => ext,
-            None => continue,
-        };
+    // Parse files in parallel. parse_file creates its own tree-sitter parser
+    // per call and sled handles concurrent reads/writes, so both the cache
+    // check and the parse can fan out. Results collect in walk order, keeping
+    // graph construction deterministic.
+    enum Outcome {
+        CacheHit(Vec<CodeNode>),
+        Parsed(Vec<CodeNode>),
+        Failed(String),
+    }
 
-        if !arbor_core::languages::is_supported(extension) {
-            continue;
-        }
+    let store_ref = store.as_ref();
+    let outcomes: Vec<(String, Outcome)> = candidates
+        .par_iter()
+        .map(|path| {
+            let path_str = path.display().to_string();
 
-        let path_str = path.display().to_string();
-        seen_files.insert(path_str.clone());
-
-        // Check cache
-        if let Some(ref store) = store {
-            // Get file mtime
             let current_mtime = match std::fs::metadata(path) {
                 Ok(meta) => meta
                     .modified()
@@ -129,50 +137,50 @@ pub fn index_directory(root: &Path, options: IndexOptions) -> Result<IndexResult
                 Err(_) => 0,
             };
 
-            // Check cached mtime
-            if let Ok(Some(cached_mtime)) = store.get_mtime(&path_str) {
-                if cached_mtime == current_mtime {
-                    // File unchanged, load from cache
-                    if let Ok(Some(cached_nodes)) = store.get_file_nodes(&path_str) {
-                        debug!("Cache hit: {}", path.display());
-                        nodes_extracted += cached_nodes.len();
-                        cache_hits += 1;
-                        builder.add_nodes(cached_nodes);
-                        continue;
+            if let Some(store) = store_ref {
+                if let Ok(Some(cached_mtime)) = store.get_mtime(&path_str) {
+                    if cached_mtime == current_mtime {
+                        // File unchanged, load from cache
+                        if let Ok(Some(cached_nodes)) = store.get_file_nodes(&path_str) {
+                            debug!("Cache hit: {}", path.display());
+                            return (path_str, Outcome::CacheHit(cached_nodes));
+                        }
                     }
                 }
             }
 
-            // Cache miss or stale, parse file
-            debug!("Parsing (cache miss): {}", path.display());
+            debug!("Parsing: {}", path.display());
             match parse_file(path) {
                 Ok(nodes) => {
-                    nodes_extracted += nodes.len();
-                    files_indexed += 1;
-                    // Update cache
-                    if let Err(e) = store.update_file(&path_str, &nodes, current_mtime) {
-                        warn!("Failed to update cache for {}: {}", path_str, e);
+                    if let Some(store) = store_ref {
+                        if let Err(e) = store.update_file(&path_str, &nodes, current_mtime) {
+                            warn!("Failed to update cache for {}: {}", path_str, e);
+                        }
                     }
-                    builder.add_nodes(nodes);
+                    (path_str, Outcome::Parsed(nodes))
                 }
                 Err(e) => {
                     warn!("Failed to parse {}: {}", path.display(), e);
-                    errors.push((path_str, e.to_string()));
+                    (path_str, Outcome::Failed(e.to_string()))
                 }
             }
-        } else {
-            // No cache, parse directly
-            debug!("Parsing {}", path.display());
-            match parse_file(path) {
-                Ok(nodes) => {
-                    nodes_extracted += nodes.len();
-                    files_indexed += 1;
-                    builder.add_nodes(nodes);
-                }
-                Err(e) => {
-                    warn!("Failed to parse {}: {}", path.display(), e);
-                    errors.push((path_str, e.to_string()));
-                }
+        })
+        .collect();
+
+    for (path_str, outcome) in outcomes {
+        match outcome {
+            Outcome::CacheHit(nodes) => {
+                nodes_extracted += nodes.len();
+                cache_hits += 1;
+                builder.add_nodes(nodes);
+            }
+            Outcome::Parsed(nodes) => {
+                nodes_extracted += nodes.len();
+                files_indexed += 1;
+                builder.add_nodes(nodes);
+            }
+            Outcome::Failed(error) => {
+                errors.push((path_str, error));
             }
         }
     }

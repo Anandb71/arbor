@@ -98,3 +98,6 @@ server.json
 lattice/
 .worktrees/
 .claude/
+
+# Local release scratch docs (never ship)
+docs/_*.md
