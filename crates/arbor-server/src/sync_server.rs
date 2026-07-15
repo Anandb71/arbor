@@ -8,7 +8,7 @@
 
 use crate::SharedGraph;
 use arbor_core::ArborParser;
-use arbor_graph::{compute_centrality, ArborGraph, Edge, EdgeKind};
+use arbor_graph::{compute_centrality_warm, ArborGraph, Edge, EdgeKind};
 use futures_util::{SinkExt, StreamExt};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -698,7 +698,10 @@ async fn run_background_indexer(
 
                         // Recompute centrality so the code map stays in sync with the
                         // patched graph — new nodes start at 0.0 otherwise and the map drifts.
-                        let scores = compute_centrality(&g, 20, 0.85);
+                        // Warm-started from the previous scores, so a single-file patch
+                        // converges in a round or two instead of the full budget.
+                        let scores =
+                            compute_centrality_warm(&g, 20, 0.85, Some(g.centrality_map()));
                         g.set_centrality(scores.into_map());
 
                         let elapsed = start.elapsed();
@@ -740,7 +743,7 @@ async fn run_background_indexer(
                 g.remove_file(&file_str);
 
                 // Recompute centrality so the code map reflects the removed nodes.
-                let scores = compute_centrality(&g, 20, 0.85);
+                let scores = compute_centrality_warm(&g, 20, 0.85, Some(g.centrality_map()));
                 g.set_centrality(scores.into_map());
 
                 let update = BroadcastMessage::GraphUpdate(GraphUpdatePayload {
