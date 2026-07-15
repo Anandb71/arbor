@@ -18,7 +18,7 @@
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License" />
 </p>
 
-> **v2.4.0 — The Agent-Native Leap** · First code-graph MCP server built for MCP `2026-07-28`. Stateless HTTP, Tasks extension, interactive MCP Apps, real git-diff blast radius, and ~95% fewer tokens than file-reading agents. [Release notes →](docs/RELEASE_NOTES_v2.4.0.md)
+> **v2.5.0 — The Last Excuse** · PageRank **23x faster** (149.8ms → 6.6ms on a 10k-node graph). Indexing goes parallel across every core. A 178k-LOC codebase cold-indexes in **1.6s**. "Indexing is slow" was the last argument for letting your agent navigate with `grep -r` — it's gone. Every number reproducible: [BENCHMARKS.md](docs/BENCHMARKS.md) · [Release notes →](docs/RELEASE_NOTES_v2.5.0.md)
 
 ---
 
@@ -37,7 +37,19 @@ No keyword guessing. No embedding hallucinations. One graph, every interface.
 
 ---
 
-## What's new in v2.4.0
+## What's new in v2.5.0
+
+| Change | Measured |
+|--------|----------|
+| **PageRank rewrite** — flat call-graph adjacency replaces per-iteration traversal | 149.8ms → **6.6ms** on a 10k-node graph (**23x**), verified side-by-side vs the old implementation |
+| **Parallel indexing** — parse fans out across all cores, deterministic assembly | Arbor: 253ms → **95ms** · tokio (178k LOC): 2.7s → **1.6s** |
+| **Warm-start centrality** — watcher recomputes seed from previous scores | Converges in ~2 rounds after a one-file patch instead of the full 20-iteration budget |
+| **Convergence early-exit** | Iteration stops at 1e-9 max delta — the budget is a ceiling, not a sentence |
+
+Zero breaking changes — `cargo install arbor-graph-cli --force` and everything is just faster. Think a number is wrong? `cargo bench -p arbor-graph` and prove it: [BENCHMARKS.md](docs/BENCHMARKS.md).
+
+<details>
+<summary><strong>v2.4.0 — The Agent-Native Leap</strong> (MCP <code>2026-07-28</code>, HTTP transport, Tasks, MCP Apps)</summary>
 
 | Feature | What it does |
 |---------|--------------|
@@ -48,6 +60,8 @@ No keyword guessing. No embedding hallucinations. One graph, every interface.
 | **Real `get_blast_radius`** | Git-diff-aware impact analysis via shared `arbor-graph::compute_blast_radius` |
 | **Pagination** | `offset` / `limit` / `hasMore` on `search_symbols` and `get_map` |
 | **Benchmarks** | Criterion suite + CI regression gate — see [BENCHMARKS.md](docs/BENCHMARKS.md) |
+
+</details>
 
 ---
 

@@ -5,6 +5,17 @@ All notable changes to Arbor will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2.5.0
+
+### Added
+- **Parallel indexing:** `index_directory` fans the cache-check/parse phase out across all cores with rayon; results assemble in walk order so graph construction stays deterministic. Measured (median of 3, warm FS cache): Arbor itself 253ms → 95ms (2.7x, 123 files); tokio 2.7s → 1.6s (1.7x, 815 files / 178k LOC — serial graph assembly caps the gain, see `docs/BENCHMARKS.md`). Thread count is tunable via `RAYON_NUM_THREADS`.
+- **Warm-start PageRank:** `compute_centrality_warm` seeds iteration from previous scores (with analytic rescaling of the max-normalized stored values back to fixed-point scale) — watcher/server graph patches now converge in a couple of rounds instead of the full iteration budget. Wired into the sync server's re-index and delete paths.
+- **Convergence early-exit:** centrality iteration stops once no score moves more than 1e-9 between rounds.
+- **Benchmarks:** `compute_centrality_10k` and `compute_centrality_10k_warm` on a realistic fan-in graph (~10k nodes).
+
+### Changed
+- **23x faster PageRank:** `compute_centrality` rewritten from per-iteration `get_callers`/string-ID lookups to a one-pass flat adjacency build plus dense Vec iteration — 149.8ms → 6.6ms on a 10k-node graph. Semantics preserved (Calls-edges only, 10% test-caller weight, [0,1] max-normalization).
+
 ## [2.4.0] - 2026-07-08 "The Agent-Native Leap"
 
 ### Added
