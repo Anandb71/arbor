@@ -18,6 +18,13 @@
   <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License" />
 </p>
 
+<p align="center">
+  <img src="docs/assets/arbor-demo.gif" alt="Side-by-side: an agent navigating tokio with grep-and-read (47 tool calls, still searching) vs the same agent with arbor's code graph (4 graph calls + 1 read, done)" width="900" />
+</p>
+<p align="center">
+  <sub>Simulated replay — the <code>arbor</code> commands and their output are real (tokio @ 178k LOC). Methodology: <a href="docs/BENCHMARKS.md">BENCHMARKS.md</a></sub>
+</p>
+
 > **v2.5.0 — The Last Excuse** · PageRank **23x faster** (149.8ms → 6.6ms on a 10k-node graph). Indexing goes parallel across every core. A 178k-LOC codebase cold-indexes in **1.6s**. "Indexing is slow" was the last argument for letting your agent navigate with `grep -r` — it's gone. Every number reproducible: [BENCHMARKS.md](docs/BENCHMARKS.md) · [Release notes →](docs/RELEASE_NOTES_v2.5.0.md)
 
 ---
@@ -158,10 +165,6 @@ All query commands support `--json`. `map` additionally supports `--tokens N`, `
 ---
 
 ## Visual tour
-
-<p align="center">
-  <img src="docs/assets/arbor-demo.gif" alt="Arbor demo animation" width="760" />
-</p>
 
 <p align="center">
   <img src="docs/assets/visualizer-screenshot.png" alt="Arbor visualizer screenshot" width="760" />
