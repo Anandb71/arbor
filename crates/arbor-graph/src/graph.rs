@@ -236,6 +236,11 @@ impl ArborGraph {
         self.centrality = scores;
     }
 
+    /// Returns the full centrality score map (e.g. to warm-start a recompute).
+    pub fn centrality_map(&self) -> &HashMap<NodeId, f64> {
+        &self.centrality
+    }
+
     /// Returns the number of nodes.
     pub fn node_count(&self) -> usize {
         self.graph.node_count()
