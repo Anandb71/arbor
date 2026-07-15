@@ -28,6 +28,7 @@ serde_json = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
 tokio = { version = "1.0", features = ["full"] }
+rayon = "1.10"
 
 # Tree-sitter and parsers
 tree-sitter = "0.22"
