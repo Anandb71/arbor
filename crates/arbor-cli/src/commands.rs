@@ -38,8 +38,29 @@ const ROOT_MARKERS: &[&str] = &[
     "pubspec.yaml",
 ];
 
+/// Removes Windows' extended-length path prefix.
+///
+/// `fs::canonicalize` returns verbatim paths (`\\?\C:\...`) on Windows. That
+/// prefix flowed into every stored node path and therefore into every line of
+/// user-facing output, where it is noise at best and confusing at worst.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    match path.to_str() {
+        Some(s) => {
+            if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+                PathBuf::from(format!(r"\\{rest}"))
+            } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+                PathBuf::from(rest)
+            } else {
+                path
+            }
+        }
+        None => path,
+    }
+}
+
 fn find_workspace_root(start: &Path) -> PathBuf {
-    let mut current = fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    let mut current =
+        strip_verbatim_prefix(fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf()));
     if current.is_file() {
         if let Some(parent) = current.parent() {
             current = parent.to_path_buf();
@@ -1997,13 +2018,18 @@ pub fn refactor(
     let _ = ensure_arbor_initialized(&resolved_path)?;
     let graph = load_or_index_graph(&resolved_path)?;
 
-    // Find the target node
-    let node_idx = graph.get_index(target).or_else(|| {
-        graph
-            .find_by_name(target)
-            .first()
-            .and_then(|n| graph.get_index(&n.id))
-    });
+    // Find the target node, preferring the most connected definition when the
+    // name is ambiguous — picking the first parsed one reported unrelated
+    // methods as dead code.
+    let node_idx = match resolve_symbol_ranked(&graph, target) {
+        Ok((idx, others)) => {
+            if !json_output {
+                report_symbol_ambiguity(&graph, target, idx, &others);
+            }
+            Some(idx)
+        }
+        Err(_) => None,
+    };
 
     let node_idx = match node_idx {
         Some(idx) => idx,
@@ -3236,23 +3262,82 @@ pub fn audit(sink: &str, depth: usize, format: &str, path: &Path) -> Result<()> 
     Ok(())
 }
 
+/// Resolves a symbol name to the node a user most likely meant.
+///
+/// Names collide constantly — `getPath` is a utility function in `utils/url.ts`
+/// *and* a method on four AWS Lambda event processors. This used to take
+/// `find_by_name(..).first()`, i.e. whichever file happened to be parsed first,
+/// and then answered as if that were the only candidate. On hono that meant
+/// `arbor inspect getPath` reported "unreachable, 0 callers, may be dead code"
+/// about a function 23 files depend on.
+///
+/// Candidates are ranked by graph degree, then centrality, then file path, so
+/// the pick is both meaningful and deterministic. Alternatives are returned so
+/// the caller can tell the user what else matched.
+fn resolve_symbol_ranked(
+    graph: &arbor_graph::ArborGraph,
+    symbol: &str,
+) -> Result<(arbor_graph::NodeId, Vec<arbor_graph::NodeId>)> {
+    let mut candidates = graph.resolve_symbol_ranked(symbol);
+    if candidates.is_empty() {
+        return Err(format!("Symbol '{}' not found", symbol).into());
+    }
+    let best = candidates.remove(0);
+    Ok((best, candidates))
+}
+
 fn resolve_symbol(graph: &arbor_graph::ArborGraph, symbol: &str) -> Result<arbor_graph::NodeId> {
-    graph
-        .get_index(symbol)
-        .or_else(|| {
-            graph
-                .find_by_name(symbol)
-                .first()
-                .and_then(|n| graph.get_index(&n.id))
-        })
-        .ok_or_else(|| format!("Symbol '{}' not found", symbol).into())
+    resolve_symbol_ranked(graph, symbol).map(|(best, _)| best)
+}
+
+/// Tells the user which definition was chosen when a name matched several.
+///
+/// Silence here is what turned an ambiguous lookup into a confidently wrong
+/// answer, so the note is printed even though it adds noise.
+fn report_symbol_ambiguity(
+    graph: &arbor_graph::ArborGraph,
+    symbol: &str,
+    chosen: arbor_graph::NodeId,
+    others: &[arbor_graph::NodeId],
+) {
+    if others.is_empty() {
+        return;
+    }
+    let describe = |i: arbor_graph::NodeId| {
+        graph
+            .get(i)
+            .map(|n| {
+                format!(
+                    "{} ({}) {}:{}",
+                    n.qualified_name, n.kind, n.file, n.line_start
+                )
+            })
+            .unwrap_or_default()
+    };
+
+    eprintln!(
+        "note: '{}' matches {} definitions; showing the most connected one:",
+        symbol,
+        others.len() + 1
+    );
+    eprintln!("      → {}", describe(chosen));
+    for &o in others.iter().take(4) {
+        eprintln!("        {}", describe(o));
+    }
+    if others.len() > 4 {
+        eprintln!("        … and {} more", others.len() - 4);
+    }
+    eprintln!("      Pass a qualified name (e.g. Class.method) to pick a specific one.");
 }
 
 pub fn callers(symbol: &str, path: &Path, json_output: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let graph = load_or_index_graph(&resolved_path)?;
 
-    let idx = resolve_symbol(&graph, symbol)?;
+    let (idx, ambiguous_with) = resolve_symbol_ranked(&graph, symbol)?;
+    if !json_output {
+        report_symbol_ambiguity(&graph, symbol, idx, &ambiguous_with);
+    }
     let callers = graph.get_callers(idx);
 
     if json_output {
@@ -3296,7 +3381,10 @@ pub fn callees(symbol: &str, path: &Path, json_output: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let graph = load_or_index_graph(&resolved_path)?;
 
-    let idx = resolve_symbol(&graph, symbol)?;
+    let (idx, ambiguous_with) = resolve_symbol_ranked(&graph, symbol)?;
+    if !json_output {
+        report_symbol_ambiguity(&graph, symbol, idx, &ambiguous_with);
+    }
     let callees = graph.get_callees(idx);
 
     if json_output {
@@ -3468,7 +3556,10 @@ pub fn inspect(symbol: &str, path: &Path, json_output: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let graph = load_or_index_graph(&resolved_path)?;
 
-    let idx = resolve_symbol(&graph, symbol)?;
+    let (idx, ambiguous_with) = resolve_symbol_ranked(&graph, symbol)?;
+    if !json_output {
+        report_symbol_ambiguity(&graph, symbol, idx, &ambiguous_with);
+    }
     let node = graph
         .get(idx)
         .ok_or_else(|| format!("Node index invalid for '{}'", symbol))?;

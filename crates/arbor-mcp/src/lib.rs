@@ -674,12 +674,9 @@ impl McpServer {
                 let graph = self.graph.read().await;
 
                 // Resolve node by name or ID
-                let node_index = graph.get_index(node_id).or_else(|| {
-                    graph
-                        .find_by_name(node_id)
-                        .first()
-                        .and_then(|n| graph.get_index(&n.id))
-                });
+                let node_index = graph
+                    .get_index(node_id)
+                    .or_else(|| graph.resolve_symbol(node_id));
 
                 match node_index {
                     Some(idx) => {
@@ -773,18 +770,12 @@ impl McpServer {
 
                 let graph = self.graph.read().await;
 
-                let start_idx = graph.get_index(start_node).or_else(|| {
-                    graph
-                        .find_by_name(start_node)
-                        .first()
-                        .and_then(|n| graph.get_index(&n.id))
-                });
-                let end_idx = graph.get_index(end_node).or_else(|| {
-                    graph
-                        .find_by_name(end_node)
-                        .first()
-                        .and_then(|n| graph.get_index(&n.id))
-                });
+                let start_idx = graph
+                    .get_index(start_node)
+                    .or_else(|| graph.resolve_symbol(start_node));
+                let end_idx = graph
+                    .get_index(end_node)
+                    .or_else(|| graph.resolve_symbol(end_node));
 
                 match (start_idx, end_idx) {
                     (Some(u), Some(v)) => {
@@ -875,9 +866,8 @@ impl McpServer {
                     .map(|idx| (symbol.to_string(), idx))
                     .or_else(|| {
                         graph
-                            .find_by_name(symbol)
-                            .first()
-                            .and_then(|n| graph.get_index(&n.id).map(|idx| (n.id.clone(), idx)))
+                            .resolve_symbol(symbol)
+                            .and_then(|idx| graph.get(idx).map(|n| (n.id.clone(), idx)))
                     });
                 match resolved {
                     None => Ok(Self::err_envelope(
@@ -928,9 +918,8 @@ impl McpServer {
                     .map(|idx| (symbol.to_string(), idx))
                     .or_else(|| {
                         graph
-                            .find_by_name(symbol)
-                            .first()
-                            .and_then(|n| graph.get_index(&n.id).map(|idx| (n.id.clone(), idx)))
+                            .resolve_symbol(symbol)
+                            .and_then(|idx| graph.get(idx).map(|n| (n.id.clone(), idx)))
                     });
                 match resolved {
                     None => Ok(Self::err_envelope(
@@ -1077,12 +1066,9 @@ impl McpServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let graph = self.graph.read().await;
-                let idx = graph.get_index(symbol).or_else(|| {
-                    graph
-                        .find_by_name(symbol)
-                        .first()
-                        .and_then(|n| graph.get_index(&n.id))
-                });
+                let idx = graph
+                    .get_index(symbol)
+                    .or_else(|| graph.resolve_symbol(symbol));
                 match idx {
                     None => Ok(Self::err_envelope(
                         "get_node_detail",
@@ -1314,12 +1300,9 @@ impl McpServer {
                 self.trigger_spotlight(symbol).await;
                 let graph = self.graph.read().await;
 
-                let resolved = graph.get_index(symbol).or_else(|| {
-                    graph
-                        .find_by_name(symbol)
-                        .first()
-                        .and_then(|n| graph.get_index(&n.id))
-                });
+                let resolved = graph
+                    .get_index(symbol)
+                    .or_else(|| graph.resolve_symbol(symbol));
 
                 match resolved {
                     None => Ok(Self::err_envelope(
@@ -1402,12 +1385,9 @@ impl McpServer {
                 self.trigger_spotlight(source).await;
                 let graph = self.graph.read().await;
 
-                let resolved = graph.get_index(source).or_else(|| {
-                    graph
-                        .find_by_name(source)
-                        .first()
-                        .and_then(|n| graph.get_index(&n.id))
-                });
+                let resolved = graph
+                    .get_index(source)
+                    .or_else(|| graph.resolve_symbol(source));
 
                 match resolved {
                     None => Ok(Self::err_envelope(
@@ -1582,12 +1562,7 @@ impl McpServer {
 
                 for sym_val in symbols {
                     if let Some(sym) = sym_val.as_str() {
-                        let idx = graph.get_index(sym).or_else(|| {
-                            graph
-                                .find_by_name(sym)
-                                .first()
-                                .and_then(|n| graph.get_index(&n.id))
-                        });
+                        let idx = graph.get_index(sym).or_else(|| graph.resolve_symbol(sym));
 
                         if let Some(idx) = idx {
                             if let Some(node) = graph.get(idx) {
@@ -1921,17 +1896,8 @@ impl McpServer {
         let graph = self.graph.read().await;
 
         // 1. Resolve Node
-        let node_idx = if let Some(idx) = graph.get_index(node_start) {
-            Some(idx)
-        } else {
-            // Try by name
-            let candidates = graph.find_by_name(node_start);
-            if let Some(first) = candidates.first() {
-                graph.get_index(&first.id)
-            } else {
-                None
-            }
-        };
+        // Prefers the most connected definition when a name is ambiguous.
+        let node_idx = graph.resolve_symbol(node_start);
 
         let node_idx = match node_idx {
             Some(idx) => idx,

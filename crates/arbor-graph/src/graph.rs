@@ -127,6 +127,54 @@ impl ArborGraph {
             .unwrap_or_default()
     }
 
+    /// Resolves a symbol name to candidate nodes, best match first.
+    ///
+    /// Names collide constantly — `getPath` may be a utility function *and* a
+    /// method on four unrelated classes. Callers that took
+    /// `find_by_name(..).first()` got whichever file happened to be parsed
+    /// first and then answered as though it were the only candidate; on a real
+    /// codebase that reported a heavily-used function as unreachable dead code.
+    ///
+    /// Ranking is by graph degree, then centrality, then file path — so the
+    /// pick is meaningful and does not depend on parse order. An exact node-id
+    /// match short-circuits to a single result.
+    pub fn resolve_symbol_ranked(&self, name: &str) -> Vec<NodeId> {
+        if let Some(idx) = self.get_index(name) {
+            return vec![idx];
+        }
+
+        let mut candidates: Vec<NodeId> = self
+            .find_by_name(name)
+            .iter()
+            .filter_map(|n| self.get_index(&n.id))
+            .collect();
+
+        candidates.sort_by(|&a, &b| {
+            let degree = |i: NodeId| self.get_callers(i).len() + self.get_callees(i).len();
+            degree(b)
+                .cmp(&degree(a))
+                .then_with(|| {
+                    self.centrality(b)
+                        .partial_cmp(&self.centrality(a))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| {
+                    let file = |i: NodeId| self.get(i).map(|n| n.file.clone()).unwrap_or_default();
+                    file(a).cmp(&file(b))
+                })
+        });
+
+        candidates
+    }
+
+    /// The single node a user most likely meant by `name`.
+    ///
+    /// See [`resolve_symbol_ranked`](Self::resolve_symbol_ranked) for how ties
+    /// are broken.
+    pub fn resolve_symbol(&self, name: &str) -> Option<NodeId> {
+        self.resolve_symbol_ranked(name).into_iter().next()
+    }
+
     /// Finds all nodes in a file.
     pub fn find_by_file(&self, file: &str) -> Vec<&CodeNode> {
         self.file_index
@@ -398,11 +446,23 @@ impl ArborGraph {
         &self,
         file: &str,
     ) -> (Vec<&CodeNode>, Vec<(String, String, String)>) {
-        let node_ids: std::collections::HashSet<NodeId> = self
-            .file_index
-            .get(file)
-            .map(|ids| ids.iter().copied().collect())
-            .unwrap_or_default();
+        // Exact key first; fall back to a separator-insensitive match.
+        //
+        // `file_index` is keyed on the path exactly as the parser recorded it.
+        // Callers build lookup paths by joining a project root with a
+        // forward-slash relative path, which on Windows yields a mixed
+        // `C:\root\src/lib.rs` that never equals the stored `C:\root\src\lib.rs`.
+        let node_ids: std::collections::HashSet<NodeId> = match self.file_index.get(file) {
+            Some(ids) => ids.iter().copied().collect(),
+            None => {
+                let wanted = normalize_separators(file);
+                self.file_index
+                    .iter()
+                    .filter(|(stored, _)| normalize_separators(stored) == wanted)
+                    .flat_map(|(_, ids)| ids.iter().copied())
+                    .collect()
+            }
+        };
 
         let nodes: Vec<&CodeNode> = node_ids
             .iter()
@@ -705,6 +765,26 @@ mod new_query_tests {
     }
 
     #[test]
+    fn nodes_in_file_lookup_is_separator_insensitive() {
+        // Callers join a project root with a forward-slash relative path,
+        // which on Windows yields `C:\root\src/lib.rs` while the parser
+        // recorded `C:\root\src\lib.rs`. Exact-key lookup missed, and
+        // `file-graph` reported "No symbols found" for a file full of symbols.
+        let mut g = ArborGraph::new();
+        g.add_node(make_node(
+            "helper",
+            NodeKind::Function,
+            r"C:/root/src\lib.rs",
+        ));
+
+        let (backslash, _) = g.nodes_in_file_with_edges(r"C:/root/src\lib.rs");
+        assert_eq!(backslash.len(), 1, "exact key must still work");
+
+        let (forward, _) = g.nodes_in_file_with_edges("C:/root/src/lib.rs");
+        assert_eq!(forward.len(), 1, "separator spelling must not matter");
+    }
+
+    #[test]
     fn test_nodes_in_file_with_edges_excludes_cross_file_edges() {
         use crate::edge::{Edge, EdgeKind};
         let mut g = ArborGraph::new();
@@ -736,4 +816,13 @@ fn index_node_documentation(index: &mut SearchIndex, node: &CodeNode, id: NodeId
     if node.qualified_name != node.name {
         index.insert_documentation(&node.qualified_name, id);
     }
+}
+
+/// Normalizes path separators for comparison.
+///
+/// Windows accepts both `/` and `\`, so the same file can be spelled either
+/// way depending on whether the path came from a directory walk or from
+/// joining a user-supplied relative path.
+fn normalize_separators(path: &str) -> String {
+    path.replace('\\', "/")
 }
