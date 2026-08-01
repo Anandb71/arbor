@@ -9,20 +9,20 @@ class Arbor < Formula
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/Anandb71/arbor/releases/download/v#{version}/arbor-macos-aarch64.tar.gz"
-      sha256 "faac85e2b922dbbd1ecdf0afccba10e32ed0a16a64c92383a419fd89e55ecda1"
+      sha256 "733d2b9e8871be2b0c757cefe5a2d7cefc7e4375a7f15f2796b6c9680d940634"
     else
       url "https://github.com/Anandb71/arbor/releases/download/v#{version}/arbor-macos-x86_64.tar.gz"
-      sha256 "d3cdfe9d3f998c0a9641eb9d6d93c8a54afdf0f8b71f85ba75b9befd3db606e4"
+      sha256 "9de570cf05d5cf7a50d1c6e9c9a0081dfa22a3fe5b8a05c3b9058aab9bfdc032"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
       url "https://github.com/Anandb71/arbor/releases/download/v#{version}/arbor-linux-aarch64.tar.gz"
-      sha256 "895223f8930cd5571d3568b22db22c7ecec38e63b1e6fa4d5bb29b77cdfb7b51"
+      sha256 "7ef2123047198f6678d8ef714e477edd1cbd53846bba6ed2c09090950722d4f3"
     else
       url "https://github.com/Anandb71/arbor/releases/download/v#{version}/arbor-linux-x86_64.tar.gz"
-      sha256 "715dddb5a17fef4a04f2a2cbc7e449ad08164652d704ff034a86523eb68ab941"
+      sha256 "9a84fc6654c8569c0a2c954c1093bdcbf5afc942b704f24dc6408c115f8222f8"
     end
   end
 

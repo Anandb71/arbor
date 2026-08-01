@@ -5,8 +5,8 @@
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/Anandb71/arbor/releases/download/v2.5.0/arbor-windows-x86_64.zip",
-      "hash": "1cef8cf672f51a106166fb1214105b52ca45a51d4f6ce0f790599deea12f2e8a",
+      "url": "https://github.com/Anandb71/arbor/releases/download/v2.6.0/arbor-windows-x86_64.zip",
+      "hash": "72877177b0a1bed7a8f7830627e86ddc86f0f59aa0cbeef957d500b662344fba",
       "bin": "arbor.exe"
     }
   },
