@@ -6,28 +6,57 @@
 
 use crate::node::{CodeNode, NodeKind};
 
-/// Extra language extensions supported via fallback parsing.
+/// Extra language extensions indexed into the **code** graph via fallback parsing.
+///
+/// Markdown is deliberately absent. It is parseable (see [`MARKDOWN_EXTENSIONS`])
+/// but headings are prose, not symbols: indexing them put a node named `fetch`
+/// into the graph for a `# fetch benchmark` heading in a README, which then
+/// competed with real `fetch` definitions when resolving TypeScript call sites.
+/// Callers that want a document graph ask for it explicitly.
 pub const FALLBACK_EXTENSIONS: &[&str] = &[
     "kt", "kts",   // Kotlin
     "swift", // Swift
     "rb",    // Ruby
     "php", "phtml", // PHP
     "sh", "bash", "zsh", // Shell
-    "md", "markdown", // Markdown for knowledge graphs (Lattice)
 ];
+
+/// Markdown extensions, parsed into `Section` nodes for document graphs.
+///
+/// Not part of [`FALLBACK_EXTENSIONS`] — opt in by calling
+/// [`parse_fallback_source`] with one of these directly.
+pub const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown"];
 
 pub fn is_fallback_supported_extension(ext: &str) -> bool {
     let ext = ext.to_ascii_lowercase();
     FALLBACK_EXTENSIONS.iter().any(|e| *e == ext)
 }
 
+/// Whether this extension is parsed as prose rather than code.
+pub fn is_markdown_extension(ext: &str) -> bool {
+    let ext = ext.to_ascii_lowercase();
+    MARKDOWN_EXTENSIONS.iter().any(|e| *e == ext)
+}
+
 pub fn parse_fallback_source(source: &str, file_path: &str, ext: &str) -> Vec<CodeNode> {
     let ext = ext.to_ascii_lowercase();
+    let is_markdown = is_markdown_extension(&ext);
     let mut nodes = Vec::new();
 
     for (idx, line) in source.lines().enumerate() {
         let line_no = idx as u32 + 1;
         let trimmed = line.trim_start();
+
+        // Comments are never declarations. Skip them *before* parsing: the
+        // shell rule looks for `()` anywhere on the line, so the comment
+        // `# Compare app.fetch() between refs` used to yield a function named
+        // "# Compare app.fetch". Markdown is exempt — there `#` starts a
+        // heading, which is the thing we want.
+        if trimmed.is_empty()
+            || (!is_markdown && (trimmed.starts_with('#') || trimmed.starts_with("//")))
+        {
+            continue;
+        }
 
         let candidate = match ext.as_str() {
             "md" | "markdown" => parse_markdown_line(trimmed),
@@ -38,12 +67,6 @@ pub fn parse_fallback_source(source: &str, file_path: &str, ext: &str) -> Vec<Co
             "sh" | "bash" | "zsh" => parse_shell_line(trimmed),
             _ => None,
         };
-
-        if trimmed.is_empty()
-            || (trimmed.starts_with('#') || trimmed.starts_with("//")) && candidate.is_none()
-        {
-            continue;
-        }
 
         if let Some((name, kind)) = candidate {
             let col = (line.len().saturating_sub(trimmed.len())) as u32;
@@ -158,12 +181,25 @@ fn parse_shell_line(line: &str) -> Option<(String, NodeKind)> {
     // foo() {
     if let Some(paren_idx) = line.find("()") {
         let name = line[..paren_idx].trim();
-        if !name.is_empty() {
+        // The name must be a bare shell identifier. Without this check any
+        // line containing `()` anywhere — prose, a call, a pipeline — yielded
+        // a "function" whose name was the whole preceding text.
+        if is_shell_identifier(name) {
             return Some((name.to_string(), NodeKind::Function));
         }
     }
 
     None
+}
+
+/// Whether a string is a plain shell function name.
+fn is_shell_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn parse_markdown_line(line: &str) -> Option<(String, NodeKind)> {
@@ -215,9 +251,13 @@ mod tests {
 
     #[test]
     fn fallback_supports_requested_extensions() {
-        for ext in ["kt", "swift", "rb", "php", "sh", "md"] {
+        for ext in ["kt", "swift", "rb", "php", "sh"] {
             assert!(is_fallback_supported_extension(ext));
         }
+        // Markdown moved out of the code-graph set — headings are prose, and
+        // indexing them polluted symbol resolution. Still parseable on request.
+        assert!(!is_fallback_supported_extension("md"));
+        assert!(is_markdown_extension("md"));
     }
 
     #[test]
@@ -381,5 +421,65 @@ object Singleton
         let source = "function deploy_staging { echo staging; }";
         let nodes = parse_fallback_source(source, "deploy.bash", "bash");
         assert!(nodes.iter().any(|n| n.name == "deploy_staging"));
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn markdown_is_not_indexed_as_code() {
+        // A `# fetch benchmark` heading in a README produced a graph node named
+        // `fetch`, which then competed with real `fetch` definitions when
+        // resolving TypeScript call sites.
+        assert!(!is_fallback_supported_extension("md"));
+        assert!(!is_fallback_supported_extension("markdown"));
+        assert!(is_markdown_extension("md"));
+    }
+
+    #[test]
+    fn markdown_still_parses_when_asked_directly() {
+        let nodes = parse_fallback_source("# fetch benchmark\n## setup\n", "README.md", "md");
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes.iter().all(|n| n.kind == NodeKind::Section));
+    }
+
+    #[test]
+    fn shell_comments_are_not_functions() {
+        // `# Compare app.fetch() between the working tree and a git ref`
+        // matched the `()` rule and became a function named
+        // "# Compare app.fetch".
+        let src = "#!/bin/bash\n# Compare app.fetch() between refs\nreal_fn() {\n  echo hi\n}\n";
+        let nodes = parse_fallback_source(src, "compare.sh", "sh");
+
+        assert_eq!(nodes.len(), 1, "only the real function should be indexed");
+        assert_eq!(nodes[0].name, "real_fn");
+    }
+
+    #[test]
+    fn shell_names_must_be_identifiers() {
+        assert!(is_shell_identifier("deploy_app"));
+        assert!(is_shell_identifier("build-web"));
+        assert!(!is_shell_identifier("# Compare app.fetch"));
+        assert!(!is_shell_identifier("app.fetch"));
+        assert!(!is_shell_identifier(""));
+        assert!(!is_shell_identifier("2fast"));
+    }
+
+    #[test]
+    fn prose_containing_parens_is_not_a_function() {
+        let nodes = parse_fallback_source("echo \"call foo() now\"\n", "x.sh", "sh");
+        assert!(
+            nodes.is_empty(),
+            "a string mentioning foo() is not a definition"
+        );
+    }
+
+    #[test]
+    fn double_slash_comments_are_skipped() {
+        let nodes = parse_fallback_source("// fun notReal()\nfun real() {}\n", "a.kt", "kt");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "real");
     }
 }
