@@ -10,7 +10,7 @@ use crate::symbol_table::SymbolTable;
 use arbor_core::{CodeNode, NodeKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tracing::warn;
+use tracing::debug;
 
 /// Beyond this many candidate definitions, a bare name carries no information
 /// and linking to all of them would swamp the graph with noise.
@@ -168,8 +168,10 @@ impl GraphBuilder {
                 let resolution = self.symbol_table.resolve_ref(lookup, &from_file);
 
                 if !resolution.is_resolved() {
-                    #[cfg(debug_assertions)]
-                    warn!(
+                    // The overwhelming majority of references are stdlib or
+                    // third-party and have no definition here. Expected, not
+                    // notable.
+                    debug!(
                         "Unresolved reference '{}' in {} (likely external/stdlib)",
                         reference,
                         from_file.display()
@@ -196,7 +198,9 @@ impl GraphBuilder {
                     // A name like `new`, `get`, or `run` with dozens of
                     // definitions carries no information. Linking to all of
                     // them would swamp the graph.
-                    warn!(
+                    // Routine on any real codebase — `.get`, `.encode`, `.match`
+                    // are shared by many types. Diagnostic, not a user problem.
+                    debug!(
                         "Reference '{}' in {} has {} candidate definitions — too ambiguous to link",
                         reference,
                         from_file.display(),
@@ -289,7 +293,7 @@ impl GraphBuilder {
         }
 
         // Different module and not imported: almost certainly a name collision.
-        warn!(
+        debug!(
             "Downgrading unimported cross-module reference '{}' in {} → {}",
             reference,
             from_file.display(),
