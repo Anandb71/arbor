@@ -1,3 +1,5 @@
+[![MCP Toplist](https://mcptoplist.com/badge/io.github.Anandb71%2Farbor.svg)](https://mcptoplist.com/server/io.github.Anandb71%2Farbor)
+
 <p align="center">
   <img src="docs/assets/arbor-logo.svg" alt="Arbor logo" width="120" height="120" />
 </p>
