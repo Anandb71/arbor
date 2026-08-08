@@ -5,8 +5,10 @@
 
 use arbor_core::{parse_file, CodeNode};
 use arbor_graph::{ArborGraph, GraphBuilder, GraphStore};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -42,6 +44,77 @@ pub struct IndexOptions {
     /// Path to cache directory (e.g., `.arbor/cache`).
     /// If None, caching is disabled.
     pub cache_path: Option<PathBuf>,
+}
+
+const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
+    "node_modules/",
+    "venv/",
+    ".venv/",
+    "site-packages/",
+    "__pycache__/",
+    "target/",
+    "dist/",
+    "build/",
+    "out/",
+];
+
+#[derive(Debug, Deserialize)]
+struct ArborConfig {
+    #[serde(default)]
+    ignore: Vec<String>,
+}
+
+fn build_ignore_matcher(root: &Path) -> Option<Gitignore> {
+    let mut builder = GitignoreBuilder::new(root);
+    for pattern in DEFAULT_EXCLUDE_PATTERNS {
+        if let Err(e) = builder.add_line(None, pattern) {
+            warn!("Invalid built-in ignore pattern '{}': {}", pattern, e);
+        }
+    }
+
+    let config_path = root.join(".arbor").join("config.json");
+    if config_path.exists() {
+        match std::fs::read_to_string(&config_path) {
+            Ok(text) => match serde_json::from_str::<ArborConfig>(&text) {
+                Ok(config) => {
+                    for pattern in config.ignore {
+                        let trimmed = pattern.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if let Err(e) = builder.add_line(None, trimmed) {
+                            warn!(
+                                "Invalid ignore pattern '{}' in {}: {}",
+                                trimmed,
+                                config_path.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to parse {}: {}", config_path.display(), e);
+                }
+            },
+            Err(e) => {
+                warn!("Failed to read {}: {}", config_path.display(), e);
+            }
+        }
+    }
+
+    match builder.build() {
+        Ok(matcher) => Some(matcher),
+        Err(e) => {
+            warn!("Failed to build ignore matcher: {}", e);
+            None
+        }
+    }
+}
+
+fn is_ignored(path: &Path, is_dir: bool, matcher: Option<&Gitignore>) -> bool {
+    matcher
+        .map(|m| m.matched_path_or_any_parents(path, is_dir).is_ignore())
+        .unwrap_or(false)
 }
 
 /// Indexes a directory and returns the code graph.
@@ -84,12 +157,16 @@ pub fn index_directory(root: &Path, options: IndexOptions) -> Result<IndexResult
                 }
             });
 
-    // Walk the directory, respecting .gitignore, collecting supported files
+    // Walk the directory, respecting ignore files and collecting supported files.
+    let ignore_matcher = build_ignore_matcher(root);
     let walker = WalkBuilder::new(root)
         .hidden(true) // Skip hidden files
         .git_ignore(true) // Respect .gitignore
+        .ignore(true) // Respect .ignore and custom ignore files
+        .require_git(false) // Respect .gitignore even outside a git repository
         .git_global(true)
         .git_exclude(true)
+        .add_custom_ignore_filename(".arborignore")
         .follow_links(options.follow_symlinks)
         .build();
 
@@ -97,6 +174,13 @@ pub fn index_directory(root: &Path, options: IndexOptions) -> Result<IndexResult
         .filter_map(Result::ok)
         .filter(|entry| {
             let path = entry.path();
+            if is_ignored(
+                path,
+                entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false),
+                ignore_matcher.as_ref(),
+            ) {
+                return false;
+            }
             if path.is_dir() {
                 return false;
             }
@@ -233,16 +317,27 @@ pub fn parse_single_file(path: &Path) -> Result<Vec<CodeNode>, arbor_core::Parse
 /// UNIX epoch. Catches edits and additions; a lone deletion leaves no newer
 /// file, so it is picked up on the next edit instead.
 pub fn sources_newer_than(root: &Path, cache_mtime: u64, follow_symlinks: bool) -> bool {
+    let ignore_matcher = build_ignore_matcher(root);
     let walker = WalkBuilder::new(root)
         .hidden(true)
         .git_ignore(true)
+        .ignore(true)
+        .require_git(false)
         .git_global(true)
         .git_exclude(true)
+        .add_custom_ignore_filename(".arborignore")
         .follow_links(follow_symlinks)
         .build();
 
     for entry in walker.filter_map(Result::ok) {
         let path = entry.path();
+        if is_ignored(
+            path,
+            entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false),
+            ignore_matcher.as_ref(),
+        ) {
+            continue;
+        }
         if path.is_dir() {
             continue;
         }
@@ -381,5 +476,64 @@ mod tests {
         let result = index_directory(dir.path(), options).unwrap();
         assert_eq!(result.files_indexed, 1);
         assert!(result.nodes_extracted > 0);
+    }
+
+    #[test]
+    fn test_index_honors_gitignore_outside_git_repo() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("venv")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "venv/\n").unwrap();
+        fs::write(
+            dir.path().join("venv").join("ignored.rs"),
+            "pub fn ignored() {}",
+        )
+        .unwrap();
+        fs::write(dir.path().join("kept.rs"), "pub fn kept() {}").unwrap();
+
+        let result = index_directory(dir.path(), IndexOptions::default()).unwrap();
+        assert_eq!(result.files_indexed, 1);
+        assert!(result.graph.find_by_name("kept").len() == 1);
+        assert!(result.graph.find_by_name("ignored").is_empty());
+    }
+
+    #[test]
+    fn test_index_honors_arborignore() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("vendor")).unwrap();
+        fs::write(dir.path().join(".arborignore"), "vendor/\n").unwrap();
+        fs::write(
+            dir.path().join("vendor").join("ignored.rs"),
+            "pub fn ignored() {}",
+        )
+        .unwrap();
+        fs::write(dir.path().join("kept.rs"), "pub fn kept() {}").unwrap();
+
+        let result = index_directory(dir.path(), IndexOptions::default()).unwrap();
+        assert_eq!(result.files_indexed, 1);
+        assert!(result.graph.find_by_name("kept").len() == 1);
+        assert!(result.graph.find_by_name("ignored").is_empty());
+    }
+
+    #[test]
+    fn test_index_honors_arbor_config_ignore_patterns() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".arbor")).unwrap();
+        fs::create_dir_all(dir.path().join("third_party")).unwrap();
+        fs::write(
+            dir.path().join(".arbor").join("config.json"),
+            r#"{"version":"1.0","ignore":["third_party/"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("third_party").join("ignored.rs"),
+            "pub fn ignored() {}",
+        )
+        .unwrap();
+        fs::write(dir.path().join("kept.rs"), "pub fn kept() {}").unwrap();
+
+        let result = index_directory(dir.path(), IndexOptions::default()).unwrap();
+        assert_eq!(result.files_indexed, 1);
+        assert!(result.graph.find_by_name("kept").len() == 1);
+        assert!(result.graph.find_by_name("ignored").is_empty());
     }
 }
