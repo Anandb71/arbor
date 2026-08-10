@@ -25,7 +25,7 @@
   <sub>Simulated replay — the <code>arbor</code> commands and their output are real (tokio @ 178k LOC). Methodology: <a href="docs/BENCHMARKS.md">BENCHMARKS.md</a></sub>
 </p>
 
-> **v2.6.0 — Ground Truth** · The graph was wrong in ways v2.5.0 made fast. Colliding symbols were silently dropped, resolution depended on hash order, every edge claimed certainty, and every exported TypeScript symbol was indexed twice. All fixed, all tested. Edge recall **+14% on TypeScript**, **+44% on Rust**; **25% of a TS graph was phantom nodes**. Reproduce it yourself: `cargo run -p arbor-watcher --example graph_stats -- <dir>`
+> **v3.0.0 — The Right Node** · v2.6.0 stopped *dropping* colliding symbols. It did not stop resolving them to the wrong one. When a bare name matched several modules, resolution fell through to "same directory" and confidently attached the edge to whichever definition happened to sit next to the caller. On a graded fixture the three largest hubs reported **zero downstream impact** while unrelated siblings inherited their centrality. A file's own imports now settle it. Reproduce it yourself: [getArbor-dev/arbor-torture](https://github.com/getArbor-dev/arbor-torture)
 
 ---
 
@@ -46,7 +46,69 @@ Where the graph is *unsure*, it says so — edges carry a confidence, and ambigu
 
 ---
 
-## What's new in v2.6.0
+## What's new in v3.0.0
+
+One fix, measured.
+
+**Symbol resolution consults the importing file.** When a bare name matched
+definitions in several modules, `resolve_ref` fell through to `SameDir` and
+attached the edge to whichever definition sat in the caller's own directory —
+not a dropped edge, a confidently misrouted one, stamped at 0.55 confidence.
+
+`GraphBuilder` already kept a per-file import map, but only
+`apply_import_validation` read it, and that scores an edge *after* one has been
+chosen. It never saw the references going to the wrong node. Consulting it
+between the same-file and same-directory checks keeps a local definition
+shadowing an import, while letting a written import beat mere adjacency.
+`Resolution::ViaImport` scores 0.93, above `SameDir`'s 0.55.
+
+### Measured
+
+A fixture of 260 modules across 10 layers, each layer defining the same 26
+function names. Ground truth is derived from the generator's own edge list, so
+the expected answer is exact rather than estimated.
+
+| True downstream | v2.6.0 | v3.0.0 |
+|---|---|---|
+| 179 | 0 | **163** |
+| 178 | 0 | **161** |
+| 161 | 0 | **133** |
+| 143 | 22 | **133** |
+| 122 | 22 | **119** |
+| 36 | 22 | 61 |
+| 16 | 22 | 46 |
+
+Previously flat at about 22 regardless of the real answer. Now it tracks. Risk
+on the largest hub moves from `LOW` to `CRITICAL`.
+
+Total edge count barely moves (1335 → 1334). That is the signature of
+misrouting rather than loss: the edges were always there, pointing at the wrong
+nodes.
+
+### Breaking
+
+- `Resolution` gains a `ViaImport` variant — an exhaustive match will not compile
+- Edges land on different nodes, so cached graphs, stored node ids, and
+  centrality baselines from 2.6.0 will differ
+
+### Known and still open
+
+Written down rather than left to be discovered:
+
+- Small targets now **over**-report (36 → 61, 16 → 46). Safer direction than
+  silence, but not yet correct.
+- PageRank has no escape from a closed cycle. Every member of a 500-function
+  ring scores above 90% centrality on one caller each, so mutually recursive
+  clusters — parsers, tree walkers, state machines — crowd the top of any
+  ranking.
+- Inheritance produces no edges. `class Middle(Base)` is invisible, so changing
+  a base class shows zero blast radius.
+- Dynamic and reflective imports (`importlib`, `__import__`, `import()`,
+  `eval(require(...))`) are unresolvable by construction and are documented as
+  expected misses in the fixture rather than counted as defects.
+
+<details>
+<summary><strong>v2.6.0 — Ground Truth</strong> (colliding symbols kept, deterministic resolution, edge confidence, percentile centrality)</summary>
 
 Correctness, not speed. Each of these was silently wrong before.
 
@@ -72,6 +134,8 @@ Measured on identical node sets, after the duplicate-extraction fix:
 | Rust (arbor-graph) | 116 edges | **167** (+44%) |
 
 Graph caches from earlier versions are invalidated — centrality now means something different, so a stale cache would be read wrong.
+
+</details>
 
 <details>
 <summary><strong>v2.5.0 — The Last Excuse</strong> (PageRank 23x, parallel indexing, warm-start centrality)</summary>
@@ -266,7 +330,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: Anandb71/arbor@v2.4.0
+      - uses: getArbor-dev/arbor@v3.0.0
         with:
           command: check . --max-blast-radius 30 --markdown
           comment-on-pr: true
