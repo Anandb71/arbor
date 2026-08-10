@@ -6,7 +6,7 @@
   "architecture": {
     "64bit": {
       "url": "https://github.com/Anandb71/arbor/releases/download/v3.0.0/arbor-windows-x86_64.zip",
-      "hash": "72877177b0a1bed7a8f7830627e86ddc86f0f59aa0cbeef957d500b662344fba",
+      "hash": "4b52193313af78716af7b6f6efb17460f2ff84665dcaafdd52cf08ae84ecf7f0",
       "bin": "arbor.exe"
     }
   },
