@@ -42,6 +42,12 @@ pub enum Resolution {
     SameFile(NodeId),
     /// Suffix match with exactly one definition repo-wide.
     UniqueSuffix(NodeId),
+    /// Several candidates; the referencing file's own import statement names
+    /// exactly one module, and one candidate came from it.
+    ///
+    /// Stronger evidence than `SameDir`: the author wrote down which module they
+    /// meant. Ranked accordingly in `confidence`.
+    ViaImport(NodeId),
     /// Several candidates; exactly one lives in the referencing file's directory.
     SameDir(NodeId),
     /// Several equally-plausible candidates, sorted deterministically.
@@ -61,6 +67,7 @@ impl Resolution {
             Resolution::Exact(_) => 1.0,
             Resolution::SameFile(_) => 0.95,
             Resolution::UniqueSuffix(_) => 0.80,
+            Resolution::ViaImport(_) => 0.93,
             Resolution::SameDir(_) => 0.55,
             Resolution::Ambiguous(_) => 0.25,
             Resolution::Unresolved => 0.0,
@@ -73,6 +80,7 @@ impl Resolution {
             Resolution::Exact(id)
             | Resolution::SameFile(id)
             | Resolution::UniqueSuffix(id)
+            | Resolution::ViaImport(id)
             | Resolution::SameDir(id) => Some(*id),
             Resolution::Ambiguous(_) | Resolution::Unresolved => None,
         }
@@ -185,6 +193,34 @@ impl SymbolTable {
     ///   5. Exactly one candidate in the referencing directory → `SameDir`
     ///   6. Otherwise → `Ambiguous`
     pub fn resolve_ref(&self, name: &str, context_file: &Path) -> Resolution {
+        self.resolve_ref_with_imports(name, context_file, None)
+    }
+
+    /// Resolve a reference, allowing the referencing file's imports to break ties.
+    ///
+    /// Without `imports`, a bare name matching definitions in several modules
+    /// falls through to `Ambiguous` whenever no candidate shares a file or a
+    /// directory with the caller — and the builder drops ambiguous edges. On a
+    /// codebase that reuses a name across modules that is the common case, not
+    /// the rare one: every call to it is discarded, and the module those calls
+    /// belonged to reports no callers at all.
+    ///
+    /// The disambiguating fact is usually written at the top of the file.
+    /// `from deep.l0.m14 import value_m14` says exactly which `value_m14` is
+    /// meant here. `import_map` already carries that, but only
+    /// `apply_import_validation` consumed it, and that runs *after* a candidate
+    /// has been chosen — so it never saw the references that were being thrown
+    /// away. Consulting it during disambiguation instead of after it is the
+    /// whole change.
+    ///
+    /// `imports` maps a locally-visible name to the module it came from, so an
+    /// aliased import (`from x import y as z`) is keyed on `z`.
+    pub fn resolve_ref_with_imports(
+        &self,
+        name: &str,
+        context_file: &Path,
+        imports: Option<&HashMap<String, String>>,
+    ) -> Resolution {
         let exact = self.by_fqn.get(name);
         if let Some(entries) = exact {
             if entries.len() == 1 {
@@ -245,6 +281,28 @@ impl SymbolTable {
             return Resolution::SameFile(same_file[0].id);
         }
 
+        // The referencing file said which module it meant. Believe it.
+        //
+        // Checked after same-file (a local definition shadows an import) and
+        // before same-directory (a written import is better evidence than mere
+        // adjacency). Matching is done on the module path so it works whether
+        // the source records `deep.l0.m14` or a path-like `deep/l0/m14`.
+        if let Some(map) = imports {
+            if let Some(source_module) = map.get(name) {
+                let wanted = normalize_module_path(source_module);
+                if !wanted.is_empty() {
+                    let from_import: Vec<&SymbolEntry> = candidates
+                        .iter()
+                        .copied()
+                        .filter(|e| entry_belongs_to_module(e, &wanted))
+                        .collect();
+                    if from_import.len() == 1 {
+                        return Resolution::ViaImport(from_import[0].id);
+                    }
+                }
+            }
+        }
+
         let context_dir = context_file.parent();
         let same_dir: Vec<&SymbolEntry> = candidates
             .iter()
@@ -271,6 +329,54 @@ impl SymbolTable {
     pub fn is_empty(&self) -> bool {
         self.by_fqn.is_empty()
     }
+}
+
+/// Reduce a module reference to dot-separated segments for comparison.
+///
+/// `deep.l0.m14`, `deep/l0/m14`, `./deep/l0/m14.py` and `crate::deep::l0::m14`
+/// all normalize to `deep.l0.m14`, so the same check works across the languages
+/// this engine parses without a per-language branch.
+fn normalize_module_path(raw: &str) -> String {
+    let cleaned = raw.replace("::", ".").replace(['/', '\\'], ".");
+    let cleaned = cleaned
+        .trim_start_matches('.')
+        .trim_end_matches(".py")
+        .trim_end_matches(".ts")
+        .trim_end_matches(".js")
+        .trim_end_matches(".rs")
+        .trim_end_matches(".go");
+    cleaned
+        .split('.')
+        .filter(|seg| {
+            !seg.is_empty()
+                && *seg != "index"
+                && *seg != "mod"
+                && *seg != "crate"
+                && *seg != "self"
+                && *seg != "super"
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Did this symbol come from `module`?
+///
+/// A `SymbolEntry` carries only its id and its file, so the file path is the
+/// module identity. Requires a segment-aligned match, so a reference to
+/// `l0.m14` is never satisfied by `l0.m1`.
+fn entry_belongs_to_module(entry: &SymbolEntry, module: &str) -> bool {
+    let file_norm = normalize_module_path(&entry.file.to_string_lossy());
+    segment_aligned_contains(&file_norm, module)
+}
+
+/// True when `needle` appears in `haystack` on segment boundaries.
+fn segment_aligned_contains(haystack: &str, needle: &str) -> bool {
+    if haystack == needle {
+        return true;
+    }
+    haystack.starts_with(&format!("{needle}."))
+        || haystack.ends_with(&format!(".{needle}"))
+        || haystack.contains(&format!(".{needle}."))
 }
 
 /// Sorts entries by `(file, node index)` for a total, parse-order-independent order.
@@ -528,5 +634,96 @@ mod tests {
             table.resolve_ref("función", Path::new("b.py")),
             Resolution::UniqueSuffix(nid(1))
         );
+    }
+}
+
+#[cfg(test)]
+mod import_resolution_tests {
+    use super::*;
+
+    fn nid(i: usize) -> NodeId {
+        NodeId::new(i)
+    }
+
+    /// The exact shape that returned zero on the torture fixture: one bare name
+    /// defined in ten modules, called from an eleventh that imported one of them.
+    #[test]
+    fn import_breaks_a_tie_that_would_otherwise_be_ambiguous() {
+        let mut table = SymbolTable::default();
+        for layer in 0usize..10 {
+            table.insert(
+                format!("deep.l{layer}.m14.value_m14"),
+                nid(layer),
+                PathBuf::from(format!("/repo/deep/l{layer}/m14.py")),
+            );
+        }
+
+        let caller = Path::new("/repo/deep/l1/m03.py");
+
+        // Without imports the resolver does NOT report ambiguity — it picks the
+        // sibling sitting in the caller's own directory and reports SameDir at
+        // 0.55 confidence. That is the real defect: the edge is not dropped, it
+        // is confidently attached to the wrong module. Every caller in `l1/`
+        // resolves to `l1/m14.py`, which is why `l0/m14.py` ends up with no
+        // callers at all while an unrelated layer inherits its centrality.
+        let bare = table.resolve_ref("value_m14", caller);
+        assert_eq!(
+            bare,
+            Resolution::SameDir(nid(1)),
+            "expected the same-directory sibling to be mis-picked, got {bare:?}"
+        );
+
+        // With the import the caller actually wrote, exactly one survives.
+        let mut imports = HashMap::new();
+        imports.insert("value_m14".to_string(), "deep.l0.m14".to_string());
+        let resolved = table.resolve_ref_with_imports("value_m14", caller, Some(&imports));
+
+        match resolved {
+            Resolution::ViaImport(id) => {
+                assert_eq!(id, nid(0), "resolved to the wrong layer");
+            }
+            other => panic!("expected ViaImport(l0), got {other:?}"),
+        }
+    }
+
+    /// A definition in the caller's own file outranks an import of the same name.
+    #[test]
+    fn local_definition_still_shadows_an_import() {
+        let mut table = SymbolTable::default();
+        table.insert(
+            "a.mod.process".to_string(),
+            nid(0),
+            PathBuf::from("/repo/a/mod.py"),
+        );
+        table.insert(
+            "b.other.process".to_string(),
+            nid(1),
+            PathBuf::from("/repo/b/other.py"),
+        );
+
+        let caller = Path::new("/repo/a/mod.py");
+        let mut imports = HashMap::new();
+        imports.insert("process".to_string(), "b.other".to_string());
+
+        let r = table.resolve_ref_with_imports("process", caller, Some(&imports));
+        assert!(
+            matches!(r, Resolution::SameFile(_)),
+            "a local definition must win over an import, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn module_paths_normalize_across_separator_styles() {
+        assert_eq!(normalize_module_path("deep/l0/m14.py"), "deep.l0.m14");
+        assert_eq!(normalize_module_path("crate::deep::l0::m14"), "deep.l0.m14");
+        assert_eq!(normalize_module_path("./deep/l0/m14"), "deep.l0.m14");
+    }
+
+    /// `l0.m1` must never satisfy a request for `l0.m14`.
+    #[test]
+    fn module_matching_is_segment_aligned() {
+        assert!(segment_aligned_contains("x.deep.l0.m14", "deep.l0.m14"));
+        assert!(!segment_aligned_contains("x.deep.l0.m140", "deep.l0.m14"));
+        assert!(!segment_aligned_contains("x.deep.l0.m1", "deep.l0.m14"));
     }
 }
