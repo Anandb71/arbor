@@ -168,13 +168,12 @@ impl GraphBuilder {
                 // Hand the referencing file's imports to the resolver so a bare
                 // name that matches several modules can be pinned to the one
                 // the author actually imported. Without this the resolver
-                // returns Ambiguous and the edge below is dropped.
+                // falls through to SameDir and attaches the edge to whichever
+                // definition happens to sit in the caller's own directory.
                 let file_imports = self.import_map.get(&from_file_str);
-                let resolution = self.symbol_table.resolve_ref_with_imports(
-                    lookup,
-                    &from_file,
-                    file_imports,
-                );
+                let resolution =
+                    self.symbol_table
+                        .resolve_ref_with_imports(lookup, &from_file, file_imports);
 
                 if !resolution.is_resolved() {
                     // The overwhelming majority of references are stdlib or
