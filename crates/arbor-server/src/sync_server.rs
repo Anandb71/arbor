@@ -618,6 +618,35 @@ fn should_process_file(path: &Path, extensions: &[String], ignore_matcher: &Igno
 // Background Indexer
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Recompute centrality for the patched graph and broadcast the update.
+fn broadcast_graph_update(
+    g: &mut ArborGraph,
+    broadcast_tx: &broadcast::Sender<BroadcastMessage>,
+    changed_files: Vec<String>,
+) {
+    // Recompute centrality so the code map stays in sync with the
+    // patched graph — new nodes start at 0.0 otherwise and the map drifts.
+    // Warm-started from the previous scores, so a single-file patch
+    // converges in a round or two instead of the full budget.
+    let scores = compute_centrality_warm(g, 20, 0.85, Some(g.centrality_map()));
+    g.set_centrality(scores.into_map());
+
+    let update = BroadcastMessage::GraphUpdate(GraphUpdatePayload {
+        is_delta: true,
+        node_count: g.node_count(),
+        edge_count: g.edge_count(),
+        file_count: g.stats().files,
+        changed_files,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        nodes: Some(g.nodes().cloned().collect()),
+        edges: Some(g.export_edges()),
+    });
+
+    let _ = broadcast_tx.send(update);
+}
+
 /// Runs the background indexer that processes file changes.
 ///
 /// The CPU-heavy graph update and centrality recompute are moved to
@@ -714,14 +743,6 @@ async fn run_background_indexer(
                                 }
                             }
 
-                            // Recompute centrality so the code map stays in sync with the
-                            // patched graph — new nodes start at 0.0 otherwise and the map drifts.
-                            // Warm-started from the previous scores, so a single-file patch
-                            // converges in a round or two instead of the full budget.
-                            let scores =
-                                compute_centrality_warm(&g, 20, 0.85, Some(g.centrality_map()));
-                            g.set_centrality(scores.into_map());
-
                             let elapsed = start.elapsed();
                             info!(
                                 "✅ Indexed {} in {:?} ({} symbols, {} relations)",
@@ -731,21 +752,7 @@ async fn run_background_indexer(
                                 result.relations.len()
                             );
 
-                            // Broadcast update
-                            let update = BroadcastMessage::GraphUpdate(GraphUpdatePayload {
-                                is_delta: true,
-                                node_count: g.node_count(),
-                                edge_count: g.edge_count(),
-                                file_count: g.stats().files,
-                                changed_files: vec![result.file_path],
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map_or(0, |d| d.as_secs()),
-                                nodes: Some(g.nodes().cloned().collect()),
-                                edges: Some(g.export_edges()),
-                            });
-
-                            let _ = broadcast_tx.send(update);
+                            broadcast_graph_update(&mut g, &broadcast_tx, vec![result.file_path]);
                         }
                         Err(e) => {
                             warn!("⚠️  Parse error for {}: {}", file_name, e);
@@ -760,24 +767,7 @@ async fn run_background_indexer(
                     let mut g = graph.blocking_write();
                     g.remove_file(&file_str);
 
-                    // Recompute centrality so the code map reflects the removed nodes.
-                    let scores = compute_centrality_warm(&g, 20, 0.85, Some(g.centrality_map()));
-                    g.set_centrality(scores.into_map());
-
-                    let update = BroadcastMessage::GraphUpdate(GraphUpdatePayload {
-                        is_delta: true,
-                        node_count: g.node_count(),
-                        edge_count: g.edge_count(),
-                        file_count: g.stats().files,
-                        changed_files: vec![file_str],
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_secs()),
-                        nodes: Some(g.nodes().cloned().collect()),
-                        edges: Some(g.export_edges()),
-                    });
-
-                    let _ = broadcast_tx.send(update);
+                    broadcast_graph_update(&mut g, &broadcast_tx, vec![file_str]);
                 }
             }
 
