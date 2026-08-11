@@ -47,6 +47,8 @@ pub struct IndexOptions {
 }
 
 const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
+    ".git/",
+    ".arbor/",
     "node_modules/",
     "venv/",
     ".venv/",
@@ -64,57 +66,83 @@ struct ArborConfig {
     ignore: Vec<String>,
 }
 
-fn build_ignore_matcher(root: &Path) -> Option<Gitignore> {
-    let mut builder = GitignoreBuilder::new(root);
-    for pattern in DEFAULT_EXCLUDE_PATTERNS {
-        if let Err(e) = builder.add_line(None, pattern) {
-            warn!("Invalid built-in ignore pattern '{}': {}", pattern, e);
-        }
-    }
+/// Shared ignore matcher used by both the directory walker and the file watcher.
+///
+/// Combines Arbor's built-in excludes (`.git/`, `target/`, `node_modules/`, ...),
+/// the root `.gitignore` and `.arborignore` files, and any custom patterns from
+/// `.arbor/config.json`.
+pub struct IgnoreMatcher {
+    inner: Option<Gitignore>,
+}
 
-    let config_path = root.join(".arbor").join("config.json");
-    if config_path.exists() {
-        match std::fs::read_to_string(&config_path) {
-            Ok(text) => match serde_json::from_str::<ArborConfig>(&text) {
-                Ok(config) => {
-                    for pattern in config.ignore {
-                        let trimmed = pattern.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        if let Err(e) = builder.add_line(None, trimmed) {
-                            warn!(
-                                "Invalid ignore pattern '{}' in {}: {}",
-                                trimmed,
-                                config_path.display(),
-                                e
-                            );
+impl IgnoreMatcher {
+    /// Build a matcher rooted at `root`.
+    pub fn new(root: &Path) -> Self {
+        let mut builder = GitignoreBuilder::new(root);
+
+        for pattern in DEFAULT_EXCLUDE_PATTERNS {
+            if let Err(e) = builder.add_line(None, pattern) {
+                warn!("Invalid built-in ignore pattern '{}': {}", pattern, e);
+            }
+        }
+
+        // Root-level ignore files. (Nested `.gitignore` files are honored by
+        // `WalkBuilder` during the initial walk; this matcher is enough for the
+        // watcher and for root-level rules in the indexer.)
+        for ignore_file in [".gitignore", ".arborignore"] {
+            let path = root.join(ignore_file);
+            if path.exists() {
+                if let Some(e) = builder.add(&path) {
+                    warn!("Failed to add {}: {}", path.display(), e);
+                }
+            }
+        }
+
+        // Custom ignore patterns from `.arbor/config.json`
+        let config_path = root.join(".arbor").join("config.json");
+        if config_path.exists() {
+            match std::fs::read_to_string(&config_path) {
+                Ok(text) => match serde_json::from_str::<ArborConfig>(&text) {
+                    Ok(config) => {
+                        for pattern in config.ignore {
+                            let trimmed = pattern.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            if let Err(e) = builder.add_line(None, trimmed) {
+                                warn!(
+                                    "Invalid ignore pattern '{}' in {}: {}",
+                                    trimmed,
+                                    config_path.display(),
+                                    e
+                                );
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    warn!("Failed to parse {}: {}", config_path.display(), e);
-                }
+                    Err(e) => warn!("Failed to parse {}: {}", config_path.display(), e),
+                },
+                Err(e) => warn!("Failed to read {}: {}", config_path.display(), e),
+            }
+        }
+
+        match builder.build() {
+            Ok(matcher) => Self {
+                inner: Some(matcher),
             },
             Err(e) => {
-                warn!("Failed to read {}: {}", config_path.display(), e);
+                warn!("Failed to build ignore matcher: {}", e);
+                Self { inner: None }
             }
         }
     }
 
-    match builder.build() {
-        Ok(matcher) => Some(matcher),
-        Err(e) => {
-            warn!("Failed to build ignore matcher: {}", e);
-            None
-        }
+    /// Returns `true` if `path` should be ignored.
+    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        self.inner
+            .as_ref()
+            .map(|m| m.matched_path_or_any_parents(path, is_dir).is_ignore())
+            .unwrap_or(false)
     }
-}
-
-fn is_ignored(path: &Path, is_dir: bool, matcher: Option<&Gitignore>) -> bool {
-    matcher
-        .map(|m| m.matched_path_or_any_parents(path, is_dir).is_ignore())
-        .unwrap_or(false)
 }
 
 /// Indexes a directory and returns the code graph.
@@ -158,7 +186,7 @@ pub fn index_directory(root: &Path, options: IndexOptions) -> Result<IndexResult
             });
 
     // Walk the directory, respecting ignore files and collecting supported files.
-    let ignore_matcher = build_ignore_matcher(root);
+    let ignore_matcher = IgnoreMatcher::new(root);
     let walker = WalkBuilder::new(root)
         .hidden(true) // Skip hidden files
         .git_ignore(true) // Respect .gitignore
@@ -174,10 +202,9 @@ pub fn index_directory(root: &Path, options: IndexOptions) -> Result<IndexResult
         .filter_map(Result::ok)
         .filter(|entry| {
             let path = entry.path();
-            if is_ignored(
+            if ignore_matcher.is_ignored(
                 path,
                 entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false),
-                ignore_matcher.as_ref(),
             ) {
                 return false;
             }
@@ -317,7 +344,7 @@ pub fn parse_single_file(path: &Path) -> Result<Vec<CodeNode>, arbor_core::Parse
 /// UNIX epoch. Catches edits and additions; a lone deletion leaves no newer
 /// file, so it is picked up on the next edit instead.
 pub fn sources_newer_than(root: &Path, cache_mtime: u64, follow_symlinks: bool) -> bool {
-    let ignore_matcher = build_ignore_matcher(root);
+    let ignore_matcher = IgnoreMatcher::new(root);
     let walker = WalkBuilder::new(root)
         .hidden(true)
         .git_ignore(true)
@@ -331,10 +358,9 @@ pub fn sources_newer_than(root: &Path, cache_mtime: u64, follow_symlinks: bool) 
 
     for entry in walker.filter_map(Result::ok) {
         let path = entry.path();
-        if is_ignored(
+        if ignore_matcher.is_ignored(
             path,
             entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false),
-            ignore_matcher.as_ref(),
         ) {
             continue;
         }
