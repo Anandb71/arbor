@@ -217,12 +217,6 @@ pub fn index_directory(root: &Path, options: IndexOptions) -> Result<IndexResult
     })
 }
 
-/// Parses a single file and returns its nodes.
-#[allow(dead_code)]
-pub fn parse_single_file(path: &Path) -> Result<Vec<CodeNode>, arbor_core::ParseError> {
-    parse_file(path)
-}
-
 /// Returns true if any supported source file under `root` is newer than `cache_mtime`.
 ///
 /// Used by read commands to detect a stale `graph.bin` before trusting it.

@@ -19,8 +19,8 @@ pub enum FileChange {
 
 /// Watches a directory for file changes.
 pub struct FileWatcher {
-    #[allow(dead_code)]
-    watcher: notify::RecommendedWatcher,
+    /// Held so the notify watcher is not dropped.
+    _watcher: notify::RecommendedWatcher,
     receiver: Receiver<FileChange>,
 }
 
@@ -75,7 +75,7 @@ impl FileWatcher {
         info!("Watching {} for changes", root.display());
 
         Ok(Self {
-            watcher,
+            _watcher: watcher,
             receiver: rx,
         })
     }

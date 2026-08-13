@@ -107,8 +107,10 @@ impl CentralityScores {
 }
 
 /// Returns true if this file path is a test/spec/fixture file.
-/// Callers from test files get de-weighted 10x so test utilities don't
-/// false-inflate their centrality scores vs. production callers.
+///
+/// Broader than [`crate::is_test_file`]: a substring match is intentional here
+/// so callers from `testing/` or `testutils/` still get the 10x de-weight.
+/// Query filtering uses the stricter classifier.
 fn is_test_file(file: &str) -> bool {
     let lower = file.to_lowercase();
     lower.contains("/test")

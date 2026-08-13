@@ -4,7 +4,7 @@
 //! enabling blast-radius analysis for CVEs and security reviews.
 
 use anyhow::Result;
-use arbor_graph::{ArborGraph, NodeId, NodeInfo};
+use arbor_graph::{is_test_file, ArborGraph, NodeId, NodeInfo};
 use serde::Serialize;
 
 /// Severity level of an audit finding based on path characteristics.
@@ -132,20 +132,6 @@ impl AuditResult {
         self.summary.unique_entry_points = entry_names.len();
         self.summary.unique_files = files.len();
     }
-}
-
-/// Returns true if the file path looks like a test file.
-fn is_test_file(file: &str) -> bool {
-    let lower = file.to_lowercase();
-    lower.contains("test")
-        || lower.contains("spec")
-        || lower.contains("__tests__")
-        || lower.ends_with("_test.rs")
-        || lower.ends_with("_test.go")
-        || lower.ends_with(".test.ts")
-        || lower.ends_with(".test.js")
-        || lower.ends_with(".spec.ts")
-        || lower.ends_with(".spec.js")
 }
 
 /// Run a security audit: find all paths from entry points to the given sink.

@@ -55,7 +55,7 @@ arbor-core  →  arbor-graph  →  arbor-watcher
 
 ### Crate Roles
 
-**`arbor-core`** — Tree-sitter AST parsing. Extracts functions, classes, structs, imports, and call edges for 9 production languages (Rust, TS/JS, Python, Go, Java, C/C++, C#, Dart) plus 5 fallback parsers. Each language lives in `crates/arbor-core/src/languages/`. `parser_v2.rs` is the active parser; `parser.rs` is legacy.
+**`arbor-core`** — Tree-sitter AST parsing. Extracts functions, classes, structs, imports, and call edges for 9 production languages (Rust, TS/JS, Python, Go, Java, C/C++, C#, Dart) plus 5 fallback parsers. Each language lives in `crates/arbor-core/src/languages/`. `parser.rs` (`parse_file`) is the production indexer path; `parser_v2.rs` (`ArborParser`) is used by the live sync server and also extracts relations.
 
 **`arbor-graph`** — In-memory petgraph + sled persistence. Key modules:
 - `builder.rs` — converts parsed nodes/edges into the graph, builds per-file import maps for cross-module edge filtering

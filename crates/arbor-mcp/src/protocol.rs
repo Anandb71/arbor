@@ -19,10 +19,11 @@ pub const DEFAULT_TTL_MS: u64 = 300_000;
 
 /// Client metadata extracted from `_meta` on stateless requests.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct RequestMeta {
     pub protocol_version: Option<String>,
+    #[allow(dead_code)]
     pub client_name: Option<String>,
+    #[allow(dead_code)]
     pub client_version: Option<String>,
 }
 

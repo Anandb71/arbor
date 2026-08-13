@@ -35,6 +35,7 @@ mod graph;
 mod heuristics;
 mod impact;
 pub mod lexicon;
+mod paths;
 mod query;
 mod ranking;
 mod search_index;
@@ -59,6 +60,9 @@ pub use heuristics::{
 };
 pub use impact::{AffectedNode, ImpactAnalysis, ImpactDirection, ImpactSeverity};
 pub use lexicon::{stem, tokenize_identifier, Lexicon};
+pub use paths::{
+    compress_path, is_minified_or_generated, is_test_file, make_relative, shorten_signature,
+};
 pub use query::{DependentInfo, ImpactResult, NodeInfo, QueryResult};
 pub use ranking::{compute_centrality, compute_centrality_warm, CentralityScores};
 pub use slice::{ContextNode, ContextSlice, TruncationReason};

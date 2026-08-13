@@ -38,23 +38,11 @@ pub struct ArborApp {
     /// Status message
     status: String,
 
-    /// Is analysis in progress
-    #[allow(dead_code)]
-    loading: bool,
-
     /// Dark mode toggle
     dark_mode: bool,
 
     /// Search history
     search_history: Vec<String>,
-
-    /// Show call tree (collapsible)
-    #[allow(dead_code)]
-    show_call_tree: bool,
-
-    /// Show dependencies (collapsible)
-    #[allow(dead_code)]
-    show_dependencies: bool,
 
     /// Show file path (spoiler mode - click to reveal)
     show_file_path: bool,
@@ -69,11 +57,8 @@ impl ArborApp {
             graph: None,
             result: None,
             status: "Ready. Enter a symbol name to analyze.".to_string(),
-            loading: false,
             dark_mode: true,
             search_history: Vec::new(),
-            show_call_tree: true,
-            show_dependencies: true,
             show_file_path: false, // Hidden by default (spoiler mode)
         }
     }
@@ -181,37 +166,6 @@ impl ArborApp {
                     );
                 }
             }
-        }
-    }
-
-    #[allow(dead_code)]
-    fn copy_as_markdown(&self) -> String {
-        if let Some(r) = &self.result {
-            let mut md = format!("## Impact Analysis: {}\n\n", r.target_name);
-            md += &format!("**File:** `{}`\n", r.target_file);
-            md += &format!("**Role:** {}\n", r.role);
-            md += &format!("**Confidence:** {}\n\n", r.confidence);
-
-            if !r.direct_callers.is_empty() {
-                md += "### Direct Callers (will break immediately)\n";
-                for c in &r.direct_callers {
-                    md += &format!("- {}\n", c);
-                }
-                md += "\n";
-            }
-
-            if !r.indirect_callers.is_empty() {
-                md += "### Indirect Callers (may break)\n";
-                for c in r.indirect_callers.iter().take(5) {
-                    md += &format!("- {}\n", c);
-                }
-                md += "\n";
-            }
-
-            md += &format!("**Total Affected:** {} nodes\n", r.total_affected);
-            md
-        } else {
-            String::new()
         }
     }
 }

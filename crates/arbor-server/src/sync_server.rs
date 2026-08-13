@@ -169,10 +169,8 @@ pub struct IndexerStatusPayload {
 
 /// Internal event for the file watcher.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 enum WatcherEvent {
     Changed(PathBuf),
-    Created(PathBuf),
     Deleted(PathBuf),
 }
 
@@ -636,7 +634,7 @@ async fn run_background_indexer(
         let start = Instant::now();
 
         match event {
-            WatcherEvent::Changed(path) | WatcherEvent::Created(path) => {
+            WatcherEvent::Changed(path) => {
                 let file_name = path
                     .file_name()
                     .and_then(|n| n.to_str())
