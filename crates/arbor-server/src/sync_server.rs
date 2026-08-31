@@ -9,6 +9,7 @@
 use crate::SharedGraph;
 use arbor_core::ArborParser;
 use arbor_graph::{compute_centrality_warm, ArborGraph, Edge, EdgeKind};
+use arbor_watcher::IgnoreMatcher;
 use futures_util::{SinkExt, StreamExt};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -553,6 +554,8 @@ async fn run_file_watcher(
     watcher.watch(&watch_path, RecursiveMode::Recursive)?;
     info!("👁️  File watcher started for {}", watch_path.display());
 
+    let ignore_matcher = IgnoreMatcher::new(&watch_path);
+
     // Debounce state
     let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
     let debounce_dur = Duration::from_millis(debounce_ms);
@@ -570,7 +573,7 @@ async fn run_file_watcher(
 
         for path in ready {
             pending.remove(&path);
-            if should_process_file(&path, &extensions) {
+            if should_process_file(&path, &extensions, &ignore_matcher) {
                 let event = if path.exists() {
                     WatcherEvent::Changed(path)
                 } else {
@@ -584,7 +587,7 @@ async fn run_file_watcher(
         match tokio::time::timeout(Duration::from_millis(50), notify_rx.recv()).await {
             Ok(Some(Ok(event))) => {
                 for path in event.paths {
-                    if should_process_file(&path, &extensions) {
+                    if should_process_file(&path, &extensions, &ignore_matcher) {
                         pending.insert(path, Instant::now());
                     }
                 }
@@ -600,8 +603,11 @@ async fn run_file_watcher(
     Ok(())
 }
 
-/// Checks if a file should be processed based on extension.
-fn should_process_file(path: &Path, extensions: &[String]) -> bool {
+/// Checks if a file should be processed based on extension and ignore rules.
+fn should_process_file(path: &Path, extensions: &[String], ignore_matcher: &IgnoreMatcher) -> bool {
+    if ignore_matcher.is_ignored(path, path.is_dir()) {
+        return false;
+    }
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| extensions.iter().any(|e| e == ext))
@@ -612,7 +618,40 @@ fn should_process_file(path: &Path, extensions: &[String]) -> bool {
 // Background Indexer
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Recompute centrality for the patched graph and broadcast the update.
+fn broadcast_graph_update(
+    g: &mut ArborGraph,
+    broadcast_tx: &broadcast::Sender<BroadcastMessage>,
+    changed_files: Vec<String>,
+) {
+    // Recompute centrality so the code map stays in sync with the
+    // patched graph — new nodes start at 0.0 otherwise and the map drifts.
+    // Warm-started from the previous scores, so a single-file patch
+    // converges in a round or two instead of the full budget.
+    let scores = compute_centrality_warm(g, 20, 0.85, Some(g.centrality_map()));
+    g.set_centrality(scores.into_map());
+
+    let update = BroadcastMessage::GraphUpdate(GraphUpdatePayload {
+        is_delta: true,
+        node_count: g.node_count(),
+        edge_count: g.edge_count(),
+        file_count: g.stats().files,
+        changed_files,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        nodes: Some(g.nodes().cloned().collect()),
+        edges: Some(g.export_edges()),
+    });
+
+    let _ = broadcast_tx.send(update);
+}
+
 /// Runs the background indexer that processes file changes.
+///
+/// The CPU-heavy graph update and centrality recompute are moved to
+/// `tokio::task::spawn_blocking` so the async core worker stays responsive
+/// and does not busy-loop on a single file change.
 async fn run_background_indexer(
     mut rx: mpsc::Receiver<WatcherEvent>,
     graph: SharedGraph,
@@ -633,135 +672,115 @@ async fn run_background_indexer(
     info!("🔧 Background indexer started");
 
     while let Some(event) = rx.recv().await {
-        let start = Instant::now();
+        // Take ownership of the parser for this event; the blocking task
+        // returns it so we can reuse it for the next event.
+        let mut current_parser = parser.take();
 
-        match event {
-            WatcherEvent::Changed(path) | WatcherEvent::Created(path) => {
-                let file_name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown");
-
-                info!("📝 Re-indexing: {}", file_name);
-
-                if parser.is_none() {
-                    parser = match ArborParser::new() {
-                        Ok(parser) => Some(parser),
-                        Err(error) => {
-                            warn!(
-                                "Skipping '{}' due to parser init failure: {}",
-                                file_name, error
-                            );
-                            None
-                        }
-                    };
+        if current_parser.is_none() {
+            current_parser = match ArborParser::new() {
+                Ok(parser) => Some(parser),
+                Err(error) => {
+                    warn!("Failed to initialize parser for re-indexing: {}", error);
+                    None
                 }
+            };
+        }
 
-                let Some(parser) = parser.as_mut() else {
-                    continue;
-                };
+        let Some(mut event_parser) = current_parser else {
+            continue;
+        };
 
-                match parser.parse_file(&path) {
-                    Ok(result) => {
-                        let mut g = graph.write().await;
+        let graph = graph.clone();
+        let broadcast_tx = broadcast_tx.clone();
 
-                        // Remove old nodes from this file
-                        g.remove_file(&result.file_path);
+        parser = match tokio::task::spawn_blocking(move || {
+            let start = Instant::now();
 
-                        // Add new nodes
-                        let mut node_ids = HashMap::new();
-                        for symbol in &result.symbols {
-                            let id = g.add_node(symbol.clone());
-                            node_ids.insert(symbol.id.clone(), id);
-                        }
+            match event {
+                WatcherEvent::Changed(path) | WatcherEvent::Created(path) => {
+                    let file_name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown");
 
-                        // Add edges for relations
-                        for relation in &result.relations {
-                            if let Some(&from_id) = node_ids.get(&relation.from_id) {
-                                // Try to find the target by name
-                                let targets = g.find_by_name(&relation.to_name);
-                                if let Some(target) = targets.first() {
-                                    if let Some(to_id) = g.get_index(&target.id) {
-                                        let edge_kind = match relation.kind {
-                                            arbor_core::RelationType::Calls => EdgeKind::Calls,
-                                            arbor_core::RelationType::Imports => EdgeKind::Imports,
-                                            arbor_core::RelationType::Extends => EdgeKind::Extends,
-                                            arbor_core::RelationType::Implements => {
-                                                EdgeKind::Implements
-                                            }
-                                        };
-                                        g.add_edge(from_id, to_id, Edge::new(edge_kind));
+                    info!("📝 Re-indexing: {}", file_name);
+
+                    match event_parser.parse_file(&path) {
+                        Ok(result) => {
+                            let mut g = graph.blocking_write();
+
+                            // Remove old nodes from this file
+                            g.remove_file(&result.file_path);
+
+                            // Add new nodes
+                            let mut node_ids = HashMap::new();
+                            for symbol in &result.symbols {
+                                let id = g.add_node(symbol.clone());
+                                node_ids.insert(symbol.id.clone(), id);
+                            }
+
+                            // Add edges for relations
+                            for relation in &result.relations {
+                                if let Some(&from_id) = node_ids.get(&relation.from_id) {
+                                    let targets = g.find_by_name(&relation.to_name);
+                                    if let Some(target) = targets.first() {
+                                        if let Some(to_id) = g.get_index(&target.id) {
+                                            let edge_kind = match relation.kind {
+                                                arbor_core::RelationType::Calls => EdgeKind::Calls,
+                                                arbor_core::RelationType::Imports => {
+                                                    EdgeKind::Imports
+                                                }
+                                                arbor_core::RelationType::Extends => {
+                                                    EdgeKind::Extends
+                                                }
+                                                arbor_core::RelationType::Implements => {
+                                                    EdgeKind::Implements
+                                                }
+                                            };
+                                            g.add_edge(from_id, to_id, Edge::new(edge_kind));
+                                        }
                                     }
                                 }
                             }
+
+                            let elapsed = start.elapsed();
+                            info!(
+                                "✅ Indexed {} in {:?} ({} symbols, {} relations)",
+                                file_name,
+                                elapsed,
+                                result.symbols.len(),
+                                result.relations.len()
+                            );
+
+                            broadcast_graph_update(&mut g, &broadcast_tx, vec![result.file_path]);
                         }
-
-                        // Recompute centrality so the code map stays in sync with the
-                        // patched graph — new nodes start at 0.0 otherwise and the map drifts.
-                        // Warm-started from the previous scores, so a single-file patch
-                        // converges in a round or two instead of the full budget.
-                        let scores =
-                            compute_centrality_warm(&g, 20, 0.85, Some(g.centrality_map()));
-                        g.set_centrality(scores.into_map());
-
-                        let elapsed = start.elapsed();
-                        info!(
-                            "✅ Indexed {} in {:?} ({} symbols, {} relations)",
-                            file_name,
-                            elapsed,
-                            result.symbols.len(),
-                            result.relations.len()
-                        );
-
-                        // Broadcast update
-                        let update = BroadcastMessage::GraphUpdate(GraphUpdatePayload {
-                            is_delta: true,
-                            node_count: g.node_count(),
-                            edge_count: g.edge_count(),
-                            file_count: g.stats().files,
-                            changed_files: vec![result.file_path],
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map_or(0, |d| d.as_secs()),
-                            nodes: Some(g.nodes().cloned().collect()),
-                            edges: Some(g.export_edges()),
-                        });
-
-                        let _ = broadcast_tx.send(update);
+                        Err(e) => {
+                            warn!("⚠️  Parse error for {}: {}", file_name, e);
+                        }
                     }
-                    Err(e) => {
-                        warn!("⚠️  Parse error for {}: {}", file_name, e);
-                    }
+                }
+
+                WatcherEvent::Deleted(path) => {
+                    let file_str = path.to_string_lossy().to_string();
+                    info!("🗑️  File deleted: {}", path.display());
+
+                    let mut g = graph.blocking_write();
+                    g.remove_file(&file_str);
+
+                    broadcast_graph_update(&mut g, &broadcast_tx, vec![file_str]);
                 }
             }
 
-            WatcherEvent::Deleted(path) => {
-                let file_str = path.to_string_lossy().to_string();
-                info!("🗑️  File deleted: {}", path.display());
-
-                let mut g = graph.write().await;
-                g.remove_file(&file_str);
-
-                // Recompute centrality so the code map reflects the removed nodes.
-                let scores = compute_centrality_warm(&g, 20, 0.85, Some(g.centrality_map()));
-                g.set_centrality(scores.into_map());
-
-                let update = BroadcastMessage::GraphUpdate(GraphUpdatePayload {
-                    is_delta: true,
-                    node_count: g.node_count(),
-                    edge_count: g.edge_count(),
-                    file_count: g.stats().files,
-                    changed_files: vec![file_str],
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs()),
-                    nodes: Some(g.nodes().cloned().collect()),
-                    edges: Some(g.export_edges()),
-                });
-
-                let _ = broadcast_tx.send(update);
+            Some(event_parser)
+        })
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Background indexer task failed: {}", e);
+                None
             }
-        }
+        };
     }
 }
 
@@ -776,11 +795,33 @@ mod tests {
     #[test]
     fn test_should_process_file() {
         let extensions = vec!["ts".to_string(), "rs".to_string()];
+        let ignore_matcher = IgnoreMatcher::new(Path::new("."));
 
-        assert!(should_process_file(Path::new("foo.ts"), &extensions));
-        assert!(should_process_file(Path::new("bar.rs"), &extensions));
-        assert!(!should_process_file(Path::new("baz.py"), &extensions));
-        assert!(!should_process_file(Path::new("README.md"), &extensions));
+        assert!(should_process_file(
+            Path::new("foo.ts"),
+            &extensions,
+            &ignore_matcher
+        ));
+        assert!(should_process_file(
+            Path::new("bar.rs"),
+            &extensions,
+            &ignore_matcher
+        ));
+        assert!(!should_process_file(
+            Path::new("baz.py"),
+            &extensions,
+            &ignore_matcher
+        ));
+        assert!(!should_process_file(
+            Path::new("README.md"),
+            &extensions,
+            &ignore_matcher
+        ));
+        assert!(!should_process_file(
+            Path::new("target/debug/foo.rs"),
+            &extensions,
+            &ignore_matcher
+        ));
     }
 
     #[test]
