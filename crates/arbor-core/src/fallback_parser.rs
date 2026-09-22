@@ -42,19 +42,30 @@ pub fn parse_fallback_source(source: &str, file_path: &str, ext: &str) -> Vec<Co
     let ext = ext.to_ascii_lowercase();
     let is_markdown = is_markdown_extension(&ext);
     let mut nodes = Vec::new();
+    let mut pending_annotations: Vec<String> = Vec::new();
 
     for (idx, line) in source.lines().enumerate() {
         let line_no = idx as u32 + 1;
         let trimmed = line.trim_start();
+
+        if trimmed.is_empty() {
+            continue;
+        }
 
         // Comments are never declarations. Skip them *before* parsing: the
         // shell rule looks for `()` anywhere on the line, so the comment
         // `# Compare app.fetch() between refs` used to yield a function named
         // "# Compare app.fetch". Markdown is exempt — there `#` starts a
         // heading, which is the thing we want.
-        if trimmed.is_empty()
-            || (!is_markdown && (trimmed.starts_with('#') || trimmed.starts_with("//")))
-        {
+        if !is_markdown && (trimmed.starts_with('#') || trimmed.starts_with("//")) {
+            pending_annotations.clear();
+            continue;
+        }
+
+        // Keep Hilt/Android annotations on the following declaration so entry
+        // detection can see `@AndroidEntryPoint` without treating `@` names as symbols.
+        if !is_markdown && trimmed.starts_with('@') {
+            pending_annotations.push(trimmed.to_string());
             continue;
         }
 
@@ -70,11 +81,22 @@ pub fn parse_fallback_source(source: &str, file_path: &str, ext: &str) -> Vec<Co
 
         if let Some((name, kind)) = candidate {
             let col = (line.len().saturating_sub(trimmed.len())) as u32;
+            let signature = if pending_annotations.is_empty() {
+                trimmed.to_string()
+            } else {
+                let mut signature = pending_annotations.join(" ");
+                signature.push(' ');
+                signature.push_str(trimmed);
+                signature
+            };
+            pending_annotations.clear();
             let node = CodeNode::new(&name, &name, kind, file_path)
                 .with_lines(line_no, line_no)
                 .with_column(col)
-                .with_signature(trimmed.to_string());
+                .with_signature(signature);
             nodes.push(node);
+        } else {
+            pending_annotations.clear();
         }
     }
 
@@ -82,15 +104,12 @@ pub fn parse_fallback_source(source: &str, file_path: &str, ext: &str) -> Vec<Co
 }
 
 fn parse_kotlin_line(line: &str) -> Option<(String, NodeKind)> {
+    let line = strip_kotlin_modifiers(line);
     if let Some(rest) = line.strip_prefix("fun ") {
         return take_ident(rest).map(|name| (name, NodeKind::Function));
     }
 
     if let Some(rest) = line.strip_prefix("class ") {
-        return take_ident(rest).map(|name| (name, NodeKind::Class));
-    }
-
-    if let Some(rest) = line.strip_prefix("data class ") {
         return take_ident(rest).map(|name| (name, NodeKind::Class));
     }
 
@@ -107,6 +126,31 @@ fn parse_kotlin_line(line: &str) -> Option<(String, NodeKind)> {
     }
 
     None
+}
+
+fn strip_kotlin_modifiers(line: &str) -> &str {
+    let mut rest = line.trim_start();
+    loop {
+        let stripped = [
+            "public ",
+            "private ",
+            "protected ",
+            "internal ",
+            "open ",
+            "abstract ",
+            "sealed ",
+            "inner ",
+            "data ",
+            "override ",
+            "lateinit ",
+        ]
+        .iter()
+        .find_map(|prefix| rest.strip_prefix(prefix));
+        match stripped {
+            Some(next) => rest = next.trim_start(),
+            None => return rest,
+        }
+    }
 }
 
 fn parse_swift_line(line: &str) -> Option<(String, NodeKind)> {
@@ -401,6 +445,30 @@ object Singleton
         assert!(nodes
             .iter()
             .any(|n| n.name == "Singleton" && matches!(n.kind, NodeKind::Class)));
+    }
+
+    #[test]
+    fn kotlin_annotation_stays_on_the_following_class() {
+        let source = r#"
+@HiltAndroidApp
+open class MyApplication : Application()
+
+@AndroidEntryPoint
+class MainActivity : AppCompatActivity()
+"#;
+        let nodes = parse_fallback_source(source, "app/MyApplication.kt", "kt");
+        let app = nodes.iter().find(|n| n.name == "MyApplication").unwrap();
+        assert!(app
+            .signature
+            .as_deref()
+            .unwrap()
+            .contains("@HiltAndroidApp"));
+        let activity = nodes.iter().find(|n| n.name == "MainActivity").unwrap();
+        assert!(activity
+            .signature
+            .as_deref()
+            .unwrap()
+            .contains("@AndroidEntryPoint"));
     }
 
     #[test]

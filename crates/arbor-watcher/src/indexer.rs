@@ -58,6 +58,11 @@ const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
     "dist/",
     "build/",
     "out/",
+    // Bundled third-party trees and minified assets. `vendor/` matches that
+    // directory at any depth, including Android `assets/**/vendor`.
+    "vendor/",
+    "*.min.js",
+    "*.min.css",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -538,6 +543,30 @@ mod tests {
         assert_eq!(result.files_indexed, 1);
         assert!(result.graph.find_by_name("kept").len() == 1);
         assert!(result.graph.find_by_name("ignored").is_empty());
+    }
+
+    #[test]
+    fn test_index_ignores_vendor_and_minified_assets_by_default() {
+        let dir = tempdir().unwrap();
+        let vendor_path = dir
+            .path()
+            .join("android")
+            .join("app")
+            .join("src")
+            .join("main")
+            .join("assets")
+            .join("instrument")
+            .join("vendor");
+        fs::create_dir_all(&vendor_path).unwrap();
+        fs::write(vendor_path.join("maplibre-gl.js"), "function el() {}").unwrap();
+        fs::write(dir.path().join("app.min.js"), "function boot() {}").unwrap();
+        fs::write(dir.path().join("kept.rs"), "pub fn kept() {}").unwrap();
+
+        let result = index_directory(dir.path(), IndexOptions::default()).unwrap();
+        assert_eq!(result.files_indexed, 1);
+        assert!(result.graph.find_by_name("kept").len() == 1);
+        assert!(result.graph.find_by_name("el").is_empty());
+        assert!(result.graph.find_by_name("boot").is_empty());
     }
 
     #[test]

@@ -6,8 +6,10 @@
 
 use crate::edge::EdgeKind;
 use crate::graph::{ArborGraph, NodeId};
+use arbor_core::NodeKind;
 use petgraph::visit::{EdgeRef, IntoEdgeReferences};
 use std::collections::HashMap;
+use std::path::Path;
 
 /// Iteration stops early once no node's score moves more than this between
 /// rounds. Tight enough that early exit is indistinguishable from running
@@ -259,6 +261,99 @@ pub fn compute_centrality_warm(
     CentralityScores::from_raw(nodes, scores)
 }
 
+fn normalize_path(path: &str) -> String {
+    path.replace('\\', "/").to_lowercase()
+}
+
+/// Bundled vendor trees and minified assets that should not rank as hotspots.
+///
+/// Used when a graph was indexed before those paths were excluded, so a stale
+/// cache still hides them from the hotspot table.
+pub fn is_noise_path(file: &str) -> bool {
+    let lower = normalize_path(file);
+    let with_boundary = format!("/{lower}/");
+
+    lower.ends_with(".min.js")
+        || lower.ends_with(".min.css")
+        || lower.contains(".chunk.")
+        || lower.contains(".bundle.")
+        || with_boundary.contains("/vendor/")
+        || with_boundary.contains("/dist/")
+        || with_boundary.contains("/build/")
+        || with_boundary.contains("/generated/")
+        || {
+            let filename = Path::new(&lower)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            let parts: Vec<&str> = filename.split('.').collect();
+            parts.len() >= 3
+                && parts[1].len() >= 8
+                && parts[1].chars().all(|c| c.is_ascii_hexdigit())
+        }
+}
+
+/// Computes percentile centrality when the graph has nodes and no complete score map.
+///
+/// Returns `true` when a computation was stored. Callers that persist the graph
+/// should write the cache only in that case.
+pub fn ensure_centrality(graph: &mut ArborGraph, iterations: usize, damping: f64) -> bool {
+    if graph.node_count() == 0 || graph.has_centrality_scores() {
+        return false;
+    }
+    let scores = compute_centrality(graph, iterations, damping);
+    graph.set_centrality_scores(scores);
+    true
+}
+
+/// Highest-centrality symbols that participate in the graph and are not vendor noise.
+///
+/// Disconnected symbols are omitted. A percentile of `0.0` is kept: that is the
+/// bottom rank after a real computation, not a missing score.
+pub fn top_hotspots(graph: &ArborGraph, limit: usize) -> Vec<(NodeId, f64)> {
+    let mut candidates = Vec::new();
+
+    for idx in graph.node_indexes() {
+        let Some(node) = graph.get(idx) else {
+            continue;
+        };
+        if is_noise_path(&node.file) {
+            continue;
+        }
+        if matches!(
+            node.kind,
+            NodeKind::Import | NodeKind::Export | NodeKind::Module
+        ) {
+            continue;
+        }
+        let degree = graph.get_callers(idx).len() + graph.get_callees(idx).len();
+        if degree == 0 {
+            continue;
+        }
+        candidates.push((
+            idx,
+            graph.centrality(idx),
+            degree,
+            node.file.clone(),
+            node.name.clone(),
+        ));
+    }
+
+    candidates.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.3.cmp(&b.3))
+            .then_with(|| a.4.cmp(&b.4))
+    });
+
+    candidates
+        .into_iter()
+        .take(limit)
+        .map(|(idx, centrality, _, _, _)| (idx, centrality))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,5 +601,70 @@ mod tests {
                 "warm start must converge to the same fixed point"
             );
         }
+    }
+
+    #[test]
+    fn noise_path_detects_vendor_and_minified_assets() {
+        assert!(is_noise_path(
+            "android/app/src/main/assets/instrument/vendor/maplibre-gl.js"
+        ));
+        assert!(is_noise_path("static/app.min.js"));
+        assert!(is_noise_path("dist/main.d094b1b69ba24b63.js"));
+        assert!(!is_noise_path("src/main/kotlin/MainActivity.kt"));
+    }
+
+    #[test]
+    fn top_hotspots_keeps_connected_bottom_rank_and_drops_vendor() {
+        let mut graph = ArborGraph::new();
+        let hub = graph.add_node(CodeNode::new(
+            "hub",
+            "hub",
+            NodeKind::Function,
+            "src/hub.rs",
+        ));
+        let caller = graph.add_node(CodeNode::new(
+            "caller",
+            "caller",
+            NodeKind::Function,
+            "src/a.rs",
+        ));
+        let _vendor = graph.add_node(CodeNode::new(
+            "el",
+            "el",
+            NodeKind::Function,
+            "android/app/src/main/assets/vendor/app.js",
+        ));
+        let _orphan = graph.add_node(CodeNode::new(
+            "orphan",
+            "orphan",
+            NodeKind::Function,
+            "b.rs",
+        ));
+        graph.add_edge(caller, hub, Edge::new(EdgeKind::Calls));
+
+        assert!(ensure_centrality(&mut graph, 20, 0.85));
+        assert!(!ensure_centrality(&mut graph, 20, 0.85));
+        assert_eq!(graph.centrality(caller), 0.0);
+
+        let names: Vec<String> = top_hotspots(&graph, 10)
+            .iter()
+            .filter_map(|(idx, _)| graph.get(*idx).map(|node| node.name.clone()))
+            .collect();
+        assert!(names.contains(&"hub".to_string()));
+        assert!(names.contains(&"caller".to_string()));
+        assert!(!names.contains(&"el".to_string()));
+        assert!(!names.contains(&"orphan".to_string()));
+    }
+
+    #[test]
+    fn ensure_centrality_does_not_recompute_a_flat_graph() {
+        let mut graph = ArborGraph::new();
+        graph.add_node(CodeNode::new("a", "a", NodeKind::Function, "a.rs"));
+        graph.add_node(CodeNode::new("b", "b", NodeKind::Function, "b.rs"));
+
+        assert!(ensure_centrality(&mut graph, 20, 0.85));
+        assert!(graph.has_centrality_scores());
+        assert!(!ensure_centrality(&mut graph, 20, 0.85));
+        assert!(top_hotspots(&graph, 10).is_empty());
     }
 }

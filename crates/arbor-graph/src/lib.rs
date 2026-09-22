@@ -60,7 +60,10 @@ pub use heuristics::{
 pub use impact::{AffectedNode, ImpactAnalysis, ImpactDirection, ImpactSeverity};
 pub use lexicon::{stem, tokenize_identifier, Lexicon};
 pub use query::{DependentInfo, ImpactResult, NodeInfo, QueryResult};
-pub use ranking::{compute_centrality, compute_centrality_warm, CentralityScores};
+pub use ranking::{
+    compute_centrality, compute_centrality_warm, ensure_centrality, is_noise_path, top_hotspots,
+    CentralityScores,
+};
 pub use slice::{ContextNode, ContextSlice, TruncationReason};
 pub use store::{GraphStore, StoreError};
 pub use symbol_table::{Resolution, SymbolEntry, SymbolTable};
