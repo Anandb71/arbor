@@ -6,8 +6,10 @@
 
 use crate::edge::EdgeKind;
 use crate::graph::{ArborGraph, NodeId};
+use arbor_core::NodeKind;
 use petgraph::visit::{EdgeRef, IntoEdgeReferences};
 use std::collections::HashMap;
+use std::path::Path;
 
 /// Iteration stops early once no node's score moves more than this between
 /// rounds. Tight enough that early exit is indistinguishable from running
@@ -259,6 +261,97 @@ pub fn compute_centrality_warm(
     CentralityScores::from_raw(nodes, scores)
 }
 
+fn normalize_path(path: &str) -> String {
+    path.replace('\\', "/").to_lowercase()
+}
+
+/// Returns true when a file path looks like a bundled vendor or minified asset
+/// that should not appear in architectural hotspot rankings.
+pub fn is_noise_path(file: &str) -> bool {
+    let lower = normalize_path(file);
+    let with_boundary = format!("/{lower}/");
+
+    lower.ends_with(".min.js")
+        || lower.ends_with(".min.css")
+        || lower.contains(".chunk.")
+        || lower.contains(".bundle.")
+        || with_boundary.contains("/vendor/")
+        || (with_boundary.contains("/assets/") && with_boundary.contains("/vendor/"))
+        || with_boundary.contains("/dist/")
+        || with_boundary.contains("/build/")
+        || with_boundary.contains("/generated/")
+        || {
+            let filename = Path::new(&lower)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let parts: Vec<&str> = filename.split('.').collect();
+            parts.len() >= 3
+                && parts[1].len() >= 8
+                && parts[1].chars().all(|c| c.is_ascii_hexdigit())
+        }
+}
+
+fn call_degree(graph: &ArborGraph, index: NodeId) -> usize {
+    graph.get_callers(index).len() + graph.get_callees(index).len()
+}
+
+/// Ensures centrality scores are present on the graph, computing them if needed.
+pub fn ensure_centrality(graph: &mut ArborGraph, iterations: usize, damping: f64) {
+    let has_centrality = graph.node_indexes().any(|idx| graph.centrality(idx) > 0.0);
+    if !has_centrality && graph.node_count() > 0 {
+        let scores = compute_centrality(graph, iterations, damping);
+        graph.set_centrality_scores(scores);
+    }
+}
+
+/// Returns the top architectural hotspot nodes, excluding vendor/minified noise
+/// and disconnected symbols with zero centrality.
+pub fn top_hotspots(graph: &ArborGraph, limit: usize) -> Vec<(NodeId, f64)> {
+    let mut candidates: Vec<(NodeId, f64, usize, String)> = Vec::new();
+
+    for idx in graph.node_indexes() {
+        let node = match graph.get(idx) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        if is_noise_path(&node.file) {
+            continue;
+        }
+
+        if matches!(
+            node.kind,
+            NodeKind::Import | NodeKind::Export | NodeKind::Module
+        ) {
+            continue;
+        }
+
+        let centrality = graph.centrality(idx);
+        let degree = call_degree(graph, idx);
+
+        // Hotspots must participate in the call graph; isolated symbols are noise.
+        if degree == 0 || centrality <= 0.0 {
+            continue;
+        }
+
+        candidates.push((idx, centrality, degree, node.file.clone()));
+    }
+
+    candidates.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.3.cmp(&b.3))
+    });
+
+    candidates
+        .into_iter()
+        .take(limit)
+        .map(|(idx, centrality, _, _)| (idx, centrality))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +585,70 @@ mod tests {
         let only = graph.add_node(CodeNode::new("solo", "solo", NodeKind::Function, "a.rs"));
         let scores = compute_centrality(&graph, 20, 0.85);
         assert_eq!(scores.get(only), 1.0);
+    }
+
+    #[test]
+    fn noise_path_detects_vendor_and_minified_assets() {
+        assert!(is_noise_path(
+            "android/app/src/main/assets/instrument/vendor/maplibre-gl.js"
+        ));
+        assert!(is_noise_path("static/app.min.js"));
+        assert!(is_noise_path("dist/main.d094b1b69ba24b63.js"));
+        assert!(!is_noise_path("src/main/kotlin/MainActivity.kt"));
+    }
+
+    #[test]
+    fn top_hotspots_excludes_disconnected_zero_centrality_nodes() {
+        let mut graph = ArborGraph::new();
+        let hub = graph.add_node(CodeNode::new(
+            "hub",
+            "hub",
+            NodeKind::Function,
+            "src/hub.rs",
+        ));
+        let caller = graph.add_node(CodeNode::new(
+            "caller",
+            "caller",
+            NodeKind::Function,
+            "src/a.rs",
+        ));
+        let noise = graph.add_node(CodeNode::new(
+            "el",
+            "el",
+            NodeKind::Function,
+            "android/app/src/main/assets/vendor/app.js",
+        ));
+        let orphan = graph.add_node(CodeNode::new(
+            "orphan",
+            "orphan",
+            NodeKind::Function,
+            "b.rs",
+        ));
+        graph.add_edge(caller, hub, Edge::new(EdgeKind::Calls));
+
+        let scores = compute_centrality(&graph, 20, 0.85);
+        graph.set_centrality_scores(scores);
+
+        let hotspots = top_hotspots(&graph, 10);
+        let names: Vec<String> = hotspots
+            .iter()
+            .filter_map(|(idx, _)| graph.get(*idx).map(|n| n.name.clone()))
+            .collect();
+
+        assert!(names.contains(&"hub".to_string()));
+        assert!(!names.contains(&"el".to_string()));
+        assert!(!names.contains(&"orphan".to_string()));
+    }
+
+    #[test]
+    fn ensure_centrality_populates_scores() {
+        let mut graph = ArborGraph::new();
+        let a = graph.add_node(CodeNode::new("a", "a", NodeKind::Function, "a.rs"));
+        let b = graph.add_node(CodeNode::new("b", "b", NodeKind::Function, "b.rs"));
+        graph.add_edge(a, b, Edge::new(EdgeKind::Calls));
+
+        ensure_centrality(&mut graph, 20, 0.85);
+        assert!(graph.centrality(b) > 0.0);
     }
 
     #[test]

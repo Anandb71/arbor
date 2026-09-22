@@ -106,11 +106,34 @@ impl HeuristicsMatcher {
     /// They're the roots of execution trees; if a changed function reaches one,
     /// it means the change can affect real production traffic.
     pub fn is_likely_entry_point(node: &CodeNode) -> bool {
+        let name = node.name.to_lowercase();
+        let file = node.file.to_lowercase();
+
+        // Android / Kotlin / Java mobile entry classes
+        if node.kind == NodeKind::Class
+            && (file.ends_with(".kt") || file.ends_with(".kts") || file.ends_with(".java"))
+            && (name.ends_with("activity")
+                || name.ends_with("application")
+                || name.ends_with("service")
+                || name.ends_with("receiver")
+                || name.ends_with("provider"))
+        {
+            return true;
+        }
+
+        // iOS Swift entry classes
+        if node.kind == NodeKind::Class
+            && file.ends_with(".swift")
+            && (name == "appdelegate"
+                || name.ends_with("viewcontroller")
+                || name == "scenedelegate")
+        {
+            return true;
+        }
+
         if !matches!(node.kind, NodeKind::Function | NodeKind::Method) {
             return false;
         }
-        let name = node.name.to_lowercase();
-        let file = node.file.to_lowercase();
 
         // Main / program entry
         if node.name == "main" || node.name == "__main__" {
@@ -440,6 +463,36 @@ mod tests {
             "dependency injection"
         );
         assert_eq!(UncertainEdgeKind::Reflection.to_string(), "reflection");
+    }
+
+    #[test]
+    fn test_android_activity_entry_point() {
+        let activity = CodeNode::new(
+            "MainActivity",
+            "MainActivity",
+            NodeKind::Class,
+            "app/src/main/java/com/example/MainActivity.kt",
+        );
+        assert!(HeuristicsMatcher::is_likely_entry_point(&activity));
+
+        let helper = CodeNode::new(
+            "UserRepository",
+            "UserRepository",
+            NodeKind::Class,
+            "data/UserRepository.kt",
+        );
+        assert!(!HeuristicsMatcher::is_likely_entry_point(&helper));
+    }
+
+    #[test]
+    fn test_android_application_entry_point() {
+        let app = CodeNode::new(
+            "MyApplication",
+            "MyApplication",
+            NodeKind::Class,
+            "app/src/main/java/com/example/MyApplication.kt",
+        );
+        assert!(HeuristicsMatcher::is_likely_entry_point(&app));
     }
 
     #[test]
