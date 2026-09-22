@@ -1464,7 +1464,8 @@ impl McpServer {
 
                 let has_centrality = {
                     let graph = self.graph.read().await;
-                    graph.node_indexes().any(|idx| graph.centrality(idx) > 0.0)
+                    let has = graph.node_indexes().any(|idx| graph.centrality(idx) > 0.0);
+                    has
                 };
                 if !has_centrality {
                     let mut graph = self.graph.write().await;
@@ -2029,7 +2030,7 @@ impl McpServer {
                 json!({ "entry_points": entries })
             }
             "arbor://graph/hotspots" => {
-                let hotspots: Vec<Value> = top_hotspots(graph, 20)
+                let hotspots: Vec<Value> = top_hotspots(&graph, 20)
                     .into_iter()
                     .filter_map(|(node_idx, centrality)| {
                         graph.get(node_idx).map(|node| {

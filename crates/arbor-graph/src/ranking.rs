@@ -612,13 +612,13 @@ mod tests {
             NodeKind::Function,
             "src/a.rs",
         ));
-        let noise = graph.add_node(CodeNode::new(
+        let _noise = graph.add_node(CodeNode::new(
             "el",
             "el",
             NodeKind::Function,
             "android/app/src/main/assets/vendor/app.js",
         ));
-        let orphan = graph.add_node(CodeNode::new(
+        let _orphan = graph.add_node(CodeNode::new(
             "orphan",
             "orphan",
             NodeKind::Function,
