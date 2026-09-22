@@ -1,7 +1,7 @@
 //! CLI command implementations.
 
 use arbor_core::parse_file;
-use arbor_graph::{compute_centrality, HeuristicsMatcher};
+use arbor_graph::{compute_centrality, ensure_centrality, top_hotspots, HeuristicsMatcher};
 use arbor_server::{ArborServer, ServerConfig};
 use arbor_watcher::{index_directory, IndexOptions};
 use colored::Colorize;
@@ -173,7 +173,7 @@ fn init_arbor_dir(path: &Path) -> Result<bool> {
                 "csharp",
                 "dart"
             ],
-            "ignore": ["node_modules", "target", "dist", "__pycache__", ".venv", "build", "out"]
+            "ignore": ["node_modules", "target", "dist", "__pycache__", ".venv", "build", "out", "vendor", "*.min.js", "*.min.css"]
         });
         fs::write(&config_path, serde_json::to_string_pretty(&default_config)?)?;
         return Ok(true);
@@ -4241,7 +4241,9 @@ fn map_last_word_of_param(param: &str) -> Option<&str> {
 pub fn agent_onboard(path: &Path, json: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
-    let graph = load_or_index_graph(&resolved_path)?;
+    let mut graph = load_or_index_graph(&resolved_path)?;
+    ensure_centrality(&mut graph, 20, 0.85);
+    let _ = save_graph_binary(&resolved_path, &graph);
 
     let node_count = graph.node_count();
     let edge_count = graph.edge_count();
@@ -4262,25 +4264,19 @@ pub fn agent_onboard(path: &Path, json: bool) -> Result<()> {
     let mut entry_points = graph.list_entry_points();
     entry_points.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let mut nodes_with_centrality = Vec::new();
-    for node_idx in graph.node_indexes() {
-        if let Some(node) = graph.get(node_idx) {
-            let centrality = graph.centrality(node_idx);
-            nodes_with_centrality.push((node, centrality));
-        }
-    }
-    nodes_with_centrality
-        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let hotspot_limit = if json { 20 } else { 15 };
+    let ranked_hotspots = top_hotspots(&graph, hotspot_limit);
 
     if json {
-        let hotspots_json: Vec<serde_json::Value> = nodes_with_centrality
+        let hotspots_json: Vec<serde_json::Value> = ranked_hotspots
             .iter()
-            .take(20)
-            .map(|(node, centrality)| {
-                serde_json::json!({
-                    "symbol": node.name.clone(),
-                    "centrality": centrality,
-                    "file": node.file.clone()
+            .filter_map(|(node_idx, centrality)| {
+                graph.get(*node_idx).map(|node| {
+                    serde_json::json!({
+                        "symbol": node.name.clone(),
+                        "centrality": centrality,
+                        "file": node.file.clone()
+                    })
                 })
             })
             .collect();
@@ -4324,14 +4320,16 @@ pub fn agent_onboard(path: &Path, json: bool) -> Result<()> {
         println!("## Core Components (Hotspots)");
         println!("| Rank | Symbol | Centrality | File |");
         println!("|------|--------|------------|------|");
-        for (i, (node, centrality)) in nodes_with_centrality.iter().take(15).enumerate() {
-            println!(
-                "| {} | `{}` | {:.4} | `{}` |",
-                i + 1,
-                node.name,
-                centrality,
-                node.file
-            );
+        for (i, (node_idx, centrality)) in ranked_hotspots.iter().enumerate() {
+            if let Some(node) = graph.get(*node_idx) {
+                println!(
+                    "| {} | `{}` | {:.4} | `{}` |",
+                    i + 1,
+                    node.name,
+                    centrality,
+                    node.file
+                );
+            }
         }
         println!();
 

@@ -4,7 +4,9 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arbor_graph::{changed_node_ids, compute_blast_radius, compute_centrality, HeuristicsMatcher};
+use arbor_graph::{
+    changed_node_ids, compute_blast_radius, compute_centrality, top_hotspots, HeuristicsMatcher,
+};
 use arbor_server::{SharedGraph, SyncServerHandle};
 
 mod apps;
@@ -1460,31 +1462,31 @@ impl McpServer {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(20) as usize;
 
+                let has_centrality = {
+                    let graph = self.graph.read().await;
+                    graph.node_indexes().any(|idx| graph.centrality(idx) > 0.0)
+                };
+                if !has_centrality {
+                    let mut graph = self.graph.write().await;
+                    let scores = compute_centrality(&graph, 20, 0.85);
+                    graph.set_centrality(scores.into_map());
+                }
+
                 let graph = self.graph.read().await;
                 let node_count = graph.node_count();
                 let edge_count = graph.edge_count();
 
-                let mut nodes_with_centrality = Vec::new();
-                for node_idx in graph.node_indexes() {
-                    if let Some(node) = graph.get(node_idx) {
-                        let centrality = graph.centrality(node_idx);
-                        nodes_with_centrality.push((node, centrality));
-                    }
-                }
-
-                nodes_with_centrality
-                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-                let hotspots: Vec<Value> = nodes_with_centrality
-                    .iter()
-                    .take(top_n)
-                    .map(|(node, centrality)| {
-                        json!({
-                            "id": node.id,
-                            "name": node.name,
-                            "kind": node.kind.to_string(),
-                            "file": node.file,
-                            "centrality": centrality
+                let hotspots: Vec<Value> = top_hotspots(&graph, top_n)
+                    .into_iter()
+                    .filter_map(|(node_idx, centrality)| {
+                        graph.get(node_idx).map(|node| {
+                            json!({
+                                "id": node.id,
+                                "name": node.name,
+                                "kind": node.kind.to_string(),
+                                "file": node.file,
+                                "centrality": centrality
+                            })
                         })
                     })
                     .collect();
@@ -2027,25 +2029,17 @@ impl McpServer {
                 json!({ "entry_points": entries })
             }
             "arbor://graph/hotspots" => {
-                let mut nodes_with_centrality = Vec::new();
-                for node_idx in graph.node_indexes() {
-                    if let Some(node) = graph.get(node_idx) {
-                        let centrality = graph.centrality(node_idx);
-                        nodes_with_centrality.push((node, centrality));
-                    }
-                }
-                nodes_with_centrality
-                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let hotspots: Vec<Value> = nodes_with_centrality
-                    .iter()
-                    .take(20)
-                    .map(|(node, centrality)| {
-                        json!({
-                            "id": node.id,
-                            "name": node.name,
-                            "kind": node.kind.to_string(),
-                            "file": node.file,
-                            "centrality": centrality
+                let hotspots: Vec<Value> = top_hotspots(graph, 20)
+                    .into_iter()
+                    .filter_map(|(node_idx, centrality)| {
+                        graph.get(node_idx).map(|node| {
+                            json!({
+                                "id": node.id,
+                                "name": node.name,
+                                "kind": node.kind.to_string(),
+                                "file": node.file,
+                                "centrality": centrality
+                            })
                         })
                     })
                     .collect();
