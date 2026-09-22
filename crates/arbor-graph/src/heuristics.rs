@@ -24,6 +24,35 @@ pub enum UncertainEdgeKind {
     Reflection,
 }
 
+/// Android activities and the two iOS delegate classes, plus Hilt entry annotations.
+///
+/// Suffixes like `Service`, `Provider`, and `Application` are ordinary type names
+/// in Java and Kotlin, so they are not entry points. `@AndroidEntryPoint` and
+/// `@HiltAndroidApp` are, when the parser recorded them on the signature.
+fn is_mobile_component(node: &CodeNode) -> bool {
+    if node.kind != NodeKind::Class {
+        return false;
+    }
+    let name = node.name.to_lowercase();
+    let file = node.file.replace('\\', "/").to_lowercase();
+    let jvm = file.ends_with(".kt") || file.ends_with(".kts") || file.ends_with(".java");
+    if jvm && name.ends_with("activity") {
+        return true;
+    }
+    if file.ends_with(".swift") && (name == "appdelegate" || name == "scenedelegate") {
+        return true;
+    }
+    if jvm {
+        if let Some(signature) = node.signature.as_deref() {
+            let signature = signature.to_lowercase();
+            if signature.contains("@androidentrypoint") || signature.contains("@hiltandroidapp") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 impl std::fmt::Display for UncertainEdgeKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -106,6 +135,9 @@ impl HeuristicsMatcher {
     /// They're the roots of execution trees; if a changed function reaches one,
     /// it means the change can affect real production traffic.
     pub fn is_likely_entry_point(node: &CodeNode) -> bool {
+        if is_mobile_component(node) {
+            return true;
+        }
         if !matches!(node.kind, NodeKind::Function | NodeKind::Method) {
             return false;
         }
@@ -440,6 +472,61 @@ mod tests {
             "dependency injection"
         );
         assert_eq!(UncertainEdgeKind::Reflection.to_string(), "reflection");
+    }
+
+    #[test]
+    fn android_activity_is_an_entry_point_and_a_service_is_not() {
+        let activity = CodeNode::new(
+            "MainActivity",
+            "MainActivity",
+            NodeKind::Class,
+            "app/src/main/java/com/example/MainActivity.kt",
+        );
+        assert!(HeuristicsMatcher::is_likely_entry_point(&activity));
+
+        let service = CodeNode::new(
+            "UserService",
+            "UserService",
+            NodeKind::Class,
+            "src/main/java/com/example/UserService.java",
+        );
+        assert!(!HeuristicsMatcher::is_likely_entry_point(&service));
+
+        let controller = CodeNode::new(
+            "ProfileViewController",
+            "ProfileViewController",
+            NodeKind::Class,
+            "ios/ProfileViewController.swift",
+        );
+        assert!(!HeuristicsMatcher::is_likely_entry_point(&controller));
+
+        let delegate = CodeNode::new(
+            "AppDelegate",
+            "AppDelegate",
+            NodeKind::Class,
+            "ios/AppDelegate.swift",
+        );
+        assert!(HeuristicsMatcher::is_likely_entry_point(&delegate));
+    }
+
+    #[test]
+    fn hilt_annotation_marks_the_annotated_class_only() {
+        let app = CodeNode::new(
+            "MyApplication",
+            "MyApplication",
+            NodeKind::Class,
+            "app/src/main/java/com/example/MyApplication.kt",
+        )
+        .with_signature("@HiltAndroidApp open class MyApplication : Application()");
+        assert!(HeuristicsMatcher::is_likely_entry_point(&app));
+
+        let plain = CodeNode::new(
+            "MyApplication",
+            "MyApplication",
+            NodeKind::Class,
+            "app/src/main/java/com/example/MyApplication.kt",
+        );
+        assert!(!HeuristicsMatcher::is_likely_entry_point(&plain));
     }
 
     #[test]

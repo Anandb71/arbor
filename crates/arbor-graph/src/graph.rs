@@ -344,6 +344,16 @@ impl ArborGraph {
         self.centrality = scores;
     }
 
+    /// Whether every node has a stored percentile, including a legitimate `0.0`.
+    ///
+    /// A missing computation leaves the map empty. A finished one writes a score
+    /// for each node, and the bottom rank is defined to be `0.0`, so "any score
+    /// is positive" is the wrong test.
+    pub fn has_centrality_scores(&self) -> bool {
+        let n = self.node_count();
+        n > 0 && self.centrality.len() == n
+    }
+
     /// Stores both the raw and percentile forms from a computation.
     pub fn set_centrality_scores(&mut self, scores: crate::ranking::CentralityScores) {
         let (raw, percentile) = scores.into_parts();
