@@ -91,16 +91,14 @@ nodes.
 - Edges land on different nodes, so cached graphs, stored node ids, and
   centrality baselines from 2.6.0 will differ
 
+Call cycles are condensed before PageRank. Each strongly connected component is ranked once and that mass is shared across its members, so a closed ring does not fill the top of the ranking and a cycle that calls out keeps its members together. The number `CentralityScores` reports is still the v2.6.0 percentile, `i / (n - 1)`.
+
 ### Known and still open
 
 Written down rather than left to be discovered:
 
 - Small targets now **over**-report (36 → 61, 16 → 46). Safer direction than
   silence, but not yet correct.
-- PageRank has no escape from a closed cycle. Every member of a 500-function
-  ring scores above 90% centrality on one caller each, so mutually recursive
-  clusters — parsers, tree walkers, state machines — crowd the top of any
-  ranking.
 - Inheritance produces no edges. `class Middle(Base)` is invisible, so changing
   a base class shows zero blast radius.
 - Dynamic and reflective imports (`importlib`, `__import__`, `import()`,

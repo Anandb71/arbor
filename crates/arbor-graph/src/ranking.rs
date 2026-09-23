@@ -16,19 +16,6 @@ use std::path::Path;
 /// the full iteration budget.
 const CONVERGENCE_EPSILON: f64 = 1e-9;
 
-/// Conserving dangling/sink mass couples every node through the uniform leak,
-/// so the contraction is the raw damping factor 0.85. Reaching 1e-9 from a
-/// uniform start takes ~log(1e-9)/log(0.85) ≈ 127 rounds — more than the
-/// historical 20-iteration call sites pass. Requested counts are therefore a
-/// floor; the loop still exits early once the residual is under epsilon.
-const MIN_PAGERANK_ITERS: usize = 160;
-
-/// Weight of the rank-percentile term in [`CentralityScores::from_raw`].
-/// The rest is a log-minmax of raw PageRank; the blend keeps hub=1 / leaf=0
-/// while spreading the connected body across (0, 1) instead of jumping from
-/// the bottom tie to the 90th percentile.
-const RANK_BLEND: f64 = 0.5;
-
 /// Centrality scores in two forms.
 ///
 /// # Why two
@@ -43,12 +30,10 @@ const RANK_BLEND: f64 = 0.5;
 /// cleared it; in a flat repo almost everything did. Worse, adding a single new
 /// hub rescaled every other node in the graph.
 ///
-/// [`percentile`](Self::percentile) is the comparable form — `0.6` still
-/// means the node sits above most of the repository — but the mapping is a
-/// blend of rank percentile and log-scaled raw mass. A large set of tied
-/// disconnected symbols would otherwise push every connected node above 90%
-/// (or leave it at 0%), which is not a risk distribution. [`raw`](Self::raw)
-/// is the true fixed point, kept because warm-start recomputation needs it.
+/// [`percentile`](Self::percentile) is the comparable form — `0.6` means "more
+/// central than 60% of this repository" everywhere — and is what thresholds
+/// should use. [`raw`](Self::raw) is the true fixed point, kept because
+/// warm-start recomputation needs it.
 #[derive(Debug, Default, Clone)]
 pub struct CentralityScores {
     raw: HashMap<NodeId, f64>,
@@ -81,13 +66,13 @@ impl CentralityScores {
         (self.raw, self.percentile)
     }
 
-    /// Builds a smoothed `[0, 1]` rank from raw PageRank mass.
+    /// Builds percentile ranks from raw scores.
     ///
-    /// Rank percentile alone is comparable but hard-clips: any node above a
-    /// large bottom tie (disconnected symbols) jumps to ~90%+. Mixing in a
-    /// log-minmax of the raw scores spreads that body across the unit
-    /// interval without changing order, ties, or the endpoints (min stays 0,
-    /// max stays 1).
+    /// A node's percentile is the fraction of nodes scoring strictly below it,
+    /// `rank = i / (n - 1)`, so tied nodes share a rank and the ordering is
+    /// total and deterministic. This is the v2.6.0 contract: `0.6` means
+    /// strictly above 60% of this repository, which is what `arbor agent review`
+    /// and `arbor agent guard` threshold against.
     fn from_raw(nodes: Vec<NodeId>, scores: Vec<f64>) -> Self {
         let n = scores.len();
         let mut percentile = vec![0.0f64; n];
@@ -116,19 +101,6 @@ impl CentralityScores {
                     percentile[*slot] = rank;
                 }
                 i = j + 1;
-            }
-
-            let min_s = scores[order[0]].max(f64::MIN_POSITIVE);
-            let max_s = scores[order[n - 1]].max(f64::MIN_POSITIVE);
-            let log_span = max_s.ln() - min_s.ln();
-            if log_span > f64::EPSILON {
-                let log_weight = 1.0 - RANK_BLEND;
-                for k in 0..n {
-                    let log_part = ((scores[k].max(f64::MIN_POSITIVE).ln() - min_s.ln())
-                        / log_span)
-                        .clamp(0.0, 1.0);
-                    percentile[k] = RANK_BLEND * percentile[k] + log_weight * log_part;
-                }
             }
         }
 
@@ -216,49 +188,96 @@ fn scc_ids(out_edges: &[Vec<u32>], in_edges: &[Vec<u32>]) -> Vec<usize> {
     scc_id
 }
 
-/// Nodes whose SCC has no call edge to a different component.
+/// Call-graph condensation: one supernode per SCC, edges only between components.
 ///
-/// Classic PageRank only redistributes mass from *dangling vertices*
-/// (out-degree 0). A closed cycle has out-degree 1 at every node, so the
-/// mass that walks in never walks out except via the 0.15 teleport — and a
-/// 500-function ring therefore saturates the top of the ranking. Treating
-/// the whole sink component as dangling restores the leak.
-fn sink_component_nodes(out_edges: &[Vec<u32>], in_edges: &[Vec<u32>]) -> Vec<bool> {
-    let n = out_edges.len();
-    if n == 0 {
-        return Vec::new();
+/// Every cycle is collapsed, whether or not it can call out. Internal edges
+/// do not carry mass, so a ring cannot trap the walk and a cycle that calls a
+/// helper scales with that external edge instead of circulating at damping 0.85.
+struct CondensedCalls {
+    /// Dense component id of each node.
+    scc: Vec<usize>,
+    /// Members of each component, in node-index order.
+    members: Vec<Vec<u32>>,
+    /// External in-flows: `(source component, factor)` per component.
+    incoming: Vec<Vec<(u32, f64)>>,
+    /// Sum of outgoing factors. Zero when the component calls nothing outside itself.
+    out_factor: Vec<f64>,
+    /// Largest caller-weight among members that have an external call.
+    /// Production components emit `1.0`; a component that only leaves through
+    /// a test file emits `0.1`, matching the singleton de-weight.
+    emission: Vec<f64>,
+}
+
+fn condense_calls(
+    out_edges: &[Vec<u32>],
+    in_edges: &[Vec<u32>],
+    weights: &[f64],
+) -> CondensedCalls {
+    let scc = scc_ids(out_edges, in_edges);
+    let ncomp = scc.iter().copied().max().map(|m| m + 1).unwrap_or(0);
+    let mut members = vec![Vec::new(); ncomp];
+    for (node, &comp) in scc.iter().enumerate() {
+        members[comp].push(node as u32);
     }
-    let scc_id = scc_ids(out_edges, in_edges);
-    let scc_count = scc_id.iter().copied().max().map(|m| m + 1).unwrap_or(0);
-    let mut has_external = vec![false; scc_count];
+
+    let mut buckets: Vec<HashMap<u32, f64>> = vec![HashMap::new(); ncomp];
+    let mut emission = vec![0.0f64; ncomp];
     for (source, targets) in out_edges.iter().enumerate() {
-        for &target in targets {
-            if scc_id[source] != scc_id[target as usize] {
-                has_external[scc_id[source]] = true;
-            }
+        let comp = scc[source];
+        let external: Vec<usize> = targets
+            .iter()
+            .map(|target| *target as usize)
+            .filter(|&target| scc[target] != comp)
+            .collect();
+        if external.is_empty() {
+            continue;
+        }
+        emission[comp] = emission[comp].max(weights[source]);
+        let share = weights[source] / external.len() as f64;
+        for target in external {
+            *buckets[comp].entry(scc[target] as u32).or_insert(0.0) += share;
         }
     }
-    scc_id.iter().map(|&id| !has_external[id]).collect()
+
+    let mut out_factor = vec![0.0f64; ncomp];
+    let mut incoming = vec![Vec::new(); ncomp];
+    for (comp, bucket) in buckets.iter().enumerate() {
+        let sum: f64 = bucket.values().sum();
+        out_factor[comp] = sum;
+        for (&target, &factor) in bucket {
+            incoming[target as usize].push((comp as u32, factor));
+        }
+    }
+
+    CondensedCalls {
+        scc,
+        members,
+        incoming,
+        out_factor,
+        emission,
+    }
 }
 
 /// Computes production-aware centrality scores for all nodes in the graph.
 ///
 /// Uses a modified PageRank where:
 /// 1. Nodes initialize with equal score
-/// 2. Each iteration distributes scores along call edges, damped at 0.85
-///    (0.15 teleports uniformly so no node can saturate at 1.0)
-/// 3. Sink vertices *and* closed sink components leak their mass uniformly
-///    across all N nodes — otherwise a call ring with no outbound edge traps
-///    the walk and every member ranks as a hotspot
+/// 2. Strongly connected components of the call graph are condensed. PageRank
+///    runs on that DAG, then each component's mass is shared across its members
+///    so a cycle cannot trap the walk — including cycles that call out to a helper
+/// 3. Each iteration distributes component mass along external call edges,
+///    damped at 0.85 (0.15 teleports uniformly, per node)
 /// 4. Callers from test/spec/fixture files contribute 10x less weight
 ///    — prevents test utilities from appearing more central than production code
-/// 5. Raw scores are converted to a smoothed rank (percentile blended with
-///    log-scaled mass) for cross-repo comparability (see [`CentralityScores`])
+/// 5. Raw scores are converted to percentile ranks (`i / (n - 1)`) for
+///    cross-repo comparability (see [`CentralityScores`])
 ///
 /// # Arguments
 ///
 /// * `graph` - The graph to analyze
-/// * `iterations` - Number of iterations (10-20 is usually enough)
+/// * `iterations` - Maximum power-iteration rounds (10-20 is usually enough).
+///   The loop stops early once no member score moves by more than `1e-9`.
+///   A smaller budget is honored; it is not raised internally.
 /// * `damping` - Damping factor (0.85 is standard)
 pub fn compute_centrality(graph: &ArborGraph, iterations: usize, damping: f64) -> CentralityScores {
     compute_centrality_warm(graph, iterations, damping, None)
@@ -299,10 +318,7 @@ pub fn compute_centrality_warm(
         })
         .collect();
 
-    // One pass over the edges builds the call adjacency: out-degrees for the
-    // score split, outbound lists for SCC detection, and per-node caller lists
-    // for the gather.
-    let mut out_degree: Vec<usize> = vec![0; n];
+    // Calls only. Import and containment edges are not part of the walk.
     let mut out_edges: Vec<Vec<u32>> = vec![Vec::new(); n];
     let mut in_edges: Vec<Vec<u32>> = vec![Vec::new(); n];
     for edge in graph.graph.edge_references() {
@@ -313,63 +329,56 @@ pub fn compute_centrality_warm(
         else {
             continue;
         };
-        out_degree[source] += 1;
         out_edges[source].push(target as u32);
         in_edges[target].push(source as u32);
     }
 
-    let is_sink = sink_component_nodes(&out_edges, &in_edges);
-    let sink_nodes: Vec<usize> = (0..n).filter(|&i| is_sink[i]).collect();
-    // Sink-component members redistribute uniformly instead of along their
-    // internal edges, so they must not appear in anyone's gather list.
-    for incoming in in_edges.iter_mut() {
-        incoming.retain(|&source| !is_sink[source as usize]);
-    }
-    for degree in out_degree.iter_mut() {
-        *degree = (*degree).max(1);
-    }
+    let condensed = condense_calls(&out_edges, &in_edges, &weights);
+    let ncomp = condensed.members.len();
+    let sizes: Vec<f64> = condensed.members.iter().map(|m| m.len() as f64).collect();
 
     let initial_score = 1.0 / n as f64;
-    let n_f = n as f64;
-    let base = (1.0 - damping) / n_f;
-    let incoming = |scores: &[f64], target: usize| -> f64 {
-        in_edges[target]
-            .iter()
-            .map(|&source| {
-                let source = source as usize;
-                weights[source] * scores[source] / out_degree[source] as f64
+    let base = (1.0 - damping) / n as f64;
+    // Component mass update. A singleton reproduces the historical per-node
+    // equation `base + d * Σ weight * score / out_degree`. A multi-node SCC
+    // emits its whole mass along external edges (split by those edges' factors)
+    // and splits the result evenly, so both sides of `a <-> b` stay tied.
+    let step = |mass: &[f64]| -> Vec<f64> {
+        (0..ncomp)
+            .map(|comp| {
+                let inflow: f64 = condensed.incoming[comp]
+                    .iter()
+                    .map(|&(source, factor)| {
+                        let source = source as usize;
+                        let denom = condensed.out_factor[source];
+                        if denom <= 0.0 {
+                            0.0
+                        } else {
+                            mass[source] * condensed.emission[source] * factor / denom
+                        }
+                    })
+                    .sum();
+                sizes[comp] * base + damping * inflow
             })
-            .sum()
-    };
-    let dangling_mass = |scores: &[f64]| -> f64 {
-        sink_nodes
-            .iter()
-            .map(|&i| weights[i] * scores[i])
-            .sum::<f64>()
-    };
-    // Full PageRank operator including the uniform leak from sink components.
-    let apply = |scores: &[f64], target: usize, leak: f64| -> f64 {
-        base + damping * (incoming(scores, target) + leak)
+            .collect()
     };
 
-    let mut scores: Vec<f64> = match previous {
+    let mut mass: Vec<f64> = match previous {
         Some(prev) if !prev.is_empty() => {
-            let mut warm: Vec<f64> = nodes
-                .iter()
-                .map(|id| prev.get(id).copied().unwrap_or(initial_score))
-                .collect();
+            let mut warm = vec![0.0f64; ncomp];
+            for (index, id) in nodes.iter().enumerate() {
+                warm[condensed.scc[index]] += prev.get(id).copied().unwrap_or(initial_score);
+            }
             // Stored scores may be any scalar multiple c of the iteration's
             // fixed point. For raw scores (what `centrality_map` now returns)
             // c ≈ 1 and this is a no-op; the rescale is kept so a caller that
             // hands us normalized scores still converges. For v ≈ c·x*, summing
-            // the fixed-point equation gives c = 1 − (f(v) − Σv) / (n·base)
-            // where f(v) = n·base + damping·(Σ incoming(v) + dangling) — so one
-            // pass over the edges recovers c and v/c lands next to the fixed point.
+            // the fixed-point equation gives c = 1 − (f(v) − Σv) / (1 − d).
             let sum_v: f64 = warm.iter().sum();
-            let dmass = dangling_mass(&warm);
-            let incoming_total: f64 = (0..n).map(|t| incoming(&warm, t)).sum();
-            let f_v: f64 = n_f * base + damping * (incoming_total + dmass);
-            let c = 1.0 - (f_v - sum_v) / (n_f * base);
+            let applied = step(&warm);
+            let f_v: f64 = applied.iter().sum();
+            let teleport = (1.0 - damping).max(f64::EPSILON);
+            let c = 1.0 - (f_v - sum_v) / teleport;
             if c.is_finite() && c > f64::EPSILON {
                 for score in warm.iter_mut() {
                     *score /= c;
@@ -377,22 +386,28 @@ pub fn compute_centrality_warm(
             }
             warm
         }
-        _ => vec![initial_score; n],
+        _ => sizes.iter().map(|size| size * initial_score).collect(),
     };
 
-    let mut next: Vec<f64> = vec![0.0; n];
-    let max_iters = iterations.max(MIN_PAGERANK_ITERS);
-    for _ in 0..max_iters {
-        let leak = dangling_mass(&scores) / n_f;
+    for _ in 0..iterations {
+        let applied = step(&mass);
         let mut max_delta = 0.0f64;
-        for target in 0..n {
-            let score = apply(&scores, target, leak);
-            max_delta = max_delta.max((score - scores[target]).abs());
-            next[target] = score;
+        for comp in 0..ncomp {
+            let old = mass[comp] / sizes[comp];
+            let new = applied[comp] / sizes[comp];
+            max_delta = max_delta.max((new - old).abs());
         }
-        std::mem::swap(&mut scores, &mut next);
+        mass = applied;
         if max_delta < CONVERGENCE_EPSILON {
             break;
+        }
+    }
+
+    let mut scores = vec![0.0f64; n];
+    for (comp, members) in condensed.members.iter().enumerate() {
+        let share = mass[comp] / sizes[comp];
+        for &member in members {
+            scores[member as usize] = share;
         }
     }
 
@@ -806,133 +821,298 @@ mod tests {
         assert!(top_hotspots(&graph, 10).is_empty());
     }
 
+    fn fn_node(graph: &mut ArborGraph, name: &str, file: &str) -> NodeId {
+        graph.add_node(CodeNode::new(name, name, NodeKind::Function, file))
+    }
+
+    fn link(graph: &mut ArborGraph, from: NodeId, to: NodeId) {
+        graph.add_edge(from, to, Edge::new(EdgeKind::Calls));
+    }
+
     /// Closed call ring: r0 → r1 → … → r{n-1} → r0.
     fn ring(n: usize) -> (ArborGraph, Vec<NodeId>) {
         let mut graph = ArborGraph::new();
         let mut nodes = Vec::with_capacity(n);
         for i in 0..n {
             let name = format!("r{i:03}");
-            nodes.push(graph.add_node(CodeNode::new(
-                name.clone(),
-                name,
-                NodeKind::Function,
-                "ring.py",
-            )));
+            nodes.push(fn_node(&mut graph, &name, "evil/ring500.py"));
         }
         for i in 0..n {
-            graph.add_edge(nodes[i], nodes[(i + 1) % n], Edge::new(EdgeKind::Calls));
+            link(&mut graph, nodes[i], nodes[(i + 1) % n]);
         }
         (graph, nodes)
     }
 
     #[test]
-    fn closed_cycle_does_not_outrank_a_real_hub() {
-        let (mut graph, ring_nodes) = ring(50);
-        let hub = graph.add_node(CodeNode::new("hub", "hub", NodeKind::Function, "hub.rs"));
-        for i in 0..10 {
+    fn closed_ring500_stays_out_of_the_top_decile() {
+        let (mut graph, ring_nodes) = ring(500);
+        let hub = fn_node(&mut graph, "hub", "hub.rs");
+        for i in 0..12 {
             let name = format!("c{i}");
-            let caller = graph.add_node(CodeNode::new(
-                name.clone(),
-                name,
-                NodeKind::Function,
-                format!("c{i}.rs"),
-            ));
-            graph.add_edge(caller, hub, Edge::new(EdgeKind::Calls));
+            let caller = fn_node(&mut graph, &name, &format!("c{i}.rs"));
+            link(&mut graph, caller, hub);
         }
 
-        let scores = compute_centrality(&graph, 30, 0.85);
-        let hub_score = scores.get(hub);
-        let mut above_90 = 0usize;
+        let scores = compute_centrality(&graph, 20, 0.85);
+        let hub_rank = scores.get(hub);
+        let mut in_top_decile = 0usize;
         for &idx in &ring_nodes {
-            let s = scores.get(idx);
-            assert!(s < hub_score, "ring node ranked {s} vs hub {hub_score}");
-            if s > 0.90 {
-                above_90 += 1;
+            let rank = scores.get(idx);
+            assert!(
+                rank < hub_rank,
+                "ring member ranked {rank} against hub {hub_rank}"
+            );
+            if rank > 0.90 {
+                in_top_decile += 1;
             }
         }
-        assert!(
-            above_90 < ring_nodes.len() / 10,
-            "{above_90} of {} ring nodes scored above 90%",
-            ring_nodes.len()
+        assert_eq!(
+            in_top_decile, 0,
+            "isolated 500-ring occupied the top decile"
         );
     }
 
     #[test]
-    fn pagerank_mass_is_conserved_on_production_weights() {
-        let (graph, _) = star(15);
-        let scores = compute_centrality(&graph, 40, 0.85);
-        let sum: f64 = graph.node_indexes().map(|i| scores.get_raw(i)).sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-6,
-            "PageRank mass should stay ~1.0, got {sum}"
-        );
-    }
-
-    #[test]
-    fn isolated_cycle_matches_disconnected_raw_score() {
-        let (mut graph, ring_nodes) = ring(8);
-        let orphan = graph.add_node(CodeNode::new(
-            "orphan",
-            "orphan",
-            NodeKind::Function,
-            "orphan.rs",
-        ));
-        let scores = compute_centrality(&graph, 40, 0.85);
-        let orphan_raw = scores.get_raw(orphan);
-        for &idx in &ring_nodes {
-            assert!(
-                (scores.get_raw(idx) - orphan_raw).abs() < 1e-9,
-                "closed cycle must leak like a dangling node"
-            );
-        }
-    }
-
-    #[test]
-    fn smoothed_scores_occupy_the_middle_of_the_range() {
+    fn cycle_with_exit_keeps_both_members_above_dead_code() {
+        // caller → a ↔ b, and a calls helper. The component can leave, so it
+        // is not a sink, but a and b still share one rank. b must not collapse
+        // to the orphan's score the way a sink-only edge deletion does.
         let mut graph = ArborGraph::new();
-        for i in 0..40 {
-            let name = format!("iso{i}");
-            graph.add_node(CodeNode::new(
-                name.clone(),
-                name,
-                NodeKind::Function,
-                "iso.rs",
-            ));
-        }
-        let mut prev = graph.add_node(CodeNode::new("s0", "s0", NodeKind::Function, "c.rs"));
-        for i in 1..12 {
-            let name = format!("s{i}");
-            let cur = graph.add_node(CodeNode::new(&name, &name, NodeKind::Function, "c.rs"));
-            graph.add_edge(prev, cur, Edge::new(EdgeKind::Calls));
+        let caller = fn_node(&mut graph, "caller", "caller.rs");
+        let a = fn_node(&mut graph, "a", "cycle.rs");
+        let b = fn_node(&mut graph, "b", "cycle.rs");
+        let helper = fn_node(&mut graph, "helper", "helper.rs");
+        let orphan = fn_node(&mut graph, "orphan", "orphan.rs");
+        link(&mut graph, caller, a);
+        link(&mut graph, a, b);
+        link(&mut graph, b, a);
+        link(&mut graph, a, helper);
+
+        let scores = compute_centrality(&graph, 20, 0.85);
+        assert!(
+            (scores.get_raw(a) - scores.get_raw(b)).abs() < 1e-9,
+            "cycle members share component mass, a={} b={}",
+            scores.get_raw(a),
+            scores.get_raw(b)
+        );
+        assert_eq!(scores.get(a), scores.get(b));
+        assert!(
+            scores.get_raw(b) > scores.get_raw(orphan),
+            "b must stay above dead code"
+        );
+        assert!(scores.get(b) > scores.get(orphan));
+
+        // The exit receives the component's mass, not just a's personal share.
+        let n = graph.node_count() as f64;
+        let base = (1.0 - 0.85) / n;
+        let forwarded = base + 0.85 * (2.0 * scores.get_raw(a));
+        assert!(
+            (scores.get_raw(helper) - forwarded).abs() < 1e-8,
+            "helper={} expected {forwarded} (full component mass)",
+            scores.get_raw(helper)
+        );
+        let sum: f64 = graph.node_indexes().map(|idx| scores.get_raw(idx)).sum();
+        assert!(sum <= 1.0 + 1e-6, "cycle created mass, sum={sum}");
+        assert!(sum > 0.0);
+    }
+
+    #[test]
+    fn circular_import_pair_shares_rank() {
+        // Same shape as arbor-torture `app/utils/circular_a.py` and `circular_b.py`:
+        // alpha calls beta, beta calls alpha.
+        let parser = arbor_core::languages::get_parser("py").expect("python parser");
+        let alpha_src = "\
+def alpha(n: int) -> int:\n    \
+    from app.utils.circular_b import beta\n    \
+    if n <= 0:\n        \
+        return 0\n    \
+    return beta(n - 1) + 1\n";
+        let beta_src = "\
+def beta(n: int) -> int:\n    \
+    from app.utils.circular_a import alpha\n    \
+    if n <= 0:\n        \
+        return 0\n    \
+    return alpha(n - 1) + 1\n";
+        let nodes_a =
+            arbor_core::parse_source(alpha_src, "app/utils/circular_a.py", parser.as_ref())
+                .expect("parse circular_a");
+        let nodes_b =
+            arbor_core::parse_source(beta_src, "app/utils/circular_b.py", parser.as_ref())
+                .expect("parse circular_b");
+        let mut builder = crate::builder::GraphBuilder::new();
+        builder.add_nodes(nodes_a);
+        builder.add_nodes(nodes_b);
+        let graph = builder.build();
+
+        let alpha_id = graph
+            .find_by_name("alpha")
+            .first()
+            .expect("alpha indexed")
+            .id
+            .clone();
+        let beta_id = graph
+            .find_by_name("beta")
+            .first()
+            .expect("beta indexed")
+            .id
+            .clone();
+        let alpha = graph.get_index(&alpha_id).expect("alpha id");
+        let beta = graph.get_index(&beta_id).expect("beta id");
+        assert!(
+            !graph.get_callees(alpha).is_empty() && !graph.get_callees(beta).is_empty(),
+            "circular_a/circular_b must resolve to a real call cycle"
+        );
+
+        let scores = compute_centrality(&graph, 20, 0.85);
+        assert!(
+            (scores.get_raw(alpha) - scores.get_raw(beta)).abs() < 1e-9,
+            "alpha={} beta={}",
+            scores.get_raw(alpha),
+            scores.get_raw(beta)
+        );
+        assert_eq!(scores.get(alpha), scores.get(beta));
+    }
+
+    #[test]
+    fn non_star_percentile_matches_v2_6_rank_formula() {
+        // A chain is not a star. Percentile must be exactly i/(n-1) for the
+        // strict raw order — not a log blend, which would move the middle nodes.
+        let mut graph = ArborGraph::new();
+        let mut nodes = Vec::new();
+        let mut prev = fn_node(&mut graph, "n0", "chain.rs");
+        nodes.push(prev);
+        for i in 1..4 {
+            let name = format!("n{i}");
+            let cur = fn_node(&mut graph, &name, "chain.rs");
+            link(&mut graph, prev, cur);
+            nodes.push(cur);
             prev = cur;
         }
-        let hub = graph.add_node(CodeNode::new("hub", "hub", NodeKind::Function, "hub.rs"));
-        for i in 0..6 {
-            let name = format!("h{i}");
-            let caller = graph.add_node(CodeNode::new(
-                name.clone(),
-                name,
-                NodeKind::Function,
-                format!("h{i}.rs"),
-            ));
-            graph.add_edge(caller, hub, Edge::new(EdgeKind::Calls));
-        }
 
-        let scores = compute_centrality(&graph, 40, 0.85);
-        let mid = graph
-            .node_indexes()
-            .filter(|&idx| {
-                let v = scores.get(idx);
-                v > 0.10 && v < 0.70
-            })
-            .count();
+        let scores = compute_centrality(&graph, 20, 0.85);
+        let mut order = nodes.clone();
+        order.sort_by(|&a, &b| {
+            scores
+                .get_raw(a)
+                .partial_cmp(&scores.get_raw(b))
+                .unwrap()
+                .then_with(|| a.index().cmp(&b.index()))
+        });
+        let denom = (order.len() - 1) as f64;
+        for (i, idx) in order.iter().enumerate() {
+            let expected = i as f64 / denom;
+            assert_eq!(
+                scores.get(*idx),
+                expected,
+                "node {i} percentile drifted from the v2.6.0 rank"
+            );
+        }
+        assert!(scores.get_raw(order[0]) < scores.get_raw(order[1]));
+        assert!(scores.get_raw(order[2]) < scores.get_raw(order[3]));
+    }
+
+    #[test]
+    fn non_sink_cycle_forwards_mass_without_creating_it() {
+        let mut graph = ArborGraph::new();
+        let entry = fn_node(&mut graph, "entry", "entry.rs");
+        let a = fn_node(&mut graph, "a", "cycle.rs");
+        let b = fn_node(&mut graph, "b", "cycle.rs");
+        let dst = fn_node(&mut graph, "dst", "dst.rs");
+        link(&mut graph, entry, a);
+        link(&mut graph, a, b);
+        link(&mut graph, b, a);
+        link(&mut graph, a, dst);
+
+        let scores = compute_centrality(&graph, 30, 0.85);
+        let sum: f64 = graph.node_indexes().map(|idx| scores.get_raw(idx)).sum();
+        assert!(sum <= 1.0 + 1e-6, "non-sink cycle created mass, sum={sum}");
+        assert!(scores.get_raw(dst) > scores.get_raw(a));
+        assert!((scores.get_raw(a) - scores.get_raw(b)).abs() < 1e-9);
+
+        // A longer cycle with the same entry and exit must not inflate a member
+        // above the 2-cycle, and must not destroy mass relative to padding the
+        // short graph out with dangling orphans (those hold mass that never moves).
+        let (short_sum, short_member) = {
+            let mut padded = ArborGraph::new();
+            let entry = fn_node(&mut padded, "entry", "entry.rs");
+            let a = fn_node(&mut padded, "a", "cycle.rs");
+            let b = fn_node(&mut padded, "b", "cycle.rs");
+            let dst = fn_node(&mut padded, "dst", "dst.rs");
+            link(&mut padded, entry, a);
+            link(&mut padded, a, b);
+            link(&mut padded, b, a);
+            link(&mut padded, a, dst);
+            for i in 0..6 {
+                fn_node(&mut padded, &format!("orphan{i}"), "orphan.rs");
+            }
+            let scores = compute_centrality(&padded, 30, 0.85);
+            let sum: f64 = padded.node_indexes().map(|idx| scores.get_raw(idx)).sum();
+            (sum, scores.get_raw(a))
+        };
+        let (long_sum, long_member) = {
+            let mut padded = ArborGraph::new();
+            let entry = fn_node(&mut padded, "entry", "entry.rs");
+            let mut cycle = Vec::new();
+            for i in 0..8 {
+                cycle.push(fn_node(&mut padded, &format!("c{i}"), "cycle.rs"));
+            }
+            let dst = fn_node(&mut padded, "dst", "dst.rs");
+            link(&mut padded, entry, cycle[0]);
+            for i in 0..8 {
+                link(&mut padded, cycle[i], cycle[(i + 1) % 8]);
+            }
+            link(&mut padded, cycle[0], dst);
+            let scores = compute_centrality(&padded, 30, 0.85);
+            let sum: f64 = padded.node_indexes().map(|idx| scores.get_raw(idx)).sum();
+            (sum, scores.get_raw(cycle[0]))
+        };
         assert!(
-            mid > 0,
-            "expected nodes in (10%, 70%), distribution was {:?}",
-            graph
-                .node_indexes()
-                .map(|idx| scores.get(idx))
-                .collect::<Vec<_>>()
+            long_member < short_member,
+            "longer cycle inflated a member: {long_member} vs {short_member}"
+        );
+        assert!(
+            long_sum + 1e-9 >= short_sum,
+            "lengthening a non-sink cycle leaked mass: {long_sum} vs {short_sum}"
+        );
+    }
+
+    #[test]
+    fn test_file_weight_drops_transmitted_mass() {
+        let build = |file: &str| {
+            let mut graph = ArborGraph::new();
+            let caller = fn_node(&mut graph, "caller", file);
+            let target = fn_node(&mut graph, "target", "target.rs");
+            link(&mut graph, caller, target);
+            let scores = compute_centrality(&graph, 20, 0.85);
+            let sum: f64 = graph.node_indexes().map(|idx| scores.get_raw(idx)).sum();
+            (scores.get_raw(target), sum)
+        };
+        let (prod_target, prod_sum) = build("src/caller.rs");
+        let (test_target, test_sum) = build("tests/caller_test.rs");
+        assert!(prod_target > test_target);
+        assert!(
+            test_sum < prod_sum,
+            "test weight 0.1 must drop mass, test_sum={test_sum} prod_sum={prod_sum}"
+        );
+    }
+
+    #[test]
+    fn iteration_budget_is_a_ceiling() {
+        let mut graph = ArborGraph::new();
+        let mut prev = fn_node(&mut graph, "n0", "chain.rs");
+        let mut tail = prev;
+        for i in 1..40 {
+            let name = format!("n{i}");
+            let cur = fn_node(&mut graph, &name, "chain.rs");
+            link(&mut graph, prev, cur);
+            prev = cur;
+            tail = cur;
+        }
+        let at_20 = compute_centrality(&graph, 20, 0.85);
+        let at_40 = compute_centrality(&graph, 40, 0.85);
+        assert!(
+            (at_40.get_raw(tail) - at_20.get_raw(tail)).abs() > 1e-8,
+            "compute_centrality(..., 20, ...) must stop at 20 on a long chain"
         );
     }
 }

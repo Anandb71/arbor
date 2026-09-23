@@ -2966,7 +2966,7 @@ pub async fn watch(path: &Path) -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{is_generated_or_internal_path, parse_git_name_status_output};
+    use super::{is_generated_or_internal_path, parse_git_name_status_output, raw_mass_log_pct};
     use std::path::PathBuf;
 
     /// Returns the platform-specific bundled visualizer path relative to exe_dir.
@@ -3084,6 +3084,18 @@ mod tests {
         assert!(is_generated_or_internal_path("src/models/user.g.dart"));
         assert!(is_generated_or_internal_path("pkg/generated/client.rs"));
         assert!(!is_generated_or_internal_path("src/lib.rs"));
+    }
+
+    #[test]
+    fn raw_mass_histogram_spreads_heavy_tailed_scores() {
+        // Display bins only. A hub, a mid-weight node, and a floor node must
+        // not all collapse into the same extreme bin.
+        let floor = raw_mass_log_pct(1e-6, 1e-6, 1e-2);
+        let mid = raw_mass_log_pct(1e-4, 1e-6, 1e-2);
+        let hub = raw_mass_log_pct(1e-2, 1e-6, 1e-2);
+        assert_eq!(floor, 0.0);
+        assert_eq!(hub, 100.0);
+        assert!(mid > 10.0 && mid < 70.0, "mid bin was {mid}");
     }
 
     #[test]
@@ -3986,8 +3998,28 @@ struct AnalyzeLocalRow {
     name: String,
     kind: String,
     file: String,
+    /// Percentile rank in `[0, 100]`. This is [`ArborGraph::centrality`], the
+    /// v2.6.0 contract. It is not retuned for the risk histogram.
     centrality_pct: f64,
+    /// Raw PageRank mass, used only to bin the printed risk histogram.
+    raw: f64,
     callers: usize,
+}
+
+/// Log-scaled position of one raw PageRank mass in `[0, 100]`.
+///
+/// PageRank mass is heavy-tailed, so a linear cut of the raw value piles
+/// almost every node into the bottom bin. The log scale is a display histogram
+/// for `analyze-local` only; it is not stored and it does not change
+/// [`arbor_graph::CentralityScores::get`].
+fn raw_mass_log_pct(raw: f64, min_raw: f64, max_raw: f64) -> f64 {
+    let lo = min_raw.max(f64::MIN_POSITIVE).ln();
+    let hi = max_raw.max(f64::MIN_POSITIVE).ln();
+    let span = hi - lo;
+    if !span.is_finite() || span <= f64::EPSILON {
+        return 0.0;
+    }
+    ((raw.max(f64::MIN_POSITIVE).ln() - lo) / span).clamp(0.0, 1.0) * 100.0
 }
 
 /// Freshly indexes a directory and prints a machine-readable ranking report.
@@ -4030,6 +4062,7 @@ pub fn analyze_local(path: &Path, top: usize) -> Result<()> {
             kind,
             file: rel_file,
             centrality_pct: graph.centrality(idx) * 100.0,
+            raw: graph.centrality_raw(idx),
             callers: graph.get_callers(idx).len(),
         });
     }
@@ -4043,16 +4076,19 @@ pub fn analyze_local(path: &Path, top: usize) -> Result<()> {
             .then_with(|| a.name.cmp(&b.name))
     });
 
+    let max_raw = rows.iter().map(|row| row.raw).fold(0.0_f64, f64::max);
+    let min_raw = rows.iter().map(|row| row.raw).fold(f64::MAX, f64::min);
     let mut high = 0usize;
     let mut medium = 0usize;
     let mut low = 0usize;
     let mut very_low = 0usize;
     for row in &rows {
-        if row.centrality_pct >= 70.0 {
+        let bin = raw_mass_log_pct(row.raw, min_raw, max_raw);
+        if bin >= 70.0 {
             high += 1;
-        } else if row.centrality_pct >= 40.0 {
+        } else if bin >= 40.0 {
             medium += 1;
-        } else if row.centrality_pct >= 10.0 {
+        } else if bin >= 10.0 {
             low += 1;
         } else {
             very_low += 1;
