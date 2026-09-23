@@ -23,6 +23,12 @@ const CONVERGENCE_EPSILON: f64 = 1e-9;
 /// floor; the loop still exits early once the residual is under epsilon.
 const MIN_PAGERANK_ITERS: usize = 160;
 
+/// Weight of the rank-percentile term in [`CentralityScores::from_raw`].
+/// The rest is a log-minmax of raw PageRank; the blend keeps hub=1 / leaf=0
+/// while spreading the connected body across (0, 1) instead of jumping from
+/// the bottom tie to the 90th percentile.
+const RANK_BLEND: f64 = 0.5;
+
 /// Centrality scores in two forms.
 ///
 /// # Why two
@@ -37,10 +43,12 @@ const MIN_PAGERANK_ITERS: usize = 160;
 /// cleared it; in a flat repo almost everything did. Worse, adding a single new
 /// hub rescaled every other node in the graph.
 ///
-/// [`percentile`](Self::percentile) is the comparable form — `0.6` means "more
-/// central than 60% of this repository" everywhere — and is what thresholds
-/// should use. [`raw`](Self::raw) is the true fixed point, kept because
-/// warm-start recomputation needs it.
+/// [`percentile`](Self::percentile) is the comparable form — `0.6` still
+/// means the node sits above most of the repository — but the mapping is a
+/// blend of rank percentile and log-scaled raw mass. A large set of tied
+/// disconnected symbols would otherwise push every connected node above 90%
+/// (or leave it at 0%), which is not a risk distribution. [`raw`](Self::raw)
+/// is the true fixed point, kept because warm-start recomputation needs it.
 #[derive(Debug, Default, Clone)]
 pub struct CentralityScores {
     raw: HashMap<NodeId, f64>,
@@ -73,10 +81,13 @@ impl CentralityScores {
         (self.raw, self.percentile)
     }
 
-    /// Builds percentile ranks from raw scores.
+    /// Builds a smoothed `[0, 1]` rank from raw PageRank mass.
     ///
-    /// A node's percentile is the fraction of nodes scoring strictly below it,
-    /// so tied nodes share a rank and the ordering is total and deterministic.
+    /// Rank percentile alone is comparable but hard-clips: any node above a
+    /// large bottom tie (disconnected symbols) jumps to ~90%+. Mixing in a
+    /// log-minmax of the raw scores spreads that body across the unit
+    /// interval without changing order, ties, or the endpoints (min stays 0,
+    /// max stays 1).
     fn from_raw(nodes: Vec<NodeId>, scores: Vec<f64>) -> Self {
         let n = scores.len();
         let mut percentile = vec![0.0f64; n];
@@ -105,6 +116,19 @@ impl CentralityScores {
                     percentile[*slot] = rank;
                 }
                 i = j + 1;
+            }
+
+            let min_s = scores[order[0]].max(f64::MIN_POSITIVE);
+            let max_s = scores[order[n - 1]].max(f64::MIN_POSITIVE);
+            let log_span = max_s.ln() - min_s.ln();
+            if log_span > f64::EPSILON {
+                let log_weight = 1.0 - RANK_BLEND;
+                for k in 0..n {
+                    let log_part = ((scores[k].max(f64::MIN_POSITIVE).ln() - min_s.ln())
+                        / log_span)
+                        .clamp(0.0, 1.0);
+                    percentile[k] = RANK_BLEND * percentile[k] + log_weight * log_part;
+                }
             }
         }
 
@@ -228,8 +252,8 @@ fn sink_component_nodes(out_edges: &[Vec<u32>], in_edges: &[Vec<u32>]) -> Vec<bo
 ///    the walk and every member ranks as a hotspot
 /// 4. Callers from test/spec/fixture files contribute 10x less weight
 ///    — prevents test utilities from appearing more central than production code
-/// 5. Raw scores are converted to percentile ranks for cross-repo comparability
-///    (see [`CentralityScores`])
+/// 5. Raw scores are converted to a smoothed rank (percentile blended with
+///    log-scaled mass) for cross-repo comparability (see [`CentralityScores`])
 ///
 /// # Arguments
 ///
@@ -861,5 +885,54 @@ mod tests {
                 "closed cycle must leak like a dangling node"
             );
         }
+    }
+
+    #[test]
+    fn smoothed_scores_occupy_the_middle_of_the_range() {
+        let mut graph = ArborGraph::new();
+        for i in 0..40 {
+            let name = format!("iso{i}");
+            graph.add_node(CodeNode::new(
+                name.clone(),
+                name,
+                NodeKind::Function,
+                "iso.rs",
+            ));
+        }
+        let mut prev = graph.add_node(CodeNode::new("s0", "s0", NodeKind::Function, "c.rs"));
+        for i in 1..12 {
+            let name = format!("s{i}");
+            let cur = graph.add_node(CodeNode::new(&name, &name, NodeKind::Function, "c.rs"));
+            graph.add_edge(prev, cur, Edge::new(EdgeKind::Calls));
+            prev = cur;
+        }
+        let hub = graph.add_node(CodeNode::new("hub", "hub", NodeKind::Function, "hub.rs"));
+        for i in 0..6 {
+            let name = format!("h{i}");
+            let caller = graph.add_node(CodeNode::new(
+                name.clone(),
+                name,
+                NodeKind::Function,
+                format!("h{i}.rs"),
+            ));
+            graph.add_edge(caller, hub, Edge::new(EdgeKind::Calls));
+        }
+
+        let scores = compute_centrality(&graph, 40, 0.85);
+        let mid = graph
+            .node_indexes()
+            .filter(|&idx| {
+                let v = scores.get(idx);
+                v > 0.10 && v < 0.70
+            })
+            .count();
+        assert!(
+            mid > 0,
+            "expected nodes in (10%, 70%), distribution was {:?}",
+            graph
+                .node_indexes()
+                .map(|idx| scores.get(idx))
+                .collect::<Vec<_>>()
+        );
     }
 }
