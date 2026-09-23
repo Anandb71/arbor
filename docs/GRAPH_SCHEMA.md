@@ -196,12 +196,11 @@ The graph can be serialized to JSON for export or persistence:
 
 ## Centrality Algorithm
 
-Arbor uses a simplified PageRank variant to compute node importance:
+Arbor ranks nodes with a PageRank variant on the call graph:
 
-1. Initialize all nodes with score 1/N
-2. For each iteration:
-   - Each node distributes its score to nodes it calls
-   - Damping factor of 0.85 prevents score concentration
-3. Converge after ~10-20 iterations
+1. Collapse every strongly connected component of `Calls` edges into one supernode. Cycles — closed rings and cycles that call out to a helper — are ranked as a component, then that mass is shared across the members.
+2. Initialize component mass uniformly (`1/N` per member).
+3. Iterate at most the caller's budget (early exit when the residual drops below `1e-9`). Damping is 0.85: 15% of the score teleports uniformly, and the rest follows external call edges. Callers in test files contribute 10% weight.
+4. Report a percentile rank, `i / (n - 1)`, not the raw mass. `0.6` means "above 60% of this repository."
 
-Nodes with high centrality scores are architecturally significant (many dependents) and prioritized in context windows.
+Nodes with high centrality are architecturally significant (many dependents) and are prioritized in context windows.

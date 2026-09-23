@@ -459,6 +459,18 @@ enum Commands {
         #[command(subcommand)]
         action: AgentAction,
     },
+
+    /// Index a local tree and print ranked symbols (arbor-torture grading format)
+    #[command(name = "analyze-local")]
+    AnalyzeLocal {
+        /// Path to analyze (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Maximum number of ranked symbols to print
+        #[arg(long, default_value = "25000")]
+        top: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -639,6 +651,7 @@ async fn main() {
                 max_blast_radius,
             } => commands::agent_guard(&path, max_blast_radius),
         },
+        Commands::AnalyzeLocal { path, top } => commands::analyze_local(&path, top),
     };
 
     if let Err(e) = result {
