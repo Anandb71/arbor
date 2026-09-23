@@ -16,6 +16,13 @@ use std::path::Path;
 /// the full iteration budget.
 const CONVERGENCE_EPSILON: f64 = 1e-9;
 
+/// Conserving dangling/sink mass couples every node through the uniform leak,
+/// so the contraction is the raw damping factor 0.85. Reaching 1e-9 from a
+/// uniform start takes ~log(1e-9)/log(0.85) ≈ 127 rounds — more than the
+/// historical 20-iteration call sites pass. Requested counts are therefore a
+/// floor; the loop still exits early once the residual is under epsilon.
+const MIN_PAGERANK_ITERS: usize = 160;
+
 /// Centrality scores in two forms.
 ///
 /// # Why two
@@ -132,14 +139,96 @@ fn is_test_file(file: &str) -> bool {
         || lower.ends_with("test.js")
 }
 
+/// Iterative Kosaraju on the call graph. Returns the component id of each node.
+///
+/// Iterative on purpose: the 500-node ring in the torture fixture is exactly
+/// the kind of chain that would overflow a recursive DFS.
+fn scc_ids(out_edges: &[Vec<u32>], in_edges: &[Vec<u32>]) -> Vec<usize> {
+    let n = out_edges.len();
+    let mut visited = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+
+    for start in 0..n {
+        if visited[start] {
+            continue;
+        }
+        let mut stack = vec![(start, 0usize)];
+        visited[start] = true;
+        while let Some((u, i)) = stack.pop() {
+            if i < out_edges[u].len() {
+                stack.push((u, i + 1));
+                let v = out_edges[u][i] as usize;
+                if !visited[v] {
+                    visited[v] = true;
+                    stack.push((v, 0));
+                }
+            } else {
+                order.push(u);
+            }
+        }
+    }
+
+    visited.fill(false);
+    let mut scc_id = vec![0usize; n];
+    let mut scc_count = 0usize;
+    for &start in order.iter().rev() {
+        if visited[start] {
+            continue;
+        }
+        let mut stack = vec![start];
+        visited[start] = true;
+        while let Some(u) = stack.pop() {
+            scc_id[u] = scc_count;
+            for &pred in &in_edges[u] {
+                let v = pred as usize;
+                if !visited[v] {
+                    visited[v] = true;
+                    stack.push(v);
+                }
+            }
+        }
+        scc_count += 1;
+    }
+    scc_id
+}
+
+/// Nodes whose SCC has no call edge to a different component.
+///
+/// Classic PageRank only redistributes mass from *dangling vertices*
+/// (out-degree 0). A closed cycle has out-degree 1 at every node, so the
+/// mass that walks in never walks out except via the 0.15 teleport — and a
+/// 500-function ring therefore saturates the top of the ranking. Treating
+/// the whole sink component as dangling restores the leak.
+fn sink_component_nodes(out_edges: &[Vec<u32>], in_edges: &[Vec<u32>]) -> Vec<bool> {
+    let n = out_edges.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let scc_id = scc_ids(out_edges, in_edges);
+    let scc_count = scc_id.iter().copied().max().map(|m| m + 1).unwrap_or(0);
+    let mut has_external = vec![false; scc_count];
+    for (source, targets) in out_edges.iter().enumerate() {
+        for &target in targets {
+            if scc_id[source] != scc_id[target as usize] {
+                has_external[scc_id[source]] = true;
+            }
+        }
+    }
+    scc_id.iter().map(|&id| !has_external[id]).collect()
+}
+
 /// Computes production-aware centrality scores for all nodes in the graph.
 ///
 /// Uses a modified PageRank where:
 /// 1. Nodes initialize with equal score
-/// 2. Each iteration distributes scores along edges
-/// 3. Callers from test/spec/fixture files contribute 10x less weight
+/// 2. Each iteration distributes scores along call edges, damped at 0.85
+///    (0.15 teleports uniformly so no node can saturate at 1.0)
+/// 3. Sink vertices *and* closed sink components leak their mass uniformly
+///    across all N nodes — otherwise a call ring with no outbound edge traps
+///    the walk and every member ranks as a hotspot
+/// 4. Callers from test/spec/fixture files contribute 10x less weight
 ///    — prevents test utilities from appearing more central than production code
-/// 4. Raw scores are converted to percentile ranks for cross-repo comparability
+/// 5. Raw scores are converted to percentile ranks for cross-repo comparability
 ///    (see [`CentralityScores`])
 ///
 /// # Arguments
@@ -187,8 +276,10 @@ pub fn compute_centrality_warm(
         .collect();
 
     // One pass over the edges builds the call adjacency: out-degrees for the
-    // score split, and per-node caller lists for the gather.
+    // score split, outbound lists for SCC detection, and per-node caller lists
+    // for the gather.
     let mut out_degree: Vec<usize> = vec![0; n];
+    let mut out_edges: Vec<Vec<u32>> = vec![Vec::new(); n];
     let mut in_edges: Vec<Vec<u32>> = vec![Vec::new(); n];
     for edge in graph.graph.edge_references() {
         if edge.weight().kind != EdgeKind::Calls {
@@ -199,15 +290,25 @@ pub fn compute_centrality_warm(
             continue;
         };
         out_degree[source] += 1;
+        out_edges[source].push(target as u32);
         in_edges[target].push(source as u32);
+    }
+
+    let is_sink = sink_component_nodes(&out_edges, &in_edges);
+    let sink_nodes: Vec<usize> = (0..n).filter(|&i| is_sink[i]).collect();
+    // Sink-component members redistribute uniformly instead of along their
+    // internal edges, so they must not appear in anyone's gather list.
+    for incoming in in_edges.iter_mut() {
+        incoming.retain(|&source| !is_sink[source as usize]);
     }
     for degree in out_degree.iter_mut() {
         *degree = (*degree).max(1);
     }
 
     let initial_score = 1.0 / n as f64;
-    let base = (1.0 - damping) / n as f64;
-    let gather = |scores: &[f64], target: usize| -> f64 {
+    let n_f = n as f64;
+    let base = (1.0 - damping) / n_f;
+    let incoming = |scores: &[f64], target: usize| -> f64 {
         in_edges[target]
             .iter()
             .map(|&source| {
@@ -215,6 +316,16 @@ pub fn compute_centrality_warm(
                 weights[source] * scores[source] / out_degree[source] as f64
             })
             .sum()
+    };
+    let dangling_mass = |scores: &[f64]| -> f64 {
+        sink_nodes
+            .iter()
+            .map(|&i| weights[i] * scores[i])
+            .sum::<f64>()
+    };
+    // Full PageRank operator including the uniform leak from sink components.
+    let apply = |scores: &[f64], target: usize, leak: f64| -> f64 {
+        base + damping * (incoming(scores, target) + leak)
     };
 
     let mut scores: Vec<f64> = match previous {
@@ -228,12 +339,13 @@ pub fn compute_centrality_warm(
             // c ≈ 1 and this is a no-op; the rescale is kept so a caller that
             // hands us normalized scores still converges. For v ≈ c·x*, summing
             // the fixed-point equation gives c = 1 − (f(v) − Σv) / (n·base)
-            // where f(v) = n·base + damping·Σ gather(v) — so one pass over the
-            // edges recovers c and v/c lands next to the fixed point.
+            // where f(v) = n·base + damping·(Σ incoming(v) + dangling) — so one
+            // pass over the edges recovers c and v/c lands next to the fixed point.
             let sum_v: f64 = warm.iter().sum();
-            let f_v: f64 =
-                n as f64 * base + damping * (0..n).map(|t| gather(&warm, t)).sum::<f64>();
-            let c = 1.0 - (f_v - sum_v) / (n as f64 * base);
+            let dmass = dangling_mass(&warm);
+            let incoming_total: f64 = (0..n).map(|t| incoming(&warm, t)).sum();
+            let f_v: f64 = n_f * base + damping * (incoming_total + dmass);
+            let c = 1.0 - (f_v - sum_v) / (n_f * base);
             if c.is_finite() && c > f64::EPSILON {
                 for score in warm.iter_mut() {
                     *score /= c;
@@ -245,10 +357,12 @@ pub fn compute_centrality_warm(
     };
 
     let mut next: Vec<f64> = vec![0.0; n];
-    for _ in 0..iterations {
+    let max_iters = iterations.max(MIN_PAGERANK_ITERS);
+    for _ in 0..max_iters {
+        let leak = dangling_mass(&scores) / n_f;
         let mut max_delta = 0.0f64;
         for target in 0..n {
-            let score = base + damping * gather(&scores, target);
+            let score = apply(&scores, target, leak);
             max_delta = max_delta.max((score - scores[target]).abs());
             next[target] = score;
         }
@@ -666,5 +780,86 @@ mod tests {
         assert!(graph.has_centrality_scores());
         assert!(!ensure_centrality(&mut graph, 20, 0.85));
         assert!(top_hotspots(&graph, 10).is_empty());
+    }
+
+    /// Closed call ring: r0 → r1 → … → r{n-1} → r0.
+    fn ring(n: usize) -> (ArborGraph, Vec<NodeId>) {
+        let mut graph = ArborGraph::new();
+        let mut nodes = Vec::with_capacity(n);
+        for i in 0..n {
+            let name = format!("r{i:03}");
+            nodes.push(graph.add_node(CodeNode::new(
+                name.clone(),
+                name,
+                NodeKind::Function,
+                "ring.py",
+            )));
+        }
+        for i in 0..n {
+            graph.add_edge(nodes[i], nodes[(i + 1) % n], Edge::new(EdgeKind::Calls));
+        }
+        (graph, nodes)
+    }
+
+    #[test]
+    fn closed_cycle_does_not_outrank_a_real_hub() {
+        let (mut graph, ring_nodes) = ring(50);
+        let hub = graph.add_node(CodeNode::new("hub", "hub", NodeKind::Function, "hub.rs"));
+        for i in 0..10 {
+            let name = format!("c{i}");
+            let caller = graph.add_node(CodeNode::new(
+                name.clone(),
+                name,
+                NodeKind::Function,
+                format!("c{i}.rs"),
+            ));
+            graph.add_edge(caller, hub, Edge::new(EdgeKind::Calls));
+        }
+
+        let scores = compute_centrality(&graph, 30, 0.85);
+        let hub_score = scores.get(hub);
+        let mut above_90 = 0usize;
+        for &idx in &ring_nodes {
+            let s = scores.get(idx);
+            assert!(s < hub_score, "ring node ranked {s} vs hub {hub_score}");
+            if s > 0.90 {
+                above_90 += 1;
+            }
+        }
+        assert!(
+            above_90 < ring_nodes.len() / 10,
+            "{above_90} of {} ring nodes scored above 90%",
+            ring_nodes.len()
+        );
+    }
+
+    #[test]
+    fn pagerank_mass_is_conserved_on_production_weights() {
+        let (graph, _) = star(15);
+        let scores = compute_centrality(&graph, 40, 0.85);
+        let sum: f64 = graph.node_indexes().map(|i| scores.get_raw(i)).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "PageRank mass should stay ~1.0, got {sum}"
+        );
+    }
+
+    #[test]
+    fn isolated_cycle_matches_disconnected_raw_score() {
+        let (mut graph, ring_nodes) = ring(8);
+        let orphan = graph.add_node(CodeNode::new(
+            "orphan",
+            "orphan",
+            NodeKind::Function,
+            "orphan.rs",
+        ));
+        let scores = compute_centrality(&graph, 40, 0.85);
+        let orphan_raw = scores.get_raw(orphan);
+        for &idx in &ring_nodes {
+            assert!(
+                (scores.get_raw(idx) - orphan_raw).abs() < 1e-9,
+                "closed cycle must leak like a dangling node"
+            );
+        }
     }
 }
