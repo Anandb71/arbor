@@ -3981,6 +3981,113 @@ pub fn map(
     }
     Ok(())
 }
+
+struct AnalyzeLocalRow {
+    name: String,
+    kind: String,
+    file: String,
+    centrality_pct: f64,
+    callers: usize,
+}
+
+/// Freshly indexes a directory and prints a machine-readable ranking report.
+///
+/// Output format is consumed by the `arbor-torture` grading fixture
+/// (`grade.py`).
+pub fn analyze_local(path: &Path, top: usize) -> Result<()> {
+    let base = if path == Path::new(".") {
+        std::env::current_dir()?
+    } else {
+        path.to_path_buf()
+    };
+    let resolved_path = strip_verbatim_prefix(fs::canonicalize(&base)?);
+    let root_str = resolved_path.to_string_lossy().to_string();
+
+    let result = index_directory(&resolved_path, IndexOptions::default())?;
+    let mut graph = result.graph;
+
+    let scores = compute_centrality(&graph, 20, 0.85);
+    graph.set_centrality_scores(scores);
+
+    let mut rows: Vec<AnalyzeLocalRow> = Vec::new();
+    for idx in graph.node_indexes() {
+        let node = match graph.get(idx) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        let kind = node.kind.to_string();
+        if matches!(kind.as_str(), "import" | "export" | "module") {
+            continue;
+        }
+
+        let rel_file = map_make_relative(&node.file, &root_str)
+            .replace('\\', "/")
+            .trim_start_matches('/')
+            .to_string();
+        rows.push(AnalyzeLocalRow {
+            name: node.name.clone(),
+            kind,
+            file: rel_file,
+            centrality_pct: graph.centrality(idx) * 100.0,
+            callers: graph.get_callers(idx).len(),
+        });
+    }
+
+    rows.sort_by(|a, b| {
+        b.centrality_pct
+            .partial_cmp(&a.centrality_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.callers.cmp(&a.callers))
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let mut high = 0usize;
+    let mut medium = 0usize;
+    let mut low = 0usize;
+    let mut very_low = 0usize;
+    for row in &rows {
+        if row.centrality_pct >= 70.0 {
+            high += 1;
+        } else if row.centrality_pct >= 40.0 {
+            medium += 1;
+        } else if row.centrality_pct >= 10.0 {
+            low += 1;
+        } else {
+            very_low += 1;
+        }
+    }
+
+    println!("Arbor analyze-local report");
+    println!("Path: {}", root_str);
+    println!("Symbols ranked: {}", rows.len());
+    println!("Edges: {}", graph.edge_count());
+    println!("Parse errors: {}", result.errors.len());
+    println!();
+    println!("Risk distribution:");
+    println!("  High (70%+): {} nodes", high);
+    println!("  Medium (40-70%): {} nodes", medium);
+    println!("  Low (10-40%): {} nodes", low);
+    println!("  Very Low (<10%): {} nodes", very_low);
+    println!();
+    println!("Top symbols:");
+
+    for (rank, row) in rows.iter().take(top).enumerate() {
+        println!(
+            "#{} {:.1}% {} {} [{}] {} callers",
+            rank + 1,
+            row.centrality_pct,
+            row.name,
+            row.file,
+            row.kind,
+            row.callers
+        );
+    }
+
+    Ok(())
+}
+
 pub fn agent_review(path: &Path, json: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
