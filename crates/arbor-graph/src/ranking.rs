@@ -8,7 +8,7 @@ use crate::edge::EdgeKind;
 use crate::graph::{ArborGraph, NodeId};
 use arbor_core::NodeKind;
 use petgraph::visit::{EdgeRef, IntoEdgeReferences};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 /// Iteration stops early once no node's score moves more than this between
@@ -20,7 +20,8 @@ const CONVERGENCE_EPSILON: f64 = 1e-9;
 ///
 /// # Why two
 ///
-/// Raw PageRank mass sums to 1.0 across the graph, so an individual value
+/// Raw mass is the propagation state. Sinks and the test-file weight drop
+/// some of it, so a graph does not sum to 1. An individual value still
 /// shrinks as the repository grows and means nothing on its own. The previous
 /// implementation divided every score by the maximum, which fixed the range but
 /// produced values that are not comparable between repositories: the top node
@@ -46,7 +47,7 @@ impl CentralityScores {
         self.percentile.get(&id).copied().unwrap_or(0.0)
     }
 
-    /// Raw PageRank mass. Sums to ~1.0 across the graph.
+    /// Raw propagation mass for this node. The graph sum is at most 1.
     pub fn get_raw(&self, id: NodeId) -> f64 {
         self.raw.get(&id).copied().unwrap_or(0.0)
     }
@@ -220,7 +221,10 @@ fn condense_calls(
         members[comp].push(node as u32);
     }
 
-    let mut buckets: Vec<HashMap<u32, f64>> = vec![HashMap::new(); ncomp];
+    // BTreeMap, not HashMap: a component that calls two targets sums those
+    // factors here, and HashMap iteration order changes the float sum across
+    // processes. Rankings are compared to 12 decimal places.
+    let mut buckets: Vec<BTreeMap<u32, f64>> = vec![BTreeMap::new(); ncomp];
     let mut emission = vec![0.0f64; ncomp];
     for (source, targets) in out_edges.iter().enumerate() {
         let comp = scc[source];
