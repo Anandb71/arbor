@@ -95,7 +95,7 @@ Edges represent relationships between nodes.
 | `returns` | Return type | function → type |
 | `parameter` | Parameter type | function → type |
 
-A class records each base at parse time, and the builder emits `extends` (or `implements`, when the target is an interface or the source said so) from the subclass to that base. A method the subclass does not define stays reachable from the subclass; a method the subclass overrides does not keep an implicit edge to the base version. `self`/`this` calls bind to the nearest definition. `super`/`base` calls start at the parents, so an override that calls `super` still reaches the method it shadows. PageRank walks `calls` only, so these edges change blast radius without changing what a centrality percentile means.
+A class records each base at parse time, and the builder emits `extends` (or `implements`, when the target is an interface or the source said so) from the subclass to that base. A method the subclass does not define stays reachable by a `references` edge to the nearest definition; an override does not keep that edge. `self`/`this` and `super`/`base` are separate `calls` edges: `self`/`this` bind to the nearest definition, and `super`/`base` start at the parents. PageRank walks `calls` only, so `extends`, `implements`, and `references` do not enter the rank. The receiver `calls` do, so the call graph can grow and who sits where can move. `CentralityScores::get` is still the percentile `i / (n - 1)`.
 
 ## Graph Structure
 
