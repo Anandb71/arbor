@@ -51,6 +51,37 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace
 
+  supply-chain:
+    name: Supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # cargo-deny needs no build, only the manifests and the lockfile, so this
+      # job stays fast and independent of the build matrix above.
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          # `advisories` currently fails: the tree carries 11 published
+          # advisories, two rated 7.5. Kept non-blocking until those are
+          # cleared so the gate can land first and the fixes can follow,
+          # rather than holding every unrelated PR red in the meantime.
+          # Drop this line once the advisory count reaches zero.
+          arguments: --all-features
+        continue-on-error: true
+
+      # Licences and sources are already clean, so these do block. They are the
+      # half of cargo-deny that `cargo audit` does not cover at all.
+      - name: Enforce licences and sources
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: licenses sources --all-features
+
   cross-platform-cli:
     name: Cross-platform CLI build (${{ matrix.os }})
     needs: build-test-linux

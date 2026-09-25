@@ -1,0 +1,82 @@
+# cargo-deny — supply-chain gate for the workspace.
+#
+# `cargo audit` answers one question: are any dependencies subject to a
+# published advisory. cargo-deny answers three more that matter just as much
+# for a tool people install from crates.io:
+#
+#   * are we shipping a licence we cannot ship
+#   * are we carrying the same crate at several versions
+#   * did a dependency arrive from somewhere other than crates.io
+#
+# Run locally with:  cargo deny check
+
+[graph]
+all-features = false
+
+# ── advisories ───────────────────────────────────────────────────────────────
+# Unpatched advisories fail the build. At the time this file was added the
+# workspace had 11, two of them rated 7.5 (quick-xml denial of service), so
+# this gate starts red on purpose — see the tracking issue.
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # Add an advisory ID here only with a comment explaining why it is not
+    # reachable in this workspace, and a date to revisit. An empty list is the
+    # goal state.
+]
+
+# ── licences ─────────────────────────────────────────────────────────────────
+# Arbor is MIT. These are the licences that can be redistributed inside an MIT
+# binary without adding obligations a user would not expect.
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+
+    # Permissive, MIT-compatible. Arrives via clipboard-win and error-code.
+    "BSL-1.0",
+
+    # Permissive data licence, no copyleft and no source obligation.
+    # Arrives with the Unicode character tables used by the parsers.
+    "CDLA-Permissive-2.0",
+
+    # Font licences, both from epaint_default_fonts, which the GUI links for
+    # its bundled typefaces. Neither restricts redistribution of the binary;
+    # both require the font files keep their own licence, which they do.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+confidence-threshold = 0.9
+
+# ── duplicate versions ───────────────────────────────────────────────────────
+# 55 crates are currently present at more than one version. Each duplicate is
+# compiled separately, so this is build time and binary size, not just tidiness.
+# Set to "warn" rather than "deny" because most are transitive and cannot be
+# collapsed without upstream moving first; turning this to "deny" is the goal
+# once the count is down.
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+# `quick-xml` is present at both 0.30.0 and 0.39.2, and both versions carry the
+# same two advisories. Collapsing it is the single highest-value dedup here.
+skip = []
+
+# ── sources ──────────────────────────────────────────────────────────────────
+# Everything must come from crates.io. A git dependency slipping into a
+# published crate breaks `cargo install` for everyone downstream.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
