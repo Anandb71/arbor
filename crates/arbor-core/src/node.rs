@@ -70,6 +70,130 @@ impl std::fmt::Display for NodeKind {
     }
 }
 
+/// Prefix on [`CodeNode::references`] for a superclass name.
+///
+/// These are not call targets. The graph builder turns them into `extends`
+/// edges and does not feed them to PageRank.
+pub const EXTENDS_REF_PREFIX: &str = "extends:";
+
+/// Prefix on [`CodeNode::references`] for an implemented interface or trait.
+pub const IMPLEMENTS_REF_PREFIX: &str = "implements:";
+
+/// A type relationship stored on a node until the graph builder resolves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeRelationKind {
+    /// `class Middle(Base)` — subclass depends on the base.
+    Extends,
+    /// `class Foo implements Bar` — implementor depends on the interface.
+    Implements,
+}
+
+/// Splits an `extends:` / `implements:` reference into its kind and type name.
+///
+/// Returns `None` for ordinary call references.
+pub fn type_relation_ref(reference: &str) -> Option<(TypeRelationKind, &str)> {
+    let reference = reference.trim();
+    if let Some(name) = reference.strip_prefix(EXTENDS_REF_PREFIX) {
+        let name = name.trim();
+        if !name.is_empty() {
+            return Some((TypeRelationKind::Extends, name));
+        }
+    }
+    if let Some(name) = reference.strip_prefix(IMPLEMENTS_REF_PREFIX) {
+        let name = name.trim();
+        if !name.is_empty() {
+            return Some((TypeRelationKind::Implements, name));
+        }
+    }
+    None
+}
+
+/// Strips pointers, references, and generic arguments from a type name.
+///
+/// `*Base`, `Foo<T>`, and `pkg.Base` become `Base`, `Foo`, and `pkg.Base`.
+/// Keywords and anything that is not a type path become empty.
+pub fn clean_type_name(raw: &str) -> String {
+    let mut raw = raw.trim();
+    loop {
+        if let Some(rest) = raw.strip_prefix('*').or_else(|| raw.strip_prefix('&')) {
+            raw = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = raw.strip_prefix("mut ") {
+            raw = rest.trim_start();
+            continue;
+        }
+        break;
+    }
+    let raw = raw.split(['<', '[']).next().unwrap_or(raw).trim();
+    let raw = raw.trim_end_matches('?').trim();
+    if raw.is_empty() || is_type_keyword(raw) || !is_type_path(raw) {
+        return String::new();
+    }
+    raw.to_string()
+}
+
+fn is_type_path(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_alphabetic() || first == '_') {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == ':')
+}
+
+fn is_type_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "public"
+            | "private"
+            | "protected"
+            | "virtual"
+            | "override"
+            | "abstract"
+            | "static"
+            | "final"
+            | "sealed"
+            | "partial"
+            | "readonly"
+            | "const"
+            | "class"
+            | "struct"
+            | "interface"
+            | "enum"
+            | "extends"
+            | "implements"
+            | "with"
+            | "where"
+            | "new"
+            | "base"
+            | "this"
+            | "super"
+            | "mut"
+            | "pub"
+            | "crate"
+            | "object"
+    )
+}
+
+fn push_type_relation(references: &mut Vec<String>, kind: TypeRelationKind, name: &str) {
+    let name = clean_type_name(name);
+    if name.is_empty() {
+        return;
+    }
+    let prefix = match kind {
+        TypeRelationKind::Extends => EXTENDS_REF_PREFIX,
+        TypeRelationKind::Implements => IMPLEMENTS_REF_PREFIX,
+    };
+    let encoded = format!("{prefix}{name}");
+    if !references.iter().any(|existing| existing == &encoded) {
+        references.push(encoded);
+    }
+}
+
 /// Visibility of a code entity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -243,6 +367,36 @@ impl CodeNode {
         self.references = refs;
         self
     }
+
+    /// Records a superclass. Appends to [`references`](Self::references); it
+    /// does not replace call references already stored there.
+    pub fn add_type_relation(&mut self, kind: TypeRelationKind, name: &str) {
+        push_type_relation(&mut self.references, kind, name);
+    }
+
+    /// Records superclasses this type extends.
+    pub fn with_extends<I, S>(mut self, bases: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for name in bases {
+            self.add_type_relation(TypeRelationKind::Extends, name.as_ref());
+        }
+        self
+    }
+
+    /// Records interfaces or traits this type implements.
+    pub fn with_implements<I, S>(mut self, interfaces: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for name in interfaces {
+            self.add_type_relation(TypeRelationKind::Implements, name.as_ref());
+        }
+        self
+    }
 }
 
 impl PartialEq for CodeNode {
@@ -367,6 +521,41 @@ mod tests {
         let id1 = CodeNode::compute_id("a.rs", "main", NodeKind::Function);
         let id2 = CodeNode::compute_id("b.rs", "main", NodeKind::Function);
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn type_relation_refs_round_trip() {
+        assert_eq!(
+            type_relation_ref("extends:Base"),
+            Some((TypeRelationKind::Extends, "Base"))
+        );
+        assert_eq!(
+            type_relation_ref("implements:Reader"),
+            Some((TypeRelationKind::Implements, "Reader"))
+        );
+        assert!(type_relation_ref("helper").is_none());
+        assert!(type_relation_ref("extends:").is_none());
+    }
+
+    #[test]
+    fn clean_type_name_strips_generics_and_pointers() {
+        assert_eq!(clean_type_name("*Base"), "Base");
+        assert_eq!(clean_type_name("Foo<T>"), "Foo");
+        assert_eq!(clean_type_name("pkg.Base"), "pkg.Base");
+        assert_eq!(clean_type_name("std::fmt::Display"), "std::fmt::Display");
+        assert_eq!(clean_type_name("object"), "");
+        assert_eq!(clean_type_name("public"), "");
+    }
+
+    #[test]
+    fn with_extends_appends_without_dropping_calls() {
+        let node = CodeNode::new("Middle", "Middle", NodeKind::Class, "a.py")
+            .with_references(vec!["helper".to_string()])
+            .with_extends(["Base"])
+            .with_implements(["Proto"]);
+        assert!(node.references.iter().any(|r| r == "helper"));
+        assert!(node.references.iter().any(|r| r == "extends:Base"));
+        assert!(node.references.iter().any(|r| r == "implements:Proto"));
     }
 
     #[test]
