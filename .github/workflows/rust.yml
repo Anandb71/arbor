@@ -62,16 +62,18 @@ jobs:
 
       # cargo-deny needs no build, only the manifests and the lockfile, so this
       # job stays fast and independent of the build matrix above.
-      - name: Run cargo-deny
+      # `arguments` is passed BEFORE the subcommand, so it holds global flags
+      # only. The check types go in `command-arguments`.
+      - name: Advisories
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
-          # `advisories` currently fails: the tree carries 11 published
-          # advisories, two rated 7.5. Kept non-blocking until those are
-          # cleared so the gate can land first and the fixes can follow,
-          # rather than holding every unrelated PR red in the meantime.
-          # Drop this line once the advisory count reaches zero.
           arguments: --all-features
+          command-arguments: advisories
+        # Currently fails: the tree carries 11 published advisories, two rated
+        # 7.5. Kept non-blocking so the gate can land first and the fixes can
+        # follow, rather than holding every unrelated PR red in the meantime.
+        # Drop this line once the advisory count reaches zero.
         continue-on-error: true
 
       # Licences and sources are already clean, so these do block. They are the
@@ -80,7 +82,8 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
-          arguments: licenses sources --all-features
+          arguments: --all-features
+          command-arguments: licenses sources
 
   cross-platform-cli:
     name: Cross-platform CLI build (${{ matrix.os }})
