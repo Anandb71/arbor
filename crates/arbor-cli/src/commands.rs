@@ -1,7 +1,7 @@
 //! CLI command implementations.
 
 use arbor_core::parse_file;
-use arbor_graph::{compute_centrality, HeuristicsMatcher};
+use arbor_graph::{compute_centrality, ensure_centrality, top_hotspots, HeuristicsMatcher};
 use arbor_server::{ArborServer, ServerConfig};
 use arbor_watcher::{index_directory, IndexOptions};
 use colored::Colorize;
@@ -173,7 +173,7 @@ fn init_arbor_dir(path: &Path) -> Result<bool> {
                 "csharp",
                 "dart"
             ],
-            "ignore": ["node_modules", "target", "dist", "__pycache__", ".venv", "build", "out"]
+            "ignore": ["node_modules", "target", "dist", "__pycache__", ".venv", "build", "out", "vendor", "*.min.js", "*.min.css"]
         });
         fs::write(&config_path, serde_json::to_string_pretty(&default_config)?)?;
         return Ok(true);
@@ -2966,7 +2966,7 @@ pub async fn watch(path: &Path) -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{is_generated_or_internal_path, parse_git_name_status_output};
+    use super::{is_generated_or_internal_path, parse_git_name_status_output, raw_mass_log_pct};
     use std::path::PathBuf;
 
     /// Returns the platform-specific bundled visualizer path relative to exe_dir.
@@ -3084,6 +3084,18 @@ mod tests {
         assert!(is_generated_or_internal_path("src/models/user.g.dart"));
         assert!(is_generated_or_internal_path("pkg/generated/client.rs"));
         assert!(!is_generated_or_internal_path("src/lib.rs"));
+    }
+
+    #[test]
+    fn raw_mass_histogram_spreads_heavy_tailed_scores() {
+        // Display bins only. A hub, a mid-weight node, and a floor node must
+        // not all collapse into the same extreme bin.
+        let floor = raw_mass_log_pct(1e-6, 1e-6, 1e-2);
+        let mid = raw_mass_log_pct(1e-4, 1e-6, 1e-2);
+        let hub = raw_mass_log_pct(1e-2, 1e-6, 1e-2);
+        assert_eq!(floor, 0.0);
+        assert_eq!(hub, 100.0);
+        assert!(mid > 10.0 && mid < 70.0, "mid bin was {mid}");
     }
 
     #[test]
@@ -3981,6 +3993,137 @@ pub fn map(
     }
     Ok(())
 }
+
+struct AnalyzeLocalRow {
+    name: String,
+    kind: String,
+    file: String,
+    /// Percentile rank in `[0, 100]`. This is [`ArborGraph::centrality`], the
+    /// v2.6.0 contract. It is not retuned for the risk histogram.
+    centrality_pct: f64,
+    /// Raw PageRank mass, used only to bin the printed risk histogram.
+    raw: f64,
+    callers: usize,
+}
+
+/// Log-scaled position of one raw PageRank mass in `[0, 100]`.
+///
+/// PageRank mass is heavy-tailed, so a linear cut of the raw value piles
+/// almost every node into the bottom bin. The log scale is a display histogram
+/// for `analyze-local` only; it is not stored and it does not change
+/// [`arbor_graph::CentralityScores::get`].
+fn raw_mass_log_pct(raw: f64, min_raw: f64, max_raw: f64) -> f64 {
+    let lo = min_raw.max(f64::MIN_POSITIVE).ln();
+    let hi = max_raw.max(f64::MIN_POSITIVE).ln();
+    let span = hi - lo;
+    if !span.is_finite() || span <= f64::EPSILON {
+        return 0.0;
+    }
+    ((raw.max(f64::MIN_POSITIVE).ln() - lo) / span).clamp(0.0, 1.0) * 100.0
+}
+
+/// Freshly indexes a directory and prints a machine-readable ranking report.
+///
+/// Output format is consumed by the `arbor-torture` grading fixture
+/// (`grade.py`).
+pub fn analyze_local(path: &Path, top: usize) -> Result<()> {
+    let base = if path == Path::new(".") {
+        std::env::current_dir()?
+    } else {
+        path.to_path_buf()
+    };
+    let resolved_path = strip_verbatim_prefix(fs::canonicalize(&base)?);
+    let root_str = resolved_path.to_string_lossy().to_string();
+
+    let result = index_directory(&resolved_path, IndexOptions::default())?;
+    let mut graph = result.graph;
+
+    let scores = compute_centrality(&graph, 20, 0.85);
+    graph.set_centrality_scores(scores);
+
+    let mut rows: Vec<AnalyzeLocalRow> = Vec::new();
+    for idx in graph.node_indexes() {
+        let node = match graph.get(idx) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        let kind = node.kind.to_string();
+        if matches!(kind.as_str(), "import" | "export" | "module") {
+            continue;
+        }
+
+        let rel_file = map_make_relative(&node.file, &root_str)
+            .replace('\\', "/")
+            .trim_start_matches('/')
+            .to_string();
+        rows.push(AnalyzeLocalRow {
+            name: node.name.clone(),
+            kind,
+            file: rel_file,
+            centrality_pct: graph.centrality(idx) * 100.0,
+            raw: graph.centrality_raw(idx),
+            callers: graph.get_callers(idx).len(),
+        });
+    }
+
+    rows.sort_by(|a, b| {
+        b.centrality_pct
+            .partial_cmp(&a.centrality_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.callers.cmp(&a.callers))
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let max_raw = rows.iter().map(|row| row.raw).fold(0.0_f64, f64::max);
+    let min_raw = rows.iter().map(|row| row.raw).fold(f64::MAX, f64::min);
+    let mut high = 0usize;
+    let mut medium = 0usize;
+    let mut low = 0usize;
+    let mut very_low = 0usize;
+    for row in &rows {
+        let bin = raw_mass_log_pct(row.raw, min_raw, max_raw);
+        if bin >= 70.0 {
+            high += 1;
+        } else if bin >= 40.0 {
+            medium += 1;
+        } else if bin >= 10.0 {
+            low += 1;
+        } else {
+            very_low += 1;
+        }
+    }
+
+    println!("Arbor analyze-local report");
+    println!("Path: {}", root_str);
+    println!("Symbols ranked: {}", rows.len());
+    println!("Edges: {}", graph.edge_count());
+    println!("Parse errors: {}", result.errors.len());
+    println!();
+    println!("Risk distribution:");
+    println!("  High (70%+): {} nodes", high);
+    println!("  Medium (40-70%): {} nodes", medium);
+    println!("  Low (10-40%): {} nodes", low);
+    println!("  Very Low (<10%): {} nodes", very_low);
+    println!();
+    println!("Top symbols:");
+
+    for (rank, row) in rows.iter().take(top).enumerate() {
+        println!(
+            "#{} {:.1}% {} {} [{}] {} callers",
+            rank + 1,
+            row.centrality_pct,
+            row.name,
+            row.file,
+            row.kind,
+            row.callers
+        );
+    }
+
+    Ok(())
+}
+
 pub fn agent_review(path: &Path, json: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
@@ -4241,7 +4384,10 @@ fn map_last_word_of_param(param: &str) -> Option<&str> {
 pub fn agent_onboard(path: &Path, json: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
-    let graph = load_or_index_graph(&resolved_path)?;
+    let mut graph = load_or_index_graph(&resolved_path)?;
+    if ensure_centrality(&mut graph, 20, 0.85) {
+        let _ = save_graph_binary(&resolved_path, &graph);
+    }
 
     let node_count = graph.node_count();
     let edge_count = graph.edge_count();
@@ -4262,25 +4408,19 @@ pub fn agent_onboard(path: &Path, json: bool) -> Result<()> {
     let mut entry_points = graph.list_entry_points();
     entry_points.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let mut nodes_with_centrality = Vec::new();
-    for node_idx in graph.node_indexes() {
-        if let Some(node) = graph.get(node_idx) {
-            let centrality = graph.centrality(node_idx);
-            nodes_with_centrality.push((node, centrality));
-        }
-    }
-    nodes_with_centrality
-        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let hotspot_limit = if json { 20 } else { 15 };
+    let ranked_hotspots = top_hotspots(&graph, hotspot_limit);
 
     if json {
-        let hotspots_json: Vec<serde_json::Value> = nodes_with_centrality
+        let hotspots_json: Vec<serde_json::Value> = ranked_hotspots
             .iter()
-            .take(20)
-            .map(|(node, centrality)| {
-                serde_json::json!({
-                    "symbol": node.name.clone(),
-                    "centrality": centrality,
-                    "file": node.file.clone()
+            .filter_map(|(node_idx, centrality)| {
+                graph.get(*node_idx).map(|node| {
+                    serde_json::json!({
+                        "symbol": node.name.clone(),
+                        "centrality": centrality,
+                        "file": node.file.clone()
+                    })
                 })
             })
             .collect();
@@ -4324,14 +4464,16 @@ pub fn agent_onboard(path: &Path, json: bool) -> Result<()> {
         println!("## Core Components (Hotspots)");
         println!("| Rank | Symbol | Centrality | File |");
         println!("|------|--------|------------|------|");
-        for (i, (node, centrality)) in nodes_with_centrality.iter().take(15).enumerate() {
-            println!(
-                "| {} | `{}` | {:.4} | `{}` |",
-                i + 1,
-                node.name,
-                centrality,
-                node.file
-            );
+        for (i, (node_idx, centrality)) in ranked_hotspots.iter().enumerate() {
+            if let Some(node) = graph.get(*node_idx) {
+                println!(
+                    "| {} | `{}` | {:.4} | `{}` |",
+                    i + 1,
+                    node.name,
+                    centrality,
+                    node.file
+                );
+            }
         }
         println!();
 

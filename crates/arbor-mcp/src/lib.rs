@@ -4,7 +4,9 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arbor_graph::{changed_node_ids, compute_blast_radius, compute_centrality, HeuristicsMatcher};
+use arbor_graph::{
+    changed_node_ids, compute_blast_radius, ensure_centrality, top_hotspots, HeuristicsMatcher,
+};
 use arbor_server::{SharedGraph, SyncServerHandle};
 
 mod apps;
@@ -104,6 +106,18 @@ impl McpServer {
 
     pub fn task_manager(&self) -> Arc<TaskManager> {
         self.tasks.clone()
+    }
+
+    /// Fill percentile centrality when the graph has nodes and no complete score map.
+    async fn ensure_graph_centrality(&self) {
+        {
+            let graph = self.graph.read().await;
+            if graph.node_count() == 0 || graph.has_centrality_scores() {
+                return;
+            }
+        }
+        let mut graph = self.graph.write().await;
+        ensure_centrality(&mut graph, 20, 0.85);
     }
 
     /// Triggers a spotlight on the visualizer for the given node.
@@ -1147,17 +1161,7 @@ impl McpServer {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(50) as usize;
 
-                let graph = self.graph.read().await;
-
-                let has_centrality = graph.node_indexes().any(|idx| graph.centrality(idx) > 0.0);
-
-                drop(graph);
-                if !has_centrality {
-                    let mut graph = self.graph.write().await;
-                    let scores = compute_centrality(&graph, 20, 0.85);
-                    graph.set_centrality(scores.into_map());
-                }
-
+                self.ensure_graph_centrality().await;
                 let graph = self.graph.read().await;
                 let mut result = self.build_map(&graph, token_budget, exclude_test, focus_pattern);
 
@@ -1460,31 +1464,22 @@ impl McpServer {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(20) as usize;
 
+                self.ensure_graph_centrality().await;
                 let graph = self.graph.read().await;
                 let node_count = graph.node_count();
                 let edge_count = graph.edge_count();
 
-                let mut nodes_with_centrality = Vec::new();
-                for node_idx in graph.node_indexes() {
-                    if let Some(node) = graph.get(node_idx) {
-                        let centrality = graph.centrality(node_idx);
-                        nodes_with_centrality.push((node, centrality));
-                    }
-                }
-
-                nodes_with_centrality
-                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-                let hotspots: Vec<Value> = nodes_with_centrality
-                    .iter()
-                    .take(top_n)
-                    .map(|(node, centrality)| {
-                        json!({
-                            "id": node.id,
-                            "name": node.name,
-                            "kind": node.kind.to_string(),
-                            "file": node.file,
-                            "centrality": centrality
+                let hotspots: Vec<Value> = top_hotspots(&graph, top_n)
+                    .into_iter()
+                    .filter_map(|(node_idx, centrality)| {
+                        graph.get(node_idx).map(|node| {
+                            json!({
+                                "id": node.id,
+                                "name": node.name,
+                                "kind": node.kind.to_string(),
+                                "file": node.file,
+                                "centrality": centrality
+                            })
                         })
                     })
                     .collect();
@@ -2000,6 +1995,9 @@ impl McpServer {
                 data: None,
             })?;
 
+        if uri == "arbor://graph/hotspots" {
+            self.ensure_graph_centrality().await;
+        }
         let graph = self.graph.read().await;
 
         let contents = match uri {
@@ -2027,25 +2025,17 @@ impl McpServer {
                 json!({ "entry_points": entries })
             }
             "arbor://graph/hotspots" => {
-                let mut nodes_with_centrality = Vec::new();
-                for node_idx in graph.node_indexes() {
-                    if let Some(node) = graph.get(node_idx) {
-                        let centrality = graph.centrality(node_idx);
-                        nodes_with_centrality.push((node, centrality));
-                    }
-                }
-                nodes_with_centrality
-                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let hotspots: Vec<Value> = nodes_with_centrality
-                    .iter()
-                    .take(20)
-                    .map(|(node, centrality)| {
-                        json!({
-                            "id": node.id,
-                            "name": node.name,
-                            "kind": node.kind.to_string(),
-                            "file": node.file,
-                            "centrality": centrality
+                let hotspots: Vec<Value> = top_hotspots(&graph, 20)
+                    .into_iter()
+                    .filter_map(|(node_idx, centrality)| {
+                        graph.get(node_idx).map(|node| {
+                            json!({
+                                "id": node.id,
+                                "name": node.name,
+                                "kind": node.kind.to_string(),
+                                "file": node.file,
+                                "centrality": centrality
+                            })
                         })
                     })
                     .collect();
