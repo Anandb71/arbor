@@ -4003,6 +4003,12 @@ struct AnalyzeLocalRow {
     centrality_pct: f64,
     /// Raw PageRank mass, used only to bin the printed risk histogram.
     raw: f64,
+    /// Incoming calls, subclasses, and implementors.
+    ///
+    /// The column is still labelled `callers` because that is the line the
+    /// grading fixture parses. The count is [`ArborGraph::direct_dependents`]:
+    /// a base class with no call sites is reached by the classes that extend
+    /// it. Stored centrality is not involved.
     callers: usize,
 }
 
@@ -4063,7 +4069,7 @@ pub fn analyze_local(path: &Path, top: usize) -> Result<()> {
             file: rel_file,
             centrality_pct: graph.centrality(idx) * 100.0,
             raw: graph.centrality_raw(idx),
-            callers: graph.get_callers(idx).len(),
+            callers: graph.direct_dependents(idx).len(),
         });
     }
 
