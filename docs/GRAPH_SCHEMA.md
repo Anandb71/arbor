@@ -89,6 +89,8 @@ Edges represent relationships between nodes.
 | `exports` | Re-export | module → symbol |
 | `extends` | Class inheritance | class → class |
 | `implements` | Interface implementation | class → interface |
+
+A class records each base at parse time, and the builder emits `extends` (or `implements`, when the target is an interface or the source said so) from the subclass to that base. A method the subclass does not define stays reachable from the subclass; a method the subclass overrides does not keep an implicit edge to the base version. `self`/`this` calls bind to the nearest definition. `super`/`base` calls start at the parents, so an override that calls `super` still reaches the method it shadows. PageRank walks `calls` only, so these edges change blast radius without changing what a centrality percentile means.
 | `uses_type` | Type reference | any → type/interface |
 | `references` | General symbol reference | any → any |
 | `contains` | Nesting relationship | class → method |

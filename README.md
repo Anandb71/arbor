@@ -99,8 +99,6 @@ Written down rather than left to be discovered:
 
 - Small targets now **over**-report (36 → 61, 16 → 46). Safer direction than
   silence, but not yet correct.
-- Inheritance produces no edges. `class Middle(Base)` is invisible, so changing
-  a base class shows zero blast radius.
 - Dynamic and reflective imports (`importlib`, `__import__`, `import()`,
   `eval(require(...))`) are unresolvable by construction and are documented as
   expected misses in the fixture rather than counted as defects.
