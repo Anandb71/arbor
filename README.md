@@ -1,11 +1,14 @@
 <p align="center">
-  <img src="docs/assets/arbor-logo.svg" alt="Arbor logo" width="120" height="120" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/arbor-lockup-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/arbor-lockup-light.svg" />
+    <img src="docs/assets/arbor-lockup-dark.svg" alt="Arbor" width="300" />
+  </picture>
 </p>
 
-<h1 align="center">Arbor</h1>
-
 <p align="center">
-  <strong>Graph-native intelligence for codebases.</strong><br>
+  <strong>Code context for people and agents.</strong><br>
+  Find a function&rsquo;s callers. Trace the path through your code.<br>
   Know what breaks <em>before</em> you break it.
 </p>
 
@@ -328,7 +331,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: getArbor-dev/arbor@v3.0.0
+      - uses: Anandb71/arbor@v3.0.0
         with:
           command: check . --max-blast-radius 30 --markdown
           comment-on-pr: true
