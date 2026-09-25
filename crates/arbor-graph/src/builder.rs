@@ -1279,4 +1279,29 @@ mod tests {
         );
         assert!(kinds_between(&graph, "D", "A.f").is_empty());
     }
+
+    #[test]
+    fn super_stops_at_the_intermediate_override() {
+        let file = "super_chain.py";
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            CodeNode::new("A", "A", NodeKind::Class, file),
+            CodeNode::new("foo", "A.foo", NodeKind::Method, file),
+            CodeNode::new("B", "B", NodeKind::Class, file).with_extends(["A"]),
+            CodeNode::new("foo", "B.foo", NodeKind::Method, file),
+            CodeNode::new("C", "C", NodeKind::Class, file).with_extends(["B"]),
+            CodeNode::new("foo", "C.foo", NodeKind::Method, file)
+                .with_references(vec!["super().foo".to_string()]),
+        ]);
+        let graph = b.build();
+        assert_eq!(
+            kinds_between(&graph, "C.foo", "B.foo"),
+            vec![EdgeKind::Calls],
+            "super() in C must reach B's override"
+        );
+        assert!(
+            kinds_between(&graph, "C.foo", "A.foo").is_empty(),
+            "super() must not skip B and land on A"
+        );
+    }
 }
