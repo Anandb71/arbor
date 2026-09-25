@@ -9,6 +9,7 @@ mod cpp;
 mod csharp;
 mod dart;
 mod go;
+mod heritage;
 mod java;
 mod python;
 mod rust;
@@ -123,4 +124,108 @@ pub fn supported_language_names() -> &'static [&'static str] {
 /// Checks if a file extension is supported.
 pub fn is_supported(extension: &str) -> bool {
     get_parser(extension).is_some() || is_fallback_supported_extension(extension)
+}
+
+#[cfg(test)]
+mod inheritance_emission_tests {
+    use super::get_parser;
+
+    fn references(ext: &str, source: &str, name: &str) -> Vec<String> {
+        let parser = get_parser(ext).unwrap_or_else(|| panic!("no parser for {ext}"));
+        let mut ts = tree_sitter::Parser::new();
+        ts.set_language(&parser.language()).unwrap();
+        let tree = ts.parse(source, None).unwrap();
+        let path = format!("Fixture.{ext}");
+        let nodes = parser.extract_nodes(&tree, source, &path);
+        nodes
+            .into_iter()
+            .find(|node| node.name == name)
+            .unwrap_or_else(|| panic!("{ext}: missing {name}"))
+            .references
+    }
+
+    #[test]
+    fn each_language_records_its_bases() {
+        let cases = [
+            (
+                "ts",
+                "class Middle extends Base implements Reader { run() { return super.run(); } }",
+                "Middle",
+                vec!["extends:Base", "implements:Reader"],
+            ),
+            (
+                "java",
+                "class Middle extends Base implements Runnable { public void run() {} }",
+                "Middle",
+                vec!["extends:Base", "implements:Runnable"],
+            ),
+            (
+                "cs",
+                "class Middle : Base, IReader { public void Run() {} }",
+                "Middle",
+                vec!["extends:Base", "extends:IReader"],
+            ),
+            (
+                "cpp",
+                "class Middle : public Base, public Reader { void run(); };",
+                "Middle",
+                vec!["extends:Base", "extends:Reader"],
+            ),
+            (
+                "dart",
+                "class Middle extends Base implements Reader { void run() {} }",
+                "Middle",
+                vec!["extends:Base", "implements:Reader"],
+            ),
+            (
+                "go",
+                "package p\ntype Middle struct {\n\tBase\n\t*Reader\n\tnamed int\n}\n",
+                "Middle",
+                vec!["extends:Base", "extends:Reader"],
+            ),
+            (
+                "rs",
+                "struct Middle;\nimpl Reader for Middle {}\ntrait Child: Parent {}",
+                "Middle",
+                vec!["implements:Reader"],
+            ),
+        ];
+
+        for (ext, source, name, expected) in cases {
+            let mut refs: Vec<String> = references(ext, source, name)
+                .into_iter()
+                .filter(|reference| {
+                    reference.starts_with("extends:") || reference.starts_with("implements:")
+                })
+                .collect();
+            refs.sort();
+            let mut expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
+            expected.sort();
+            assert_eq!(refs, expected, "{ext} {name}");
+        }
+
+        let rust_refs = references(
+            "rs",
+            "struct Middle;\nimpl Reader for Middle {}\ntrait Child: Parent {}",
+            "Child",
+        );
+        assert!(
+            rust_refs
+                .iter()
+                .any(|reference| reference == "extends:Parent"),
+            "trait supertrait missing, got {rust_refs:?}"
+        );
+
+        let go_refs = references(
+            "go",
+            "package p\ntype Middle struct {\n\tBase\n\t*Reader\n\tnamed int\n}\n",
+            "Middle",
+        );
+        assert!(
+            go_refs
+                .iter()
+                .all(|reference| !reference.contains("int") && !reference.contains("named")),
+            "named fields are not parents, got {go_refs:?}"
+        );
+    }
 }

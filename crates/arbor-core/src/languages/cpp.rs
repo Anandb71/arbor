@@ -191,6 +191,7 @@ fn extract_from_node(
 fn extract_class(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
     let name_node = node.child_by_field_name("name")?;
     let name = get_text(&name_node, source);
+    let (extends, implements) = super::heritage::clause_bases(node, source);
 
     Some(
         CodeNode::new(&name, &name, NodeKind::Class, file_path)
@@ -200,7 +201,9 @@ fn extract_class(node: &Node, source: &str, file_path: &str) -> Option<CodeNode>
             )
             .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
             .with_column(name_node.start_position().column as u32)
-            .with_visibility(Visibility::Public),
+            .with_visibility(Visibility::Public)
+            .with_extends(extends)
+            .with_implements(implements),
     )
 }
 
@@ -208,6 +211,7 @@ fn extract_class(node: &Node, source: &str, file_path: &str) -> Option<CodeNode>
 fn extract_struct(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
     let name_node = node.child_by_field_name("name")?;
     let name = get_text(&name_node, source);
+    let (extends, implements) = super::heritage::clause_bases(node, source);
 
     Some(
         CodeNode::new(&name, &name, NodeKind::Struct, file_path)
@@ -217,7 +221,9 @@ fn extract_struct(node: &Node, source: &str, file_path: &str) -> Option<CodeNode
             )
             .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
             .with_column(name_node.start_position().column as u32)
-            .with_visibility(Visibility::Public),
+            .with_visibility(Visibility::Public)
+            .with_extends(extends)
+            .with_implements(implements),
     )
 }
 

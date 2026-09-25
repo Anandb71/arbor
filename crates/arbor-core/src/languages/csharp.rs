@@ -193,6 +193,8 @@ fn extract_type_decl(
     let name = get_text(&name_node, source);
     let visibility = detect_visibility(node, source);
 
+    let (extends, implements) = super::heritage::clause_bases(node, source);
+
     Some(
         CodeNode::new(&name, &name, kind, file_path)
             .with_lines(
@@ -201,7 +203,9 @@ fn extract_type_decl(
             )
             .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
             .with_column(name_node.start_position().column as u32)
-            .with_visibility(visibility),
+            .with_visibility(visibility)
+            .with_extends(extends)
+            .with_implements(implements),
     )
 }
 
@@ -465,8 +469,8 @@ fn collect_calls(root: &Node, source: &str, refs: &mut Vec<String>) {
                                 let obj_text = &source[obj_range];
                                 let method = &source[name_range];
                                 if obj_text == "this" || obj_text == "base" {
-                                    // Same-class / parent call — track bare method name.
-                                    refs.push(method.to_string());
+                                    // `base.M()` is the parent method, not the override.
+                                    refs.push(format!("{obj_text}.{method}"));
                                 } else {
                                     // `MathUtils.Add` for a static/type-qualified call.
                                     // Instance calls (`obj.Add`) capture as `obj.Add`, which

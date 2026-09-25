@@ -139,6 +139,7 @@ fn extract_class(node: &Node, source: &str, file_path: &str) -> Option<CodeNode>
     let name = get_text(&name_node, source);
     let visibility = python_visibility(&name);
     let docstring = extract_docstring(node, source);
+    let bases = python_bases(node, source);
 
     Some(
         CodeNode::new(&name, &name, NodeKind::Class, file_path)
@@ -149,8 +150,43 @@ fn extract_class(node: &Node, source: &str, file_path: &str) -> Option<CodeNode>
             .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
             .with_column(name_node.start_position().column as u32)
             .with_visibility(visibility)
-            .with_docstring_if(docstring),
+            .with_docstring_if(docstring)
+            .with_extends(bases),
     )
+}
+
+/// Names in `class Middle(Base, Proto[T])`, in source order.
+///
+/// Keyword arguments (`metaclass=`) are not bases. `object` is dropped by
+/// [`crate::node::clean_type_name`] so a class that only extends `object`
+/// records no superclass.
+fn python_bases(node: &Node, source: &str) -> Vec<String> {
+    let list = node
+        .child_by_field_name("superclasses")
+        .or_else(|| find_child_by_kind(node, "argument_list"));
+    let Some(list) = list else {
+        return Vec::new();
+    };
+
+    let mut bases = Vec::new();
+    for i in 0..list.child_count() {
+        let Some(child) = list.child(i) else {
+            continue;
+        };
+        match child.kind() {
+            "identifier" | "attribute" => bases.push(get_text(&child, source)),
+            "subscript" => {
+                if let Some(value) = child
+                    .child_by_field_name("value")
+                    .or_else(|| child.child(0))
+                {
+                    bases.push(get_text(&value, source));
+                }
+            }
+            _ => {}
+        }
+    }
+    bases
 }
 
 fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
@@ -446,5 +482,92 @@ impl CodeNodeExt for CodeNode {
     fn with_docstring_if(mut self, docstring: Option<String>) -> Self {
         self.docstring = docstring;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(source: &str) -> Vec<CodeNode> {
+        let parser = PythonParser;
+        let mut ts = tree_sitter::Parser::new();
+        ts.set_language(&parser.language()).unwrap();
+        let tree = ts.parse(source, None).unwrap();
+        parser.extract_nodes(&tree, source, "inheritance.py")
+    }
+
+    fn class<'a>(nodes: &'a [CodeNode], name: &str) -> &'a CodeNode {
+        nodes
+            .iter()
+            .find(|n| n.name == name && n.kind == NodeKind::Class)
+            .unwrap_or_else(|| panic!("missing class {name}"))
+    }
+
+    #[test]
+    fn four_level_chain_records_each_base() {
+        let source = r#"
+class Base:
+    def compute(self, n: int) -> int:
+        return n
+
+class Middle(Base):
+    def compute(self, n: int) -> int:
+        return super().compute(n) * 2
+
+class Derived(Middle):
+    def shared(self) -> str:
+        return "derived"
+
+class Leaf(Derived):
+    def run(self, n: int) -> int:
+        return self.compute(n)
+"#;
+        let nodes = parse(source);
+        assert!(class(&nodes, "Base").references.is_empty());
+        assert!(class(&nodes, "Middle")
+            .references
+            .iter()
+            .any(|r| r == "extends:Base"));
+        assert!(class(&nodes, "Derived")
+            .references
+            .iter()
+            .any(|r| r == "extends:Middle"));
+        assert!(class(&nodes, "Leaf")
+            .references
+            .iter()
+            .any(|r| r == "extends:Derived"));
+
+        let middle_compute = nodes
+            .iter()
+            .find(|n| n.qualified_name == "Middle.compute")
+            .unwrap();
+        assert!(
+            middle_compute
+                .references
+                .iter()
+                .any(|r| r == "super().compute"),
+            "super() must stay qualified, got {:?}",
+            middle_compute.references
+        );
+    }
+
+    #[test]
+    fn multiple_bases_keep_source_order() {
+        let nodes = parse("class D(B, C):\n    pass\n");
+        let refs = &class(&nodes, "D").references;
+        let b = refs.iter().position(|r| r == "extends:B").unwrap();
+        let c = refs.iter().position(|r| r == "extends:C").unwrap();
+        assert!(b < c);
+    }
+
+    #[test]
+    fn class_without_a_base_is_not_an_extender() {
+        // A name like UserService is not inheritance. Only a written base is.
+        let nodes = parse("class UserService:\n    def run(self):\n        return 1\n");
+        assert!(
+            class(&nodes, "UserService").references.is_empty(),
+            "UserService has no superclass"
+        );
     }
 }

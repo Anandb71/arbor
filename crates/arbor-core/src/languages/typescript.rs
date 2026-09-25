@@ -203,6 +203,7 @@ fn extract_class(node: &Node, source: &str, file_path: &str) -> Option<CodeNode>
     let name_node = node.child_by_field_name("name")?;
     let name = get_text(&name_node, source);
     let is_exported = is_node_exported(node);
+    let (extends, implements) = super::heritage::clause_bases(node, source);
 
     Some(
         CodeNode::new(&name, &name, NodeKind::Class, file_path)
@@ -217,7 +218,9 @@ fn extract_class(node: &Node, source: &str, file_path: &str) -> Option<CodeNode>
             } else {
                 Visibility::Private
             })
-            .with_exported_if(is_exported),
+            .with_exported_if(is_exported)
+            .with_extends(extends)
+            .with_implements(implements),
     )
 }
 
@@ -450,7 +453,7 @@ fn build_arrow_signature(node: &Node, source: &str, name: &str) -> String {
 ///
 /// Resolution strategy:
 ///   - Direct call     `foo()`             → `"foo"`
-///   - this/super      `this.foo()`        → `"foo"`
+///   - this/super      `this.foo()`        → `"this.foo"` / `"super.foo"`
 ///   - Static-looking  `MathUtils.add()`   → `"MathUtils.add"` (exact FQN candidate)
 ///   - Instance call   `userService.get()` → `".get"` (unknown-receiver marker)
 ///
@@ -539,8 +542,10 @@ fn classify_callee(raw: &str) -> Option<String> {
     }
 
     if receiver == "this" || receiver == "super" {
-        // Resolvable against the enclosing class by bare method name.
-        return Some(method.to_string());
+        // Keep the receiver so an override can be told from a super call.
+        // A bare method name would bind to the subclass's own method and
+        // hide the base the `super` call actually reaches.
+        return Some(format!("{receiver}.{method}"));
     }
 
     // A chained or computed receiver (`this.repo`, `getUser().profile`,
@@ -611,9 +616,12 @@ mod callee_tests {
     }
 
     #[test]
-    fn this_and_super_strip_to_method() {
-        assert_eq!(classify_callee("this.validate"), Some("validate".into()));
-        assert_eq!(classify_callee("super.clone"), Some("clone".into()));
+    fn this_and_super_keep_the_receiver() {
+        assert_eq!(
+            classify_callee("this.validate"),
+            Some("this.validate".into())
+        );
+        assert_eq!(classify_callee("super.clone"), Some("super.clone".into()));
     }
 
     #[test]
@@ -656,7 +664,10 @@ mod callee_tests {
     #[test]
     fn optional_chaining_is_normalised() {
         assert_eq!(classify_callee("user?.getName"), Some(".getName".into()));
-        assert_eq!(classify_callee("this?.validate"), Some("validate".into()));
+        assert_eq!(
+            classify_callee("this?.validate"),
+            Some("this.validate".into())
+        );
     }
 
     #[test]

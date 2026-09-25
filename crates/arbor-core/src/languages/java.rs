@@ -144,6 +144,7 @@ fn extract_class(node: &Node, source: &str, file_path: &str) -> Option<CodeNode>
     let name_node = node.child_by_field_name("name")?;
     let name = get_text(&name_node, source);
     let visibility = detect_visibility(node, source);
+    let (extends, implements) = super::heritage::clause_bases(node, source);
 
     Some(
         CodeNode::new(&name, &name, NodeKind::Class, file_path)
@@ -153,7 +154,9 @@ fn extract_class(node: &Node, source: &str, file_path: &str) -> Option<CodeNode>
             )
             .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
             .with_column(name_node.start_position().column as u32)
-            .with_visibility(visibility),
+            .with_visibility(visibility)
+            .with_extends(extends)
+            .with_implements(implements),
     )
 }
 
@@ -412,8 +415,9 @@ fn collect_calls(root: &Node, source: &str, refs: &mut Vec<String>) {
                             if obj_range.end <= source.len() {
                                 let obj_text = &source[obj_range];
                                 if obj_text == "this" || obj_text == "super" {
-                                    // Same-class / parent call — track bare method name.
-                                    refs.push(method.to_string());
+                                    // Keep the receiver. `super.m()` must not
+                                    // collapse onto the override of `m`.
+                                    refs.push(format!("{obj_text}.{method}"));
                                 } else {
                                     // `MathUtils.add` for a static/type-qualified call.
                                     // Instance calls (`obj.add`) capture as `obj.add`, which
@@ -532,9 +536,28 @@ public class Calc {
         );
 
         let self_method = nodes.iter().find(|n| n.name == "self").unwrap();
-        // this./super. calls strip to the bare method name (same-class / parent resolution)
-        assert!(self_method.references.contains(&"helper".to_string()));
-        assert!(self_method.references.contains(&"base".to_string()));
+        assert!(self_method.references.contains(&"this.helper".to_string()));
+        assert!(self_method.references.contains(&"super.base".to_string()));
+    }
+
+    #[test]
+    fn test_class_extends_and_implements() {
+        let source = r#"
+public class Middle extends Base implements Runnable {
+    public void run() {}
+}
+"#;
+        let parser = JavaParser;
+        let mut ts = tree_sitter::Parser::new();
+        ts.set_language(&parser.language()).unwrap();
+        let tree = ts.parse(source, None).unwrap();
+        let nodes = parser.extract_nodes(&tree, source, "Middle.java");
+        let class_node = nodes.iter().find(|n| n.name == "Middle").unwrap();
+        assert!(class_node.references.iter().any(|r| r == "extends:Base"));
+        assert!(class_node
+            .references
+            .iter()
+            .any(|r| r == "implements:Runnable"));
     }
 
     #[test]
