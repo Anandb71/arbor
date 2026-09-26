@@ -191,6 +191,7 @@ fn extract_class(node: &Node, source: &str, file_path: &str) -> Option<CodeNode>
     let name_node = node.child_by_field_name("name")?;
     let name = get_text(&name_node, source);
     let visibility = detect_visibility(&name);
+    let (extends, implements) = super::heritage::clause_bases(node, source);
 
     Some(
         CodeNode::new(&name, &name, NodeKind::Class, file_path)
@@ -200,7 +201,9 @@ fn extract_class(node: &Node, source: &str, file_path: &str) -> Option<CodeNode>
             )
             .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
             .with_column(name_node.start_position().column as u32)
-            .with_visibility(visibility),
+            .with_visibility(visibility)
+            .with_extends(extends)
+            .with_implements(implements),
     )
 }
 
@@ -512,11 +515,12 @@ fn collect_calls(root: &Node, source: &str, refs: &mut Vec<String>) {
                     let call_text = &source[range];
                     if !call_text.contains('.') {
                         refs.push(call_text.to_string());
-                    } else if call_text.starts_with("this.") {
-                        if let Some(method) = call_text.split_once('.').map(|x| x.1) {
-                            if !method.is_empty() && !method.contains('.') {
-                                refs.push(method.to_string());
-                            }
+                    } else if let Some(method) = call_text
+                        .strip_prefix("this.")
+                        .or_else(|| call_text.strip_prefix("super."))
+                    {
+                        if !method.is_empty() && !method.contains('.') {
+                            refs.push(call_text.to_string());
                         }
                     }
                     // Drop other dotted calls — ambiguous without type info

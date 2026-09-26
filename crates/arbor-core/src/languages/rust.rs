@@ -4,7 +4,7 @@
 //! and impl blocks.
 
 use crate::languages::LanguageParser;
-use crate::node::{CodeNode, NodeKind, Visibility};
+use crate::node::{clean_type_name, CodeNode, NodeKind, TypeRelationKind, Visibility};
 use tree_sitter::{Language, Node, Tree};
 
 pub struct RustParser;
@@ -23,8 +23,77 @@ impl LanguageParser for RustParser {
         let root = tree.root_node();
 
         extract_from_node(&root, source, file_path, &mut nodes, None);
+        attach_rust_inheritance(&root, source, &mut nodes);
 
         nodes
+    }
+}
+
+/// `impl Trait for Type` and `trait Child: Parent` are not class clauses.
+/// Attach them onto the type or trait node extracted above.
+fn attach_rust_inheritance(root: &Node, source: &str, nodes: &mut [CodeNode]) {
+    walk_rust_inheritance(root, source, nodes);
+}
+
+fn walk_rust_inheritance(node: &Node, source: &str, nodes: &mut [CodeNode]) {
+    match node.kind() {
+        "impl_item" => {
+            if let (Some(trait_node), Some(type_node)) = (
+                node.child_by_field_name("trait"),
+                node.child_by_field_name("type"),
+            ) {
+                let trait_name = clean_type_name(&node_text(&trait_node, source));
+                let type_name = clean_type_name(&node_text(&type_node, source));
+                if !trait_name.is_empty() && !type_name.is_empty() {
+                    if let Some(target) = nodes.iter_mut().find(|n| {
+                        is_rust_type(n.kind)
+                            && (n.name == type_name || clean_type_name(&n.name) == type_name)
+                    }) {
+                        target.add_type_relation(TypeRelationKind::Implements, &trait_name);
+                    }
+                }
+            }
+        }
+        "trait_item" => {
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return;
+            };
+            let trait_name = node_text(&name_node, source);
+            if let Some(bounds) = node.child_by_field_name("bounds") {
+                let supers = super::heritage::type_names(&bounds, source);
+                if let Some(target) = nodes
+                    .iter_mut()
+                    .find(|n| n.kind == NodeKind::Interface && n.name == trait_name)
+                {
+                    for parent in supers {
+                        target.add_type_relation(TypeRelationKind::Extends, &parent);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            walk_rust_inheritance(&child, source, nodes);
+        }
+    }
+}
+
+fn is_rust_type(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Struct | NodeKind::Enum | NodeKind::Interface | NodeKind::TypeAlias
+    )
+}
+
+fn node_text(node: &Node, source: &str) -> String {
+    let range = node.byte_range();
+    if range.end <= source.len() {
+        source[range].to_string()
+    } else {
+        String::new()
     }
 }
 

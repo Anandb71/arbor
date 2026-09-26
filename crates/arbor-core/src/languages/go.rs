@@ -214,17 +214,49 @@ fn extract_type_spec(node: &Node, source: &str, file_path: &str) -> Option<CodeN
         "interface_type" => NodeKind::Interface,
         _ => NodeKind::TypeAlias,
     };
+    let embedded = embedded_types(&type_node, source);
 
-    Some(
-        CodeNode::new(&name, &name, kind, file_path)
-            .with_lines(
-                node.start_position().row as u32 + 1,
-                node.end_position().row as u32 + 1,
-            )
-            .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
-            .with_column(name_node.start_position().column as u32)
-            .with_visibility(visibility),
-    )
+    let mut code_node = CodeNode::new(&name, &name, kind, file_path)
+        .with_lines(
+            node.start_position().row as u32 + 1,
+            node.end_position().row as u32 + 1,
+        )
+        .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
+        .with_column(name_node.start_position().column as u32)
+        .with_visibility(visibility);
+    if kind == NodeKind::Interface {
+        code_node = code_node.with_implements(embedded);
+    } else {
+        code_node = code_node.with_extends(embedded);
+    }
+    Some(code_node)
+}
+
+/// Field declarations with no name are embeddings (`struct { Base }` or
+/// `struct { *pkg.T }`). Named fields are data, not parents.
+///
+/// The declarations sit under `field_declaration_list`, not directly on the
+/// struct node.
+fn embedded_types(type_node: &Node, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_embedded(type_node, source, &mut names);
+    names
+}
+
+fn collect_embedded(node: &Node, source: &str, names: &mut Vec<String>) {
+    if node.kind() == "field_declaration" {
+        if node.child_by_field_name("name").is_none() {
+            if let Some(ty) = node.child_by_field_name("type") {
+                names.push(get_text(&ty, source));
+            }
+        }
+        return;
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_embedded(&child, source, names);
+        }
+    }
 }
 
 /// Extracts package declaration.

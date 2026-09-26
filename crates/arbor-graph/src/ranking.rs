@@ -637,6 +637,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extends_edges_do_not_change_percentile() {
+        let mut graph = ArborGraph::new();
+        let caller = graph.add_node(CodeNode::new(
+            "caller",
+            "caller",
+            NodeKind::Function,
+            "a.py",
+        ));
+        let callee = graph.add_node(CodeNode::new(
+            "callee",
+            "callee",
+            NodeKind::Function,
+            "a.py",
+        ));
+        let base = graph.add_node(CodeNode::new("Base", "Base", NodeKind::Class, "a.py"));
+        let sub = graph.add_node(CodeNode::new("Sub", "Sub", NodeKind::Class, "a.py"));
+        graph.add_edge(caller, callee, Edge::new(EdgeKind::Calls));
+
+        let before = compute_centrality(&graph, 20, 0.85);
+        graph.add_edge(sub, base, Edge::new(EdgeKind::Extends));
+        let after = compute_centrality(&graph, 20, 0.85);
+
+        for idx in graph.node_indexes() {
+            assert!(
+                (before.get(idx) - after.get(idx)).abs() < 1e-12,
+                "extends must not move the percentile"
+            );
+            assert!(
+                (before.get_raw(idx) - after.get_raw(idx)).abs() < 1e-12,
+                "extends must not move raw PageRank mass"
+            );
+        }
+    }
+
     /// Builds a star: `spokes` callers all pointing at one hub.
     fn star(spokes: usize) -> (ArborGraph, NodeId) {
         let mut graph = ArborGraph::new();

@@ -222,6 +222,9 @@ impl ArborGraph {
     }
 
     /// Gets nodes that call the given node.
+    ///
+    /// Call edges only. A subclass does not call its base; that relationship
+    /// is an `extends` edge and is reported by [`direct_dependents`](Self::direct_dependents).
     pub fn get_callers(&self, index: NodeId) -> Vec<&CodeNode> {
         self.graph
             .neighbors_directed(index, petgraph::Direction::Incoming)
@@ -236,6 +239,37 @@ impl ArborGraph {
                 }
             })
             .collect()
+    }
+
+    /// Nodes that directly reach `index` by calling it, extending it, or
+    /// implementing it.
+    ///
+    /// PageRank still follows [`EdgeKind::Calls`] only. Blast radius and the
+    /// graded inheritance check need the type edges as well: a base with
+    /// subclasses is reached, even though nothing calls the class.
+    pub fn direct_dependents(&self, index: NodeId) -> Vec<&CodeNode> {
+        let mut seen = Vec::new();
+        let mut out = Vec::new();
+        for edge_ref in self
+            .graph
+            .edges_directed(index, petgraph::Direction::Incoming)
+        {
+            if !matches!(
+                edge_ref.weight().kind,
+                EdgeKind::Calls | EdgeKind::Extends | EdgeKind::Implements
+            ) {
+                continue;
+            }
+            let source = edge_ref.source();
+            if seen.contains(&source) {
+                continue;
+            }
+            seen.push(source);
+            if let Some(node) = self.graph.node_weight(source) {
+                out.push(node);
+            }
+        }
+        out
     }
 
     /// Gets nodes that this node calls.
@@ -613,6 +647,19 @@ mod tests {
         // No callers/callees for disconnected nodes
         assert!(g.get_callers(a).is_empty());
         assert!(g.get_callees(b).is_empty());
+    }
+
+    #[test]
+    fn direct_dependents_include_subclasses_and_not_callers_query() {
+        let mut g = ArborGraph::new();
+        let middle = g.add_node(make_node("Middle", "a.py"));
+        let base = g.add_node(make_node("Base", "a.py"));
+        g.add_edge(middle, base, Edge::new(EdgeKind::Extends));
+
+        assert!(g.get_callers(base).is_empty());
+        let dependents = g.direct_dependents(base);
+        assert_eq!(dependents.len(), 1);
+        assert_eq!(dependents[0].name, "Middle");
     }
 
     #[test]

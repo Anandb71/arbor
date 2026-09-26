@@ -7,8 +7,8 @@
 use crate::edge::{Edge, EdgeKind};
 use crate::graph::{ArborGraph, NodeId};
 use crate::symbol_table::SymbolTable;
-use arbor_core::{CodeNode, NodeKind};
-use std::collections::HashMap;
+use arbor_core::{clean_type_name, type_relation_ref, CodeNode, NodeKind, TypeRelationKind};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
@@ -153,6 +153,16 @@ impl GraphBuilder {
             let from_file_str = from_file.to_string_lossy().to_string();
 
             for reference in references {
+                // Inheritance is not a call. `extends:` / `implements:` and
+                // `self.method` / `super.method` are resolved in
+                // [`resolve_inheritance`](Self::resolve_inheritance), where an
+                // override can hide a base method. Falling through to a bare
+                // name here would attach the edge to the wrong definition.
+                if type_relation_ref(&reference).is_some() || receiver_method(&reference).is_some()
+                {
+                    continue;
+                }
+
                 // A leading `.` marks a call on a receiver whose type we could
                 // not determine (`userService.findOne()`). Resolve it by method
                 // name, but never let it claim the confidence of a real match.
@@ -310,9 +320,130 @@ impl GraphBuilder {
         base_confidence * 0.3
     }
 
+    /// Emits `extends` / `implements` edges and inherited-method reachability.
+    ///
+    /// A subclass reaches each base it names. A method the subclass does not
+    /// define is reachable from the subclass; an override blocks that path.
+    /// `self`/`this` calls bind to the nearest definition, including the
+    /// enclosing type. `super`/`base` calls start at the parents, so an
+    /// override that calls `super` still reaches the base method.
+    ///
+    /// These type edges are not `Calls`. PageRank stays on the call graph.
+    fn resolve_inheritance(&mut self) {
+        let indices: Vec<NodeId> = self.graph.node_indexes().collect();
+        let types = inherited_types(&self.graph, &indices);
+        let (methods_of, method_owner) = index_methods(&self.graph, &indices, &types);
+        let mut pending = Vec::new();
+        let parents = self.link_type_parents(&types, &mut pending);
+        link_inherited_methods(&types, &parents, &methods_of, &mut pending);
+        link_receiver_calls(
+            &self.graph,
+            &indices,
+            &method_owner,
+            &parents,
+            &methods_of,
+            &mut pending,
+        );
+        self.commit_inheritance_edges(pending);
+    }
+
+    /// Resolves each written base to a type node and records the parent list.
+    fn link_type_parents(
+        &self,
+        types: &[InheritedType],
+        pending: &mut Vec<PendingEdge>,
+    ) -> HashMap<NodeId, Vec<NodeId>> {
+        let mut parents: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for ty in types {
+            let file = PathBuf::from(&ty.file);
+            let mut resolved = Vec::new();
+            let relations = ty
+                .extends
+                .iter()
+                .map(|name| (TypeRelationKind::Extends, name))
+                .chain(
+                    ty.implements
+                        .iter()
+                        .map(|name| (TypeRelationKind::Implements, name)),
+                );
+            for (recorded, name) in relations {
+                let Some(target) = self.resolve_type_name(name, &file) else {
+                    continue;
+                };
+                if target == ty.id || resolved.contains(&target) {
+                    continue;
+                }
+                resolved.push(target);
+                pending.push(type_edge(self, ty, recorded, target));
+            }
+            if !resolved.is_empty() {
+                parents.insert(ty.id, resolved);
+            }
+        }
+        parents
+    }
+
+    fn commit_inheritance_edges(&mut self, pending: Vec<PendingEdge>) {
+        let mut seen: HashSet<(NodeId, NodeId, u8)> = HashSet::new();
+        for (from, to, kind, confidence) in pending {
+            if from == to || !seen.insert((from, to, edge_tag(kind))) {
+                continue;
+            }
+            self.graph
+                .add_edge(from, to, Edge::new(kind).with_confidence(confidence));
+        }
+    }
+
+    /// Resolves a base or interface name to one type node.
+    ///
+    /// A path like `pkg.Base` is tried whole, then as its last segment, so a
+    /// class recorded under the simple name `Base` still matches. Several
+    /// equally plausible types are dropped rather than guessed.
+    fn resolve_type_name(&self, name: &str, file: &Path) -> Option<NodeId> {
+        let file_str = file.to_string_lossy().to_string();
+        let imports = self.import_map.get(&file_str);
+        let mut candidates_names = vec![name.to_string()];
+        if let Some(last) = name.rsplit(['.', ':']).find(|segment| !segment.is_empty()) {
+            if last != name {
+                candidates_names.push(last.to_string());
+            }
+        }
+
+        for candidate in &candidates_names {
+            let resolution = self
+                .symbol_table
+                .resolve_ref_with_imports(candidate, file, imports);
+            let type_ids: Vec<NodeId> = resolution
+                .candidates()
+                .into_iter()
+                .filter(|id| {
+                    self.graph
+                        .get(*id)
+                        .is_some_and(|node| is_inheritable_type(node.kind))
+                })
+                .collect();
+            if type_ids.len() == 1 {
+                return Some(type_ids[0]);
+            }
+            let same_file: Vec<NodeId> = type_ids
+                .into_iter()
+                .filter(|id| {
+                    self.graph
+                        .get(*id)
+                        .is_some_and(|node| Path::new(&node.file) == file)
+                })
+                .collect();
+            if same_file.len() == 1 {
+                return Some(same_file[0]);
+            }
+        }
+        None
+    }
+
     /// Finishes building and returns the graph.
     pub fn build(mut self) -> ArborGraph {
         self.resolve_edges();
+        self.resolve_inheritance();
         self.graph
     }
 
@@ -322,10 +453,353 @@ impl GraphBuilder {
     }
 }
 
+struct InheritedType {
+    id: NodeId,
+    file: String,
+    /// Length of the raw qualified name. Tie-breaking uses this, not the cleaned form.
+    qualified_len: usize,
+    clean_name: String,
+    clean_qualified: String,
+    extends: Vec<String>,
+    implements: Vec<String>,
+}
+
+type PendingEdge = (NodeId, NodeId, EdgeKind, f32);
+
+fn inherited_types(graph: &ArborGraph, indices: &[NodeId]) -> Vec<InheritedType> {
+    let mut types = Vec::new();
+    for id in indices {
+        let Some(node) = graph.get(*id) else {
+            continue;
+        };
+        if !is_inheritable_type(node.kind) {
+            continue;
+        }
+        let mut extends = Vec::new();
+        let mut implements = Vec::new();
+        for reference in &node.references {
+            if let Some((kind, name)) = type_relation_ref(reference) {
+                match kind {
+                    TypeRelationKind::Extends => extends.push(name.to_string()),
+                    TypeRelationKind::Implements => implements.push(name.to_string()),
+                }
+            }
+        }
+        types.push(InheritedType {
+            id: *id,
+            file: node.file.clone(),
+            qualified_len: node.qualified_name.len(),
+            clean_name: clean_type_name(&node.name),
+            clean_qualified: clean_type_name(&node.qualified_name),
+            extends,
+            implements,
+        });
+    }
+    types
+}
+
+fn index_methods(
+    graph: &ArborGraph,
+    indices: &[NodeId],
+    types: &[InheritedType],
+) -> (
+    HashMap<NodeId, BTreeMap<String, NodeId>>,
+    HashMap<NodeId, NodeId>,
+) {
+    let mut types_by_file: HashMap<&str, Vec<&InheritedType>> = HashMap::new();
+    for ty in types {
+        types_by_file.entry(ty.file.as_str()).or_default().push(ty);
+    }
+
+    let mut methods_of: HashMap<NodeId, BTreeMap<String, NodeId>> = HashMap::new();
+    let mut method_owner: HashMap<NodeId, NodeId> = HashMap::new();
+    for id in indices {
+        let Some(node) = graph.get(*id) else {
+            continue;
+        };
+        if node.kind != NodeKind::Method {
+            continue;
+        }
+        let Some((parent, method_name)) = split_owner(&node.qualified_name) else {
+            continue;
+        };
+        let parent = clean_type_name(parent);
+        if parent.is_empty() || method_name.is_empty() {
+            continue;
+        }
+        let Some(file_types) = types_by_file.get(node.file.as_str()) else {
+            continue;
+        };
+        let owners: Vec<NodeId> = file_types
+            .iter()
+            .filter(|ty| ty.clean_name == parent || ty.clean_qualified == parent)
+            .map(|ty| ty.id)
+            .collect();
+        let Some(owner) = unique_owner(&owners, |id| {
+            file_types
+                .iter()
+                .find(|ty| ty.id == id)
+                .map(|ty| ty.qualified_len)
+                .unwrap_or(0)
+        }) else {
+            continue;
+        };
+        methods_of
+            .entry(owner)
+            .or_default()
+            .entry(method_name.to_string())
+            .or_insert(*id);
+        method_owner.insert(*id, owner);
+    }
+    (methods_of, method_owner)
+}
+
+fn type_edge(
+    builder: &GraphBuilder,
+    ty: &InheritedType,
+    recorded: TypeRelationKind,
+    target: NodeId,
+) -> PendingEdge {
+    let target_kind = builder.graph.get(target).map(|node| node.kind);
+    let edge_kind = match (recorded, target_kind) {
+        (TypeRelationKind::Implements, _) | (_, Some(NodeKind::Interface)) => EdgeKind::Implements,
+        _ => EdgeKind::Extends,
+    };
+    let same_file = builder
+        .graph
+        .get(target)
+        .is_some_and(|node| node.file == ty.file);
+    let confidence = if same_file { 0.95 } else { 0.85 };
+    (ty.id, target, edge_kind, confidence)
+}
+
+fn link_inherited_methods(
+    types: &[InheritedType],
+    parents: &HashMap<NodeId, Vec<NodeId>>,
+    methods_of: &HashMap<NodeId, BTreeMap<String, NodeId>>,
+    pending: &mut Vec<PendingEdge>,
+) {
+    for ty in types {
+        let own = methods_of.get(&ty.id);
+        for (name, method_id) in inherited_methods(ty.id, parents, methods_of) {
+            if own.and_then(|methods| methods.get(&name)).is_some() {
+                continue;
+            }
+            pending.push((ty.id, method_id, EdgeKind::References, 0.9));
+        }
+    }
+}
+
+fn link_receiver_calls(
+    graph: &ArborGraph,
+    indices: &[NodeId],
+    method_owner: &HashMap<NodeId, NodeId>,
+    parents: &HashMap<NodeId, Vec<NodeId>>,
+    methods_of: &HashMap<NodeId, BTreeMap<String, NodeId>>,
+    pending: &mut Vec<PendingEdge>,
+) {
+    for id in indices {
+        let Some(node) = graph.get(*id) else {
+            continue;
+        };
+        if node.kind != NodeKind::Method {
+            continue;
+        }
+        let Some(&owner) = method_owner.get(id) else {
+            continue;
+        };
+        for reference in &node.references {
+            let Some((is_super, method_name)) = receiver_method(reference) else {
+                continue;
+            };
+            let Some(target) = nearest_method(owner, method_name, is_super, parents, methods_of)
+            else {
+                continue;
+            };
+            if target != *id {
+                pending.push((*id, target, EdgeKind::Calls, 0.95));
+            }
+        }
+    }
+}
+
+fn is_inheritable_type(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Class | NodeKind::Struct | NodeKind::Interface | NodeKind::Enum
+    )
+}
+
+/// `Class.method` or `Class::method` → `("Class", "method")`.
+///
+/// When both separators appear, the later one wins, so `mod.Class::method`
+/// is `("mod.Class", "method")`.
+fn split_owner(qualified: &str) -> Option<(&str, &str)> {
+    let dot = qualified.rfind('.');
+    let colon = qualified.rfind("::");
+    match (dot, colon) {
+        (Some(dot_at), Some(colon_at)) if colon_at > dot_at => {
+            Some((&qualified[..colon_at], &qualified[colon_at + 2..]))
+        }
+        (Some(dot_at), _) => Some((&qualified[..dot_at], &qualified[dot_at + 1..])),
+        (None, Some(colon_at)) => Some((&qualified[..colon_at], &qualified[colon_at + 2..])),
+        (None, None) => None,
+    }
+}
+
+fn unique_owner(owners: &[NodeId], qualified_len: impl Fn(NodeId) -> usize) -> Option<NodeId> {
+    match owners {
+        [] => None,
+        [only] => Some(*only),
+        _ => {
+            let mut best_len = 0usize;
+            let mut best: Option<NodeId> = None;
+            let mut tied = false;
+            for id in owners {
+                let len = qualified_len(*id);
+                if len > best_len {
+                    best_len = len;
+                    best = Some(*id);
+                    tied = false;
+                } else if len == best_len {
+                    tied = true;
+                }
+            }
+            if tied {
+                None
+            } else {
+                best
+            }
+        }
+    }
+}
+
+/// Breadth-first, nearest base wins. This approximates C3 linearization and
+/// agrees with it for single inheritance and simple diamonds.
+fn inherited_methods(
+    start: NodeId,
+    parents: &HashMap<NodeId, Vec<NodeId>>,
+    methods_of: &HashMap<NodeId, BTreeMap<String, NodeId>>,
+) -> BTreeMap<String, NodeId> {
+    let mut found = BTreeMap::new();
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::new();
+    if let Some(bases) = parents.get(&start) {
+        queue.extend(bases.iter().copied());
+    }
+    while let Some(current) = queue.pop_front() {
+        if !seen.insert(current) {
+            continue;
+        }
+        if let Some(methods) = methods_of.get(&current) {
+            for (name, id) in methods {
+                found.entry(name.clone()).or_insert(*id);
+            }
+        }
+        if let Some(bases) = parents.get(&current) {
+            for base in bases {
+                if !seen.contains(base) {
+                    queue.push_back(*base);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Same nearest-base walk as [`inherited_methods`].
+fn nearest_method(
+    start: NodeId,
+    name: &str,
+    skip_self: bool,
+    parents: &HashMap<NodeId, Vec<NodeId>>,
+    methods_of: &HashMap<NodeId, BTreeMap<String, NodeId>>,
+) -> Option<NodeId> {
+    let own = if skip_self {
+        None
+    } else {
+        methods_of.get(&start).and_then(|methods| methods.get(name))
+    };
+    if let Some(id) = own {
+        return Some(*id);
+    }
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::new();
+    if let Some(bases) = parents.get(&start) {
+        queue.extend(bases.iter().copied());
+    }
+    while let Some(current) = queue.pop_front() {
+        if !seen.insert(current) {
+            continue;
+        }
+        if let Some(id) = methods_of
+            .get(&current)
+            .and_then(|methods| methods.get(name))
+        {
+            return Some(*id);
+        }
+        if let Some(bases) = parents.get(&current) {
+            for base in bases {
+                if !seen.contains(base) {
+                    queue.push_back(*base);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `self.compute` / `this.compute` search from the enclosing type.
+/// `super().compute` / `super.compute` / `base.compute` start at the parents.
+fn receiver_method(reference: &str) -> Option<(bool, &str)> {
+    const SUPER_PREFIXES: &[&str] = &["super().", "super.", "base."];
+    const SAME_PREFIXES: &[&str] = &["self.", "this->", "this.", "Self::"];
+    let reference = reference.trim();
+    for prefix in SUPER_PREFIXES {
+        if let Some(method) = reference.strip_prefix(prefix) {
+            if is_plain_method(method) {
+                return Some((true, method));
+            }
+        }
+    }
+    for prefix in SAME_PREFIXES {
+        if let Some(method) = reference.strip_prefix(prefix) {
+            if is_plain_method(method) {
+                return Some((false, method));
+            }
+        }
+    }
+    None
+}
+
+fn is_plain_method(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+fn edge_tag(kind: EdgeKind) -> u8 {
+    match kind {
+        EdgeKind::Calls => 1,
+        EdgeKind::Extends => 2,
+        EdgeKind::Implements => 3,
+        EdgeKind::References => 4,
+        EdgeKind::Imports => 5,
+        EdgeKind::UsesType => 6,
+        EdgeKind::Contains => 7,
+        EdgeKind::FlowsTo => 8,
+        EdgeKind::DataDependency => 9,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arbor_core::NodeKind;
+    use petgraph::visit::{EdgeRef, IntoEdgeReferences};
 
     #[test]
     fn test_builder_adds_nodes() {
@@ -653,6 +1127,200 @@ mod tests {
         assert_eq!(
             callees[0].qualified_name, "MathUtils.add",
             "static call must resolve to the qualified class, not a same-named sibling"
+        );
+    }
+
+    fn kinds_between(graph: &ArborGraph, from_q: &str, to_q: &str) -> Vec<EdgeKind> {
+        let mut kinds = Vec::new();
+        for edge in graph.graph.edge_references() {
+            let source = graph.get(edge.source()).unwrap();
+            let target = graph.get(edge.target()).unwrap();
+            if source.qualified_name == from_q && target.qualified_name == to_q {
+                kinds.push(edge.weight().kind);
+            }
+        }
+        kinds
+    }
+
+    fn inheritance_fixture() -> ArborGraph {
+        let file = "hard/inheritance.py";
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            CodeNode::new("Base", "Base", NodeKind::Class, file),
+            CodeNode::new("compute", "Base.compute", NodeKind::Method, file),
+            CodeNode::new("shared", "Base.shared", NodeKind::Method, file),
+            CodeNode::new("Middle", "Middle", NodeKind::Class, file).with_extends(["Base"]),
+            CodeNode::new("compute", "Middle.compute", NodeKind::Method, file)
+                .with_references(vec!["super().compute".to_string()]),
+            CodeNode::new("Derived", "Derived", NodeKind::Class, file).with_extends(["Middle"]),
+            CodeNode::new("shared", "Derived.shared", NodeKind::Method, file),
+            CodeNode::new("Leaf", "Leaf", NodeKind::Class, file).with_extends(["Derived"]),
+            CodeNode::new("run", "Leaf.run", NodeKind::Method, file).with_references(vec![
+                "self.compute".to_string(),
+                "self.shared".to_string(),
+                "len".to_string(),
+            ]),
+            // Same simple name, no superclass. Must not become an extender.
+            CodeNode::new("UserService", "UserService", NodeKind::Class, file),
+        ]);
+        b.build()
+    }
+
+    #[test]
+    fn subclass_extends_its_base() {
+        let graph = inheritance_fixture();
+        assert_eq!(
+            kinds_between(&graph, "Middle", "Base"),
+            vec![EdgeKind::Extends]
+        );
+        assert_eq!(
+            kinds_between(&graph, "Derived", "Middle"),
+            vec![EdgeKind::Extends]
+        );
+        assert_eq!(
+            kinds_between(&graph, "Leaf", "Derived"),
+            vec![EdgeKind::Extends]
+        );
+        assert!(
+            kinds_between(&graph, "UserService", "Base").is_empty(),
+            "a class with no base is not an extender"
+        );
+
+        let base = graph
+            .node_indexes()
+            .find(|&id| graph.get(id).unwrap().qualified_name == "Base")
+            .unwrap();
+        let reachers: Vec<_> = graph
+            .direct_dependents(base)
+            .into_iter()
+            .map(|node| node.qualified_name.as_str())
+            .collect();
+        assert!(
+            reachers.contains(&"Middle"),
+            "Base is reached by Middle, got {reachers:?}"
+        );
+        assert!(graph.get_callers(base).is_empty(), "extends is not a call");
+    }
+
+    #[test]
+    fn inherited_method_reaches_the_defining_class_until_overridden() {
+        let graph = inheritance_fixture();
+
+        // Leaf.run's self.compute binds to Middle.compute, not Base.compute.
+        assert_eq!(
+            kinds_between(&graph, "Leaf.run", "Middle.compute"),
+            vec![EdgeKind::Calls]
+        );
+        assert!(kinds_between(&graph, "Leaf.run", "Base.compute").is_empty());
+
+        // super() in the override still reaches the base method.
+        assert_eq!(
+            kinds_between(&graph, "Middle.compute", "Base.compute"),
+            vec![EdgeKind::Calls]
+        );
+
+        // Leaf inherits compute from Middle (the nearest definition).
+        assert_eq!(
+            kinds_between(&graph, "Leaf", "Middle.compute"),
+            vec![EdgeKind::References]
+        );
+        assert!(kinds_between(&graph, "Leaf", "Base.compute").is_empty());
+
+        // Derived overrides shared, so neither Derived nor Leaf reaches Base.shared.
+        assert!(kinds_between(&graph, "Derived", "Base.shared").is_empty());
+        assert!(kinds_between(&graph, "Leaf", "Base.shared").is_empty());
+        assert_eq!(
+            kinds_between(&graph, "Leaf.run", "Derived.shared"),
+            vec![EdgeKind::Calls]
+        );
+        assert!(kinds_between(&graph, "Leaf.run", "Base.shared").is_empty());
+
+        // Middle does not override shared, so it reaches Base.shared.
+        assert_eq!(
+            kinds_between(&graph, "Middle", "Base.shared"),
+            vec![EdgeKind::References]
+        );
+
+        let base_compute = graph
+            .node_indexes()
+            .find(|&id| graph.get(id).unwrap().qualified_name == "Base.compute")
+            .unwrap();
+        let impact = graph.analyze_impact(base_compute, 5);
+        let upstream: Vec<_> = impact
+            .upstream
+            .iter()
+            .map(|node| node.node_info.qualified_name.as_str())
+            .collect();
+        assert!(
+            upstream.contains(&"Leaf"),
+            "changing Base.compute must reach Leaf, got {upstream:?}"
+        );
+
+        let base_shared = graph
+            .node_indexes()
+            .find(|&id| graph.get(id).unwrap().qualified_name == "Base.shared")
+            .unwrap();
+        let shared_impact = graph.analyze_impact(base_shared, 5);
+        let direct: Vec<_> = shared_impact
+            .direct_only()
+            .into_iter()
+            .map(|node| node.node_info.qualified_name.clone())
+            .collect();
+        assert!(
+            direct.iter().any(|name| name == "Middle"),
+            "Middle inherits shared, got {direct:?}"
+        );
+        assert!(
+            direct
+                .iter()
+                .all(|name| name != "Derived" && name != "Leaf" && name != "Leaf.run"),
+            "Derived's override must not make Base.shared a direct dependency, got {direct:?}"
+        );
+    }
+
+    #[test]
+    fn diamond_inherits_the_nearest_override() {
+        let file = "diamond.py";
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            CodeNode::new("A", "A", NodeKind::Class, file),
+            CodeNode::new("f", "A.f", NodeKind::Method, file),
+            CodeNode::new("B", "B", NodeKind::Class, file).with_extends(["A"]),
+            CodeNode::new("C", "C", NodeKind::Class, file).with_extends(["A"]),
+            CodeNode::new("f", "C.f", NodeKind::Method, file),
+            CodeNode::new("D", "D", NodeKind::Class, file).with_extends(["B", "C"]),
+        ]);
+        let graph = b.build();
+        assert_eq!(
+            kinds_between(&graph, "D", "C.f"),
+            vec![EdgeKind::References],
+            "D(B, C) sees C.f before A.f"
+        );
+        assert!(kinds_between(&graph, "D", "A.f").is_empty());
+    }
+
+    #[test]
+    fn super_stops_at_the_intermediate_override() {
+        let file = "super_chain.py";
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            CodeNode::new("A", "A", NodeKind::Class, file),
+            CodeNode::new("foo", "A.foo", NodeKind::Method, file),
+            CodeNode::new("B", "B", NodeKind::Class, file).with_extends(["A"]),
+            CodeNode::new("foo", "B.foo", NodeKind::Method, file),
+            CodeNode::new("C", "C", NodeKind::Class, file).with_extends(["B"]),
+            CodeNode::new("foo", "C.foo", NodeKind::Method, file)
+                .with_references(vec!["super().foo".to_string()]),
+        ]);
+        let graph = b.build();
+        assert_eq!(
+            kinds_between(&graph, "C.foo", "B.foo"),
+            vec![EdgeKind::Calls],
+            "super() in C must reach B's override"
+        );
+        assert!(
+            kinds_between(&graph, "C.foo", "A.foo").is_empty(),
+            "super() must not skip B and land on A"
         );
     }
 }

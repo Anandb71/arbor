@@ -102,8 +102,6 @@ Written down rather than left to be discovered:
 
 - Small targets now **over**-report (36 → 61, 16 → 46). Safer direction than
   silence, but not yet correct.
-- Inheritance produces no edges. `class Middle(Base)` is invisible, so changing
-  a base class shows zero blast radius.
 - Dynamic and reflective imports (`importlib`, `__import__`, `import()`,
   `eval(require(...))`) are unresolvable by construction and are documented as
   expected misses in the fixture rather than counted as defects.
@@ -405,6 +403,10 @@ cargo clippy --workspace --all-targets --all-features
     <a href="https://github.com/sathguru07" title="sathguru07" style="text-decoration:none; margin:6px; display:inline-block;">
         <img src="https://avatars.githubusercontent.com/u/182798669?v=4" alt="sathguru07" width="72" height="72" loading="lazy" style="border-radius:50%; border:2px solid #30363d; box-sizing:border-box;" />
   </a>
+   <a href="https://github.com/JunaidAhamed-7777" title="Junaid" style="text-decoration:none; margin:6px; display:inline-block;">
+        <img src="https://avatars.githubusercontent.com/u/182413980?v=4" alt="Junaid" width="72" height="72" loading="lazy" style="border-radius:50%; border:2px solid #30363d; box-sizing:border-box;" />
+  </a>
+  
 </p>
 <p align="center"><sub><strong>7 contributors</strong> | <a href="https://github.com/Anandb71/arbor/graphs/contributors">View all</a></sub></p>
 
