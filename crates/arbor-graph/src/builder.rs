@@ -631,11 +631,20 @@ fn is_inheritable_type(kind: NodeKind) -> bool {
 }
 
 /// `Class.method` or `Class::method` → `("Class", "method")`.
+///
+/// When both separators appear, the later one wins, so `mod.Class::method`
+/// is `("mod.Class", "method")`.
 fn split_owner(qualified: &str) -> Option<(&str, &str)> {
-    if let Some((parent, method)) = qualified.rsplit_once('.') {
-        return Some((parent, method));
+    let dot = qualified.rfind('.');
+    let colon = qualified.rfind("::");
+    match (dot, colon) {
+        (Some(dot_at), Some(colon_at)) if colon_at > dot_at => {
+            Some((&qualified[..colon_at], &qualified[colon_at + 2..]))
+        }
+        (Some(dot_at), _) => Some((&qualified[..dot_at], &qualified[dot_at + 1..])),
+        (None, Some(colon_at)) => Some((&qualified[..colon_at], &qualified[colon_at + 2..])),
+        (None, None) => None,
     }
-    qualified.rsplit_once("::")
 }
 
 fn unique_owner(owners: &[NodeId], qualified_len: impl Fn(NodeId) -> usize) -> Option<NodeId> {
