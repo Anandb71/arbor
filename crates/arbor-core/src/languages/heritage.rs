@@ -8,11 +8,18 @@
 use crate::node::clean_type_name;
 use tree_sitter::Node;
 
+/// Which heritage clause the walker is currently inside.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Clause {
+    Extends,
+    Implements,
+}
+
 /// Superclass names and interface names declared on `type_node`.
 pub(crate) fn clause_bases(type_node: &Node, source: &str) -> (Vec<String>, Vec<String>) {
     let mut extends = Vec::new();
     let mut implements = Vec::new();
-    let mut mode: Option<bool> = None; // Some(true) = extends, Some(false) = implements
+    let mut mode: Option<Clause> = None;
     walk(
         type_node,
         source,
@@ -31,7 +38,7 @@ fn walk(
     source: &str,
     extends: &mut Vec<String>,
     implements: &mut Vec<String>,
-    mode: &mut Option<bool>,
+    mode: &mut Option<Clause>,
     at_type_root: bool,
 ) {
     for i in 0..node.child_count() {
@@ -48,12 +55,12 @@ fn walk(
 
         if is_extends_clause(kind) {
             collect_type_names(&child, source, extends);
-            *mode = Some(true);
+            *mode = Some(Clause::Extends);
             continue;
         }
         if is_implements_clause(kind) {
             collect_type_names(&child, source, implements);
-            *mode = Some(false);
+            *mode = Some(Clause::Implements);
             continue;
         }
         // C# `base_list` and C++ `base_class_clause` hold the parent types
@@ -61,7 +68,7 @@ fn walk(
         // switch modes. Interface targets are reclassified when the edge is built.
         if kind == "base_list" || kind == "base_class_clause" {
             collect_type_names(&child, source, extends);
-            *mode = Some(true);
+            *mode = Some(Clause::Extends);
             continue;
         }
         if kind == "class_heritage" {
@@ -73,20 +80,19 @@ fn walk(
             let text = child_text(&child, source);
             match text {
                 // `with` is a mixin: inherited implementation, same direction as extends.
-                "extends" | ":" | "with" => *mode = Some(true),
-                "implements" => *mode = Some(false),
+                "extends" | ":" | "with" => *mode = Some(Clause::Extends),
+                "implements" => *mode = Some(Clause::Implements),
                 _ => {}
             }
             continue;
         }
 
         if is_type_node(kind) {
-            if let Some(extends_mode) = *mode {
+            if let Some(clause) = *mode {
                 if let Some(name) = type_name_of(&child, source) {
-                    if extends_mode {
-                        extends.push(name);
-                    } else {
-                        implements.push(name);
+                    match clause {
+                        Clause::Extends => extends.push(name),
+                        Clause::Implements => implements.push(name),
                     }
                 }
             }
