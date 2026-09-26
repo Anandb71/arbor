@@ -665,6 +665,8 @@ fn unique_owner(owners: &[NodeId], qualified_len: impl Fn(NodeId) -> usize) -> O
     }
 }
 
+/// Breadth-first, nearest base wins. This approximates C3 linearization and
+/// agrees with it for single inheritance and simple diamonds.
 fn inherited_methods(
     start: NodeId,
     parents: &HashMap<NodeId, Vec<NodeId>>,
@@ -696,6 +698,7 @@ fn inherited_methods(
     found
 }
 
+/// Same nearest-base walk as [`inherited_methods`].
 fn nearest_method(
     start: NodeId,
     name: &str,
