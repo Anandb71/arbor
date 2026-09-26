@@ -456,8 +456,10 @@ impl GraphBuilder {
 struct InheritedType {
     id: NodeId,
     file: String,
-    name: String,
-    qualified: String,
+    /// Length of the raw qualified name. Tie-breaking uses this, not the cleaned form.
+    qualified_len: usize,
+    clean_name: String,
+    clean_qualified: String,
     extends: Vec<String>,
     implements: Vec<String>,
 }
@@ -486,8 +488,9 @@ fn inherited_types(graph: &ArborGraph, indices: &[NodeId]) -> Vec<InheritedType>
         types.push(InheritedType {
             id: *id,
             file: node.file.clone(),
-            name: node.name.clone(),
-            qualified: node.qualified_name.clone(),
+            qualified_len: node.qualified_name.len(),
+            clean_name: clean_type_name(&node.name),
+            clean_qualified: clean_type_name(&node.qualified_name),
             extends,
             implements,
         });
@@ -503,6 +506,11 @@ fn index_methods(
     HashMap<NodeId, BTreeMap<String, NodeId>>,
     HashMap<NodeId, NodeId>,
 ) {
+    let mut types_by_file: HashMap<&str, Vec<&InheritedType>> = HashMap::new();
+    for ty in types {
+        types_by_file.entry(ty.file.as_str()).or_default().push(ty);
+    }
+
     let mut methods_of: HashMap<NodeId, BTreeMap<String, NodeId>> = HashMap::new();
     let mut method_owner: HashMap<NodeId, NodeId> = HashMap::new();
     for id in indices {
@@ -519,20 +527,19 @@ fn index_methods(
         if parent.is_empty() || method_name.is_empty() {
             continue;
         }
-        let owners: Vec<NodeId> = types
+        let Some(file_types) = types_by_file.get(node.file.as_str()) else {
+            continue;
+        };
+        let owners: Vec<NodeId> = file_types
             .iter()
-            .filter(|ty| {
-                ty.file == node.file
-                    && (clean_type_name(&ty.name) == parent
-                        || clean_type_name(&ty.qualified) == parent)
-            })
+            .filter(|ty| ty.clean_name == parent || ty.clean_qualified == parent)
             .map(|ty| ty.id)
             .collect();
         let Some(owner) = unique_owner(&owners, |id| {
-            types
+            file_types
                 .iter()
                 .find(|ty| ty.id == id)
-                .map(|ty| ty.qualified.len())
+                .map(|ty| ty.qualified_len)
                 .unwrap_or(0)
         }) else {
             continue;
