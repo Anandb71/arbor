@@ -393,6 +393,9 @@ cargo clippy --workspace --all-targets --all-features
     <a href="https://github.com/cabinlab" title="cabinlab" style="text-decoration:none; margin:6px; display:inline-block;">
         <img src="https://avatars.githubusercontent.com/u/66889299?v=4" alt="cabinlab" width="72" height="72" loading="lazy" style="border-radius:50%; border:2px solid #30363d; box-sizing:border-box;" />
   </a>
+    <a href="https://github.com/JunaidAhamed-7777" title="JunaidAhamed-7777" style="text-decoration:none; margin:6px; display:inline-block;">
+        <img src="https://avatars.githubusercontent.com/u/182413980?v=4" alt="JunaidAhamed-7777" width="72" height="72" loading="lazy" style="border-radius:50%; border:2px solid #30363d; box-sizing:border-box;" />
+  </a>
     <a href="https://github.com/Karthiksenthilkumar1" title="Karthiksenthilkumar1" style="text-decoration:none; margin:6px; display:inline-block;">
         <img src="https://avatars.githubusercontent.com/u/182195883?v=4" alt="Karthiksenthilkumar1" width="72" height="72" loading="lazy" style="border-radius:50%; border:2px solid #30363d; box-sizing:border-box;" />
   </a>
@@ -405,8 +408,11 @@ cargo clippy --workspace --all-targets --all-features
     <a href="https://github.com/sathguru07" title="sathguru07" style="text-decoration:none; margin:6px; display:inline-block;">
         <img src="https://avatars.githubusercontent.com/u/182798669?v=4" alt="sathguru07" width="72" height="72" loading="lazy" style="border-radius:50%; border:2px solid #30363d; box-sizing:border-box;" />
   </a>
+    <a href="https://github.com/w0wl0lxd" title="w0wl0lxd" style="text-decoration:none; margin:6px; display:inline-block;">
+        <img src="https://avatars.githubusercontent.com/u/199849635?v=4" alt="w0wl0lxd" width="72" height="72" loading="lazy" style="border-radius:50%; border:2px solid #30363d; box-sizing:border-box;" />
+  </a>
 </p>
-<p align="center"><sub><strong>7 contributors</strong> | <a href="https://github.com/Anandb71/arbor/graphs/contributors">View all</a></sub></p>
+<p align="center"><sub><strong>9 contributors</strong> | <a href="https://github.com/Anandb71/arbor/graphs/contributors">View all</a></sub></p>
 
 <!-- CONTRIBUTORS:END -->
 
