@@ -400,6 +400,10 @@ cargo clippy --workspace --all-targets --all-features
     <a href="https://github.com/sathguru07" title="sathguru07" style="text-decoration:none; margin:6px; display:inline-block;">
         <img src="https://avatars.githubusercontent.com/u/182798669?v=4" alt="sathguru07" width="72" height="72" loading="lazy" style="border-radius:50%; border:2px solid #30363d; box-sizing:border-box;" />
   </a>
+   <a href="https://github.com/JunaidAhamed-7777" title="Junaid" style="text-decoration:none; margin:6px; display:inline-block;">
+        <img src="https://avatars.githubusercontent.com/u/182413980?v=4" alt="Junaid" width="72" height="72" loading="lazy" style="border-radius:50%; border:2px solid #30363d; box-sizing:border-box;" />
+  </a>
+  
 </p>
 <p align="center"><sub><strong>7 contributors</strong> | <a href="https://github.com/Anandb71/arbor/graphs/contributors">View all</a></sub></p>
 
