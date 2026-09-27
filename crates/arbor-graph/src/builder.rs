@@ -265,16 +265,13 @@ impl GraphBuilder {
         }
     }
 
-    /// Downgrades (rather than drops) an edge whose name is not imported.
+    /// Decides whether a resolved reference may become an edge.
     ///
-    /// If the referencing file declares imports and this bare name is not among
-    /// them, a cross-module match is probably a same-name coincidence. The old
-    /// behaviour dropped such edges unless the target was in the same directory
-    /// — which meant that in a flat `src/` layout, the common case for JS and
-    /// Python projects, the check never fired at all. Confidence-weighting
-    /// applies the same suspicion uniformly instead of exempting whole layouts.
+    /// Python bare names are file-scoped: a cross-file call is kept only when
+    /// this file defines the name or its import map contains that local name
+    /// (or `*`). Other languages keep the confidence downgrade.
     ///
-    /// Returns `0.0` to drop the edge entirely.
+    /// Dotted references are not bare-name visibility. Returns `0.0` to drop.
     fn apply_import_validation(
         &self,
         reference: &str,
@@ -283,10 +280,24 @@ impl GraphBuilder {
         to_idx: NodeId,
         base_confidence: f32,
     ) -> f32 {
+        if reference.contains('.') {
+            return base_confidence;
+        }
+
+        if bare_name_requires_import(from_file) {
+            return self.validate_bare_import_visibility(
+                reference,
+                from_file,
+                from_file_str,
+                to_idx,
+                base_confidence,
+            );
+        }
+
         let Some(file_imports) = self.import_map.get(from_file_str) else {
             return base_confidence;
         };
-        if file_imports.is_empty() || reference.contains('.') {
+        if file_imports.is_empty() {
             return base_confidence;
         }
         if file_imports.contains_key(reference) {
@@ -318,6 +329,46 @@ impl GraphBuilder {
             to_file.display()
         );
         base_confidence * 0.3
+    }
+
+    /// Drops a bare cross-file name the caller cannot see.
+    ///
+    /// Same-file definitions stay. An import-map entry for the local name stays,
+    /// boosted the same way an explicit import always was. `*` (`from m import *`)
+    /// stays at the resolution's own confidence, because the map does not say
+    /// which names the star brought in.
+    fn validate_bare_import_visibility(
+        &self,
+        reference: &str,
+        from_file: &Path,
+        from_file_str: &str,
+        to_idx: NodeId,
+        base_confidence: f32,
+    ) -> f32 {
+        let Some(to_node) = self.graph.get(to_idx) else {
+            return 0.0;
+        };
+        let to_file = PathBuf::from(&to_node.file);
+        if to_file == from_file {
+            return base_confidence;
+        }
+
+        if let Some(file_imports) = self.import_map.get(from_file_str) {
+            if file_imports.contains_key(reference) {
+                return base_confidence.max(0.95);
+            }
+            if file_imports.contains_key("*") {
+                return base_confidence;
+            }
+        }
+
+        debug!(
+            "Dropping unimported cross-file reference '{}' in {} → {}",
+            reference,
+            from_file.display(),
+            to_file.display()
+        );
+        0.0
     }
 
     /// Emits `extends` / `implements` edges and inherited-method reachability.
@@ -456,8 +507,7 @@ impl GraphBuilder {
 /// Languages whose parsers record imported local names.
 ///
 /// A bare call in one of these files is visible only when the file defines
-/// the name or imports it. Not consulted by edge resolution yet.
-#[allow(dead_code)]
+/// the name or imports it.
 fn bare_name_requires_import(file: &Path) -> bool {
     let Some(ext) = file.extension().and_then(|ext| ext.to_str()) else {
         return false;
@@ -995,8 +1045,7 @@ mod tests {
     }
 
     #[test]
-    fn colliding_symbols_both_remain_reachable() {
-        // The old table overwrote one of these, orphaning it with zero callers.
+    fn unimported_python_bare_call_links_neither_definition() {
         let mut b = GraphBuilder::new();
         let caller = CodeNode::new("main", "main", NodeKind::Function, "src/main.py")
             .with_references(vec!["process".to_string()]);
@@ -1015,14 +1064,12 @@ mod tests {
         )]);
         let graph = b.build();
 
-        // Both candidates are linked, each flagged as uncertain.
-        assert_eq!(graph.edge_count(), 2);
-        for weight in graph.graph.edge_weights() {
-            assert!(
-                !weight.is_confident(),
-                "ambiguous resolution must not claim certainty"
-            );
-        }
+        assert_eq!(graph.node_count(), 3, "both definitions stay in the graph");
+        assert_eq!(
+            graph.edge_count(),
+            0,
+            "an unimported bare call links to neither"
+        );
     }
 
     #[test]
@@ -1335,6 +1382,243 @@ mod tests {
             kinds_between(&graph, "C.foo", "A.foo").is_empty(),
             "super() must not skip B and land on A"
         );
+    }
+
+    #[test]
+    fn python_unimported_len_has_no_callers() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![CodeNode::new(
+            "len",
+            "len",
+            NodeKind::Function,
+            "hard/stdlib_shadow.py",
+        )]);
+        b.add_nodes(vec![CodeNode::new(
+            "process",
+            "process",
+            NodeKind::Function,
+            "hard/shadowed.py",
+        )
+        .with_references(vec!["len".to_string()])]);
+        let import = CodeNode::new(
+            "app.core.db",
+            "app.core.db",
+            NodeKind::Import,
+            "app/services/auth.py",
+        )
+        .with_references(vec!["connect".to_string()]);
+        let verify = CodeNode::new(
+            "verify_token",
+            "verify_token",
+            NodeKind::Function,
+            "app/services/auth.py",
+        )
+        .with_references(vec!["len".to_string()]);
+        b.add_nodes(vec![import, verify]);
+        let graph = b.build();
+
+        assert!(
+            callers_of(&graph, "len", "stdlib_shadow.py").is_empty(),
+            "a user len must not absorb builtin-shaped calls"
+        );
+    }
+
+    #[test]
+    fn python_local_len_binds_to_its_own_definition() {
+        let mut b = GraphBuilder::new();
+        let len_def = CodeNode::new("len", "len", NodeKind::Function, "hard/stdlib_shadow.py");
+        let uses = CodeNode::new(
+            "uses_len",
+            "uses_len",
+            NodeKind::Function,
+            "hard/stdlib_shadow.py",
+        )
+        .with_references(vec!["len".to_string()]);
+        b.add_nodes(vec![len_def, uses]);
+        let graph = b.build();
+
+        let callers = callers_of(&graph, "len", "stdlib_shadow.py");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].name, "uses_len");
+    }
+
+    #[test]
+    fn python_imported_len_binds_to_the_imported_definition() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![CodeNode::new(
+            "len",
+            "len",
+            NodeKind::Function,
+            "hard/stdlib_shadow.py",
+        )]);
+        let import = CodeNode::new(
+            "hard.stdlib_shadow",
+            "hard.stdlib_shadow",
+            NodeKind::Import,
+            "app/caller.py",
+        )
+        .with_references(vec!["len".to_string()]);
+        let caller = CodeNode::new("use", "use", NodeKind::Function, "app/caller.py")
+            .with_references(vec!["len".to_string()]);
+        b.add_nodes(vec![import, caller]);
+        let graph = b.build();
+
+        let callers = callers_of(&graph, "len", "stdlib_shadow.py");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].name, "use");
+    }
+
+    #[test]
+    fn python_star_import_keeps_a_bare_cross_file_call() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![CodeNode::new(
+            "len",
+            "len",
+            NodeKind::Function,
+            "hard/stdlib_shadow.py",
+        )]);
+        let import = CodeNode::new("helpers", "helpers", NodeKind::Import, "app/caller.py")
+            .with_references(vec!["*".to_string()]);
+        let caller = CodeNode::new("use", "use", NodeKind::Function, "app/caller.py")
+            .with_references(vec!["len".to_string()]);
+        b.add_nodes(vec![import, caller]);
+        let graph = b.build();
+
+        assert_eq!(callers_of(&graph, "len", "stdlib_shadow.py").len(), 1);
+    }
+
+    #[test]
+    fn qualified_module_call_does_not_bind_bare_len() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![CodeNode::new(
+            "len",
+            "len",
+            NodeKind::Function,
+            "hard/stdlib_shadow.py",
+        )]);
+        // `import len_module` records the module, not a local name.
+        let import = CodeNode::new(
+            "len_module",
+            "len_module",
+            NodeKind::Import,
+            "app/caller.py",
+        );
+        let caller = CodeNode::new("use", "use", NodeKind::Function, "app/caller.py")
+            .with_references(vec!["len_module.len".to_string()]);
+        b.add_nodes(vec![import, caller]);
+        let graph = b.build();
+
+        assert!(callers_of(&graph, "len", "stdlib_shadow.py").is_empty());
+    }
+
+    #[test]
+    fn shadowed_process_keeps_local_and_explicitly_imported_callers() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            CodeNode::new("process", "process", NodeKind::Function, "hard/shadowed.py"),
+            CodeNode::new("caller", "caller", NodeKind::Function, "hard/shadowed.py")
+                .with_references(vec!["process".to_string()]),
+            CodeNode::new(
+                "process",
+                "process",
+                NodeKind::Function,
+                "hard/shadow_other.py",
+            ),
+            CodeNode::new(
+                "other_caller",
+                "other_caller",
+                NodeKind::Function,
+                "hard/shadow_other.py",
+            )
+            .with_references(vec!["process".to_string()]),
+        ]);
+        let import = CodeNode::new(
+            "hard.shadowed",
+            "hard.shadowed",
+            NodeKind::Import,
+            "hard/conditional.py",
+        )
+        .with_references(vec!["process".to_string()]);
+        let imported_caller = CodeNode::new(
+            "function_local_import",
+            "function_local_import",
+            NodeKind::Function,
+            "hard/conditional.py",
+        )
+        .with_references(vec!["process".to_string()]);
+        b.add_nodes(vec![import, imported_caller]);
+        let graph = b.build();
+
+        let shadowed = callers_of(&graph, "process", "hard/shadowed.py");
+        let other = callers_of(&graph, "process", "hard/shadow_other.py");
+        assert_eq!(shadowed.len(), 2, "local caller plus the explicit import");
+        assert_eq!(
+            other.len(),
+            1,
+            "the sibling call stays on its own definition"
+        );
+        let mut shadowed_names: Vec<&str> = shadowed.iter().map(|n| n.name.as_str()).collect();
+        shadowed_names.sort();
+        assert_eq!(shadowed_names, vec!["caller", "function_local_import"]);
+        assert_eq!(other[0].name, "other_caller");
+    }
+
+    #[test]
+    fn alias_and_dotted_call_do_not_reach_original_function() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![CodeNode::new(
+            "original_function",
+            "original_function",
+            NodeKind::Function,
+            "hard/reexport_base.py",
+        )]);
+        let import = CodeNode::new(
+            "hard.reexport_base",
+            "hard.reexport_base",
+            NodeKind::Import,
+            "hard/aliased.py",
+        )
+        .with_references(vec!["renamed".to_string()]);
+        let via_alias = CodeNode::new(
+            "via_alias",
+            "via_alias",
+            NodeKind::Function,
+            "hard/aliased.py",
+        )
+        .with_references(vec!["renamed".to_string()]);
+        let via_module = CodeNode::new(
+            "via_module_alias",
+            "via_module_alias",
+            NodeKind::Function,
+            "hard/aliased.py",
+        )
+        .with_references(vec!["base_mod.original_function".to_string()]);
+        b.add_nodes(vec![import, via_alias, via_module]);
+        let graph = b.build();
+
+        assert!(
+            callers_of(&graph, "original_function", "reexport_base.py").is_empty(),
+            "alias and qualified calls are a separate resolution gap"
+        );
+    }
+
+    fn callers_of<'a>(
+        graph: &'a ArborGraph,
+        name: &str,
+        file_frag: &str,
+    ) -> Vec<&'a arbor_core::CodeNode> {
+        graph
+            .node_indexes()
+            .filter_map(|idx| {
+                let node = graph.get(idx)?;
+                if node.name == name && node.file.contains(file_frag) {
+                    Some(graph.get_callers(idx))
+                } else {
+                    None
+                }
+            })
+            .next()
+            .unwrap_or_default()
     }
 
     #[test]
