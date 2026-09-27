@@ -97,6 +97,8 @@ Edges represent relationships between nodes.
 
 A class records each base at parse time, and the builder emits `extends` (or `implements`, when the target is an interface or the source said so) from the subclass to that base. A method the subclass does not define stays reachable by a `references` edge to the nearest definition; an override does not keep that edge. `self`/`this` and `super`/`base` are separate `calls` edges: `self`/`this` bind to the nearest definition, and `super`/`base` start at the parents. PageRank walks `calls` only, so `extends`, `implements`, and `references` do not enter the rank. The receiver `calls` do, so the call graph can grow and who sits where can move. `CentralityScores::get` is still the percentile `i / (n - 1)`.
 
+A bare `calls` edge is also dropped when the caller cannot see the name. In Python and JavaScript/TypeScript, a cross-file bare call stays only when that file defines the name or its import map contains the local name or `*`. In Go, a cross-file bare call stays only when both files declare the same package clause and share a directory; the clause is the `Module` node the Go parser already emits. Dotted calls are not part of this check. Other languages still keep an unimported cross-file bare name and lower its confidence. `from m import *`, a CommonJS `require`, and a qualified `module.name()` call are not resolved by this rule.
+
 ## Graph Structure
 
 The graph is stored using an adjacency list representation:
