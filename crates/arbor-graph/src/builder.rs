@@ -453,6 +453,18 @@ impl GraphBuilder {
     }
 }
 
+/// Languages whose parsers record imported local names.
+///
+/// A bare call in one of these files is visible only when the file defines
+/// the name or imports it. Not consulted by edge resolution yet.
+#[allow(dead_code)]
+fn bare_name_requires_import(file: &Path) -> bool {
+    let Some(ext) = file.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    matches!(ext.to_ascii_lowercase().as_str(), "py" | "pyi")
+}
+
 struct InheritedType {
     id: NodeId,
     file: String,
@@ -800,6 +812,7 @@ mod tests {
     use super::*;
     use arbor_core::NodeKind;
     use petgraph::visit::{EdgeRef, IntoEdgeReferences};
+    use std::path::Path;
 
     #[test]
     fn test_builder_adds_nodes() {
@@ -1322,5 +1335,22 @@ mod tests {
             kinds_between(&graph, "C.foo", "A.foo").is_empty(),
             "super() must not skip B and land on A"
         );
+    }
+
+    #[test]
+    fn bare_name_visibility_matches_python_extensions_only() {
+        assert!(bare_name_requires_import(Path::new(
+            "hard/stdlib_shadow.py"
+        )));
+        assert!(bare_name_requires_import(Path::new("stubs/mod.pyi")));
+        assert!(bare_name_requires_import(Path::new("HARD/LEN.PY")));
+        assert!(!bare_name_requires_import(Path::new("src/main.ts")));
+        assert!(!bare_name_requires_import(Path::new("pkg/a.go")));
+        assert!(!bare_name_requires_import(Path::new("src/main.rs")));
+        assert!(!bare_name_requires_import(Path::new("src/Main.java")));
+        assert!(!bare_name_requires_import(Path::new("src/Main.cs")));
+        assert!(!bare_name_requires_import(Path::new("lib/main.dart")));
+        assert!(!bare_name_requires_import(Path::new("src/main.c")));
+        assert!(!bare_name_requires_import(Path::new("Makefile")));
     }
 }
