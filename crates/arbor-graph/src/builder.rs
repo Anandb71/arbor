@@ -51,6 +51,10 @@ pub struct GraphBuilder {
     /// those calls at parse time, this is reserved for future use when we add
     /// a richer call-site representation.
     namespace_imports: HashMap<String, HashMap<String, String>>,
+
+    /// Go package clause per file. The parser stores `package name` as a
+    /// `Module` node, and a bare call is visible only inside that package.
+    go_packages: HashMap<String, String>,
 }
 
 impl Default for GraphBuilder {
@@ -67,6 +71,7 @@ impl GraphBuilder {
             name_to_id: HashMap::new(),
             import_map: HashMap::new(),
             namespace_imports: HashMap::new(),
+            go_packages: HashMap::new(),
         }
     }
 
@@ -81,6 +86,12 @@ impl GraphBuilder {
         for node in nodes {
             // Import nodes carry the import map — process them but don't add to graph
             // (they are not code entities we want in centrality analysis)
+            if node.kind == NodeKind::Module && is_go_file(Path::new(&node.file)) {
+                self.go_packages
+                    .entry(node.file.clone())
+                    .or_insert_with(|| node.name.clone());
+            }
+
             if node.kind == NodeKind::Import {
                 let file = node.file.clone();
                 let module = node.name.clone();
@@ -267,9 +278,11 @@ impl GraphBuilder {
 
     /// Decides whether a resolved reference may become an edge.
     ///
-    /// Python bare names are file-scoped: a cross-file call is kept only when
-    /// this file defines the name or its import map contains that local name
-    /// (or `*`). Other languages keep the confidence downgrade.
+    /// Python and JavaScript/TypeScript bare names are file-scoped: a cross-file
+    /// call is kept only when this file defines the name or its import map
+    /// contains that local name (or `*`). A Go bare name is kept across files
+    /// only inside the caller's package (same directory and the same package
+    /// clause). Other languages keep the confidence downgrade.
     ///
     /// Dotted references are not bare-name visibility. Returns `0.0` to drop.
     fn apply_import_validation(
@@ -282,6 +295,16 @@ impl GraphBuilder {
     ) -> f32 {
         if reference.contains('.') {
             return base_confidence;
+        }
+
+        if is_go_file(from_file) {
+            return self.validate_go_package_visibility(
+                reference,
+                from_file,
+                from_file_str,
+                to_idx,
+                base_confidence,
+            );
         }
 
         if bare_name_requires_import(from_file) {
@@ -364,6 +387,49 @@ impl GraphBuilder {
 
         debug!(
             "Dropping unimported cross-file reference '{}' in {} → {}",
+            reference,
+            from_file.display(),
+            to_file.display()
+        );
+        0.0
+    }
+
+    /// Keeps a bare Go call that stays inside the caller's package.
+    ///
+    /// The parser records `package name` as a `Module` node in that file, not
+    /// as a field on the function. Same package means that clause matches and
+    /// the files share a directory. A matching clause in another directory
+    /// (`package main` in two commands) is a different package.
+    fn validate_go_package_visibility(
+        &self,
+        reference: &str,
+        from_file: &Path,
+        from_file_str: &str,
+        to_idx: NodeId,
+        base_confidence: f32,
+    ) -> f32 {
+        let Some(to_node) = self.graph.get(to_idx) else {
+            return 0.0;
+        };
+        let to_file = PathBuf::from(&to_node.file);
+        if to_file == from_file {
+            return base_confidence;
+        }
+
+        let to_file_str = to_file.to_string_lossy().to_string();
+        let same_package = self
+            .go_packages
+            .get(from_file_str)
+            .zip(self.go_packages.get(&to_file_str))
+            .is_some_and(|(caller_pkg, callee_pkg)| {
+                caller_pkg == callee_pkg && to_file.parent() == from_file.parent()
+            });
+        if same_package {
+            return base_confidence;
+        }
+
+        debug!(
+            "Dropping bare Go reference '{}' in {} → {}",
             reference,
             from_file.display(),
             to_file.display()
@@ -508,11 +574,20 @@ impl GraphBuilder {
 ///
 /// A bare call in one of these files is visible only when the file defines
 /// the name or imports it.
+fn is_go_file(file: &Path) -> bool {
+    file.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("go"))
+}
+
 fn bare_name_requires_import(file: &Path) -> bool {
     let Some(ext) = file.extension().and_then(|ext| ext.to_str()) else {
         return false;
     };
-    matches!(ext.to_ascii_lowercase().as_str(), "py" | "pyi")
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "py" | "pyi" | "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs"
+    )
 }
 
 struct InheritedType {
@@ -1073,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn unimported_cross_module_reference_is_downgraded_not_dropped() {
+    fn unimported_ts_cross_file_bare_call_is_dropped() {
         let mut b = GraphBuilder::new();
         let import = CodeNode::new("./other", "./other", NodeKind::Import, "src/a/main.ts")
             .with_references(vec!["somethingElse".to_string()]);
@@ -1083,11 +1158,7 @@ mod tests {
         b.add_nodes(vec![import, caller, callee]);
         let graph = b.build();
 
-        let confidence = only_edge_confidence(&graph);
-        assert!(
-            confidence > 0.0 && confidence < 0.5,
-            "not imported and in another module — weak, got {confidence}"
-        );
+        assert_eq!(graph.edge_count(), 0);
     }
 
     #[test]
@@ -1108,9 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn same_dir_unimported_reference_is_no_longer_a_free_pass() {
-        // Flat `src/` layouts made the old filter a no-op, so same-name
-        // collisions sailed through at full strength.
+    fn unimported_ts_same_dir_bare_call_is_dropped() {
         let mut b = GraphBuilder::new();
         let import = CodeNode::new("./x", "./x", NodeKind::Import, "src/main.ts")
             .with_references(vec!["other".to_string()]);
@@ -1120,11 +1189,19 @@ mod tests {
         b.add_nodes(vec![import, caller, callee]);
         let graph = b.build();
 
-        let confidence = only_edge_confidence(&graph);
-        assert!(
-            confidence < Edge::CONFIDENT_THRESHOLD,
-            "same-dir but unimported should carry doubt, got {confidence}"
-        );
+        assert_eq!(graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn ts_same_file_bare_call_binds() {
+        let mut b = GraphBuilder::new();
+        let callee = CodeNode::new("validate", "validate", NodeKind::Function, "src/main.ts");
+        let caller = CodeNode::new("main", "main", NodeKind::Function, "src/main.ts")
+            .with_references(vec!["validate".to_string()]);
+        b.add_nodes(vec![callee, caller]);
+        let graph = b.build();
+
+        assert_eq!(graph.edge_count(), 1);
     }
 
     #[test]
@@ -1622,13 +1699,153 @@ mod tests {
     }
 
     #[test]
-    fn bare_name_visibility_matches_python_extensions_only() {
+    fn go_same_package_bare_call_is_kept() {
+        let mut b = GraphBuilder::new();
+        let import = CodeNode::new("fmt", "fmt", NodeKind::Import, "pkg/a.go");
+        let caller = CodeNode::new("main", "main", NodeKind::Function, "pkg/a.go")
+            .with_references(vec!["helper".to_string()]);
+        let callee = CodeNode::new("helper", "helper", NodeKind::Function, "pkg/b.go");
+        b.add_nodes(vec![
+            go_package("handler", "pkg/a.go"),
+            go_package("handler", "pkg/b.go"),
+            import,
+            caller,
+            callee,
+        ]);
+        let graph = b.build();
+
+        assert_eq!(graph.edge_count(), 1);
+    }
+
+    #[test]
+    fn go_same_clause_in_another_directory_is_dropped() {
+        let mut b = GraphBuilder::new();
+        let caller = CodeNode::new("main", "main", NodeKind::Function, "cmd/a.go")
+            .with_references(vec!["helper".to_string()]);
+        let callee = CodeNode::new("helper", "helper", NodeKind::Function, "pkg/b.go");
+        b.add_nodes(vec![
+            go_package("main", "cmd/a.go"),
+            go_package("main", "pkg/b.go"),
+            caller,
+            callee,
+        ]);
+        let graph = b.build();
+
+        assert_eq!(graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn go_external_test_package_does_not_bind_a_bare_name() {
+        let mut b = GraphBuilder::new();
+        let caller = CodeNode::new(
+            "TestHelper",
+            "TestHelper",
+            NodeKind::Function,
+            "pkg/a_test.go",
+        )
+        .with_references(vec!["helper".to_string()]);
+        let callee = CodeNode::new("helper", "helper", NodeKind::Function, "pkg/a.go");
+        b.add_nodes(vec![
+            go_package("foo_test", "pkg/a_test.go"),
+            go_package("foo", "pkg/a.go"),
+            caller,
+            callee,
+        ]);
+        let graph = b.build();
+
+        assert_eq!(graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn go_len_does_not_bind_to_a_python_definition() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![CodeNode::new(
+            "len",
+            "len",
+            NodeKind::Function,
+            "hard/stdlib_shadow.py",
+        )]);
+        let caller = CodeNode::new(
+            "HandleRequest",
+            "HandleRequest",
+            NodeKind::Function,
+            "poly/go/handler/handler.go",
+        )
+        .with_references(vec!["len".to_string()]);
+        b.add_nodes(vec![
+            go_package("handler", "poly/go/handler/handler.go"),
+            caller,
+        ]);
+        let graph = b.build();
+
+        assert!(callers_of(&graph, "len", "stdlib_shadow.py").is_empty());
+    }
+
+    #[test]
+    fn rust_use_does_not_drop_a_bare_cross_file_call() {
+        assert_residual_bare_call_links("crate::helper", "src/main.rs", "src/helper.rs");
+    }
+
+    #[test]
+    fn c_include_does_not_drop_a_bare_cross_file_call() {
+        assert_residual_bare_call_links("foo.h", "src/main.c", "src/foo.c");
+    }
+
+    #[test]
+    fn java_import_does_not_drop_a_bare_cross_file_call() {
+        assert_residual_bare_call_links("com.example.Helper", "src/Main.java", "src/Helper.java");
+    }
+
+    #[test]
+    fn csharp_using_does_not_drop_a_bare_cross_file_call() {
+        assert_residual_bare_call_links("Example", "src/Main.cs", "src/Helper.cs");
+    }
+
+    #[test]
+    fn dart_import_does_not_drop_a_bare_cross_file_call() {
+        assert_residual_bare_call_links(
+            "package:app/helper.dart",
+            "lib/main.dart",
+            "lib/helper.dart",
+        );
+    }
+
+    fn go_package(name: &str, file: &str) -> CodeNode {
+        CodeNode::new(name, name, NodeKind::Module, file)
+    }
+
+    /// An import node whose name is the module path and whose references do
+    /// not include `helper`. The bare call must still link.
+    fn assert_residual_bare_call_links(import_name: &str, caller_file: &str, callee_file: &str) {
+        let mut b = GraphBuilder::new();
+        let import = CodeNode::new(import_name, import_name, NodeKind::Import, caller_file);
+        let caller = CodeNode::new("main", "main", NodeKind::Function, caller_file)
+            .with_references(vec!["helper".to_string()]);
+        let callee = CodeNode::new("helper", "helper", NodeKind::Function, callee_file);
+        b.add_nodes(vec![import, caller, callee]);
+        let graph = b.build();
+        assert_eq!(
+            graph.edge_count(),
+            1,
+            "{caller_file} should still call {callee_file}"
+        );
+    }
+
+    #[test]
+    fn bare_name_visibility_matches_python_and_js_extensions() {
         assert!(bare_name_requires_import(Path::new(
             "hard/stdlib_shadow.py"
         )));
         assert!(bare_name_requires_import(Path::new("stubs/mod.pyi")));
         assert!(bare_name_requires_import(Path::new("HARD/LEN.PY")));
-        assert!(!bare_name_requires_import(Path::new("src/main.ts")));
+        assert!(bare_name_requires_import(Path::new("src/main.ts")));
+        assert!(bare_name_requires_import(Path::new("src/App.tsx")));
+        assert!(bare_name_requires_import(Path::new("src/app.js")));
+        assert!(bare_name_requires_import(Path::new("src/app.jsx")));
+        assert!(bare_name_requires_import(Path::new("src/app.mts")));
+        assert!(bare_name_requires_import(Path::new("src/app.cts")));
+        assert!(bare_name_requires_import(Path::new("src/app.mjs")));
+        assert!(bare_name_requires_import(Path::new("src/app.cjs")));
         assert!(!bare_name_requires_import(Path::new("pkg/a.go")));
         assert!(!bare_name_requires_import(Path::new("src/main.rs")));
         assert!(!bare_name_requires_import(Path::new("src/Main.java")));
