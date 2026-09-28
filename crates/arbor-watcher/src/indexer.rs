@@ -243,15 +243,7 @@ pub fn index_directory(root: &Path, options: IndexOptions) -> Result<IndexResult
         .map(|path| {
             let path_str = path.display().to_string();
 
-            let current_mtime = match std::fs::metadata(path) {
-                Ok(meta) => meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                Err(_) => 0,
-            };
+            let current_mtime = mtime_nanos(path).unwrap_or(0);
 
             if let Some(store) = store_ref {
                 if let Ok(Some(cached_mtime)) = store.get_mtime(&path_str) {
@@ -348,6 +340,20 @@ pub fn parse_single_file(path: &Path) -> Result<Vec<CodeNode>, arbor_core::Parse
 /// `cache_mtime` is the modified time of the cache file, in seconds since the
 /// UNIX epoch. Catches edits and additions; a lone deletion leaves no newer
 /// file, so it is picked up on the next edit instead.
+/// A file's modification time in nanoseconds since the Unix epoch.
+///
+/// Whole seconds were not enough: an edit in the same second as the last
+/// index (easy for a coding agent) looked unchanged to both the per-file
+/// cache and the staleness check, so the graph silently missed it. Caches
+/// written with second precision simply miss once and are rebuilt.
+pub fn mtime_nanos(path: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    u64::try_from(since_epoch.as_nanos()).ok()
+}
+
+/// True when any supported source file under `root` was modified after
+/// `cache_mtime` (nanoseconds since the Unix epoch, see [`mtime_nanos`]).
 pub fn sources_newer_than(root: &Path, cache_mtime: u64, follow_symlinks: bool) -> bool {
     let ignore_matcher = IgnoreMatcher::new(root);
     let walker = WalkBuilder::new(root)
@@ -376,12 +382,8 @@ pub fn sources_newer_than(root: &Path, cache_mtime: u64, follow_symlinks: bool) 
             Some(ext) if arbor_core::languages::is_supported(ext) => {}
             _ => continue,
         }
-        let mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
-            Ok(t) => t
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            Err(_) => continue,
+        let Some(mtime) = mtime_nanos(path) else {
+            continue;
         };
         if mtime > cache_mtime {
             return true;
@@ -415,6 +417,20 @@ mod tests {
         // Cache mtime far in the future → nothing newer → fresh.
         let far_future = u64::MAX;
         assert!(!sources_newer_than(dir.path(), far_future, false));
+    }
+
+    #[test]
+    fn an_edit_within_the_same_second_is_still_newer() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        fs::write(&file, "pub fn a() {}").unwrap();
+        let before = mtime_nanos(&file).unwrap();
+        // Well under a second later: whole-second precision would call this equal.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&file, "pub fn a() { let _ = 1; }").unwrap();
+        let after = mtime_nanos(&file).unwrap();
+        assert!(after > before, "{after} should be newer than {before}");
+        assert!(sources_newer_than(dir.path(), before, false));
     }
 
     #[test]
