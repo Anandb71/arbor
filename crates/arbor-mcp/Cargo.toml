@@ -19,6 +19,11 @@ tracing.workspace = true
 tokio.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
+# Local Streamable HTTP transport: real HTTP/1.1 framing, deadlines and limits.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 
 arbor-core = { path = "../arbor-core", version = "3.0.0" }
 arbor-graph = { path = "../arbor-graph", version = "3.0.0" }
