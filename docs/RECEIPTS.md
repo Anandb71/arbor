@@ -61,7 +61,7 @@ Receipts are saved as JSON in `.arbor/receipts/`.
 
 `arbor receipt undo <id> --unasked` puts the files outside your request back the way they were before the turn, and keeps the rest of the agent's work. Name files to undo just those, or leave both out to undo the whole turn. New files are removed, deleted ones come back and renames are reversed. Only the working tree changes; your staged changes and commits are left alone.
 
-If a file changed again after the turn, by you or a later turn, undo refuses and changes nothing, so later work is never lost. `--force` undoes it anyway. Since the hooks allow `arbor receipt`, you can also just tell Claude to undo what it wasn't asked to do.
+If a file changed again after the turn, by you or a later turn, undo refuses and changes nothing, so later work is never lost. `--force` undoes it anyway. You can also just tell Claude to undo what it wasn't asked to do. `arbor hook claude` lets Claude read receipts without asking, but it asks before running `undo`.
 
 ## Limits
 
