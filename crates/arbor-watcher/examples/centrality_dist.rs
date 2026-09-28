@@ -23,7 +23,10 @@ fn main() {
     // Raw PageRank, then the old max-normalization: score / max.
     let raw: Vec<f64> = nodes.iter().map(|&i| scores.get_raw(i)).collect();
     let max = raw.iter().cloned().fold(0.0f64, f64::max);
-    let max_norm: Vec<f64> = raw.iter().map(|r| if max > 0.0 { r / max } else { 0.0 }).collect();
+    let max_norm: Vec<f64> = raw
+        .iter()
+        .map(|r| if max > 0.0 { r / max } else { 0.0 })
+        .collect();
     let pct: Vec<f64> = nodes.iter().map(|&i| scores.get(i)).collect();
 
     let frac_above = |v: &[f64], t: f64| v.iter().filter(|x| **x > t).count() as f64 / n as f64;
