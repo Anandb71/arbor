@@ -26,6 +26,7 @@ const PERMISSIONS: &[&str] = &[
     "Bash(arbor entry-points *)",
     "Bash(arbor refactor *)",
     "Bash(arbor export *)",
+    "Bash(arbor receipt *)",
 ];
 
 pub struct Claude;
@@ -285,7 +286,34 @@ fn ensure_hooks(settings: &mut Value) -> bool {
 
     let pre = add_bash_hooks(hooks, "PreToolUse", &[init, block]);
     let post = add_bash_hooks(hooks, "PostToolUse", &[map]);
-    pre || post
+    // A receipt after every turn: snapshot when a request is sent, explain
+    // the difference when Claude finishes.
+    let begin = add_event_hook(hooks, "UserPromptSubmit", RECEIPT_BEGIN);
+    let end = add_event_hook(hooks, "Stop", RECEIPT_END);
+    pre || post || begin || end
+}
+
+const RECEIPT_BEGIN: &str = "arbor receipt begin";
+const RECEIPT_END: &str = "arbor receipt end --hook";
+
+/// Ensure `command` runs on `event` (an event without a tool matcher).
+/// Returns true if it was added.
+fn add_event_hook(hooks: &mut serde_json::Map<String, Value>, event: &str, command: &str) -> bool {
+    let entries = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
+    if !entries.is_array() {
+        *entries = json!([]);
+    }
+    let entries = entries.as_array_mut().unwrap();
+    let present = entries
+        .iter()
+        .flat_map(|group| group.get("hooks").and_then(|h| h.as_array()))
+        .flatten()
+        .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(command));
+    if present {
+        return false;
+    }
+    entries.push(json!({ "hooks": [{ "type": "command", "command": command }] }));
+    true
 }
 
 /// Ensure each command in `cmds` is registered under `event` for the Bash

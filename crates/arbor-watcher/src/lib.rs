@@ -10,5 +10,7 @@
 mod indexer;
 mod watcher;
 
-pub use indexer::{index_directory, sources_newer_than, IgnoreMatcher, IndexOptions, IndexResult};
+pub use indexer::{
+    index_directory, mtime_nanos, sources_newer_than, IgnoreMatcher, IndexOptions, IndexResult,
+};
 pub use watcher::{FileChange, FileWatcher};

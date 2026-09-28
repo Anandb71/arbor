@@ -11,6 +11,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod audit;
 mod commands;
 mod hook;
+mod receipt;
 
 #[derive(Parser)]
 #[command(name = "arbor")]
@@ -454,6 +455,12 @@ enum Commands {
         focus: Option<String>,
     },
 
+    /// Plain-English receipts of what each agent turn changed
+    Receipt {
+        #[command(subcommand)]
+        action: ReceiptAction,
+    },
+
     /// Built-in agent workflows for autonomous code analysis
     Agent {
         #[command(subcommand)]
@@ -470,6 +477,70 @@ enum Commands {
         /// Maximum number of ranked symbols to print
         #[arg(long, default_value = "25000")]
         top: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReceiptAction {
+    /// Record the start of an agent turn (run by the agent's prompt hook)
+    Begin {
+        /// Project path (defaults to the hook's working directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Which agent is making the change
+        #[arg(long, default_value = "claude-code")]
+        agent: String,
+    },
+    /// Explain what changed since the turn began (run by the agent's stop hook)
+    End {
+        /// Project path (defaults to the hook's working directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Print the receipt as a hook `systemMessage` and never fail the agent
+        #[arg(long)]
+        hook: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List recent receipts, newest first
+    List {
+        /// Project path (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// How many to show
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one receipt in full (the latest by default)
+    Show {
+        /// Receipt id or a prefix of it
+        id: Option<String>,
+        /// Project path (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Put back what a turn changed, as it was before the turn
+    Undo {
+        /// Receipt id or a prefix of it
+        id: String,
+        /// Only these files (default: every file the turn changed)
+        files: Vec<String>,
+        /// Only the files outside your request
+        #[arg(long, conflicts_with = "files")]
+        unasked: bool,
+        /// Undo even files that changed again after the turn
+        #[arg(long)]
+        force: bool,
+        /// Project path (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
     },
 }
 
@@ -509,8 +580,29 @@ enum AgentAction {
     },
 }
 
-#[tokio::main]
-async fn main() {
+/// The command tree and its async dispatch are large in debug builds, and
+/// Windows gives the main thread only 1 MB of stack. Running the CLI on a
+/// thread with room keeps every command (and every future one) clear of it.
+const CLI_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn main() {
+    let cli = std::thread::Builder::new()
+        .name("arbor".into())
+        .stack_size(CLI_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to start the async runtime")
+                .block_on(run())
+        })
+        .expect("failed to start the arbor thread");
+    if cli.join().is_err() {
+        std::process::exit(101);
+    }
+}
+
+async fn run() {
     let cli = Cli::parse();
 
     // Set up logging
@@ -652,6 +744,26 @@ async fn main() {
             } => commands::agent_guard(&path, max_blast_radius),
         },
         Commands::AnalyzeLocal { path, top } => commands::analyze_local(&path, top),
+        Commands::Receipt { action } => match action {
+            ReceiptAction::Begin { path, agent } => {
+                // A hook must never block the agent. Failures go to stderr,
+                // which Claude Code keeps in its debug log.
+                if let Err(error) = receipt::begin(&path, &agent) {
+                    eprintln!("arbor receipt begin: {error}");
+                }
+                Ok(())
+            }
+            ReceiptAction::End { path, hook, json } => receipt::end(&path, hook, json),
+            ReceiptAction::List { path, limit, json } => receipt::list(&path, limit, json),
+            ReceiptAction::Show { id, path, json } => receipt::show(id.as_deref(), &path, json),
+            ReceiptAction::Undo {
+                id,
+                files,
+                unasked,
+                force,
+                path,
+            } => receipt::undo(&id, &files, unasked, force, &path),
+        },
     };
 
     if let Err(e) = result {

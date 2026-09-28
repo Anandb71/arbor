@@ -1,7 +1,10 @@
 //! TypeScript/JavaScript parser implementation.
 //!
-//! This handles TS, TSX, JS, and JSX files. Tree-sitter's TypeScript
-//! grammar is comprehensive enough to handle most JS patterns too.
+//! `.ts` files use the TypeScript grammar. `.tsx`, `.jsx` and JavaScript use
+//! the TSX grammar: the plain TypeScript grammar cannot parse JSX, so every
+//! component body in a React file used to come back as error nodes. The only
+//! construct TSX rejects, `<T>value` type assertions, is not valid in those
+//! files anyway.
 
 use crate::languages::LanguageParser;
 use crate::node::{CodeNode, NodeKind, Visibility};
@@ -15,7 +18,7 @@ impl LanguageParser for TypeScriptParser {
     }
 
     fn extensions(&self) -> &[&str] {
-        &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"]
+        &["ts", "mts", "cts"]
     }
 
     fn extract_nodes(&self, tree: &Tree, source: &str, file_path: &str) -> Vec<CodeNode> {
@@ -23,6 +26,23 @@ impl LanguageParser for TypeScriptParser {
         let root = tree.root_node();
         extract_from_node(&root, source, file_path, &mut nodes, None);
         nodes
+    }
+}
+
+/// TSX, JSX and JavaScript: the same extraction on the grammar that parses JSX.
+pub struct TsxParser;
+
+impl LanguageParser for TsxParser {
+    fn language(&self) -> Language {
+        tree_sitter_typescript::language_tsx()
+    }
+
+    fn extensions(&self) -> &[&str] {
+        &["tsx", "jsx", "js", "mjs", "cjs"]
+    }
+
+    fn extract_nodes(&self, tree: &Tree, source: &str, file_path: &str) -> Vec<CodeNode> {
+        TypeScriptParser.extract_nodes(tree, source, file_path)
     }
 }
 
@@ -487,6 +507,22 @@ fn extract_call_references(root: &Node, source: &str) -> Vec<String> {
             }
         }
 
+        // Rendering `<PricingButton />` uses that component the way a call
+        // does. In React code this is most of the dependency graph.
+        if matches!(
+            node.kind(),
+            "jsx_opening_element" | "jsx_self_closing_element"
+        ) {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let range = name_node.byte_range();
+                if range.end <= source.len() {
+                    if let Some(reference) = component_reference(&source[range]) {
+                        refs.push(reference);
+                    }
+                }
+            }
+        }
+
         // Iterative depth-first traversal — no recursion, no stack overflow
         if cursor.goto_first_child() {
             continue;
@@ -511,6 +547,16 @@ fn extract_call_references(root: &Node, source: &str) -> Vec<String> {
     refs.sort();
     refs.dedup();
     refs
+}
+
+/// A JSX tag that names a component. `<div>` and `<motion.div>` are host
+/// elements; a component starts with a capital letter.
+fn component_reference(tag: &str) -> Option<String> {
+    let last = tag.rsplit('.').next()?;
+    if !last.chars().next()?.is_ascii_uppercase() {
+        return None;
+    }
+    classify_callee(tag)
 }
 
 /// Turns the callee text of a call expression into a resolvable reference.
@@ -601,6 +647,81 @@ impl CodeNodeExt for CodeNode {
         } else {
             self
         }
+    }
+}
+
+#[cfg(test)]
+mod jsx_tests {
+    use super::{component_reference, TsxParser, TypeScriptParser};
+    use crate::languages::LanguageParser;
+
+    fn parse(parser: &dyn LanguageParser, source: &str, file: &str) -> Vec<crate::node::CodeNode> {
+        let mut ts = tree_sitter::Parser::new();
+        ts.set_language(&parser.language()).unwrap();
+        let tree = ts.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{file} did not parse cleanly"
+        );
+        parser.extract_nodes(&tree, source, file)
+    }
+
+    #[test]
+    fn rendering_a_component_references_it() {
+        let source = r#"
+import { PricingButton } from "./PricingButton";
+import * as Tabs from "./tabs";
+
+export default function PricingPage({ plans }: { plans: string[] }) {
+  return (
+    <main className="p-4">
+      <PricingButton plan={plans[0]} />
+      <Tabs.Panel>{plans.map(p => <span key={p}>{p}</span>)}</Tabs.Panel>
+    </main>
+  );
+}
+"#;
+        let nodes = parse(&TsxParser, source, "app/pricing/page.tsx");
+        let page = nodes
+            .iter()
+            .find(|n| n.name == "PricingPage")
+            .expect("page component");
+        assert!(
+            page.references.contains(&"PricingButton".to_string()),
+            "{:?}",
+            page.references
+        );
+        assert!(
+            page.references.contains(&"Tabs.Panel".to_string()),
+            "{:?}",
+            page.references
+        );
+        assert!(
+            !page
+                .references
+                .iter()
+                .any(|r| r == "main" || r == "span" || r == "div"),
+            "{:?}",
+            page.references
+        );
+    }
+
+    #[test]
+    fn plain_typescript_keeps_angle_bracket_assertions() {
+        let source = "export function toCount(value: unknown) { return <number>value; }\n";
+        let nodes = parse(&TypeScriptParser, source, "lib/count.ts");
+        assert!(nodes.iter().any(|n| n.name == "toCount"));
+    }
+
+    #[test]
+    fn host_elements_are_not_components() {
+        assert_eq!(component_reference("div"), None);
+        assert_eq!(component_reference("motion.div"), None);
+        assert_eq!(
+            component_reference("PricingButton"),
+            Some("PricingButton".into())
+        );
+        assert_eq!(component_reference("ui.Button"), Some(".Button".into()));
     }
 }
 
