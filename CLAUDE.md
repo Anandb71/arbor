@@ -80,7 +80,7 @@ Module layout: `lib.rs` (tool dispatch + `tools/list`), `protocol.rs` (version n
 
 All tools emit a standard JSON envelope: `{ok, tool, arbor_version, data, meta: {node_count, suggested_next_tool, suggested_next_args}}`. Error responses use `{ok: false, error}`. `search_symbols` and `get_map` support pagination (`offset`, `limit`, `hasMore`).
 
-**`arbor-cli`** — Clap CLI with ~30 subcommands. Most command logic lives in `src/commands.rs`; `src/audit/` implements the security audit and `src/hook/` implements agent-harness installation (`arbor hook claude`). Entry point: `src/main.rs`. Dispatches to the other crates. Binary name: `arbor` (crate name: `arbor-graph-cli`).
+**`arbor-cli`** — Clap CLI with ~30 subcommands. Most command logic lives in `src/commands.rs`; `src/audit/` implements the security audit and `src/hook/` implements agent-harness installation (`arbor hook claude`), and `src/receipt/` builds the per-turn receipts those hooks print (`arbor receipt`, see docs/RECEIPTS.md). Entry point: `src/main.rs`. Dispatches to the other crates. Binary name: `arbor` (crate name: `arbor-graph-cli`).
 Key features:
 - `map . --exclude-test`: ranked, token-budgeted project skeleton (PageRank + entry point detection). Supports `--tokens N`, `--focus "pattern"`, `--focus-changed`, `--json`, `--verbose`.
 - `callers`/`callees`/`entry-points`/`file-graph`/`inspect`/`path`: graph query commands matching MCP tools.

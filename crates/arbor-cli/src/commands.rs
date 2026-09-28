@@ -100,7 +100,7 @@ pub(crate) fn resolve_project_path(path: &Path) -> Result<PathBuf> {
 /// different repo) don't silently create a `.arbor/` and write a cache into it.
 /// Resolution order: `ARBOR_AUTO_INDEX` env var, then `auto_index` in the
 /// global config (`~/.arbor/config.json`), then `false`.
-fn auto_index_enabled() -> bool {
+pub(crate) fn auto_index_enabled() -> bool {
     if let Ok(val) = std::env::var("ARBOR_AUTO_INDEX") {
         return matches!(
             val.trim().to_lowercase().as_str(),
@@ -119,7 +119,7 @@ fn global_config_auto_index() -> Option<bool> {
 }
 
 /// Returns true if `path` has already been indexed (has a `.arbor/` directory).
-fn project_is_indexed(path: &Path) -> bool {
+pub(crate) fn project_is_indexed(path: &Path) -> bool {
     path.join(".arbor").exists()
 }
 
@@ -281,13 +281,8 @@ fn load_graph_from_store(path: &Path) -> Result<arbor_graph::ArborGraph> {
 }
 
 /// Returns the modified time of a cache file in seconds since the UNIX epoch.
-fn cache_mtime_secs(cache_path: &Path) -> Option<u64> {
-    fs::metadata(cache_path)
-        .and_then(|m| m.modified())
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs())
+fn cache_mtime(cache_path: &Path) -> Option<u64> {
+    arbor_watcher::mtime_nanos(cache_path)
 }
 
 /// Returns true if a source file is newer than the freshest cache file,
@@ -297,7 +292,7 @@ fn cache_is_stale(path: &Path) -> bool {
     // periodic writer keeps graph.bin current, so prefer whichever is newer.
     let newest = [graph_binary_path(path), graph_snapshot_path(path)]
         .iter()
-        .filter_map(|p| cache_mtime_secs(p))
+        .filter_map(|p| cache_mtime(p))
         .max();
     match newest {
         Some(cache_mtime) => arbor_watcher::sources_newer_than(path, cache_mtime, false),
@@ -305,7 +300,23 @@ fn cache_is_stale(path: &Path) -> bool {
     }
 }
 
-fn load_or_index_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
+/// Re-index now, reusing the per-file cache so only changed files are parsed.
+/// For callers that must see edits made moments ago (agent turn receipts),
+/// where a staleness check is one more thing that can be fooled.
+pub(crate) fn refresh_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
+    let result = index_directory(
+        path,
+        IndexOptions {
+            cache_path: Some(path.join(".arbor").join("cache")),
+            ..IndexOptions::default()
+        },
+    )?;
+    save_graph_snapshot(path, &result.graph)?;
+    save_graph_binary(path, &result.graph)?;
+    Ok(result.graph)
+}
+
+pub(crate) fn load_or_index_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
     // Refuse to index an un-indexed project unless auto-indexing is enabled —
     // this is the choke point for read commands that don't call
     // ensure_arbor_initialized first, and prevents writing a cache into a
@@ -358,7 +369,7 @@ fn run_git(path: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn is_git_repo(path: &Path) -> bool {
+pub(crate) fn is_git_repo(path: &Path) -> bool {
     Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(path)
@@ -400,7 +411,7 @@ fn parse_git_name_status_output(output: &str) -> Vec<String> {
         .collect()
 }
 
-fn is_generated_or_internal_path(path: &str) -> bool {
+pub(crate) fn is_generated_or_internal_path(path: &str) -> bool {
     let normalized = normalize_slashes(path).to_lowercase();
     let with_boundary = format!("/{normalized}/");
 
@@ -1145,7 +1156,7 @@ fn export_graph(graph: &arbor_graph::ArborGraph, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn is_test_file(file_path: &str) -> bool {
+pub(crate) fn is_test_file(file_path: &str) -> bool {
     let lower = file_path.to_lowercase().replace('\\', "/");
     let segments: Vec<&str> = lower.split('/').collect();
     let filename = segments.last().copied().unwrap_or("");

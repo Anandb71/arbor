@@ -185,6 +185,8 @@ arbor diff                          # impact of uncommitted git changes
 claude mcp add --transport stdio --scope project arbor -- arbor bridge
 ```
 
+**After every turn:** `arbor hook claude` makes Claude Code show a receipt of what it changed, what it touched that you didn't ask for, and what to test. [Receipts →](docs/RECEIPTS.md)
+
 **Agent workflow:** call `get_map` first → `search_symbols` / `get_file_graph` to locate code → `Read` only the target file. [Full MCP guide →](docs/MCP_INTEGRATION.md)
 
 ---
@@ -253,6 +255,8 @@ Every tool returns `{ ok, tool, data, meta: { suggested_next_tool, suggested_nex
 | `arbor agent guard` | Real-time architectural safety gate |
 | `arbor bridge` | MCP server (add `--http` for HTTP transport) |
 | `arbor watch` | Live re-index on file changes |
+| `arbor receipt list / show` | Plain-English receipts of what each agent turn changed ([guide](docs/RECEIPTS.md)) |
+| `arbor hook claude` | Wire Arbor into Claude Code: directives, receipts after every turn |
 | `arbor gui` | Native desktop UI |
 
 All query commands support `--json`. `map` additionally supports `--tokens N`, `--focus "pattern"`, `--focus-changed`.
@@ -350,7 +354,7 @@ arbor-core (Tree-sitter parsing)
             └── arbor-gui      — desktop UI
 ```
 
-**Docs:** [Quickstart](docs/QUICKSTART.md) · [Architecture](docs/ARCHITECTURE.md) · [Graph schema](docs/GRAPH_SCHEMA.md) · [MCP integration](docs/MCP_INTEGRATION.md) · [Benchmarks](docs/BENCHMARKS.md) · [Roadmap](docs/ROADMAP.md) · [Philosophy](PHILOSOPHY.md)
+**Docs:** [Quickstart](docs/QUICKSTART.md) · [Architecture](docs/ARCHITECTURE.md) · [Graph schema](docs/GRAPH_SCHEMA.md) · [MCP integration](docs/MCP_INTEGRATION.md) · [Receipts](docs/RECEIPTS.md) · [Benchmarks](docs/BENCHMARKS.md) · [Roadmap](docs/ROADMAP.md) · [Philosophy](PHILOSOPHY.md)
 
 **Release channels:** GitHub Releases · crates.io · GHCR · npm · VS Code / Open VSX · Homebrew · Scoop — [Releasing guide](docs/RELEASING.md)
 
