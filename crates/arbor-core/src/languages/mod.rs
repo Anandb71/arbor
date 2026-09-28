@@ -48,8 +48,8 @@ pub trait LanguageParser: Send + Sync {
 pub fn get_parser(extension: &str) -> Option<Box<dyn LanguageParser>> {
     match extension.to_lowercase().as_str() {
         // TypeScript and JavaScript
-        "ts" | "tsx" | "mts" | "cts" => Some(Box::new(typescript::TypeScriptParser)),
-        "js" | "jsx" | "mjs" | "cjs" => Some(Box::new(typescript::TypeScriptParser)),
+        "ts" | "mts" | "cts" => Some(Box::new(typescript::TypeScriptParser)),
+        "tsx" | "jsx" | "js" | "mjs" | "cjs" => Some(Box::new(typescript::TsxParser)),
 
         // Rust
         "rs" => Some(Box::new(rust::RustParser)),
