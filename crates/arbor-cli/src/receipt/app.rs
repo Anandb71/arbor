@@ -108,7 +108,6 @@ impl Area {
                 "env",
                 "dotenv",
                 "config",
-                "settings",
                 "next.config",
                 "vite.config",
                 "dockerfile",
@@ -145,8 +144,13 @@ pub fn areas(path: &str, names: &[String]) -> Vec<Area> {
         .iter()
         .filter(|(area, keywords)| {
             keywords.iter().any(|keyword| tokens.iter().any(|token| token == keyword))
-                // Environment files (.env, .env.local) are settings.
-                || (*area == Area::Settings && (file_name.starts_with(".env") || file_name == "dockerfile"))
+                // Environment files (.env, .env.local) and Django's settings.py
+                // are app settings. A settings *page* is not, so the bare word
+                // "settings" doesn't count.
+                || (*area == Area::Settings
+                    && (file_name.starts_with(".env")
+                        || file_name == "dockerfile"
+                        || file_name == "settings.py"))
         })
         .map(|(area, _)| *area)
         .collect();
@@ -327,6 +331,8 @@ mod tests {
             vec![Area::Database]
         );
         assert_eq!(areas(".env.local", &[]), vec![Area::Settings]);
+        assert_eq!(areas("mysite/settings.py", &[]), vec![Area::Settings]);
+        assert_eq!(areas("app/settings/page.tsx", &[]), vec![]);
         assert!(areas("components/Button.tsx", &["PricingButton".into()]).is_empty());
     }
 }

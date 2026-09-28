@@ -68,6 +68,62 @@ pub fn snapshot(root: &Path) -> Result<String> {
     Ok(tree?.trim().to_string())
 }
 
+/// Whether git still has a snapshot. Nothing references these trees, so
+/// `git gc` prunes them once they are old enough (two weeks by default).
+pub fn exists(root: &Path, tree: &str) -> bool {
+    git(root, &["cat-file", "-e", &format!("{tree}^{{tree}}")], None).is_ok()
+}
+
+fn blob(root: &Path, tree: &str, file: &str) -> Option<String> {
+    git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{tree}:{file}"),
+        ],
+        None,
+    )
+    .ok()
+    .map(|id| id.trim().to_string())
+}
+
+/// True when `file` in the working tree is exactly as the snapshot recorded
+/// it, including when neither has it.
+pub fn unchanged_since(root: &Path, tree: &str, file: &str) -> Result<bool> {
+    let on_disk = root.join(file);
+    Ok(match (blob(root, tree, file), on_disk.is_file()) {
+        (None, false) => !on_disk.exists(),
+        (Some(recorded), true) => git(root, &["hash-object", "--", file], None)?.trim() == recorded,
+        _ => false,
+    })
+}
+
+/// Put `file` back as `tree` recorded it, removing it when the snapshot does
+/// not have it. A rename is undone by removing the new path and restoring the
+/// old one. Only the working tree changes; the index is left alone.
+pub fn restore(root: &Path, tree: &str, file: &str, old_path: Option<&str>) -> Result<()> {
+    for path in old_path.into_iter().chain(std::iter::once(file)) {
+        if blob(root, tree, path).is_some() {
+            git(
+                root,
+                &[
+                    "restore",
+                    &format!("--source={tree}"),
+                    "--worktree",
+                    "--",
+                    &format!(":(literal){path}"),
+                ],
+                None,
+            )?;
+        } else if root.join(path).is_file() {
+            std::fs::remove_file(root.join(path))?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChangeKind {
@@ -198,6 +254,7 @@ mod tests {
             vec!["init", "-q"],
             vec!["config", "user.email", "t@example.com"],
             vec!["config", "user.name", "t"],
+            vec!["config", "core.autocrlf", "false"],
         ] {
             git(dir.path(), &args, None).unwrap();
         }
@@ -235,6 +292,57 @@ b
         let changed = changes(root, &start, &end).unwrap();
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].path, "a.txt");
+    }
+
+    #[test]
+    fn undo_restores_each_kind_of_change_and_notices_later_edits() {
+        let dir = repo();
+        let root = dir.path();
+        let read = |name: &str| std::fs::read_to_string(root.join(name)).ok();
+        std::fs::write(root.join("kept.txt"), "one\n").unwrap();
+        std::fs::write(root.join("moved.txt"), "same\n").unwrap();
+        git(root, &["add", "."], None).unwrap();
+        git(root, &["commit", "-qm", "base"], None).unwrap();
+        // Untracked before the turn: undo must still bring it back.
+        std::fs::write(root.join("gone [1].txt"), "bye\n").unwrap();
+        let before = snapshot(root).unwrap();
+
+        std::fs::write(root.join("kept.txt"), "two\n").unwrap();
+        std::fs::remove_file(root.join("gone [1].txt")).unwrap();
+        std::fs::write(root.join("new.txt"), "hi\n").unwrap();
+        std::fs::rename(root.join("moved.txt"), root.join("renamed.txt")).unwrap();
+        let after = snapshot(root).unwrap();
+
+        for file in [
+            "kept.txt",
+            "gone [1].txt",
+            "new.txt",
+            "renamed.txt",
+            "moved.txt",
+        ] {
+            assert!(unchanged_since(root, &after, file).unwrap(), "{file}");
+        }
+        std::fs::write(root.join("kept.txt"), "three\n").unwrap();
+        assert!(!unchanged_since(root, &after, "kept.txt").unwrap());
+        std::fs::write(root.join("moved.txt"), "recreated\n").unwrap();
+        assert!(!unchanged_since(root, &after, "moved.txt").unwrap());
+        std::fs::remove_file(root.join("moved.txt")).unwrap();
+
+        restore(root, &before, "kept.txt", None).unwrap();
+        restore(root, &before, "gone [1].txt", None).unwrap();
+        restore(root, &before, "new.txt", None).unwrap();
+        restore(root, &before, "renamed.txt", Some("moved.txt")).unwrap();
+        assert_eq!(read("kept.txt").as_deref(), Some("one\n"));
+        assert_eq!(read("gone [1].txt").as_deref(), Some("bye\n"));
+        assert_eq!(read("new.txt"), None);
+        assert_eq!(read("moved.txt").as_deref(), Some("same\n"));
+        assert_eq!(read("renamed.txt"), None);
+        // The user's index is untouched.
+        let staged = git(root, &["diff", "--cached", "--name-only"], None).unwrap();
+        assert!(staged.trim().is_empty(), "undo staged files: {staged}");
+
+        assert!(exists(root, &before));
+        assert!(!exists(root, "0123456789012345678901234567890123456789"));
     }
 
     #[test]

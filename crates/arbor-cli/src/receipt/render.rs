@@ -50,6 +50,9 @@ pub fn tests(files: &[ChangedFile], affects: &Affects) -> Vec<String> {
 }
 
 /// The full receipt, as shown after the agent finishes.
+/// Pages and APIs named in "Could affect" before the rest are counted.
+const SHOWN_ROUTES: usize = 4;
+
 pub fn text(receipt: &Receipt) -> String {
     let mut out = Vec::new();
     let functions: usize = receipt.files.iter().map(|f| f.functions.len()).sum();
@@ -68,6 +71,13 @@ pub fn text(receipt: &Receipt) -> String {
     out.push(changed);
 
     let unasked: Vec<&ChangedFile> = receipt.unasked().collect();
+    let undo_hint = (!unasked.is_empty() && !receipt.before.is_empty()).then(|| {
+        format!(
+            "  Undo {}: `arbor receipt undo {} --unasked`",
+            if unasked.len() == 1 { "it" } else { "them" },
+            receipt.id
+        )
+    });
     if !unasked.is_empty() {
         out.push(String::new());
         // Sign in, payments, data and settings can break quietly, so they warn.
@@ -94,14 +104,23 @@ pub fn text(receipt: &Receipt) -> String {
             }
             out.push(line);
         }
+        out.extend(undo_hint);
     }
 
     let mut affect_parts: Vec<String> = Vec::new();
     affect_parts.extend(receipt.affects.areas.iter().map(|a| a.label().to_string()));
-    affect_parts.extend(receipt.affects.routes.iter().map(|s| match s.kind {
+    let routes = &receipt.affects.routes;
+    affect_parts.extend(routes.iter().take(SHOWN_ROUTES).map(|s| match s.kind {
         RouteKind::Page => format!("{} page", s.route),
         RouteKind::Api => format!("{} API", s.route),
     }));
+    if routes.len() > SHOWN_ROUTES {
+        affect_parts.push(plural(
+            routes.len() - SHOWN_ROUTES,
+            "more page or API",
+            "more pages and APIs",
+        ));
+    }
     if receipt.affects.callers > 0 {
         affect_parts.push(plural(
             receipt.affects.callers,
@@ -183,6 +202,8 @@ mod tests {
             affects,
             tests,
             limits: vec![],
+            before: "4b825dc6".into(),
+            after: "9d1f2e3a".into(),
         }
     }
 
@@ -216,7 +237,7 @@ mod tests {
         let text = text(&r);
         assert!(
             text.contains(
-                "⚠ Not in your request (1):\n  lib/auth/session.ts · Sign in · refreshSession"
+                "⚠ Not in your request (1):\n  lib/auth/session.ts · Sign in · refreshSession\n  Undo it: `arbor receipt undo 20260929T101203-abcdef12 --unasked`"
             ),
             "{text}"
         );
@@ -252,5 +273,38 @@ mod tests {
             vec!["Run the app and try what you asked for".to_string()]
         );
         assert!(text(&r).contains("Could affect: nothing else we can see uses this code"));
+    }
+
+    #[test]
+    fn a_long_list_of_pages_is_counted_not_listed() {
+        let page = |route: &str| Surface {
+            kind: RouteKind::Page,
+            route: route.into(),
+        };
+        let r = receipt(
+            vec![file("components/Nav.tsx", Some(true), vec![], &["Nav"])],
+            Affects {
+                routes: [
+                    "/",
+                    "/changelog",
+                    "/dashboard",
+                    "/pricing",
+                    "/settings",
+                    "/signup",
+                ]
+                .map(page)
+                .to_vec(),
+                areas: vec![],
+                entry_points: vec![],
+                callers: 0,
+            },
+        );
+        assert!(
+            text(&r).contains(
+                "Could affect: / page · /changelog page · /dashboard page · /pricing page · 2 more pages and APIs"
+            ),
+            "{}",
+            text(&r)
+        );
     }
 }

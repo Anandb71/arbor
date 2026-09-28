@@ -90,6 +90,11 @@ pub struct Receipt {
     pub tests: Vec<String>,
     /// What this receipt could not check, stated plainly.
     pub limits: Vec<String>,
+    /// Snapshot trees from the start and end of the turn, for `arbor receipt undo`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub before: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub after: String,
 }
 
 impl Receipt {
@@ -424,13 +429,20 @@ fn build(root: &Path, turn: &Turn) -> Result<Option<Receipt>> {
     }
     for file in &reached_files {
         let relative = relative_to(root, file);
-        if let Some((kind, route)) = app::route_for(&relative) {
+        let route = app::route_for(&relative);
+        let page = matches!(route, Some((RouteKind::Page, _)));
+        if let Some((kind, route)) = route {
             routes.insert(Surface { kind, route });
         }
-        areas.extend(app::areas(
-            &relative,
-            reached_names.get(file).map(Vec::as_slice).unwrap_or(&[]),
-        ));
+        // A page that only renders the changed code is reported as that page.
+        // Its name alone (/signup, /pricing) doesn't mean sign in or payments
+        // logic changed, and saying so would bury the warnings that matter.
+        if !page {
+            areas.extend(app::areas(
+                &relative,
+                reached_names.get(file).map(Vec::as_slice).unwrap_or(&[]),
+            ));
+        }
     }
 
     if !unparsed.is_empty() {
@@ -475,6 +487,8 @@ fn build(root: &Path, turn: &Turn) -> Result<Option<Receipt>> {
         affects,
         tests,
         limits,
+        before: turn.tree.clone(),
+        after: now_tree,
     }))
 }
 
@@ -540,6 +554,88 @@ pub fn show(id: Option<&str>, path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Which of a turn's files to undo: the named ones, the ones outside the
+/// request, or all of them.
+fn undo_targets<'a>(
+    receipt: &'a Receipt,
+    files: &[String],
+    unasked: bool,
+) -> Result<Vec<&'a ChangedFile>> {
+    let wanted: Vec<String> = files
+        .iter()
+        .map(|file| file.replace('\\', "/").trim_start_matches("./").to_string())
+        .collect();
+    if let Some(unknown) = wanted
+        .iter()
+        .find(|name| !receipt.files.iter().any(|file| &file.path == *name))
+    {
+        return Err(format!("{unknown} wasn't changed in this turn.").into());
+    }
+    Ok(receipt
+        .files
+        .iter()
+        .filter(|file| {
+            if !wanted.is_empty() {
+                wanted.contains(&file.path)
+            } else if unasked {
+                file.in_scope == Some(false)
+            } else {
+                true
+            }
+        })
+        .collect())
+}
+
+/// Put files back the way they were before a turn. A file that changed again
+/// after the turn is refused unless `force` is set, so undo never throws away
+/// later work; when anything is refused, nothing is undone.
+pub fn undo(id: &str, files: &[String], unasked: bool, force: bool, path: &Path) -> Result<()> {
+    let root = crate::commands::resolve_project_path(path)?;
+    let receipts = load_all(&root);
+    let receipt = receipts
+        .iter()
+        .find(|r| r.id.starts_with(id))
+        .ok_or("No matching receipt. `arbor receipt list` shows what is saved.")?;
+    if receipt.before.is_empty() || receipt.after.is_empty() {
+        return Err("This receipt was saved without snapshots, so it can't be undone.".into());
+    }
+    if !snapshot::exists(&root, &receipt.before) || !snapshot::exists(&root, &receipt.after) {
+        return Err("Git no longer has this turn's snapshots (unused ones are cleaned up after about two weeks), so it can't be undone.".into());
+    }
+    let targets = undo_targets(receipt, files, unasked)?;
+    if targets.is_empty() {
+        println!("Nothing to undo: no file in this turn was flagged as outside your request.");
+        return Ok(());
+    }
+    if !force {
+        let mut moved = Vec::new();
+        for file in &targets {
+            for path in std::iter::once(&file.path).chain(file.old_path.as_ref()) {
+                if !snapshot::unchanged_since(&root, &receipt.after, path)? {
+                    moved.push(path.as_str());
+                }
+            }
+        }
+        if !moved.is_empty() {
+            return Err(format!(
+                "{} changed after this turn, so undoing would lose that work. Nothing was undone; add --force to undo anyway.",
+                moved.join(", ")
+            )
+            .into());
+        }
+    }
+    for file in &targets {
+        snapshot::restore(&root, &receipt.before, &file.path, file.old_path.as_deref())?;
+        match (file.change, &file.old_path) {
+            (ChangeKind::Added, _) => println!("Removed {} (new in this turn)", file.path),
+            (ChangeKind::Deleted, _) => println!("Restored {}", file.path),
+            (ChangeKind::Renamed, Some(old)) => println!("Moved {} back to {old}", file.path),
+            _ => println!("Put back {}", file.path),
+        }
+    }
+    Ok(())
+}
+
 /// UTC time as RFC 3339, without a date-time dependency.
 fn now_rfc3339() -> String {
     let seconds = SystemTime::now()
@@ -585,6 +681,59 @@ mod tests {
     fn session_ids_cannot_escape_the_receipts_folder() {
         let path = turn_path(Path::new("/p"), "../../etc/passwd");
         assert!(path.ends_with("______etc_passwd.json"), "{path:?}");
+    }
+
+    fn changed(path: &str, in_scope: Option<bool>) -> ChangedFile {
+        ChangedFile {
+            path: path.into(),
+            old_path: None,
+            change: ChangeKind::Modified,
+            additions: 1,
+            deletions: 1,
+            functions: vec![],
+            areas: vec![],
+            in_scope,
+        }
+    }
+
+    #[test]
+    fn undo_picks_named_unasked_or_all_files() {
+        let receipt = Receipt {
+            version: 1,
+            id: "20260929T101203-abcdef12".into(),
+            agent: "claude-code".into(),
+            prompt: "make the pricing button green".into(),
+            started_at: String::new(),
+            finished_at: String::new(),
+            files: vec![
+                changed("components/PricingButton.tsx", Some(true)),
+                changed("lib/auth/session.ts", Some(false)),
+            ],
+            scope_known: true,
+            affects: Affects {
+                routes: vec![],
+                areas: vec![],
+                entry_points: vec![],
+                callers: 0,
+            },
+            tests: vec![],
+            limits: vec![],
+            before: "a".into(),
+            after: "b".into(),
+        };
+        let paths = |files: Vec<&ChangedFile>| -> Vec<String> {
+            files.into_iter().map(|f| f.path.clone()).collect()
+        };
+        assert_eq!(
+            paths(undo_targets(&receipt, &[], true).unwrap()),
+            ["lib/auth/session.ts"]
+        );
+        assert_eq!(undo_targets(&receipt, &[], false).unwrap().len(), 2);
+        assert_eq!(
+            paths(undo_targets(&receipt, &[".\\lib\\auth\\session.ts".into()], false).unwrap()),
+            ["lib/auth/session.ts"]
+        );
+        assert!(undo_targets(&receipt, &["README.md".into()], false).is_err());
     }
 
     #[test]

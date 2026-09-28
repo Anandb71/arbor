@@ -526,6 +526,22 @@ enum ReceiptAction {
         #[arg(long)]
         json: bool,
     },
+    /// Put back what a turn changed, as it was before the turn
+    Undo {
+        /// Receipt id or a prefix of it
+        id: String,
+        /// Only these files (default: every file the turn changed)
+        files: Vec<String>,
+        /// Only the files outside your request
+        #[arg(long, conflicts_with = "files")]
+        unasked: bool,
+        /// Undo even files that changed again after the turn
+        #[arg(long)]
+        force: bool,
+        /// Project path (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -740,6 +756,13 @@ async fn run() {
             ReceiptAction::End { path, hook, json } => receipt::end(&path, hook, json),
             ReceiptAction::List { path, limit, json } => receipt::list(&path, limit, json),
             ReceiptAction::Show { id, path, json } => receipt::show(id.as_deref(), &path, json),
+            ReceiptAction::Undo {
+                id,
+                files,
+                unasked,
+                force,
+                path,
+            } => receipt::undo(&id, &files, unasked, force, &path),
         },
     };
 

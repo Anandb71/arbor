@@ -8,6 +8,7 @@ Changed 2 files · 2 functions
 
 ⚠ Not in your request (1):
   lib/auth/session.ts · Sign in · refreshSession
+  Undo it: `arbor receipt undo 20260929T101203-f0c322c1 --unasked`
 
 Could affect: Sign in · Payments · /checkout page · /pricing page · /api/checkout API · 4 other functions use this code
 
@@ -51,9 +52,16 @@ Running it again is safe; existing hooks are left alone.
 |---------|-------------|
 | `arbor receipt list` | Recent receipts, newest first (`--limit N`, `--json`) |
 | `arbor receipt show [id]` | One receipt in full, the latest by default (`--json`) |
+| `arbor receipt undo <id> [files]` | Put back what a turn changed: everything, the named files, or `--unasked` for only the files outside your request |
 | `arbor receipt begin` / `end` | Used by the hooks; `end` without `--hook` prints to the terminal |
 
 Receipts are saved as JSON in `.arbor/receipts/`.
+
+## Undo
+
+`arbor receipt undo <id> --unasked` puts the files outside your request back the way they were before the turn, and keeps the rest of the agent's work. Name files to undo just those, or leave both out to undo the whole turn. New files are removed, deleted ones come back and renames are reversed. Only the working tree changes; your staged changes and commits are left alone.
+
+If a file changed again after the turn, by you or a later turn, undo refuses and changes nothing, so later work is never lost. `--force` undoes it anyway. Since the hooks allow `arbor receipt`, you can also just tell Claude to undo what it wasn't asked to do.
 
 ## Limits
 
@@ -61,3 +69,4 @@ Receipts are saved as JSON in `.arbor/receipts/`.
 - Scope matching is by words. A request that names a page or feature works well; "make it better" can't be judged, and the receipt says so.
 - Routes come from file-based routers. Frameworks that declare routes in code (Express, FastAPI, Rails) show their entry points by function name instead.
 - The hooks need `git` and an indexed project. Outside a git repository they do nothing.
+- Undo uses git snapshots that nothing else references, so `git gc` removes them after about two weeks. Older receipts stay readable but can't be undone.
