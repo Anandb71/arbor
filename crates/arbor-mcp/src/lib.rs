@@ -48,6 +48,14 @@ struct JsonRpcError {
     data: Option<Value>,
 }
 
+/// How the HTTP transport answers one POSTed message.
+pub(crate) enum HttpReply {
+    /// A JSON-RPC response body with the HTTP status its outcome maps to.
+    Json(u16, String),
+    /// An accepted notification: `202 Accepted` with no body.
+    Accepted,
+}
+
 pub struct McpServer {
     graph: SharedGraph,
     spotlight_handle: Option<SyncServerHandle>,
@@ -198,6 +206,47 @@ impl McpServer {
         match self.handle_request(req).await {
             Some(resp) => serde_json::to_string(&resp).unwrap_or_default(),
             None => "{}".to_string(),
+        }
+    }
+
+    /// Handle one POSTed Streamable HTTP message and say how the transport
+    /// should answer. The body must be a single JSON-RPC request or
+    /// notification; arrays, responses and other shapes are invalid.
+    pub(crate) async fn handle_http_message(&self, body: &str) -> HttpReply {
+        let invalid = |code: i32, message: String| {
+            HttpReply::Json(
+                400,
+                serde_json::to_string(&JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code,
+                        message,
+                        data: None,
+                    }),
+                    id: None,
+                })
+                .unwrap_or_default(),
+            )
+        };
+        let value: Value = match serde_json::from_str(body) {
+            Ok(value) => value,
+            Err(e) => return invalid(-32700, format!("Parse error: {}", e)),
+        };
+        if !value.is_object() {
+            return invalid(
+                -32600,
+                "Invalid Request: the body must be a single JSON-RPC request or notification"
+                    .to_string(),
+            );
+        }
+        let req: JsonRpcRequest = match serde_json::from_value(value) {
+            Ok(req) => req,
+            Err(e) => return invalid(-32600, format!("Invalid Request: {}", e)),
+        };
+        match self.handle_request(req).await {
+            Some(resp) => HttpReply::Json(200, serde_json::to_string(&resp).unwrap_or_default()),
+            None => HttpReply::Accepted,
         }
     }
 
