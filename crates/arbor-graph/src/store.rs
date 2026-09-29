@@ -243,6 +243,17 @@ mod tests {
     use arbor_core::NodeKind;
     use tempfile::tempdir;
 
+    /// test_cache_version failed on CI when the second open found the lock
+    /// still held by the handle just dropped (#250). Repeat the sequence so a
+    /// missing wait shows up here rather than once in a while in CI.
+    #[test]
+    fn a_store_can_be_reopened_right_after_it_is_dropped() {
+        let dir = tempdir().unwrap();
+        for _ in 0..200 {
+            drop(GraphStore::open(dir.path()).unwrap());
+        }
+    }
+
     #[test]
     fn an_outdated_cache_is_cleared_without_reopening() {
         let dir = tempdir().unwrap();
