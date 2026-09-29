@@ -96,6 +96,46 @@ fn a_branch_switch_never_answers_from_the_other_branch() {
     assert_eq!(names(&back["callers"]), vec!["order_history"]);
 }
 
+#[test]
+fn an_upgrade_rebuilds_a_graph_the_old_version_saved() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let lib = "pub fn helper() -> u32 {\n    1\n}\n\npub fn other() -> u32 {\n    2\n}\n";
+    write(dir, "src/lib.rs", lib);
+    write(
+        dir,
+        "src/run.rs",
+        "pub fn run() -> u32 {\n    crate::helper()\n}\n",
+    );
+    assert!(arbor(dir, &["index", "."]).status.success());
+    let arbor_dir = dir.join(".arbor");
+    let old_bin = fs::read(arbor_dir.join("graph.bin")).unwrap();
+    let old_json = fs::read(arbor_dir.join("graph.json")).ok();
+
+    // What the current extractor sees: `run` calls `other` now.
+    write(
+        dir,
+        "src/run.rs",
+        "pub fn run() -> u32 {\n    crate::other()\n}\n",
+    );
+    assert!(arbor(dir, &["index", "."]).status.success());
+
+    // Put back the graph an older release built, newer than every source
+    // file, the way it sits on disk right after upgrading.
+    fs::write(arbor_dir.join("graph.bin"), old_bin).unwrap();
+    if let Some(json) = old_json {
+        fs::write(arbor_dir.join("graph.json"), json).unwrap();
+    }
+    fs::write(arbor_dir.join("graph.builder"), "arbor-3.0.0").unwrap();
+
+    let callers = json(dir, &["callers", "other", ".", "--json"]);
+    assert_eq!(
+        names(&callers["callers"]),
+        vec!["run"],
+        "answered from the old version's graph: {callers}"
+    );
+}
+
 fn mixed_project() -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path();
