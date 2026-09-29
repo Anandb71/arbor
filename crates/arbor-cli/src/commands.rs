@@ -524,7 +524,10 @@ fn git_availability_with(program: &str, path: &Path) -> GitAvailability {
         .output()
     {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => GitAvailability::Missing,
-        Ok(output) if output.status.success() => GitAvailability::Repository,
+        // Inside .git or a bare repository git succeeds but prints "false".
+        Ok(output) if output.status.success() && output.stdout.trim_ascii() == b"true" => {
+            GitAvailability::Repository
+        }
         _ => GitAvailability::NotARepository,
     }
 }
@@ -611,6 +614,21 @@ mod git_prerequisite_tests {
         assert_eq!(
             git_availability_with("git", dir.path()),
             GitAvailability::Repository
+        );
+    }
+
+    #[test]
+    fn the_git_directory_itself_is_not_a_work_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            git_availability_with("git", &dir.path().join(".git")),
+            GitAvailability::NotARepository
         );
     }
 
