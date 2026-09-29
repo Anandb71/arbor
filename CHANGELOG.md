@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Receipts that could not record:** `arbor hook claude` warns at install time when receipts cannot work there, and `receipt begin` writes the reason to stderr instead of returning silently.
 - **Read-only projects:** failing to create `.arbor/`, `CLAUDE.md` or `.claude/settings.json` names the path and what to do, instead of a bare "Access is denied".
 - **`arbor hook claude` overwriting files:** an existing `CLAUDE.md` or `.claude/settings.json` that could not be read (for example, saved as UTF-16) was treated as empty and replaced. It is now left untouched and the install stops with an explanation.
+- **Linux binaries on older distributions (#242):** v3.0.3's Linux binaries needed glibc 2.39 and would not start on Ubuntu 22.04, Debian 12 or RHEL 9. They are now built in manylinux_2_28 and need glibc 2.28, and the build fails if that floor rises.
+
+### Added
+- **Release checks:** every binary runs a first-use smoke test on its own platform before anything is published, including Intel macOS, Linux arm64, AlmaLinux 8, Ubuntu 22.04 and Debian 12. Pull requests that change the release build or `Cargo.lock` run the same build and smoke test without publishing.
+- **Verifiable downloads:** releases publish `SHA256SUMS` and a signed build provenance attestation for each archive (`gh attestation verify <archive> --repo Anandb71/arbor`).
 
 ## [3.0.3] - 2026-09-29
 
