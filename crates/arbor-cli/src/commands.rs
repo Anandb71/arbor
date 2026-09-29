@@ -517,10 +517,44 @@ pub(crate) fn is_git_repo(path: &Path) -> bool {
     git_availability(path) == GitAvailability::Repository
 }
 
+/// The actionable reason `command` cannot run in `path`, or `None` when git is
+/// installed and `path` is inside a repository.
+pub(crate) fn git_prerequisite_error(path: &Path, command: &str) -> Option<String> {
+    git_prerequisite_message(git_availability(path), path, command)
+}
+
+fn git_prerequisite_message(
+    availability: GitAvailability,
+    path: &Path,
+    command: &str,
+) -> Option<String> {
+    match availability {
+        GitAvailability::Repository => None,
+        GitAvailability::Missing => Some(format!(
+            "{command} needs git, but no `git` executable was found on PATH.\n  \
+             Install Git (https://git-scm.com/downloads) or add it to PATH, then run it again."
+        )),
+        GitAvailability::NotARepository => Some(format!(
+            "{command} needs a git repository, and {} is not inside one.\n  \
+             Run it from your project's repository, or run `git init` there first.",
+            path.display()
+        )),
+    }
+}
+
+/// Fail with an actionable message unless git is installed and `path` is a repository.
+pub(crate) fn require_git_repo(path: &Path, command: &str) -> Result<()> {
+    match git_prerequisite_error(path, command) {
+        Some(message) => Err(message.into()),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod git_prerequisite_tests {
-    use super::{git_availability_with, GitAvailability};
+    use super::{git_availability_with, git_prerequisite_message, GitAvailability};
+    use std::path::Path;
 
     const NO_SUCH_GIT: &str = "arbor-test-no-such-git-executable";
 
@@ -559,6 +593,32 @@ mod git_prerequisite_tests {
             git_availability_with("git", dir.path()),
             GitAvailability::Repository
         );
+    }
+
+    #[test]
+    fn messages_name_the_command_the_problem_and_the_fix() {
+        let path = Path::new("work").join("app");
+        assert!(
+            git_prerequisite_message(GitAvailability::Repository, &path, "arbor diff").is_none()
+        );
+
+        let missing =
+            git_prerequisite_message(GitAvailability::Missing, &path, "arbor diff").unwrap();
+        assert!(missing.starts_with("arbor diff needs git,"), "{missing}");
+        assert!(missing.contains("PATH"), "{missing}");
+        assert!(
+            missing.contains("https://git-scm.com/downloads"),
+            "{missing}"
+        );
+
+        let outside =
+            git_prerequisite_message(GitAvailability::NotARepository, &path, "arbor diff").unwrap();
+        assert!(
+            outside.starts_with("arbor diff needs a git repository,"),
+            "{outside}"
+        );
+        assert!(outside.contains(&path.display().to_string()), "{outside}");
+        assert!(outside.contains("git init"), "{outside}");
     }
 }
 
@@ -1548,9 +1608,7 @@ pub fn diff(
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
 
-    if !is_git_repo(&resolved_path) {
-        return Err("arbor diff requires a git repository".into());
-    }
+    require_git_repo(&resolved_path, "arbor diff")?;
 
     let set = crate::changes::ChangeSet::collect(&resolved_path, scope)?;
     if set.is_empty() {
@@ -1603,9 +1661,7 @@ pub fn check(
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
 
-    if !is_git_repo(&resolved_path) {
-        return Err("arbor check requires a git repository".into());
-    }
+    require_git_repo(&resolved_path, "arbor check")?;
 
     let set = crate::changes::ChangeSet::collect(&resolved_path, scope)?;
     let (_graph, _symbols, summary) = change_impact(&resolved_path, &set, depth)?;
@@ -3008,9 +3064,7 @@ pub fn summary(path: &Path, scope: &crate::changes::Scope) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
 
-    if !is_git_repo(&resolved_path) {
-        return Err("arbor summary requires a git repository".into());
-    }
+    require_git_repo(&resolved_path, "arbor summary")?;
 
     let set = crate::changes::ChangeSet::collect(&resolved_path, scope)?;
     if set.is_empty() {
@@ -4601,9 +4655,7 @@ pub fn agent_review(path: &Path, json: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
 
-    if !is_git_repo(&resolved_path) {
-        return Err("arbor agent review requires a git repository".into());
-    }
+    require_git_repo(&resolved_path, "arbor agent review")?;
 
     let set =
         crate::changes::ChangeSet::collect(&resolved_path, &crate::changes::Scope::WorkingTree)?;
@@ -4957,9 +5009,7 @@ pub fn agent_guard(path: &Path, max_blast_radius: usize) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
 
-    if !is_git_repo(&resolved_path) {
-        return Err("arbor agent guard requires a git repository".into());
-    }
+    require_git_repo(&resolved_path, "arbor agent guard")?;
 
     let set =
         crate::changes::ChangeSet::collect(&resolved_path, &crate::changes::Scope::WorkingTree)?;
