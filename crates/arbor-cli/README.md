@@ -23,13 +23,13 @@ Arbor is the **graph-native intelligence layer for code**. It parses your codeba
 
 This CLI is the primary interface for indexing, querying, and connecting your code to AI via the Model Context Protocol (MCP).
 
-> Release status (July 2026): **v2.4.0** — MCP `2026-07-28`, Tasks extension, MCP Apps, and `arbor bridge --http`.
-
 ## Installation
 
 ```bash
 cargo install arbor-graph-cli
 ```
+
+crates.io can lag the GitHub releases. Prebuilt binaries and a from-source install of the latest tag are in the [installation guide](https://github.com/Anandb71/arbor/blob/main/docs/INSTALL.md).
 
 ## Quick Start
 
@@ -54,8 +54,18 @@ arbor bridge --viz
 | `arbor index` | Full index of the codebase |
 | `arbor index --changed-only` | Incremental index of git-modified files |
 | `arbor query <q>` | Search the graph |
-| `arbor diff` | Preview blast radius for current git changes |
-| `arbor check` | CI safety gate for risky change sets |
+| `arbor map` | Ranked, token-budgeted project skeleton |
+| `arbor callers <symbol>` / `arbor callees <symbol>` | One-hop traversal; same-named symbols are listed per definition |
+| `arbor inspect <symbol>` | Full detail for one symbol |
+| `arbor path <a> <b>` | Shortest call-graph path |
+| `arbor entry-points` | HTTP handlers, main, jobs, webhooks, CLI commands |
+| `arbor file-graph <path>` | Symbols and call edges within one file |
+| `arbor diff` | Blast radius of git changes, per symbol (`--base <ref>`, `--staged`) |
+| `arbor check` | CI safety gate for risky change sets (`--max-blast-radius N`) |
+| `arbor summary` | Pull request description from the change set |
+| `arbor agent review` / `onboard` / `guard` | Built-in agent workflows |
+| `arbor receipt list` / `show` / `undo` | Plain-English receipts of what each agent turn changed |
+| `arbor hook claude` | Wire Arbor into Claude Code (directives and per-turn receipts) |
 | `arbor open <symbol>` | Open symbol/file in your editor |
 | `arbor refactor <symbol>` | Blast-radius preview before refactoring |
 | `arbor explain <symbol>` | Graph-backed context for code explanation |
@@ -83,13 +93,13 @@ arbor diff
 arbor check --json --max-blast-radius 30
 ```
 
-## Release Docs
+## Docs
 
-- [Quickstart](../../docs/QUICKSTART.md)
-- [Installation](../../docs/INSTALL.md)
-- [MCP Integration](../../docs/MCP_INTEGRATION.md)
-- [v1.6 Release Notes](../../docs/RELEASE_NOTES_v1.6.0.md)
-- [v1.6.2 Release Notes](../../docs/RELEASE_NOTES_v1.6.2.md)
+- [Quickstart](https://github.com/Anandb71/arbor/blob/main/docs/QUICKSTART.md)
+- [Installation](https://github.com/Anandb71/arbor/blob/main/docs/INSTALL.md)
+- [MCP Integration](https://github.com/Anandb71/arbor/blob/main/docs/MCP_INTEGRATION.md)
+- [Receipts](https://github.com/Anandb71/arbor/blob/main/docs/RECEIPTS.md)
+- [Changelog](https://github.com/Anandb71/arbor/blob/main/CHANGELOG.md)
 
 ## Supported Languages
 

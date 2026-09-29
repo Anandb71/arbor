@@ -2,8 +2,6 @@
 
 Install Arbor without building from source.
 
-> Updated for March 2026 standards (reproducibility + safer install flows).
-
 ## Fastest Install (Recommended)
 
 For local evaluation, one-line install is fine. For production/CI, use version-pinned install and review scripts before execution.
@@ -68,17 +66,37 @@ If you already use Rust tooling:
 cargo install arbor-graph-cli
 ```
 
-crates.io can lag the GitHub releases: it currently has `arbor-graph-cli` 2.6.0, while the latest release is 3.0.0. To build a release from source instead:
+crates.io can lag the GitHub releases. Check with `cargo search arbor-graph-cli`; if it is behind the [latest release](https://github.com/Anandb71/arbor/releases/latest), build the release tag from source instead:
 
 ```bash
-cargo install --git https://github.com/Anandb71/arbor --tag v3.0.0 arbor-graph-cli
+cargo install --git https://github.com/Anandb71/arbor --tag v3.0.3 arbor-graph-cli
 ```
 
 Run `arbor --version` afterwards. An older `arbor` earlier on your `PATH` (for example in `~/.cargo/bin`) wins over a newer one elsewhere. The crates.io crate named plain `arbor` is an unrelated project.
 
+## Scoop (Windows)
+
+The manifest lives in this repository rather than in a bucket, so install it by URL:
+
+```powershell
+scoop install https://raw.githubusercontent.com/Anandb71/arbor/main/packaging/scoop/arbor.json
+```
+
+## npm wrapper
+
+Downloads the matching release binary on install:
+
+```bash
+npx @anandb71/arbor-cli
+```
+
+## Homebrew
+
+A formula is kept at [`packaging/homebrew/arbor.rb`](../packaging/homebrew/arbor.rb), but no tap is published yet, so `brew install` cannot find it. On macOS and Linux use the install script above.
+
 ## GitHub Packages (GHCR Container)
 
-Arbor container images are published to GitHub Container Registry (GHCR) when a release is published.
+Arbor container images are published to GitHub Container Registry (GHCR) after the release workflow finishes.
 
 Pull image:
 
@@ -114,6 +132,6 @@ Release page:
 
 ---
 
-For maintainers shipping new versions across registries (GitHub Releases, crates.io, GHCR, VS Code Marketplace, Open VSX), follow:
+For maintainers shipping new versions across registries (GitHub Releases, crates.io, GHCR, npm, VS Code Marketplace, Open VSX, Scoop), follow:
 
 - [Release Runbook](./RELEASING.md)

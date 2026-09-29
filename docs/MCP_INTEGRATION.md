@@ -210,11 +210,18 @@ Examples:
 
 All tools return a standard envelope:
 ```json
-{ "ok": true, "tool": "...", "arbor_version": "2.2.0", "data": {...}, "meta": { "node_count": N, "suggested_next_tool": "...", "suggested_next_args": {...} } }
+{ "ok": true, "tool": "...", "arbor_version": "3.0.3", "data": {...}, "meta": { "node_count": N, "suggested_next_tool": "...", "suggested_next_args": {...} } }
 ```
 Errors return `{ "ok": false, "error": "..." }`.
 
-### Surgical tools (v2.1.0)
+### Orientation
+
+| Tool | Description |
+|------|-------------|
+| `get_map` | Ranked, token-budgeted skeleton of the codebase. Recommended first call |
+| `get_architecture_overview` | Hotspots, module boundaries, entry points, languages detected, graph statistics |
+
+### Surgical tools
 
 | Tool | Description |
 |------|-------------|
@@ -224,8 +231,10 @@ Errors return `{ "ok": false, "error": "..." }`.
 | `search_symbols` | Fuzzy search across all symbol names |
 | `get_file_graph` | Returns all nodes and intra-file edges for a given file path |
 | `get_node_detail` | Returns full detail for a node by ID or name |
+| `explain_symbol` | Token-bounded explanation of a symbol: role, callers, callees, centrality |
+| `batch_query` | Several symbols in one call, optionally with callers and callees |
 
-### Broad tools (existing)
+### Broad tools
 
 | Tool | Description |
 |------|-------------|
@@ -233,6 +242,8 @@ Errors return `{ "ok": false, "error": "..." }`.
 | `analyze_impact` | Blast radius with confidence levels and role classification |
 | `find_path` | Shortest path between two symbols |
 | `get_knowledge_path` | Knowledge graph path with wiki-link causality explanation |
+| `get_blast_radius` | Blast radius of the current uncommitted git changes |
+| `audit_security` | Execution paths from a symbol to sensitive sinks (queries, file I/O, network, exec) |
 
 ### Example: get_callers
 
