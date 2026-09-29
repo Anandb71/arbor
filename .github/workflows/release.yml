@@ -143,9 +143,18 @@ jobs:
     needs: [prepare, verify-version-sync]
     uses: ./.github/workflows/release-build.yml
 
+  # Nothing is published until every binary has run on its own platform, so
+  # a binary that cannot start there never reaches a channel.
+  smoke:
+    name: Smoke test
+    needs: [prepare, build]
+    uses: ./.github/workflows/release-smoke.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+
   publish-crates:
     name: Publish crates to crates.io
-    needs: [prepare, build]
+    needs: [prepare, build, smoke]
     runs-on: ubuntu-latest
     # A crates.io failure shows as a failed job with an error annotation, but
     # it must not fail the run: GHCR, npm and the VS Code extension publish
@@ -213,7 +222,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [prepare, build]
+    needs: [prepare, build, smoke]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
