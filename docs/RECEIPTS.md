@@ -68,5 +68,5 @@ If a file changed again after the turn, by you or a later turn, undo refuses and
 - Relationships are static. "Could affect" means the code can reach it, not that it will break.
 - Scope matching is by words. A request that names a page or feature works well; "make it better" can't be judged, and the receipt says so.
 - Routes come from file-based routers. Frameworks that declare routes in code (Express, FastAPI, Rails) show their entry points by function name instead.
-- The hooks need `git` and an indexed project. Outside a git repository they do nothing.
+- The hooks need `git` and an indexed project. Outside a git repository they record nothing: `arbor hook claude` warns about that when you install, and each turn writes the reason to stderr, which Claude Code keeps in its debug log.
 - Undo uses git snapshots that nothing else references, so `git gc` removes them after about two weeks. Older receipts stay readable but can't be undone.
