@@ -543,6 +543,9 @@ fn git_prerequisite_message(
 }
 
 /// Fail with an actionable message unless git is installed and `path` is a repository.
+///
+/// Call it before `ensure_arbor_initialized`: outside a repository git is the
+/// real blocker, and auto-index would otherwise create `.arbor/` there first.
 pub(crate) fn require_git_repo(path: &Path, command: &str) -> Result<()> {
     match git_prerequisite_error(path, command) {
         Some(message) => Err(message.into()),
@@ -1606,9 +1609,8 @@ pub fn diff(
     scope: &crate::changes::Scope,
 ) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
-    let _ = ensure_arbor_initialized(&resolved_path)?;
-
     require_git_repo(&resolved_path, "arbor diff")?;
+    let _ = ensure_arbor_initialized(&resolved_path)?;
 
     let set = crate::changes::ChangeSet::collect(&resolved_path, scope)?;
     if set.is_empty() {
@@ -1659,9 +1661,8 @@ pub fn check(
     scope: &crate::changes::Scope,
 ) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
-    let _ = ensure_arbor_initialized(&resolved_path)?;
-
     require_git_repo(&resolved_path, "arbor check")?;
+    let _ = ensure_arbor_initialized(&resolved_path)?;
 
     let set = crate::changes::ChangeSet::collect(&resolved_path, scope)?;
     let (_graph, _symbols, summary) = change_impact(&resolved_path, &set, depth)?;
@@ -3062,9 +3063,8 @@ pub fn pr_summary(symbols: &str, path: &Path) -> Result<()> {
 /// Generate an auto-description for a PR based on graph changes.
 pub fn summary(path: &Path, scope: &crate::changes::Scope) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
-    let _ = ensure_arbor_initialized(&resolved_path)?;
-
     require_git_repo(&resolved_path, "arbor summary")?;
+    let _ = ensure_arbor_initialized(&resolved_path)?;
 
     let set = crate::changes::ChangeSet::collect(&resolved_path, scope)?;
     if set.is_empty() {
@@ -4653,9 +4653,8 @@ pub fn analyze_local(path: &Path, top: usize) -> Result<()> {
 
 pub fn agent_review(path: &Path, json: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
-    let _ = ensure_arbor_initialized(&resolved_path)?;
-
     require_git_repo(&resolved_path, "arbor agent review")?;
+    let _ = ensure_arbor_initialized(&resolved_path)?;
 
     let set =
         crate::changes::ChangeSet::collect(&resolved_path, &crate::changes::Scope::WorkingTree)?;
@@ -5007,9 +5006,8 @@ pub fn agent_onboard(path: &Path, json: bool) -> Result<()> {
 
 pub fn agent_guard(path: &Path, max_blast_radius: usize) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
-    let _ = ensure_arbor_initialized(&resolved_path)?;
-
     require_git_repo(&resolved_path, "arbor agent guard")?;
+    let _ = ensure_arbor_initialized(&resolved_path)?;
 
     let set =
         crate::changes::ChangeSet::collect(&resolved_path, &crate::changes::Scope::WorkingTree)?;
