@@ -3,6 +3,7 @@ use crate::graph::ArborGraph;
 use arbor_core::CodeNode;
 use sled::{Batch, Db};
 use std::path::Path;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 /// Current cache format version. The cache stores parser output, so a change
@@ -35,7 +36,7 @@ impl GraphStore {
     /// Opens or creates a graph store at the specified path.
     /// Returns an error if the cache version doesn't match.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StoreError> {
-        let db = sled::open(path)?;
+        let db = open_db(path.as_ref())?;
         match stored_version(&db)? {
             Some(found) if found != CACHE_VERSION => Err(StoreError::VersionMismatch {
                 expected: CACHE_VERSION.to_string(),
@@ -56,7 +57,7 @@ impl GraphStore {
     /// straight after `open` reported a mismatch could fail with "could not
     /// acquire lock", on the first run after an upgrade.
     pub fn open_or_reset<P: AsRef<Path>>(path: P) -> Result<Self, StoreError> {
-        let db = sled::open(path)?;
+        let db = open_db(path.as_ref())?;
         match stored_version(&db)? {
             Some(found) if found == CACHE_VERSION => {}
             Some(_) => {
@@ -219,6 +220,25 @@ impl GraphStore {
         self.db.insert("meta:version", version_bytes)?;
         self.db.flush()?;
         Ok(())
+    }
+}
+
+/// Open the sled database, waiting up to a second while a handle this
+/// process just dropped still holds the directory lock (sled releases it
+/// when that handle's flusher thread exits). A store held open by another
+/// process still fails, after the wait.
+fn open_db(path: &Path) -> Result<Db, StoreError> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match sled::open(path) {
+            Err(sled::Error::Io(error))
+                if error.to_string().contains("could not acquire lock")
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => return Ok(result?),
+        }
     }
 }
 
