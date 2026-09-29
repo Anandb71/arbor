@@ -151,6 +151,21 @@ fn not_indexed_error(path: &Path) -> Box<dyn std::error::Error> {
     .into()
 }
 
+/// Name the path Arbor failed to write, and the fix when access was refused.
+/// A bare "Access is denied. (os error 5)" says neither.
+pub(crate) fn write_error(path: &Path, error: std::io::Error) -> Box<dyn std::error::Error> {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => format!(
+            "Arbor could not write {}: {error}.\n  \
+             Check that your user can write there, or run Arbor on a copy of the project you own.",
+            path.display()
+        )
+        .into(),
+        _ => format!("Arbor could not write {}: {error}", path.display()).into(),
+    }
+}
+
 /// Ensures `.arbor/` exists for an *implicit* (non-`index`/`init`) command.
 ///
 /// If the project is already indexed, this is a no-op create. If it is NOT
@@ -170,7 +185,7 @@ fn init_arbor_dir(path: &Path) -> Result<bool> {
     let config_path = arbor_dir.join("config.json");
 
     if !arbor_dir.exists() {
-        fs::create_dir_all(&arbor_dir)?;
+        fs::create_dir_all(&arbor_dir).map_err(|e| write_error(&arbor_dir, e))?;
     }
 
     if !config_path.exists() {
@@ -190,7 +205,8 @@ fn init_arbor_dir(path: &Path) -> Result<bool> {
             ],
             "ignore": ["node_modules", "target", "dist", "__pycache__", ".venv", "build", "out", "vendor", "*.min.js", "*.min.css"]
         });
-        fs::write(&config_path, serde_json::to_string_pretty(&default_config)?)?;
+        fs::write(&config_path, serde_json::to_string_pretty(&default_config)?)
+            .map_err(|e| write_error(&config_path, e))?;
         return Ok(true);
     }
 
@@ -3372,6 +3388,25 @@ mod tests {
         {
             ("flutter", "linux")
         }
+    }
+
+    #[test]
+    fn write_errors_name_the_path_and_the_fix_for_refused_access() {
+        use std::io::{Error, ErrorKind};
+        let dir = std::path::Path::new("app").join(".arbor");
+
+        let refused = super::write_error(&dir, Error::from(ErrorKind::PermissionDenied));
+        let refused = refused.to_string();
+        assert!(refused.starts_with("Arbor could not write "), "{refused}");
+        assert!(refused.contains(&dir.display().to_string()), "{refused}");
+        assert_eq!(
+            refused.lines().nth(1),
+            Some("  Check that your user can write there, or run Arbor on a copy of the project you own.")
+        );
+
+        let full = super::write_error(&dir, Error::from(ErrorKind::StorageFull)).to_string();
+        assert!(full.contains(&dir.display().to_string()), "{full}");
+        assert_eq!(full.lines().count(), 1, "{full}");
     }
 
     #[test]
