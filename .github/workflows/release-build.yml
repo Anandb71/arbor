@@ -48,6 +48,9 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p arbor-graph-cli
 
+      - name: Check the glibc floor
+        run: bash scripts/ci/check-glibc-floor.sh "target/${{ matrix.target }}/release/arbor" 2.28
+
       - name: Package artifact
         shell: bash
         run: |
