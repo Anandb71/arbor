@@ -492,4 +492,34 @@ mod tests {
         slow.write_all(b"POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 50\r\n\r\n{").await.unwrap();
         assert!(read_all(&mut slow).await.starts_with("HTTP/1.1 408"));
     }
+
+    /// Write `raw` on one connection and return everything the server sends
+    /// back before closing it.
+    async fn exchange(address: std::net::SocketAddr, raw: &str) -> String {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.write_all(raw.as_bytes()).await.unwrap();
+        read_all(&mut stream).await
+    }
+
+    fn responses(output: &str) -> usize {
+        output.matches("HTTP/1.1 ").count()
+    }
+
+    const HEAD: &str =
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n";
+
+    fn framed(body: &str) -> String {
+        format!("{HEAD}Content-Length: {}\r\n\r\n{body}", body.len())
+    }
+
+    /// Keep-alive is off, so each connection carries exactly one request.
+    /// That is what stops a mis-framed body from being read as a second,
+    /// smuggled request, so pin it: a pipelined request gets no answer.
+    #[tokio::test]
+    async fn one_connection_answers_one_request() {
+        let address = spawn(Limits::default()).await;
+        let output = exchange(address, &format!("{}{}", framed(LIST), framed(LIST))).await;
+        assert!(output.starts_with("HTTP/1.1 200"), "{output}");
+        assert_eq!(responses(&output), 1, "{output}");
+    }
 }
