@@ -8,12 +8,17 @@ on:
         required: false
         default: status .
         type: string
+  pull_request:
+    paths:
+      - action.yml
+      - .github/workflows/arbor-action-smoke.yml
 
 permissions:
   contents: read
 
 jobs:
   smoke:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -31,3 +36,32 @@ jobs:
         with:
           install-from-source: "true"
           command: ${{ github.event.inputs.command || matrix.command }}
+
+  # The in-repo workflows install from source, so nothing exercised the
+  # prebuilt download that users of `uses: Anandb71/arbor@vX` get, and it
+  # matched no release asset for as long as it existed.
+  prebuilt:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Arbor action with a released binary
+        uses: ./
+        with:
+          arbor-version: "3.0.0"
+          command: --version
+          comment-on-pr: "false"
+
+      - name: Binary came from the release, not a source build
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls "$HOME/.arbor-bin"
+          test -f "$HOME/.arbor-bin/arbor" || test -f "$HOME/.arbor-bin/arbor.exe"
+          arbor --version | grep -F "3.0.0"

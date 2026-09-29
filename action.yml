@@ -62,40 +62,54 @@ runs:
           
           DOWNLOADED=false
           if [[ -n "$VERSION" ]]; then
-            ARCH=$(uname -m || echo "x86_64")
-            OS="unknown-linux-gnu"
-            if [[ "$OSTYPE" == "darwin"* ]]; then
-              OS="apple-darwin"
-            elif [[ "$OSTYPE" == "msys"* || "$OSTYPE" == "win32"* ]]; then
-              OS="pc-windows-msvc"
+            # Release assets are named arbor-<os>-<arch> (arbor-linux-x86_64.tar.gz,
+            # arbor-macos-aarch64.tar.gz, arbor-windows-x86_64.zip). This used to
+            # build Rust target triples instead, which matched no asset, so every
+            # run silently fell back to compiling whatever crates.io had.
+            case "$(uname -m 2>/dev/null || echo x86_64)" in
+              arm64|aarch64) ARCH="aarch64" ;;
+              *) ARCH="x86_64" ;;
+            esac
+            case "$RUNNER_OS" in
+              macOS) OS="macos" ;;
+              Windows) OS="windows" ;;
+              *) OS="linux" ;;
+            esac
+
+            TARBALL="arbor-${OS}-${ARCH}.tar.gz"
+            if [[ "$OS" == "windows" ]]; then
+              TARBALL="arbor-${OS}-${ARCH}.zip"
             fi
-            
-            TARBALL="arbor-${ARCH}-${OS}.tar.gz"
-            if [[ "$OS" == "pc-windows-msvc" ]]; then
-              TARBALL="arbor-${ARCH}-${OS}.zip"
-            fi
-            
+
             DOWNLOAD_URL="https://github.com/Anandb71/arbor/releases/download/v${VERSION}/${TARBALL}"
             echo "Attempting to download pre-built binary: $DOWNLOAD_URL"
-            
+
             if curl -fsSL -o "$TARBALL" "$DOWNLOAD_URL"; then
               echo "Extracting..."
               if [[ "$TARBALL" == *.zip ]]; then
-                unzip -q "$TARBALL" || true
+                unzip -q -o "$TARBALL" 2>/dev/null \
+                  || powershell -NoProfile -Command "Expand-Archive -Force -Path '$TARBALL' -DestinationPath ." \
+                  || true
               else
                 tar -xzf "$TARBALL" || true
               fi
-              
+
               BINARY="arbor"
-              if [[ "$OS" == "pc-windows-msvc" ]]; then
+              if [[ "$OS" == "windows" ]]; then
                 BINARY="arbor.exe"
               fi
               
               if [[ -f "$BINARY" ]]; then
                 mkdir -p "$HOME/.arbor-bin"
                 mv "$BINARY" "$HOME/.arbor-bin/"
-                echo "Adding $HOME/.arbor-bin to GITHUB_PATH"
-                echo "$HOME/.arbor-bin" >> $GITHUB_PATH
+                PATH_ENTRY="$HOME/.arbor-bin"
+                # GITHUB_PATH is read by the runner, which needs a native
+                # path on Windows rather than Git Bash's /c/... form.
+                if command -v cygpath >/dev/null 2>&1; then
+                  PATH_ENTRY="$(cygpath -w "$PATH_ENTRY")"
+                fi
+                echo "Adding $PATH_ENTRY to GITHUB_PATH"
+                echo "$PATH_ENTRY" >> "$GITHUB_PATH"
                 export PATH="$HOME/.arbor-bin:$PATH"
                 rm -f "$TARBALL"
                 DOWNLOADED=true
@@ -105,11 +119,13 @@ runs:
           fi
           
           if [[ "$DOWNLOADED" == "false" ]]; then
-            echo "Could not download pre-built binary. Installing via cargo instead (this might take a few minutes)..."
-            if [[ "${{ inputs.arbor-version }}" == "latest" ]]; then
-              cargo install arbor-graph-cli --force
+            echo "Could not download pre-built binary. Building with cargo instead (this might take a few minutes)..."
+            # Build the resolved release tag rather than whatever crates.io
+            # has: crates.io can lag the GitHub releases.
+            if [[ -n "$VERSION" ]]; then
+              cargo install --git https://github.com/Anandb71/arbor --tag "v${VERSION}" arbor-graph-cli --locked --force
             else
-              cargo install arbor-graph-cli --version "${{ inputs.arbor-version }}" --force
+              cargo install arbor-graph-cli --force
             fi
           fi
         fi
