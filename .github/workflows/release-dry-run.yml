@@ -1,0 +1,55 @@
+name: Release dry run
+
+# Builds and smoke-tests the release binaries exactly as a release would,
+# without publishing anything. Runs on pull requests that change how the
+# binaries are built or checked, or that change dependencies, so a broken
+# release is found before a tag instead of after it.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/workflows/release-build.yml
+      - .github/workflows/release-smoke.yml
+      - .github/workflows/release-dry-run.yml
+      - scripts/ci/check-glibc-floor.sh
+      - scripts/ci/smoke-release-binary.sh
+      - Cargo.lock
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-dry-run-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  version:
+    name: Read the workspace version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: read
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          with open("Cargo.toml", "rb") as f:
+              print("version=" + tomllib.load(f)["workspace"]["package"]["version"])
+          PY
+
+  build:
+    name: Build
+    uses: ./.github/workflows/release-build.yml
+
+  smoke:
+    name: Smoke test
+    needs: [version, build]
+    uses: ./.github/workflows/release-smoke.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
