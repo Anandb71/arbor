@@ -170,7 +170,7 @@ Think a number is wrong? `cargo bench -p arbor-graph` and prove it: [BENCHMARKS.
 ## Quickstart
 
 ```bash
-# Install
+# Install (crates.io can lag the latest release: see docs/INSTALL.md)
 cargo install arbor-graph-cli
 
 # Index your project (one command)
@@ -180,6 +180,7 @@ cd your-project && arbor setup
 arbor map . --exclude-test          # ranked project skeleton (~1k tokens)
 arbor refactor parse_file           # blast radius of changing a symbol
 arbor diff                          # impact of uncommitted git changes
+arbor diff --base origin/main       # impact of this branch, as its PR shows it
 
 # Wire up your AI agent
 claude mcp add --transport stdio --scope project arbor -- arbor bridge
@@ -241,15 +242,15 @@ Every tool returns `{ ok, tool, data, meta: { suggested_next_tool, suggested_nex
 | `arbor setup` | One-shot init + index |
 | `arbor map` | Ranked, token-budgeted project skeleton |
 | `arbor query <term>` | Fuzzy symbol search (supports `\|` OR) |
-| `arbor callers / callees <sym>` | One-hop graph traversal |
+| `arbor callers / callees <sym>` | One-hop graph traversal. Same-named symbols are listed per definition; narrow with `jobs::enqueue`, `Type.method` or `src/jobs.rs:enqueue` |
 | `arbor entry-points` | HTTP handlers, main, jobs, webhooks |
 | `arbor file-graph <path>` | Symbols + edges in one file |
 | `arbor inspect <sym>` | Full symbol detail |
 | `arbor path <a> <b>` | Shortest call-graph path |
 | `arbor refactor <sym>` | Blast radius before refactoring |
-| `arbor diff` | Git-change impact report |
-| `arbor check` | CI safety gate (`--max-blast-radius N`) |
-| `arbor summary` | Auto-generate PR description |
+| `arbor diff` | Git-change impact report, per symbol: new symbols carry no blast radius. `--base <ref>` compares against the merge base (what a PR shows), `--staged` only staged changes |
+| `arbor check` | CI safety gate (`--max-blast-radius N`, `--base <ref>`) |
+| `arbor summary` | Auto-generate PR description (`--base <ref>`) |
 | `arbor agent review` | Autonomous PR architecture review |
 | `arbor agent onboard` | Codebase onboarding guide |
 | `arbor agent guard` | Real-time architectural safety gate |

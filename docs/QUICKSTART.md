@@ -79,6 +79,9 @@ arbor explain validate_input
 # Preview impact for current git diff
 arbor diff
 
+# Preview a whole branch the way its pull request will show it
+arbor diff --base origin/main
+
 # CI safety gate (fails on risky blast radius)
 arbor check --max-blast-radius 30
 

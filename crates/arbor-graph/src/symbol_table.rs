@@ -221,8 +221,18 @@ impl SymbolTable {
         context_file: &Path,
         imports: Option<&HashMap<String, String>>,
     ) -> Resolution {
-        let exact = self.by_fqn.get(name);
-        if let Some(entries) = exact {
+        // A call never crosses languages: a Rust `enqueue` isn't called by a
+        // TypeScript `enqueue(...)`. Definitions in another language are not
+        // candidates at all, so they can neither win nor make a match ambiguous.
+        let family = language_family(context_file);
+        let visible = |e: &SymbolEntry| same_family(family, &e.file);
+
+        let exact: Option<Vec<&SymbolEntry>> = self
+            .by_fqn
+            .get(name)
+            .map(|entries| entries.iter().filter(|e| visible(e)).collect::<Vec<_>>())
+            .filter(|entries| !entries.is_empty());
+        if let Some(entries) = &exact {
             if entries.len() == 1 {
                 return Resolution::Exact(entries[0].id);
             }
@@ -249,7 +259,7 @@ impl SymbolTable {
             for fqn in fqns {
                 if let Some(entries) = self.by_fqn.get(fqn) {
                     for e in entries {
-                        if !seen.contains(&e.id) {
+                        if visible(e) && !seen.contains(&e.id) {
                             seen.push(e.id);
                             candidates.push(e);
                         }
@@ -316,6 +326,99 @@ impl SymbolTable {
         Resolution::Ambiguous(candidates.into_iter().map(|e| e.id).collect())
     }
 
+    /// Resolves a `::` path reference: `jobs::enqueue`, `Provider::new`,
+    /// `crate::db::queries::get_user`, `my_app::app::create`.
+    ///
+    /// The path says where the definition lives, so it is matched on that
+    /// rather than on the bare name:
+    ///
+    /// - a path some parser recorded verbatim (C++ `ns::fn`) matches directly;
+    /// - a capitalised owner is a type, and `Type::new` is stored as `Type.new`;
+    /// - anything else is a module, matched against the definition's file
+    ///   (`jobs.rs`, `app/mod.rs`). Leading segments are dropped until one
+    ///   matches, so a crate-name prefix (`my_app::app::…`) works,
+    ///   and a definition re-exported from a submodule is found at lower
+    ///   confidence.
+    ///
+    /// A path into an external crate (`sqlx::query`, `std::fs::read`) matches
+    /// nothing here and stays unresolved, instead of binding to an unrelated
+    /// local function that shares the last name.
+    pub fn resolve_path(&self, path: &str, context_file: &Path) -> Resolution {
+        let family = language_family(context_file);
+        let visible = |e: &&SymbolEntry| same_family(family, &e.file);
+
+        let verbatim = self.entries_with_suffix(path, &visible);
+        if !verbatim.is_empty() {
+            return pick(verbatim, context_file, Resolution::Exact);
+        }
+
+        let segments: Vec<&str> = path
+            .split("::")
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !matches!(*s, "crate" | "self" | "super"))
+            .collect();
+        let Some((name, qualifiers)) = segments.split_last() else {
+            return Resolution::Unresolved;
+        };
+        let Some(owner) = qualifiers.last() else {
+            return self.resolve_ref(name, context_file);
+        };
+
+        if owner.starts_with(|c: char| c.is_uppercase()) {
+            let mut entries = self.entries_with_suffix(&format!("{owner}.{name}"), &visible);
+            entries.extend(self.entries_with_suffix(&format!("{owner}::{name}"), &visible));
+            // Nothing: an enum variant (`Error::NotFound(e)`) or an external type.
+            return pick(entries, context_file, Resolution::Exact);
+        }
+
+        // Free functions are stored under their bare name.
+        let named: Vec<&SymbolEntry> = self
+            .by_fqn
+            .get(*name)
+            .into_iter()
+            .flatten()
+            .filter(|e| visible(e))
+            .collect();
+        for start in 0..qualifiers.len() {
+            let wanted = normalize_module_path(&qualifiers[start..].join("."));
+            if wanted.is_empty() {
+                continue;
+            }
+            let in_module: Vec<&SymbolEntry> = named
+                .iter()
+                .copied()
+                .filter(|e| module_is(e, &wanted))
+                .collect();
+            if !in_module.is_empty() {
+                return pick(in_module, context_file, Resolution::ViaImport);
+            }
+            let re_exported: Vec<&SymbolEntry> = named
+                .iter()
+                .copied()
+                .filter(|e| entry_belongs_to_module(e, &wanted))
+                .collect();
+            if !re_exported.is_empty() {
+                return pick(re_exported, context_file, Resolution::UniqueSuffix);
+            }
+        }
+        Resolution::Unresolved
+    }
+
+    /// Entries whose FQN is `fqn` or ends with it on a segment boundary.
+    fn entries_with_suffix(
+        &self,
+        fqn: &str,
+        visible: &dyn Fn(&&SymbolEntry) -> bool,
+    ) -> Vec<&SymbolEntry> {
+        let mut fqns: Vec<&String> = self.by_suffix.get(fqn).into_iter().flatten().collect();
+        fqns.sort();
+        fqns.into_iter()
+            .filter_map(|f| self.by_fqn.get(f))
+            .flatten()
+            .filter(|e| visible(e))
+            .collect()
+    }
+
     /// Back-compatible wrapper returning only a confidently-resolved node.
     pub fn resolve_with_context(&self, name: &str, context_file: &Path) -> Option<NodeId> {
         self.resolve_ref(name, context_file).node()
@@ -357,6 +460,71 @@ fn normalize_module_path(raw: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// Picks among entries that all match the reference equally well: one is
+/// `unique`, otherwise the referencing file, then its directory, break ties.
+fn pick(
+    mut entries: Vec<&SymbolEntry>,
+    context_file: &Path,
+    unique: fn(NodeId) -> Resolution,
+) -> Resolution {
+    sort_entries(&mut entries);
+    entries.dedup_by_key(|e| e.id);
+    match entries.as_slice() {
+        [] => Resolution::Unresolved,
+        [only] => unique(only.id),
+        _ => {
+            let same_file: Vec<&&SymbolEntry> =
+                entries.iter().filter(|e| e.file == context_file).collect();
+            if same_file.len() == 1 {
+                return Resolution::SameFile(same_file[0].id);
+            }
+            let dir = context_file.parent();
+            let same_dir: Vec<&&SymbolEntry> =
+                entries.iter().filter(|e| e.file.parent() == dir).collect();
+            if same_dir.len() == 1 {
+                return Resolution::SameDir(same_dir[0].id);
+            }
+            Resolution::Ambiguous(entries.into_iter().map(|e| e.id).collect())
+        }
+    }
+}
+
+/// Is this symbol defined in exactly `module` (`jobs.rs`, `jobs/mod.rs`)?
+fn module_is(entry: &SymbolEntry, module: &str) -> bool {
+    let file_norm = normalize_module_path(&entry.file.to_string_lossy());
+    file_norm == module || file_norm.ends_with(&format!(".{module}"))
+}
+
+/// Source languages that can call each other directly. Calls are never
+/// resolved across families; a name shared by a Rust and a TypeScript
+/// definition is two symbols, not one.
+fn language_family(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "rs" => "rust",
+        "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" | "vue" | "svelte" => "js",
+        "py" | "pyi" => "python",
+        "go" => "go",
+        "java" | "kt" | "kts" | "scala" => "jvm",
+        "c" | "h" | "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" | "m" | "mm" => "c",
+        "cs" => "csharp",
+        "rb" => "ruby",
+        "php" | "phtml" => "php",
+        "swift" => "swift",
+        "dart" => "dart",
+        "sh" | "bash" | "zsh" => "shell",
+        _ => return None,
+    })
+}
+
+/// Unknown extensions on either side don't filter anything out.
+fn same_family(family: Option<&'static str>, file: &Path) -> bool {
+    match (family, language_family(file)) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
 }
 
 /// Did this symbol come from `module`?
