@@ -4956,20 +4956,26 @@ mod staleness_tests {
 
     #[test]
     fn only_an_open_index_cache_counts_as_a_running_bridge() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = dir.path().join(".arbor").join("cache");
-        {
-            let _open = arbor_graph::GraphStore::open_or_reset(&cache).unwrap();
-            assert!(
-                index_cache_in_use(dir.path()),
-                "an open store holds the lock"
-            );
-        }
-        // Closed again, the `db` file stays behind. That's every indexed
-        // project, and it must not switch staleness checks off.
-        assert!(cache.join("db").exists());
-        assert!(!index_cache_in_use(dir.path()));
+        let open = tempfile::tempdir().unwrap();
+        let _store =
+            arbor_graph::GraphStore::open_or_reset(open.path().join(".arbor").join("cache"))
+                .unwrap();
+        assert!(
+            index_cache_in_use(open.path()),
+            "an open store holds the lock"
+        );
+
+        // What every indexed project has once the indexing process exits: the
+        // `db` file, with no lock on it. It must not switch staleness off.
+        // (Dropping a store in-process is no substitute: sled's flusher thread
+        // can keep the file locked for a moment on Linux.)
+        let left = tempfile::tempdir().unwrap();
+        let cache = left.path().join(".arbor").join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("db"), b"").unwrap();
+        assert!(!index_cache_in_use(left.path()));
+
         // No cache at all.
-        assert!(!index_cache_in_use(&dir.path().join("elsewhere")));
+        assert!(!index_cache_in_use(&left.path().join("elsewhere")));
     }
 }
