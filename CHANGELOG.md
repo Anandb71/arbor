@@ -5,7 +5,57 @@ All notable changes to Arbor will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2.5.0
+## [3.0.3] - 2026-09-29
+
+A fix release. See [docs/RELEASE_NOTES_v3.0.3.md](docs/RELEASE_NOTES_v3.0.3.md).
+
+### Fixed
+- **Rust call edges (#226):** calls through paths (`crate::jobs::enqueue()`, `jobs::enqueue()`), associated functions (`Type::new()`), `self.method()` and calls inside macro arguments (`assert!`, `format!`) now resolve. Paths resolve through the module tree via the new `SymbolTable::resolve_path`; paths into external crates stay unresolved instead of binding to a same-named local function.
+- **Per-symbol `arbor diff` (#226):** only modified symbols carry a blast radius; new symbols are listed separately. Tests that call the change are counted as `tests_exercising`, not as impact or entry points.
+- **Change scopes (#226):** `arbor diff`, `check` and `summary` take `--base <ref>` (committed and uncommitted changes since the merge base, as a pull request shows them) and `--staged`. Whitespace-only edits and generated files are ignored.
+- **Cross-language callers (#226):** resolution only considers definitions in the caller's language family. `arbor callers`/`callees` list each same-named definition separately, accept `module::name` and `file:name`, and say what an empty answer cannot see.
+- **Stale graphs (#226, this release):** the saved graph records the commit and the extractor that built it. A `HEAD` move (checkout, commit, rebase) or an upgrade refreshes it instead of answering from the old graph. A leftover index cache no longer disables the staleness check.
+- **Inheritance (#191):** classes emit `extends`/`implements` edges to their bases, and inherited methods stay reachable.
+- **Call cycles (#190):** PageRank runs on the condensation of the call graph, so a closed ring no longer fills the top of the ranking. `CentralityScores::get` is still the percentile rank.
+- **Vendor assets (#189):** `vendor/` and minified files are not indexed, `arbor agent onboard` computes centrality before ranking hotspots, and Android activities and Hilt annotations are entry points.
+- **HTTP bridge (#222):** `arbor bridge --http` rejects non-loopback `Origin` and `Host` headers (cross-origin and DNS-rebinding requests), requires `application/json`, sends no CORS headers, and bounds request size, time and connections.
+- **Bridge busy loop (#174):** the bridge's watcher skips ignored build and dependency directories, and graph patches run off the async runtime.
+- **GitHub Action:** the prebuilt-binary download named assets that don't exist, so every run compiled from crates.io instead. It now downloads the release asset, and a pinned version builds that tag when no asset fits.
+- **Packaging (#186):** v3.0.0 Homebrew and Scoop checksums corrected.
+
+### Added
+- **`arbor receipt` (#223, #224):** a plain-English receipt after each coding-agent turn: what changed, what was touched outside the request, and `arbor receipt undo` to put a turn back. `arbor hook claude` wires it into Claude Code; reading receipts needs no prompt, undo asks first.
+- **cargo-deny in CI (#220):** licences, duplicate dependencies and advisories are checked on every pull request.
+
+### Changed
+- **Release workflow:** a crates.io or manifest-PR failure is reported on its job without failing the run, so GHCR, npm and the VS Code extension still publish (v3.0.0's expired crates.io token skipped all three). The Homebrew formula and Scoop manifest are written by the workflow after the build instead of being bumped by hand before the tag.
+- **Docs (#219 and this release):** new brand mark; install instructions list only channels that work; MCP tool tables list all sixteen tools; `docs/GRAPH_SCHEMA.md` documents call resolution.
+- Cached graphs and per-file caches from 3.0.0 are rebuilt on first use.
+
+## [3.0.0] - 2026-08-10 "The Right Node"
+
+### Fixed
+- **Symbol resolution consults the importing file.** When a bare name matched several modules, resolution fell through to the same-directory rule and attached the edge to whichever definition sat beside the caller. The file's own imports are now checked first (`Resolution::ViaImport`, confidence 0.93).
+
+### Breaking
+- `Resolution` gains a `ViaImport` variant; an exhaustive match will not compile.
+- Edges land on different nodes, so cached graphs, stored node ids and centrality baselines from 2.6.0 differ.
+
+## [2.6.0] - 2026-08-03 "Ground Truth"
+
+### Fixed
+- Colliding symbols are kept instead of the second definition replacing the first.
+- Resolution is deterministic across processes.
+- Edges carry a confidence in `[0, 1]` from how they resolved.
+- Exported TypeScript symbols are indexed once, not twice.
+- Method calls on untyped receivers resolve.
+- Markdown headings and shell comments are no longer indexed as code.
+- Centrality is a percentile rank rather than a fraction of the maximum.
+
+### Added
+- Concept search on the library (`ArborGraph::search_ranked`).
+
+## [2.5.0] - 2026-07-15
 
 ### Added
 - **Parallel indexing:** `index_directory` fans the cache-check/parse phase out across all cores with rayon; results assemble in walk order so graph construction stays deterministic. Measured (median of 3, warm FS cache): Arbor itself 253ms → 95ms (2.7x, 123 files); tokio 2.7s → 1.6s (1.7x, 815 files / 178k LOC — serial graph assembly caps the gain, see `docs/BENCHMARKS.md`). Thread count is tunable via `RAYON_NUM_THREADS`.
@@ -108,16 +158,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Stable for v2.0 Release
 - `v2.0.0` tagged and `v2.0` PR branch prepared; release workflows (release, GHCR, Marketplace, MCP notes) are aligned and stable.
 
-## [Unreleased]
-
-### Added
-
-- None yet.
-
-### Changed
-
-- None yet.
-
 ## [1.7.0] - 2026-03-25 "Distribution & Reach"
 
 > **Feature release focused on making Arbor available everywhere — every package manager, every editor, every CI pipeline.**
@@ -214,7 +254,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.6.0] - 2026-03-16
 
-> See [Release Notes](docs/RELEASE_NOTES_v1.6.0.md) for full details.
+> See [Release Notes](https://github.com/Anandb71/arbor/blob/v1.6.0/docs/RELEASE_NOTES_v1.6.0.md) for full details.
 
 ## [1.5.0] - 2026-02-xx
 
@@ -222,7 +262,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.4.0] - 2026-02-xx "The Trust Update"
 
-> See [Release Notes](docs/RELEASE_NOTES_v1.4.0.md) for full details.
+> See [Release Notes](https://github.com/Anandb71/arbor/blob/v1.4.0/docs/RELEASE_NOTES_v1.4.0.md) for full details.
 
 ## [1.3.0] - 2026-01-xx
 
