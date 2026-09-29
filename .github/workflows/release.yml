@@ -240,9 +240,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          # An unset or empty secret is a failed publish, not a skip: `gh secret
+          # set` stores an empty value when nothing reaches its prompt, and the
+          # job then reported success while publishing nothing.
           if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "CARGO_REGISTRY_TOKEN not set; skipping crates.io publish."
-            exit 0
+            echo "::error title=crates.io publish skipped::CARGO_REGISTRY_TOKEN is unset or empty. Set it, then re-run this job."
+            exit 1
           fi
 
           crates=(
