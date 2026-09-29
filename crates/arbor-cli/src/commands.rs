@@ -151,6 +151,21 @@ fn not_indexed_error(path: &Path) -> Box<dyn std::error::Error> {
     .into()
 }
 
+/// Name the path Arbor failed to write, and the fix when access was refused.
+/// A bare "Access is denied. (os error 5)" says neither.
+pub(crate) fn write_error(path: &Path, error: std::io::Error) -> Box<dyn std::error::Error> {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => format!(
+            "Arbor could not write {}: {error}.\n  \
+             Check that your user can write there, or run Arbor on a copy of the project you own.",
+            path.display()
+        )
+        .into(),
+        _ => format!("Arbor could not write {}: {error}", path.display()).into(),
+    }
+}
+
 /// Ensures `.arbor/` exists for an *implicit* (non-`index`/`init`) command.
 ///
 /// If the project is already indexed, this is a no-op create. If it is NOT
@@ -170,7 +185,7 @@ fn init_arbor_dir(path: &Path) -> Result<bool> {
     let config_path = arbor_dir.join("config.json");
 
     if !arbor_dir.exists() {
-        fs::create_dir_all(&arbor_dir)?;
+        fs::create_dir_all(&arbor_dir).map_err(|e| write_error(&arbor_dir, e))?;
     }
 
     if !config_path.exists() {
@@ -190,7 +205,8 @@ fn init_arbor_dir(path: &Path) -> Result<bool> {
             ],
             "ignore": ["node_modules", "target", "dist", "__pycache__", ".venv", "build", "out", "vendor", "*.min.js", "*.min.css"]
         });
-        fs::write(&config_path, serde_json::to_string_pretty(&default_config)?)?;
+        fs::write(&config_path, serde_json::to_string_pretty(&default_config)?)
+            .map_err(|e| write_error(&config_path, e))?;
         return Ok(true);
     }
 
@@ -481,13 +497,235 @@ fn run_git(path: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-pub(crate) fn is_git_repo(path: &Path) -> bool {
-    Command::new("git")
+/// What git can tell us about a project directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GitAvailability {
+    /// No `git` executable could be started.
+    Missing,
+    /// Git runs, but the directory is not inside a work tree (or does not exist).
+    NotARepository,
+    /// Git found a repository but would not use it, for example because of
+    /// "dubious ownership". Holds git's own explanation, which says how to fix it.
+    Refused(String),
+    /// The directory is inside a git work tree.
+    Repository,
+}
+
+pub(crate) fn git_availability(path: &Path) -> GitAvailability {
+    git_availability_with("git", path)
+}
+
+fn git_availability_with(program: &str, path: &Path) -> GitAvailability {
+    // Spawning with a missing working directory also reports NotFound, which
+    // would be misread as "git is not installed".
+    if !path.is_dir() {
+        return GitAvailability::NotARepository;
+    }
+    match Command::new(program)
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(path)
+        // Untranslated, so "not a git repository" can be recognised below.
+        .env("LC_ALL", "C")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => GitAvailability::Missing,
+        Err(error) => GitAvailability::Refused(format!("git could not be started: {error}")),
+        // Inside .git or a bare repository git succeeds but prints "false".
+        Ok(output) if output.status.success() && output.stdout.trim_ascii() == b"true" => {
+            GitAvailability::Repository
+        }
+        Ok(output) if output.status.success() => GitAvailability::NotARepository,
+        Ok(output) => classify_git_failure(&String::from_utf8_lossy(&output.stderr)),
+    }
+}
+
+/// Tell "no repository here" apart from git refusing the one it found.
+fn classify_git_failure(stderr: &str) -> GitAvailability {
+    let reason = stderr.trim();
+    if reason.is_empty() || reason.contains("not a git repository") {
+        GitAvailability::NotARepository
+    } else {
+        GitAvailability::Refused(reason.to_string())
+    }
+}
+
+pub(crate) fn is_git_repo(path: &Path) -> bool {
+    git_availability(path) == GitAvailability::Repository
+}
+
+/// The actionable reason `command` cannot run in `path`, or `None` when git is
+/// installed and `path` is inside a repository.
+pub(crate) fn git_prerequisite_error(path: &Path, command: &str) -> Option<String> {
+    git_prerequisite_message(git_availability(path), path, command)
+}
+
+fn git_prerequisite_message(
+    availability: GitAvailability,
+    path: &Path,
+    command: &str,
+) -> Option<String> {
+    match availability {
+        GitAvailability::Repository => None,
+        GitAvailability::Missing => Some(format!(
+            "{command} needs git, but no `git` executable was found on PATH.\n  \
+             Install Git (https://git-scm.com/downloads) or add it to PATH, then run it again."
+        )),
+        GitAvailability::NotARepository => Some(format!(
+            "{command} needs a git repository, and {} is not inside one.\n  \
+             Run it from your project's repository, or run `git init` there first.",
+            path.display()
+        )),
+        GitAvailability::Refused(reason) => Some(format!(
+            "{command} could not use the git repository at {}. Git said:\n{}",
+            path.display(),
+            indent(&reason)
+        )),
+    }
+}
+
+fn indent(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Fail with an actionable message unless git is installed and `path` is a repository.
+///
+/// Call it before `ensure_arbor_initialized`: outside a repository git is the
+/// real blocker, and auto-index would otherwise create `.arbor/` there first.
+pub(crate) fn require_git_repo(path: &Path, command: &str) -> Result<()> {
+    match git_prerequisite_error(path, command) {
+        Some(message) => Err(message.into()),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod git_prerequisite_tests {
+    use super::{
+        classify_git_failure, git_availability_with, git_prerequisite_message, GitAvailability,
+    };
+    use std::path::Path;
+
+    const DUBIOUS: &str = "fatal: detected dubious ownership in repository at '/work/app'\n\
+        '/work/app' is owned by:\n\t1000\nbut the current user is:\n\t0\n\
+        To add an exception for this directory, call:\n\n\
+        \tgit config --global --add safe.directory /work/app\n";
+
+    #[test]
+    fn git_refusing_a_repository_is_not_reported_as_no_repository() {
+        assert_eq!(
+            classify_git_failure(
+                "fatal: not a git repository (or any of the parent directories): .git\n"
+            ),
+            GitAvailability::NotARepository
+        );
+        assert_eq!(classify_git_failure(""), GitAvailability::NotARepository);
+        assert_eq!(
+            classify_git_failure(DUBIOUS),
+            GitAvailability::Refused(DUBIOUS.trim().to_string())
+        );
+    }
+
+    #[test]
+    fn a_refusal_passes_on_git_s_own_fix() {
+        let message = git_prerequisite_message(
+            classify_git_failure(DUBIOUS),
+            Path::new("app"),
+            "arbor diff",
+        )
+        .unwrap();
+        assert!(
+            message.starts_with("arbor diff could not use the git repository at app. Git said:\n"),
+            "{message}"
+        );
+        assert!(
+            message.contains("\n  \tgit config --global --add safe.directory /work/app"),
+            "{message}"
+        );
+    }
+
+    const NO_SUCH_GIT: &str = "arbor-test-no-such-git-executable";
+
+    #[test]
+    fn a_missing_git_executable_is_reported_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            git_availability_with(NO_SUCH_GIT, dir.path()),
+            GitAvailability::Missing
+        );
+    }
+
+    #[test]
+    fn a_missing_directory_is_not_mistaken_for_a_missing_git() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            git_availability_with(NO_SUCH_GIT, &dir.path().join("gone")),
+            GitAvailability::NotARepository
+        );
+    }
+
+    #[test]
+    fn a_plain_directory_is_not_a_repository_until_git_init() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            git_availability_with("git", dir.path()),
+            GitAvailability::NotARepository
+        );
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            git_availability_with("git", dir.path()),
+            GitAvailability::Repository
+        );
+    }
+
+    #[test]
+    fn the_git_directory_itself_is_not_a_work_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            git_availability_with("git", &dir.path().join(".git")),
+            GitAvailability::NotARepository
+        );
+    }
+
+    #[test]
+    fn messages_name_the_command_the_problem_and_the_fix() {
+        let path = Path::new("work").join("app");
+        assert!(
+            git_prerequisite_message(GitAvailability::Repository, &path, "arbor diff").is_none()
+        );
+
+        let missing =
+            git_prerequisite_message(GitAvailability::Missing, &path, "arbor diff").unwrap();
+        assert!(missing.starts_with("arbor diff needs git,"), "{missing}");
+        assert!(missing.contains("PATH"), "{missing}");
+        assert!(
+            missing.contains("https://git-scm.com/downloads"),
+            "{missing}"
+        );
+
+        let outside =
+            git_prerequisite_message(GitAvailability::NotARepository, &path, "arbor diff").unwrap();
+        assert!(
+            outside.starts_with("arbor diff needs a git repository,"),
+            "{outside}"
+        );
+        assert!(outside.contains(&path.display().to_string()), "{outside}");
+        assert!(outside.contains("git init"), "{outside}");
+    }
 }
 
 fn parse_git_name_status_output(output: &str) -> Vec<String> {
@@ -1474,11 +1712,8 @@ pub fn diff(
     scope: &crate::changes::Scope,
 ) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
+    require_git_repo(&resolved_path, "arbor diff")?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
-
-    if !is_git_repo(&resolved_path) {
-        return Err("arbor diff requires a git repository".into());
-    }
 
     let set = crate::changes::ChangeSet::collect(&resolved_path, scope)?;
     if set.is_empty() {
@@ -1529,11 +1764,8 @@ pub fn check(
     scope: &crate::changes::Scope,
 ) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
+    require_git_repo(&resolved_path, "arbor check")?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
-
-    if !is_git_repo(&resolved_path) {
-        return Err("arbor check requires a git repository".into());
-    }
 
     let set = crate::changes::ChangeSet::collect(&resolved_path, scope)?;
     let (_graph, _symbols, summary) = change_impact(&resolved_path, &set, depth)?;
@@ -2934,11 +3166,8 @@ pub fn pr_summary(symbols: &str, path: &Path) -> Result<()> {
 /// Generate an auto-description for a PR based on graph changes.
 pub fn summary(path: &Path, scope: &crate::changes::Scope) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
+    require_git_repo(&resolved_path, "arbor summary")?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
-
-    if !is_git_repo(&resolved_path) {
-        return Err("arbor summary requires a git repository".into());
-    }
 
     let set = crate::changes::ChangeSet::collect(&resolved_path, scope)?;
     if set.is_empty() {
@@ -3246,6 +3475,25 @@ mod tests {
         {
             ("flutter", "linux")
         }
+    }
+
+    #[test]
+    fn write_errors_name_the_path_and_the_fix_for_refused_access() {
+        use std::io::{Error, ErrorKind};
+        let dir = std::path::Path::new("app").join(".arbor");
+
+        let refused = super::write_error(&dir, Error::from(ErrorKind::PermissionDenied));
+        let refused = refused.to_string();
+        assert!(refused.starts_with("Arbor could not write "), "{refused}");
+        assert!(refused.contains(&dir.display().to_string()), "{refused}");
+        assert_eq!(
+            refused.lines().nth(1),
+            Some("  Check that your user can write there, or run Arbor on a copy of the project you own.")
+        );
+
+        let full = super::write_error(&dir, Error::from(ErrorKind::StorageFull)).to_string();
+        assert!(full.contains(&dir.display().to_string()), "{full}");
+        assert_eq!(full.lines().count(), 1, "{full}");
     }
 
     #[test]
@@ -4527,11 +4775,8 @@ pub fn analyze_local(path: &Path, top: usize) -> Result<()> {
 
 pub fn agent_review(path: &Path, json: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
+    require_git_repo(&resolved_path, "arbor agent review")?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
-
-    if !is_git_repo(&resolved_path) {
-        return Err("arbor agent review requires a git repository".into());
-    }
 
     let set =
         crate::changes::ChangeSet::collect(&resolved_path, &crate::changes::Scope::WorkingTree)?;
@@ -4883,11 +5128,8 @@ pub fn agent_onboard(path: &Path, json: bool) -> Result<()> {
 
 pub fn agent_guard(path: &Path, max_blast_radius: usize) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
+    require_git_repo(&resolved_path, "arbor agent guard")?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
-
-    if !is_git_repo(&resolved_path) {
-        return Err("arbor agent guard requires a git repository".into());
-    }
 
     let set =
         crate::changes::ChangeSet::collect(&resolved_path, &crate::changes::Scope::WorkingTree)?;

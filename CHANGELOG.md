@@ -5,6 +5,14 @@ All notable changes to Arbor will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **First run without git or a repository:** `arbor diff`, `check`, `summary`, `agent review` and `agent guard` now say whether git is missing from PATH, the folder is outside a repository, or git refused the repository (quoting git, which names the fix, such as `safe.directory`). They check this before the index, so the reason is the real one and a failed run no longer creates `.arbor/`. The `.git` folder and bare repositories are no longer mistaken for work trees.
+- **Receipts that could not record:** `arbor hook claude` warns at install time when receipts cannot work there, and `receipt begin` writes the reason to stderr instead of returning silently.
+- **Read-only projects:** failing to create `.arbor/`, `CLAUDE.md` or `.claude/settings.json` names the path and what to do, instead of a bare "Access is denied".
+- **`arbor hook claude` overwriting files:** an existing `CLAUDE.md` or `.claude/settings.json` that could not be read (for example, saved as UTF-16) was treated as empty and replaced. It is now left untouched and the install stops with an explanation.
+
 ## [3.0.3] - 2026-09-29
 
 A fix release. See [docs/RELEASE_NOTES_v3.0.3.md](docs/RELEASE_NOTES_v3.0.3.md).
