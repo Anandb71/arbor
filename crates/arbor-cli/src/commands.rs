@@ -481,13 +481,85 @@ fn run_git(path: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-pub(crate) fn is_git_repo(path: &Path) -> bool {
-    Command::new("git")
+/// What git can tell us about a project directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitAvailability {
+    /// No `git` executable could be started.
+    Missing,
+    /// Git runs, but the directory is not inside a work tree (or does not exist).
+    NotARepository,
+    /// The directory is inside a git work tree.
+    Repository,
+}
+
+pub(crate) fn git_availability(path: &Path) -> GitAvailability {
+    git_availability_with("git", path)
+}
+
+fn git_availability_with(program: &str, path: &Path) -> GitAvailability {
+    // Spawning with a missing working directory also reports NotFound, which
+    // would be misread as "git is not installed".
+    if !path.is_dir() {
+        return GitAvailability::NotARepository;
+    }
+    match Command::new(program)
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(path)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => GitAvailability::Missing,
+        Ok(output) if output.status.success() => GitAvailability::Repository,
+        _ => GitAvailability::NotARepository,
+    }
+}
+
+pub(crate) fn is_git_repo(path: &Path) -> bool {
+    git_availability(path) == GitAvailability::Repository
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod git_prerequisite_tests {
+    use super::{git_availability_with, GitAvailability};
+
+    const NO_SUCH_GIT: &str = "arbor-test-no-such-git-executable";
+
+    #[test]
+    fn a_missing_git_executable_is_reported_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            git_availability_with(NO_SUCH_GIT, dir.path()),
+            GitAvailability::Missing
+        );
+    }
+
+    #[test]
+    fn a_missing_directory_is_not_mistaken_for_a_missing_git() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            git_availability_with(NO_SUCH_GIT, &dir.path().join("gone")),
+            GitAvailability::NotARepository
+        );
+    }
+
+    #[test]
+    fn a_plain_directory_is_not_a_repository_until_git_init() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            git_availability_with("git", dir.path()),
+            GitAvailability::NotARepository
+        );
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            git_availability_with("git", dir.path()),
+            GitAvailability::Repository
+        );
+    }
 }
 
 fn parse_git_name_status_output(output: &str) -> Vec<String> {
