@@ -224,6 +224,11 @@ jobs:
     name: Create GitHub Release
     needs: [prepare, build, smoke]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Signing and storing the build provenance attestations.
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -244,6 +249,14 @@ jobs:
           (cd release-assets && sha256sum -- *.tar.gz *.zip > SHA256SUMS)
           cat release-assets/SHA256SUMS
           ls -la release-assets
+
+      # A signed SLSA provenance statement for every archive in SHA256SUMS,
+      # tying it to this workflow run and commit. Check a download with
+      # `gh attestation verify <archive> --repo Anandb71/arbor`.
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-checksums: release-assets/SHA256SUMS
 
       - name: Generate release notes
         shell: bash
@@ -288,6 +301,8 @@ jobs:
 
           \`\`\`bash
           sha256sum -c SHA256SUMS --ignore-missing
+          # Check that an archive was built by this repository's release workflow
+          gh attestation verify arbor-linux-x86_64.tar.gz --repo Anandb71/arbor
           \`\`\`
           EOF
 
