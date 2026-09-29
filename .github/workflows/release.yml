@@ -139,84 +139,22 @@ jobs:
         run: cargo test --workspace
 
   build:
-    name: Build (${{ matrix.target }})
+    name: Build
     needs: [prepare, verify-version-sync]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact: arbor-linux-x86_64
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact: arbor-linux-aarch64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            artifact: arbor-macos-x86_64
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            artifact: arbor-macos-aarch64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            artifact: arbor-windows-x86_64
+    uses: ./.github/workflows/release-build.yml
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: bash scripts/ci/install-linux-deps.sh pkg-config libssl-dev build-essential cmake
-
-      - name: Install Linux aarch64 cross toolchain
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: bash scripts/ci/install-linux-deps.sh gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-
-      - name: Configure aarch64 linker
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} -p arbor-graph-cli
-
-      - name: Package artifact (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/arbor" "dist/arbor"
-          chmod +x dist/arbor
-          tar -C dist -czf "${{ matrix.artifact }}.tar.gz" arbor
-
-      - name: Package artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/arbor.exe" "dist/arbor.exe"
-          Compress-Archive -Path "dist/arbor.exe" -DestinationPath "${{ matrix.artifact }}.zip" -Force
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: |
-            ${{ matrix.artifact }}.tar.gz
-            ${{ matrix.artifact }}.zip
-          if-no-files-found: error
+  # Nothing is published until every binary has run on its own platform, so
+  # a binary that cannot start there never reaches a channel.
+  smoke:
+    name: Smoke test
+    needs: [prepare, build]
+    uses: ./.github/workflows/release-smoke.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
 
   publish-crates:
     name: Publish crates to crates.io
-    needs: [prepare, build]
+    needs: [prepare, build, smoke]
     runs-on: ubuntu-latest
     # A crates.io failure shows as a failed job with an error annotation, but
     # it must not fail the run: GHCR, npm and the VS Code extension publish
@@ -284,8 +222,13 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [prepare, build]
+    needs: [prepare, build, smoke]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Signing and storing the build provenance attestations.
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -301,7 +244,19 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets
           find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release-assets/ \;
+          # Published next to the archives so installers and users can check
+          # a download with `sha256sum -c SHA256SUMS --ignore-missing`.
+          (cd release-assets && sha256sum -- *.tar.gz *.zip > SHA256SUMS)
+          cat release-assets/SHA256SUMS
           ls -la release-assets
+
+      # A signed SLSA provenance statement for every archive in SHA256SUMS,
+      # tying it to this workflow run and commit. Check a download with
+      # `gh attestation verify <archive> --repo Anandb71/arbor`.
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-checksums: release-assets/SHA256SUMS
 
       - name: Generate release notes
         shell: bash
@@ -341,6 +296,14 @@ jobs:
           | macOS | x86_64 | \`arbor-macos-x86_64.tar.gz\` |
           | macOS | Apple Silicon | \`arbor-macos-aarch64.tar.gz\` |
           | Windows | x86_64 | \`arbor-windows-x86_64.zip\` |
+
+          ### Verify a download
+
+          \`\`\`bash
+          sha256sum -c SHA256SUMS --ignore-missing
+          # Check that an archive was built by this repository's release workflow
+          gh attestation verify arbor-linux-x86_64.tar.gz --repo Anandb71/arbor
+          \`\`\`
           EOF
 
       - name: Create/Update GitHub release

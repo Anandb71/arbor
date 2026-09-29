@@ -1,0 +1,119 @@
+name: Release smoke test
+
+# Runs every release binary built earlier in the same workflow run on the
+# platform it is for, before anything is published. Two of the five were
+# never executed before: linux-aarch64 was cross-linked and macos-x86_64 was
+# cross-compiled on Apple Silicon.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version the binaries must report, without the leading v."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Smoke (${{ matrix.artifact }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: arbor-linux-x86_64
+          - os: ubuntu-24.04-arm
+            artifact: arbor-linux-aarch64
+          - os: macos-15-intel
+            artifact: arbor-macos-x86_64
+          - os: macos-latest
+            artifact: arbor-macos-aarch64
+          - os: windows-latest
+            artifact: arbor-windows-x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download the built binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: artifact
+
+      - name: Unpack
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bin
+          if [ -f "artifact/${{ matrix.artifact }}.zip" ]; then
+            unzip -q "artifact/${{ matrix.artifact }}.zip" -d bin
+          else
+            tar -xzf "artifact/${{ matrix.artifact }}.tar.gz" -C bin
+          fi
+          ls -l bin
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$PWD/bin/arbor"
+          [ -f "$binary" ] || binary="$PWD/bin/arbor.exe"
+          bash scripts/ci/smoke-release-binary.sh "$binary" "${{ inputs.version }}"
+
+  # The oldest supported glibc (2.28) and the distributions v3.0.3 failed to
+  # start on.
+  distributions:
+    name: Smoke (${{ matrix.artifact }} on ${{ matrix.image }})
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.image }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: arbor-linux-x86_64
+            image: almalinux:8
+          - os: ubuntu-latest
+            artifact: arbor-linux-x86_64
+            image: ubuntu:22.04
+          - os: ubuntu-latest
+            artifact: arbor-linux-x86_64
+            image: debian:12
+          - os: ubuntu-24.04-arm
+            artifact: arbor-linux-aarch64
+            image: ubuntu:22.04
+
+    steps:
+      - name: Install git and tar
+        run: |
+          if command -v apt-get >/dev/null; then
+            apt-get update -qq && apt-get install -y -qq git ca-certificates tar gzip >/dev/null
+          else
+            dnf install -y -q git tar gzip
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download the built binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: artifact
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          # sed reads to the end; `head -n 1` would close the pipe early and
+          # pipefail would turn ldd's SIGPIPE into a failed step.
+          ldd --version | sed -n 1p
+          mkdir -p bin
+          tar -xzf "artifact/${{ matrix.artifact }}.tar.gz" -C bin
+          bash scripts/ci/smoke-release-binary.sh "$PWD/bin/arbor" "${{ inputs.version }}"
