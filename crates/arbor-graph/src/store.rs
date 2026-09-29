@@ -5,8 +5,12 @@ use sled::{Batch, Db};
 use std::path::Path;
 use thiserror::Error;
 
-/// Current cache format version. Increment when schema changes.
-const CACHE_VERSION: &str = concat!("arbor-", env!("CARGO_PKG_VERSION"));
+/// Current cache format version. The cache stores parser output, so a change
+/// to what the parsers extract must invalidate it too, not only a release:
+/// bump `extract-N` whenever extracted nodes or references change shape.
+/// (Revision 2: Rust calls are normalized to `module::fn` / `Type::fn` /
+/// `self.m` / `.m`, and calls inside macros are recorded.)
+const CACHE_VERSION: &str = concat!("arbor-", env!("CARGO_PKG_VERSION"), "+extract-2");
 
 #[derive(Error, Debug)]
 pub enum StoreError {

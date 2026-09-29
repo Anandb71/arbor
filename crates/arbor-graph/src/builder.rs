@@ -181,9 +181,15 @@ impl GraphBuilder {
                 // falls through to SameDir and attaches the edge to whichever
                 // definition happens to sit in the caller's own directory.
                 let file_imports = self.import_map.get(&from_file_str);
-                let resolution =
+                // `jobs::enqueue` / `Provider::new` name where the definition
+                // lives; matching only the last segment would drop the call or
+                // bind it to a same-named function in the wrong module.
+                let resolution = if !receiver_unknown && lookup.contains("::") {
+                    self.symbol_table.resolve_path(lookup, &from_file)
+                } else {
                     self.symbol_table
-                        .resolve_ref_with_imports(lookup, &from_file, file_imports);
+                        .resolve_ref_with_imports(lookup, &from_file, file_imports)
+                };
 
                 if !resolution.is_resolved() {
                     // The overwhelming majority of references are stdlib or
@@ -201,7 +207,20 @@ impl GraphBuilder {
                 if receiver_unknown {
                     base_confidence *= UNKNOWN_RECEIVER_PENALTY;
                 }
-                let candidates = resolution.candidates();
+                let mut candidates = resolution.candidates();
+                // In Rust `x.f()` is always a method call (modules use `::`),
+                // so it can't reach a free function that shares the name:
+                // sqlx's `.bind(...)` is not a test helper called `bind`.
+                if receiver_unknown && from_file_str.ends_with(".rs") {
+                    candidates.retain(|id| {
+                        self.graph
+                            .get(*id)
+                            .is_some_and(|n| n.kind == NodeKind::Method)
+                    });
+                    if candidates.is_empty() {
+                        continue;
+                    }
+                }
 
                 // A receiver-unknown call to a name shared by many symbols
                 // (`get`, `run`, `execute`) is pure noise; hold it to a tighter
@@ -286,7 +305,7 @@ impl GraphBuilder {
         let Some(file_imports) = self.import_map.get(from_file_str) else {
             return base_confidence;
         };
-        if file_imports.is_empty() || reference.contains('.') {
+        if file_imports.is_empty() || reference.contains('.') || reference.contains("::") {
             return base_confidence;
         }
         if file_imports.contains_key(reference) {
@@ -507,8 +526,15 @@ fn index_methods(
     HashMap<NodeId, NodeId>,
 ) {
     let mut types_by_file: HashMap<&str, Vec<&InheritedType>> = HashMap::new();
+    let mut rust_types_by_name: HashMap<&str, Vec<&InheritedType>> = HashMap::new();
     for ty in types {
         types_by_file.entry(ty.file.as_str()).or_default().push(ty);
+        if ty.file.ends_with(".rs") {
+            rust_types_by_name
+                .entry(ty.clean_name.as_str())
+                .or_default()
+                .push(ty);
+        }
     }
 
     let mut methods_of: HashMap<NodeId, BTreeMap<String, NodeId>> = HashMap::new();
@@ -527,21 +553,49 @@ fn index_methods(
         if parent.is_empty() || method_name.is_empty() {
             continue;
         }
-        let Some(file_types) = types_by_file.get(node.file.as_str()) else {
-            continue;
-        };
+        let file_types = types_by_file
+            .get(node.file.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let owners: Vec<NodeId> = file_types
             .iter()
             .filter(|ty| ty.clean_name == parent || ty.clean_qualified == parent)
             .map(|ty| ty.id)
             .collect();
-        let Some(owner) = unique_owner(&owners, |id| {
+        let owner = unique_owner(&owners, |id| {
             file_types
                 .iter()
                 .find(|ty| ty.id == id)
                 .map(|ty| ty.qualified_len)
                 .unwrap_or(0)
-        }) else {
+        })
+        .or_else(|| {
+            // A Rust `impl Provider` block may sit in any file of the crate,
+            // far from `struct Provider`. Without this its methods have no
+            // owner, and every `self.method()` call inside them is lost.
+            // Look where Rust puts it: the impl file's own module directory
+            // first, then its parents. Tests often declare their own mock
+            // `struct Provider`, so a repo-wide unique name is too strict.
+            if !node.file.ends_with(".rs") || !owners.is_empty() {
+                return None;
+            }
+            let candidates = rust_types_by_name.get(parent.as_str())?;
+            let mut dir = Path::new(&node.file).parent();
+            while let Some(current) = dir {
+                let here: Vec<NodeId> = candidates
+                    .iter()
+                    .filter(|ty| Path::new(&ty.file).parent() == Some(current))
+                    .map(|ty| ty.id)
+                    .collect();
+                match here.as_slice() {
+                    [] => dir = current.parent(),
+                    [only] => return Some(*only),
+                    _ => return None,
+                }
+            }
+            None
+        });
+        let Some(owner) = owner else {
             continue;
         };
         methods_of
@@ -1321,6 +1375,179 @@ mod tests {
         assert!(
             kinds_between(&graph, "C.foo", "A.foo").is_empty(),
             "super() must not skip B and land on A"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rust_path_tests {
+    use super::*;
+    use arbor_core::NodeKind;
+
+    fn function(name: &str, file: &str, calls: &[&str]) -> CodeNode {
+        CodeNode::new(name, name, NodeKind::Function, file)
+            .with_references(calls.iter().map(|c| c.to_string()).collect())
+    }
+
+    fn method(owner: &str, name: &str, file: &str, calls: &[&str]) -> CodeNode {
+        CodeNode::new(name, format!("{owner}.{name}"), NodeKind::Method, file)
+            .with_references(calls.iter().map(|c| c.to_string()).collect())
+    }
+
+    fn callers_of(graph: &ArborGraph, name: &str, file: &str) -> Vec<String> {
+        let id = graph
+            .node_indexes()
+            .find(|id| {
+                graph
+                    .get(*id)
+                    .is_some_and(|n| n.name == name && n.file == file)
+            })
+            .unwrap_or_else(|| panic!("no {name} in {file}"));
+        let mut names: Vec<String> = graph
+            .get_callers(id)
+            .into_iter()
+            .map(|n| n.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn module_paths_resolve_to_the_named_module_and_never_across_languages() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            function("enqueue", "src/app/jobs.rs", &[]),
+            function("enqueue", "src/billing/jobs_old.rs", &[]),
+            function("enqueue", "web/src/components/Toast.tsx", &[]),
+            function("dispatch", "src/app/dispatch.rs", &["jobs::enqueue"]),
+            function("start", "web/src/lib/bridge.ts", &["enqueue"]),
+        ]);
+        let graph = b.build();
+        assert_eq!(
+            callers_of(&graph, "enqueue", "src/app/jobs.rs"),
+            vec!["dispatch"]
+        );
+        assert!(callers_of(&graph, "enqueue", "src/billing/jobs_old.rs").is_empty());
+        // The TypeScript call binds to the TypeScript definition only.
+        assert_eq!(
+            callers_of(&graph, "enqueue", "web/src/components/Toast.tsx"),
+            vec!["start"]
+        );
+    }
+
+    #[test]
+    fn mod_rs_crate_prefixes_and_re_exports_resolve() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            function("create_project", "src/app/mod.rs", &[]),
+            function("record", "src/app/audit/writer.rs", &[]),
+            function(
+                "handler",
+                "src/routes/mod.rs",
+                &["app::create_project", "app::audit::record"],
+            ),
+            function(
+                "persistence_test",
+                "tests/integration.rs",
+                &["my_app::app::create_project", "app::record"],
+            ),
+        ]);
+        let graph = b.build();
+        assert_eq!(
+            callers_of(&graph, "create_project", "src/app/mod.rs"),
+            vec!["handler", "persistence_test"]
+        );
+        // `app::record` is a `pub use audit::writer::record` re-export.
+        assert_eq!(
+            callers_of(&graph, "record", "src/app/audit/writer.rs"),
+            vec!["handler", "persistence_test"]
+        );
+    }
+
+    #[test]
+    fn external_crate_paths_do_not_bind_to_local_names() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            function("query", "src/db/queries.rs", &[]),
+            function("load", "src/routes/mod.rs", &["sqlx::query"]),
+        ]);
+        let graph = b.build();
+        assert!(callers_of(&graph, "query", "src/db/queries.rs").is_empty());
+    }
+
+    #[test]
+    fn type_paths_resolve_to_the_types_method() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            CodeNode::new(
+                "Provider",
+                "Provider",
+                NodeKind::Struct,
+                "src/billing/mod.rs",
+            ),
+            method("Provider", "new", "src/billing/mod.rs", &[]),
+            method("Fixture", "new", "tests/fixture.rs", &[]),
+            function("boot", "src/main.rs", &["Provider::new"]),
+        ]);
+        let graph = b.build();
+        assert_eq!(
+            callers_of(&graph, "new", "src/billing/mod.rs"),
+            vec!["boot"]
+        );
+        assert!(callers_of(&graph, "new", "tests/fixture.rs").is_empty());
+    }
+
+    #[test]
+    fn a_mock_struct_with_the_same_name_does_not_hide_the_real_owner() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            CodeNode::new(
+                "Provider",
+                "Provider",
+                NodeKind::Struct,
+                "src/payments/mod.rs",
+            ),
+            CodeNode::new("Provider", "Provider", NodeKind::Struct, "tests/mocks.rs"),
+            method("Provider", "owner_of", "src/payments/checkout.rs", &[]),
+            method(
+                "Provider",
+                "order_history",
+                "src/payments/cancellation.rs",
+                &["self.owner_of", ".bind"],
+            ),
+            function("bind", "src/payments/tests.rs", &[]),
+        ]);
+        let graph = b.build();
+        assert_eq!(
+            callers_of(&graph, "owner_of", "src/payments/checkout.rs"),
+            vec!["order_history"]
+        );
+        // `.bind(...)` is a method call; it can't reach a free function.
+        assert!(callers_of(&graph, "bind", "src/payments/tests.rs").is_empty());
+    }
+
+    #[test]
+    fn self_calls_reach_methods_whose_impl_is_in_another_file() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            CodeNode::new(
+                "Provider",
+                "Provider",
+                NodeKind::Struct,
+                "src/payments/mod.rs",
+            ),
+            method("Provider", "owner_of", "src/payments/checkout.rs", &[]),
+            method(
+                "Provider",
+                "order_history",
+                "src/payments/cancellation.rs",
+                &["self.owner_of"],
+            ),
+        ]);
+        let graph = b.build();
+        assert_eq!(
+            callers_of(&graph, "owner_of", "src/payments/checkout.rs"),
+            vec!["order_history"]
         );
     }
 }
