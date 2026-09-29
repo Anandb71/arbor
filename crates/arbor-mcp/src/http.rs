@@ -554,4 +554,19 @@ mod tests {
             assert_eq!(responses(&output), 1, "{case}: {output}");
         }
     }
+
+    #[tokio::test]
+    async fn malformed_requests_get_400() {
+        let address = spawn(Limits::default()).await;
+        for (case, raw) in [
+            (
+                "unsupported transfer coding",
+                format!("{HEAD}Transfer-Encoding: gzip\r\n\r\n{LIST}"),
+            ),
+            ("not HTTP at all", "NOT AN HTTP REQUEST\r\n\r\n".to_string()),
+        ] {
+            let output = exchange(address, &raw).await;
+            assert!(output.starts_with("HTTP/1.1 400"), "{case}: {output}");
+        }
+    }
 }
