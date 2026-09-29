@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Release checks:** every binary runs a first-use smoke test on its own platform before anything is published, including Intel macOS, Linux arm64, AlmaLinux 8, Ubuntu 22.04 and Debian 12. Pull requests that change the release build or `Cargo.lock` run the same build and smoke test without publishing.
 - **Verifiable downloads:** releases publish `SHA256SUMS` and a signed build provenance attestation for each archive (`gh attestation verify <archive> --repo Anandb71/arbor`).
 
+### Security
+- **WebSocket servers refuse foreign origins:** the RPC and sync WebSocket servers, which `arbor bridge` always starts and `arbor serve` runs, accepted a handshake from any web page, because browsers apply no CORS to WebSockets. A page open while they ran could read the code graph. They now apply the MCP HTTP transport's policy: a present `Origin` must be loopback, and on a loopback-bound server `Host` must be too (403 otherwise). Desktop clients send no `Origin` and are unaffected; `--headless` still accepts remote hosts but checks `Origin`.
+
 ## [3.0.3] - 2026-09-29
 
 A fix release. See [docs/RELEASE_NOTES_v3.0.3.md](docs/RELEASE_NOTES_v3.0.3.md).

@@ -311,6 +311,7 @@ impl SyncServer {
         info!("🌐 WebSocket server listening on ws://{}", self.config.addr);
         info!("👁️  Watching: {}", self.config.watch_path.display());
         info!("⏱️  Debounce: {}ms", self.config.debounce_ms);
+        let bound_to_loopback = self.config.addr.ip().is_loopback();
 
         loop {
             match listener.accept().await {
@@ -320,7 +321,10 @@ impl SyncServer {
                     let broadcast_rx = self.broadcast_tx.subscribe();
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, addr, graph, broadcast_rx).await {
+                        if let Err(e) =
+                            handle_client(stream, addr, graph, broadcast_rx, bound_to_loopback)
+                                .await
+                        {
                             warn!("Connection error from {}: {}", addr, e);
                         }
                     });
@@ -372,6 +376,7 @@ async fn handle_client(
     addr: SocketAddr,
     graph: SharedGraph,
     mut broadcast_rx: broadcast::Receiver<BroadcastMessage>,
+    bound_to_loopback: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
@@ -382,7 +387,12 @@ async fn handle_client(
         ..Default::default()
     };
 
-    let ws_stream = tokio_tungstenite::accept_async_with_config(stream, Some(config)).await?;
+    let ws_stream = tokio_tungstenite::accept_hdr_async_with_config(
+        stream,
+        crate::handshake::check(bound_to_loopback),
+        Some(config),
+    )
+    .await?;
     let (mut write, mut read) = ws_stream.split();
 
     info!("✅ WebSocket handshake complete with {}", addr);
@@ -911,5 +921,48 @@ mod tests {
         let msg = BroadcastMessage::GraphEnd;
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("GraphEnd"));
+    }
+
+    /// Serve one client on a loopback port; return the handshake's refusal
+    /// status for a client sending `origin`, or `None` when it upgraded.
+    async fn handshake_with_origin(origin: Option<&str>) -> Option<u16> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let graph = Arc::new(RwLock::new(ArborGraph::new()));
+        let (broadcast_tx, broadcast_rx) = broadcast::channel(4);
+        tokio::spawn(async move {
+            let _keep_sender = broadcast_tx;
+            let (stream, peer) = listener.accept().await.unwrap();
+            let _ = handle_client(stream, peer, graph, broadcast_rx, true).await;
+        });
+
+        let mut request = format!("ws://{address}/").into_client_request().unwrap();
+        if let Some(origin) = origin {
+            request
+                .headers_mut()
+                .insert("origin", origin.parse().unwrap());
+        }
+        match tokio_tungstenite::connect_async(request).await {
+            Ok(_) => None,
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                Some(response.status().as_u16())
+            }
+            Err(other) => panic!("unexpected handshake error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_foreign_page_cannot_open_the_sync_socket() {
+        assert_eq!(
+            handshake_with_origin(Some("https://evil.example")).await,
+            Some(403)
+        );
+        assert_eq!(handshake_with_origin(None).await, None);
+        assert_eq!(
+            handshake_with_origin(Some("http://localhost:3000")).await,
+            None
+        );
     }
 }

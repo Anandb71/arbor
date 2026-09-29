@@ -26,6 +26,7 @@ pub enum ServerMessage {
 }
 
 mod handlers;
+mod handshake;
 mod protocol;
 mod server;
 pub mod sync_server;

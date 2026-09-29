@@ -6,6 +6,7 @@ use crate::handlers::{
     handle_context, handle_discover, handle_impact, handle_info, handle_node_get, handle_search,
     SharedGraph,
 };
+use crate::handshake;
 use crate::protocol::{
     ContextParams, DiscoverParams, ImpactParams, NodeGetParams, Request, Response, SearchParams,
 };
@@ -15,7 +16,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{accept_hdr_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 /// Server configuration.
@@ -61,6 +62,7 @@ impl ArborServer {
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let listener = TcpListener::bind(&self.config.addr).await?;
         info!("Arbor server listening on {}", self.config.addr);
+        let bound_to_loopback = self.config.addr.ip().is_loopback();
 
         loop {
             match listener.accept().await {
@@ -68,7 +70,9 @@ impl ArborServer {
                     debug!("New connection from {}", addr);
                     let graph = self.graph.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, addr, graph).await {
+                        if let Err(e) =
+                            handle_connection(stream, addr, graph, bound_to_loopback).await
+                        {
                             error!("Connection error from {}: {}", addr, e);
                         }
                     });
@@ -86,8 +90,9 @@ async fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
     graph: SharedGraph,
+    bound_to_loopback: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ws_stream = accept_async(stream).await?;
+    let ws_stream = accept_hdr_async(stream, handshake::check(bound_to_loopback)).await?;
     info!("WebSocket connection established with {}", addr);
 
     let (mut write, mut read) = ws_stream.split();
@@ -166,5 +171,60 @@ async fn process_message(text: &str, graph: SharedGraph) -> Response {
         },
 
         _ => Response::method_not_found(id, method),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_connection;
+    use arbor_graph::ArborGraph;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::RwLock;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Error;
+
+    /// Serve one connection, as `ArborServer::run` does for each client.
+    async fn serve_once(bound_to_loopback: bool) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let graph = Arc::new(RwLock::new(ArborGraph::new()));
+        tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let _ = handle_connection(stream, peer, graph, bound_to_loopback).await;
+        });
+        address
+    }
+
+    /// The HTTP status of a refused handshake, or `None` when it upgraded.
+    async fn handshake(address: SocketAddr, headers: &[(&'static str, &str)]) -> Option<u16> {
+        let mut request = format!("ws://{address}/").into_client_request().unwrap();
+        for (name, value) in headers {
+            request.headers_mut().insert(*name, value.parse().unwrap());
+        }
+        match tokio_tungstenite::connect_async(request).await {
+            Ok(_) => None,
+            Err(Error::Http(response)) => Some(response.status().as_u16()),
+            Err(other) => panic!("unexpected handshake error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_foreign_page_cannot_open_the_rpc_socket() {
+        let refused = handshake(
+            serve_once(true).await,
+            &[("origin", "https://evil.example")],
+        );
+        assert_eq!(refused.await, Some(403));
+        let rebinding = handshake(serve_once(true).await, &[("host", "evil.example:7433")]);
+        assert_eq!(rebinding.await, Some(403));
+    }
+
+    #[tokio::test]
+    async fn desktop_clients_and_local_pages_still_connect() {
+        assert_eq!(handshake(serve_once(true).await, &[]).await, None);
+        let local = [("origin", "http://localhost:3000")];
+        assert_eq!(handshake(serve_once(true).await, &local).await, None);
     }
 }
