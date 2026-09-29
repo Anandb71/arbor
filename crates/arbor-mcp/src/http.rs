@@ -522,4 +522,36 @@ mod tests {
         assert!(output.starts_with("HTTP/1.1 200"), "{output}");
         assert_eq!(responses(&output), 1, "{output}");
     }
+
+    #[tokio::test]
+    async fn ambiguous_body_lengths_cannot_smuggle_a_request() {
+        let address = spawn(Limits::default()).await;
+
+        // Both headers: framed by Transfer-Encoding alone (RFC 9112 section
+        // 6.1). Content-Length would end the body after 5 bytes and leave the
+        // rest to be read as another request; nothing after it is answered.
+        let chunked = format!("{:x}\r\n{LIST}\r\n0\r\n\r\n", LIST.len());
+        let output = exchange(
+            address,
+            &format!(
+                "{HEAD}Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n{chunked}{}",
+                framed(LIST)
+            ),
+        )
+        .await;
+        assert!(output.starts_with("HTTP/1.1 200"), "{output}");
+        assert_eq!(responses(&output), 1, "{output}");
+
+        for (case, headers) in [
+            (
+                "conflicting lengths",
+                format!("Content-Length: {}\r\nContent-Length: 3\r\n", LIST.len()),
+            ),
+            ("non-numeric length", "Content-Length: abc\r\n".to_string()),
+        ] {
+            let output = exchange(address, &format!("{HEAD}{headers}\r\n{LIST}")).await;
+            assert!(output.starts_with("HTTP/1.1 400"), "{case}: {output}");
+            assert_eq!(responses(&output), 1, "{case}: {output}");
+        }
+    }
 }
