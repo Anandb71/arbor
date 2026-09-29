@@ -270,6 +270,38 @@ mod tests {
         dir
     }
 
+    /// Git trusts an index entry whose stat data still matches the file,
+    /// unless the entry is "racily clean": modified no earlier than the index
+    /// file itself. That is the state after a file is staged and then
+    /// rewritten at the same size within the same second. The times are
+    /// pinned to one instant in the past so the test does not depend on
+    /// where a second boundary falls.
+    #[test]
+    fn a_same_size_rewrite_in_the_same_second_is_still_seen() {
+        let dir = repo();
+        let root = dir.path();
+        // ctime cannot be set from a test; stop git from comparing it.
+        git(root, &["config", "core.trustctime", "false"], None).unwrap();
+        let instant = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let pin = |path: std::path::PathBuf| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(instant)
+                .unwrap();
+        };
+        std::fs::write(root.join("kept.txt"), "one\n").unwrap();
+        pin(root.join("kept.txt"));
+        git(root, &["add", "kept.txt"], None).unwrap();
+        pin(root.join(".git").join("index"));
+        std::fs::write(root.join("kept.txt"), "two\n").unwrap();
+        pin(root.join("kept.txt"));
+
+        let tree = snapshot(root).unwrap();
+        assert!(unchanged_since(root, &tree, "kept.txt").unwrap());
+    }
+
     #[test]
     fn works_when_arbor_is_gitignored() {
         let dir = repo();
