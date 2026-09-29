@@ -2,6 +2,7 @@
 //! arbor command permissions.
 
 use super::{Harness, Result, Scope};
+use crate::commands::write_error;
 use colored::Colorize;
 use serde_json::{json, Value};
 use std::fs;
@@ -81,7 +82,7 @@ fn claude_md_path(root: &Path, scope: &Scope) -> PathBuf {
 fn apply_directives(root: &Path, scope: &Scope) -> Result<()> {
     let path = claude_md_path(root, scope);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|e| write_error(parent, e))?;
     }
 
     let existing = fs::read_to_string(&path).unwrap_or_default();
@@ -97,7 +98,7 @@ fn apply_directives(root: &Path, scope: &Scope) -> Result<()> {
     } else {
         "updated"
     };
-    fs::write(&path, updated)?;
+    fs::write(&path, updated).map_err(|e| write_error(&path, e))?;
     println!("  {} {} {}", "✓".green(), verb, path.display());
     Ok(())
 }
@@ -219,7 +220,7 @@ fn settings_path(root: &Path) -> PathBuf {
 fn apply_settings(root: &Path) -> Result<()> {
     let path = settings_path(root);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|e| write_error(parent, e))?;
     }
 
     let mut settings: Value = match fs::read_to_string(&path) {
@@ -240,7 +241,8 @@ fn apply_settings(root: &Path) -> Result<()> {
         return Ok(());
     }
 
-    fs::write(&path, serde_json::to_string_pretty(&settings)? + "\n")?;
+    fs::write(&path, serde_json::to_string_pretty(&settings)? + "\n")
+        .map_err(|e| write_error(&path, e))?;
     println!("  {} settings written to {}", "✓".green(), path.display());
     Ok(())
 }
