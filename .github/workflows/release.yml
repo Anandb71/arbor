@@ -239,6 +239,10 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets
           find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release-assets/ \;
+          # Published next to the archives so installers and users can check
+          # a download with `sha256sum -c SHA256SUMS --ignore-missing`.
+          (cd release-assets && sha256sum -- *.tar.gz *.zip > SHA256SUMS)
+          cat release-assets/SHA256SUMS
           ls -la release-assets
 
       - name: Generate release notes
@@ -279,6 +283,12 @@ jobs:
           | macOS | x86_64 | \`arbor-macos-x86_64.tar.gz\` |
           | macOS | Apple Silicon | \`arbor-macos-aarch64.tar.gz\` |
           | Windows | x86_64 | \`arbor-windows-x86_64.zip\` |
+
+          ### Verify a download
+
+          \`\`\`bash
+          sha256sum -c SHA256SUMS --ignore-missing
+          \`\`\`
           EOF
 
       - name: Create/Update GitHub release
