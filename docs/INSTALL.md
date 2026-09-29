@@ -68,6 +68,14 @@ If you already use Rust tooling:
 cargo install arbor-graph-cli
 ```
 
+crates.io can lag the GitHub releases: it currently has `arbor-graph-cli` 2.6.0, while the latest release is 3.0.0. To build a release from source instead:
+
+```bash
+cargo install --git https://github.com/Anandb71/arbor --tag v3.0.0 arbor-graph-cli
+```
+
+Run `arbor --version` afterwards. An older `arbor` earlier on your `PATH` (for example in `~/.cargo/bin`) wins over a newer one elsewhere. The crates.io crate named plain `arbor` is an unrelated project.
+
 ## GitHub Packages (GHCR Container)
 
 Arbor container images are published to GitHub Container Registry (GHCR) when a release is published.

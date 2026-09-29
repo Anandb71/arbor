@@ -300,3 +300,159 @@ fn diff_markdown_and_summary_use_env_commit_range() {
         "expected file src/range.rs in summary, got: {summary_stdout}"
     );
 }
+
+fn diff_json(repo: &Path, extra: &[&str]) -> Value {
+    let mut args = vec!["diff", "--json"];
+    args.extend_from_slice(extra);
+    args.push(".");
+    let output = run_arbor(repo, &args);
+    assert!(
+        output.status.success(),
+        "arbor diff failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("valid json output")
+}
+
+const BASE_SOURCE: &str = "\
+fn helper() -> u32 {
+    1
+}
+
+fn caller_a() -> u32 {
+    helper()
+}
+
+fn caller_b() -> u32 {
+    helper() + 1
+}
+";
+
+fn committed_repo() -> tempfile::TempDir {
+    let temp = init_repo();
+    let repo = temp.path();
+    fs::write(repo.join("src").join("lib.rs"), BASE_SOURCE).expect("write file");
+    run_git(repo, &["add", "."]);
+    run_git(repo, &["commit", "-m", "base"]);
+    temp
+}
+
+#[test]
+fn an_additive_change_is_new_code_without_blast_radius() {
+    let temp = committed_repo();
+    let repo = temp.path();
+    fs::write(
+        repo.join("src").join("lib.rs"),
+        format!("{BASE_SOURCE}\nfn brand_new() -> u32 {{\n    7\n}}\n"),
+    )
+    .expect("append a function");
+
+    let json = diff_json(repo, &[]);
+    assert_eq!(json["modified_symbols"], 0, "{json}");
+    assert_eq!(json["added_symbols"], 1, "{json}");
+    assert_eq!(json["new_symbols"][0], "brand_new", "{json}");
+    // Untouched neighbours in the same file don't bring their callers in.
+    assert_eq!(json["impact"]["blast_radius_nodes"], 0, "{json}");
+}
+
+#[test]
+fn editing_a_function_counts_its_callers_only() {
+    let temp = committed_repo();
+    let repo = temp.path();
+    fs::write(
+        repo.join("src").join("lib.rs"),
+        BASE_SOURCE.replacen("    1\n", "    2\n", 1),
+    )
+    .expect("edit helper");
+
+    let json = diff_json(repo, &[]);
+    assert_eq!(json["modified_symbols"], 1, "{json}");
+    assert_eq!(json["added_symbols"], 0, "{json}");
+    assert_eq!(json["impact"]["direct_callers"], 2, "{json}");
+}
+
+#[test]
+fn base_compares_committed_branch_work_against_the_merge_base() {
+    let temp = committed_repo();
+    let repo = temp.path();
+    run_git(repo, &["branch", "trunk"]);
+    run_git(repo, &["checkout", "-b", "feature"]);
+    fs::write(
+        repo.join("src").join("extra.rs"),
+        "fn extra() -> u32 {\n    3\n}\n",
+    )
+    .expect("write extra");
+    run_git(repo, &["add", "."]);
+    run_git(repo, &["commit", "-m", "feature work"]);
+
+    // Everything is committed, so there's nothing against HEAD...
+    let working = run_arbor(repo, &["diff", "."]);
+    assert!(String::from_utf8_lossy(&working.stdout).contains("No modified files"));
+
+    // ...but the branch still changed something since it left trunk.
+    let json = diff_json(repo, &["--base", "trunk"]);
+    assert_eq!(json["changed_files"][0], "src/extra.rs", "{json}");
+    assert_eq!(json["added_symbols"], 1, "{json}");
+    assert!(
+        json["compared"]
+            .as_str()
+            .is_some_and(|c| c.contains("trunk")),
+        "{json}"
+    );
+
+    let unknown = run_arbor(repo, &["diff", "--base", "no-such-branch", "."]);
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("no-such-branch"));
+}
+
+#[test]
+fn staged_only_counts_what_is_staged() {
+    let temp = committed_repo();
+    let repo = temp.path();
+    fs::write(
+        repo.join("src").join("staged.rs"),
+        "fn staged() -> u32 {\n    4\n}\n",
+    )
+    .expect("write staged");
+    run_git(repo, &["add", "src/staged.rs"]);
+    fs::write(
+        repo.join("src").join("lib.rs"),
+        BASE_SOURCE.replacen("    1\n", "    9\n", 1),
+    )
+    .expect("unstaged edit");
+
+    let json = diff_json(repo, &["--staged"]);
+    let files: Vec<&str> = json["changed_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(files, vec!["src/staged.rs"], "{json}");
+}
+
+#[test]
+fn tests_calling_the_change_are_listed_not_counted_as_impact() {
+    let temp = committed_repo();
+    let repo = temp.path();
+    fs::create_dir_all(repo.join("tests")).expect("tests dir");
+    fs::write(
+        repo.join("tests").join("helper_tests.rs"),
+        "fn helper_works() {\n    assert_eq!(helper(), 1);\n}\n",
+    )
+    .expect("write test");
+    run_git(repo, &["add", "."]);
+    run_git(repo, &["commit", "-m", "test"]);
+    fs::write(
+        repo.join("src").join("lib.rs"),
+        BASE_SOURCE.replacen("    1\n", "    2\n", 1),
+    )
+    .expect("edit helper");
+
+    let json = diff_json(repo, &[]);
+    assert_eq!(json["impact"]["direct_callers"], 2, "{json}");
+    assert_eq!(json["impact"]["tests_exercising"], 1, "{json}");
+    // A test has no callers of its own, but it isn't an API entrypoint.
+    assert_eq!(json["impact"]["api_entrypoints_affected"], 2, "{json}");
+}

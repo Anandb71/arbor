@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod audit;
+mod changes;
 mod commands;
 mod hook;
 mod receipt;
@@ -109,6 +110,15 @@ enum Commands {
         /// Output as Markdown (for PR comments)
         #[arg(long)]
         markdown: bool,
+
+        /// Compare against where this branch left REF (e.g. origin/main):
+        /// committed and uncommitted changes since the merge base, as a PR shows them
+        #[arg(long, value_name = "REF", conflicts_with = "staged")]
+        base: Option<String>,
+
+        /// Only staged changes, against HEAD
+        #[arg(long)]
+        staged: bool,
     },
 
     /// CI safety mode for changed code paths
@@ -136,6 +146,15 @@ enum Commands {
         /// Output as Markdown (for PR comments)
         #[arg(long)]
         markdown: bool,
+
+        /// Compare against where this branch left REF (e.g. origin/main):
+        /// committed and uncommitted changes since the merge base, as a PR shows them
+        #[arg(long, value_name = "REF", conflicts_with = "staged")]
+        base: Option<String>,
+
+        /// Only staged changes, against HEAD
+        #[arg(long)]
+        staged: bool,
     },
 
     /// Start the Arbor server
@@ -297,6 +316,15 @@ enum Commands {
         /// Path to analyze (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Compare against where this branch left REF (e.g. origin/main):
+        /// committed and uncommitted changes since the merge base, as a PR shows them
+        #[arg(long, value_name = "REF", conflicts_with = "staged")]
+        base: Option<String>,
+
+        /// Only staged changes, against HEAD
+        #[arg(long)]
+        staged: bool,
     },
 
     /// Watch for file changes and re-index automatically
@@ -648,7 +676,15 @@ async fn run() {
             depth,
             json,
             markdown,
-        } => commands::diff(&path, depth, json, markdown),
+            base,
+            staged,
+        } => commands::diff(
+            &path,
+            depth,
+            json,
+            markdown,
+            &changes::Scope::from_flags(base, staged),
+        ),
         Commands::Check {
             path,
             depth,
@@ -656,7 +692,17 @@ async fn run() {
             no_fail,
             json,
             markdown,
-        } => commands::check(&path, depth, max_blast_radius, no_fail, json, markdown),
+            base,
+            staged,
+        } => commands::check(
+            &path,
+            depth,
+            max_blast_radius,
+            no_fail,
+            json,
+            markdown,
+            &changes::Scope::from_flags(base, staged),
+        ),
         Commands::Serve {
             port,
             headless,
@@ -694,7 +740,9 @@ async fn run() {
         Commands::Open { symbol, path } => commands::open(&symbol, &path),
         Commands::Gui { path } => commands::gui(&path),
         Commands::PrSummary { symbols, path } => commands::pr_summary(&symbols, &path),
-        Commands::Summary { path } => commands::summary(&path),
+        Commands::Summary { path, base, staged } => {
+            commands::summary(&path, &changes::Scope::from_flags(base, staged))
+        }
         Commands::Watch { path } => commands::watch(&path).await,
         Commands::Audit {
             sink,
