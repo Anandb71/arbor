@@ -41,6 +41,15 @@ pub fn snapshot(root: &Path) -> Result<String> {
     let real = git_path("index")?;
     if real.exists() {
         std::fs::copy(&real, &index)?;
+        // Keep the index's modification time too. Git re-checks the content
+        // of an entry modified no earlier than the index file; a copy stamped
+        // "now" (std::fs::copy on Linux) makes it trust stat data, so a
+        // same-size rewrite in the same second is recorded as the old text.
+        let modified = std::fs::metadata(&real)?.modified()?;
+        std::fs::File::options()
+            .write(true)
+            .open(&index)?
+            .set_modified(modified)?;
     } else {
         let _ = std::fs::remove_file(&index);
     }
