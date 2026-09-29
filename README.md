@@ -28,7 +28,7 @@
   <sub>Simulated replay — the <code>arbor</code> commands and their output are real (tokio @ 178k LOC). Methodology: <a href="docs/BENCHMARKS.md">BENCHMARKS.md</a></sub>
 </p>
 
-> **v3.0.0 — The Right Node** · v2.6.0 stopped *dropping* colliding symbols. It did not stop resolving them to the wrong one. When a bare name matched several modules, resolution fell through to "same directory" and confidently attached the edge to whichever definition happened to sit next to the caller. On a graded fixture the three largest hubs reported **zero downstream impact** while unrelated siblings inherited their centrality. A file's own imports now settle it. Reproduce it yourself: [getArbor-dev/arbor-torture](https://github.com/getArbor-dev/arbor-torture)
+> **v3.0.3** · Rust calls through module paths, macros and `self` are now edges. `arbor diff --base origin/main` reports a branch the way its pull request shows it, and a new function no longer inherits the blast radius of the file it lands in. Same-named symbols in different languages stay apart, and a graph built on another branch is refreshed instead of answered from. New: `arbor receipt`, a plain-English account of what each agent turn changed. [Release notes](docs/RELEASE_NOTES_v3.0.3.md)
 
 ---
 
@@ -49,7 +49,31 @@ Where the graph is *unsure*, it says so — edges carry a confidence, and ambigu
 
 ---
 
-## What's new in v3.0.0
+## What's new in v3.0.3
+
+A fix release. Every item below was a wrong answer, not a missing feature, and
+each ships with a regression test.
+
+| Fix | What was wrong |
+|-----|----------------|
+| **Rust calls resolve** | `crate::jobs::enqueue()`, `Type::new()`, `self.helper()` and calls inside `assert!`/`format!` produced no edge, so heavily used Rust functions reported no callers. Paths now resolve through the module tree, and macro arguments are read as code. |
+| **Per-symbol `arbor diff`** | Every symbol in a touched file counted as changed, so adding a function to a busy file reported that file's whole blast radius. New symbols now carry none; only modified ones do. Tests that call the change are listed as worth running, not counted as impact. |
+| **`--base` and `--staged`** | `arbor diff`, `check` and `summary` saw only uncommitted edits unless `ARBOR_DIFF_BASE` was set. `--base origin/main` compares against the merge base, which is what a pull request shows; `--staged` checks just what is staged. |
+| **Languages stay apart** | A TypeScript `enqueue` could be reported as a caller of a Rust `enqueue`. Resolution stays within a language family, and `callers`/`callees` list each same-named definition separately. |
+| **No stale graphs** | After a branch switch, answers came from the old branch's graph when no remaining file was newer than it. The graph now records the commit it was built from and refreshes when `HEAD` moves. |
+| **Inheritance edges** | `class Middle(Base)` produced no edge, so changing a base class showed zero blast radius. `extends`/`implements` edges are emitted and inherited methods stay reachable. |
+| **Call cycles rank as one** | A closed ring of functions filled the top of every centrality ranking. Cycles are condensed before PageRank. |
+| **HTTP bridge hardening** | `arbor bridge --http` accepted cross-origin and DNS-rebinding requests. It now checks `Origin`/`Host` and requires JSON bodies. |
+| **Quieter bridge** | The bridge re-indexed ignored build directories in a busy loop. |
+
+Also new: [`arbor receipt`](docs/RECEIPTS.md). After each coding-agent turn it
+explains, in plain English, what changed and what was touched that you didn't
+ask for, with `arbor receipt undo` to put a turn back.
+
+Cached graphs from 3.0.0 are rebuilt automatically on first use.
+
+<details>
+<summary><strong>v3.0.0 — The Right Node</strong> (symbol resolution consults the importing file)</summary>
 
 One fix, measured.
 
@@ -105,6 +129,8 @@ Written down rather than left to be discovered:
 - Dynamic and reflective imports (`importlib`, `__import__`, `import()`,
   `eval(require(...))`) are unresolvable by construction and are documented as
   expected misses in the fixture rather than counted as defects.
+
+</details>
 
 <details>
 <summary><strong>v2.6.0 — Ground Truth</strong> (colliding symbols kept, deterministic resolution, edge confidence, percentile centrality)</summary>
@@ -256,7 +282,7 @@ Every tool returns `{ ok, tool, data, meta: { suggested_next_tool, suggested_nex
 | `arbor agent guard` | Real-time architectural safety gate |
 | `arbor bridge` | MCP server (add `--http` for HTTP transport) |
 | `arbor watch` | Live re-index on file changes |
-| `arbor receipt list / show` | Plain-English receipts of what each agent turn changed ([guide](docs/RECEIPTS.md)) |
+| `arbor receipt list / show / undo` | Plain-English receipts of what each agent turn changed, and undo for a turn ([guide](docs/RECEIPTS.md)) |
 | `arbor hook claude` | Wire Arbor into Claude Code: directives, receipts after every turn |
 | `arbor gui` | Native desktop UI |
 
@@ -270,21 +296,22 @@ All query commands support `--json`. `map` additionally supports `--tokens N`, `
   <img src="docs/assets/visualizer-screenshot.png" alt="Arbor visualizer screenshot" width="760" />
 </p>
 
-Full recording: [media/recording-2026-01-13.mp4](media/recording-2026-01-13.mp4)
-
 ---
 
 ## Installation
 
 ```bash
-# Rust / Cargo
-cargo install arbor-graph-cli
+# macOS / Linux: prebuilt binary from the latest GitHub release
+curl -fsSL https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.sh | bash
 
-# Homebrew (macOS/Linux)
-brew install Anandb71/tap/arbor
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.ps1 | iex
 
 # Scoop (Windows)
-scoop bucket add arbor https://github.com/Anandb71/arbor && scoop install arbor
+scoop install https://raw.githubusercontent.com/Anandb71/arbor/main/packaging/scoop/arbor.json
+
+# Rust / Cargo (crates.io can lag the latest release)
+cargo install arbor-graph-cli
 
 # npm wrapper (cross-platform)
 npx @anandb71/arbor-cli
@@ -292,11 +319,6 @@ npx @anandb71/arbor-cli
 # Docker
 docker pull ghcr.io/anandb71/arbor:latest
 ```
-
-No-Rust installers:
-
-- macOS/Linux: `curl -fsSL https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.sh | bash`
-- Windows: `irm https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.ps1 | iex`
 
 Pinned installs: [docs/INSTALL.md](docs/INSTALL.md)
 
@@ -334,7 +356,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: Anandb71/arbor@v3.0.0
+      - uses: Anandb71/arbor@v3.0.3
         with:
           command: check . --max-blast-radius 30 --markdown
           comment-on-pr: true
@@ -357,7 +379,7 @@ arbor-core (Tree-sitter parsing)
 
 **Docs:** [Quickstart](docs/QUICKSTART.md) · [Architecture](docs/ARCHITECTURE.md) · [Graph schema](docs/GRAPH_SCHEMA.md) · [MCP integration](docs/MCP_INTEGRATION.md) · [Receipts](docs/RECEIPTS.md) · [Benchmarks](docs/BENCHMARKS.md) · [Roadmap](docs/ROADMAP.md) · [Philosophy](PHILOSOPHY.md)
 
-**Release channels:** GitHub Releases · crates.io · GHCR · npm · VS Code / Open VSX · Homebrew · Scoop — [Releasing guide](docs/RELEASING.md)
+**Release channels:** GitHub Releases · crates.io · GHCR · npm · VS Code / Open VSX · Scoop — [Releasing guide](docs/RELEASING.md)
 
 ---
 
@@ -367,7 +389,7 @@ arbor-core (Tree-sitter parsing)
 2. **Accessibility second** — works across ecosystems, runs anywhere
 3. **Affordability next** — minimal overhead, from laptops to monoliths
 
-Arbor is **local-first**: no mandatory data exfiltration, offline-capable, open source. [Security policy →](SECURITY.md)
+Arbor is **local-first**: no mandatory data exfiltration, offline-capable, open source. [Security policy →](.github/SECURITY.md)
 
 ---
 
@@ -379,7 +401,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets --all-features
 ```
 
-[CONTRIBUTING.md](CONTRIBUTING.md) · [Good first issues](docs/GOOD_FIRST_ISSUES.md) · [Code of conduct](CODE_OF_CONDUCT.md)
+[CONTRIBUTING.md](.github/CONTRIBUTING.md) · [Good first issues](docs/GOOD_FIRST_ISSUES.md) · [Code of conduct](.github/CODE_OF_CONDUCT.md)
 
 ---
 

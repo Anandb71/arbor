@@ -9,8 +9,8 @@ This runbook ensures Arbor releases propagate across all distribution channels �
 - GHCR container image (`ghcr.io/anandb71/arbor`)
 - VS Code Marketplace extension
 - Open VSX extension
-- Homebrew formula (`packaging/homebrew/arbor.rb`)
-- Scoop manifest (`packaging/scoop/arbor.json`)
+- Scoop manifest (`packaging/scoop/arbor.json`, installed by URL)
+- Homebrew formula (`packaging/homebrew/arbor.rb`, kept current; no tap is published yet)
 - npm wrapper (`packaging/npm/`)
 - MCP release note enrichment snippets
 
@@ -18,7 +18,7 @@ This runbook ensures Arbor releases propagate across all distribution channels �
 
 Configure these in **Settings → Secrets and variables → Actions**:
 
-- `CARGO_REGISTRY_TOKEN` — crates.io publishing token
+- `CARGO_REGISTRY_TOKEN` — crates.io publishing token. crates.io tokens can expire: an expired one fails the publish with a 403, and the job now says so instead of skipping quietly
 - `VSCE_PAT` — VS Code Marketplace publisher token (optional but recommended)
 - `OVSX_PAT` — Open VSX publisher token (optional but recommended)
 - `NPM_TOKEN` — npm publish token for `@anandb71/arbor-cli` wrapper (optional but recommended)
@@ -27,20 +27,24 @@ Configure these in **Settings → Secrets and variables → Actions**:
 >
 > npm wrapper publishing requires `NPM_TOKEN`.
 
+Also enable **Settings → Actions → General → Allow GitHub Actions to create and approve pull requests**. Without it the release workflow still pushes the `chore/manifest-checksums-vX.Y.Z` branch, but cannot open its pull request; open it by hand from the link in the job's error.
+
 ## Workflow map
 
 - `.github/workflows/release.yml`
   - Trigger: tag push (`v*`)
+  - Checks that the tag matches `Cargo.toml`, `agent-card.json`, `packaging/npm/package.json` and `extensions/arbor-vscode/package.json`
   - Builds cross-platform CLI binaries (5 targets)
-  - Publishes crates to crates.io
   - Creates GitHub Release and uploads assets
+  - Publishes crates to crates.io (a failure is reported on the job but does not fail the run)
+  - Writes the new version and checksums into the Homebrew formula and Scoop manifest, and opens a pull request with them
 
 - `.github/workflows/ghcr.yml`
-  - Trigger: GitHub Release published
+  - Trigger: the Release workflow completing successfully, or manual dispatch
   - Builds and publishes GHCR image (tag + latest)
 
 - `.github/workflows/vscode-marketplace.yml`
-  - Trigger: GitHub Release published or manual dispatch
+  - Trigger: the Release workflow completing successfully, or manual dispatch
   - Compiles extension
   - Resolves extension version from release tag (`vX.Y.Z` → `X.Y.Z`) unless manually overridden
   - Publishes packaged VSIX to VS Code Marketplace and/or Open VSX
@@ -55,20 +59,26 @@ Configure these in **Settings → Secrets and variables → Actions**:
   - Gracefully posts fallback context when markdown report generation fails
 
 - `.github/workflows/npm-publish.yml`
-  - Trigger: GitHub Release published or manual dispatch
+  - Trigger: the Release workflow completing successfully, or manual dispatch
   - Publishes npm wrapper package from `packaging/npm/`
 
 ## Recommended release sequence
 
-1. Ensure `CHANGELOG.md` and release notes docs are updated.
-2. Ensure workspace version and internal crate dependency versions are aligned.
+1. Ensure `CHANGELOG.md` and `docs/RELEASE_NOTES_vX.Y.Z.md` are updated.
+2. Bump the workspace version, the internal crate dependency versions, `Cargo.lock`, `agent-card.json`, `packaging/npm/package.json` and `extensions/arbor-vscode/package.json` (and its lockfile). Leave `packaging/homebrew` and `packaging/scoop` alone: the release workflow writes them once the assets and their checksums exist.
 3. Create and push a release tag:
    - `vX.Y.Z`
 4. Wait for all workflows to complete:
    - Release
    - GHCR
-   - VS Code Extension Publish
+   - Publish NPM Wrapper
+   - Publish VS Code Extension
    - MCP Release Adoption Notes
+5. Merge the `chore: update package manifests for vX.Y.Z` pull request.
+
+A Release run whose crates.io or manifest job failed still concludes successfully, so the other channels publish. Check those two jobs for error annotations anyway: re-run `Publish crates to crates.io` after fixing the token, and open the manifest pull request by hand if the workflow could not.
+
+GHCR, npm and the VS Code extension publish only after a successful Release run. If one was skipped, run its workflow manually with the tag.
 
 ## Versioning conventions
 
@@ -81,7 +91,9 @@ Configure these in **Settings → Secrets and variables → Actions**:
 After release completion, verify:
 
 - GitHub Releases contains all CLI assets
-- `cargo install arbor-graph-cli --version X.Y.Z` succeeds
+- `cargo install arbor-graph-cli --version X.Y.Z` succeeds (or `cargo search arbor-graph-cli` shows X.Y.Z)
+- `npm view @anandb71/arbor-cli version` shows X.Y.Z
+- `scoop install https://raw.githubusercontent.com/Anandb71/arbor/main/packaging/scoop/arbor.json` installs X.Y.Z once the manifest pull request is merged
 - `docker pull ghcr.io/anandb71/arbor:latest` succeeds
 - VS Code Marketplace listing shows latest extension version
 - Open VSX listing shows latest extension version

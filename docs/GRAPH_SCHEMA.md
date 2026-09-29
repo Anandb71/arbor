@@ -97,6 +97,33 @@ Edges represent relationships between nodes.
 
 A class records each base at parse time, and the builder emits `extends` (or `implements`, when the target is an interface or the source said so) from the subclass to that base. A method the subclass does not define stays reachable by a `references` edge to the nearest definition; an override does not keep that edge. `self`/`this` and `super`/`base` are separate `calls` edges: `self`/`this` bind to the nearest definition, and `super`/`base` start at the parents. PageRank walks `calls` only, so `extends`, `implements`, and `references` do not enter the rank. The receiver `calls` do, so the call graph can grow and who sits where can move. `CentralityScores::get` is still the percentile `i / (n - 1)`.
 
+### Call Resolution
+
+Parsers record each call as a reference string. The builder resolves it to a definition and stamps the edge with how it resolved (`Resolution::confidence`):
+
+| Resolution | Confidence | Meaning |
+|------------|-----------:|---------|
+| `Exact` | 1.00 | One definition with that fully qualified name |
+| `SameFile` | 0.95 | Defined in the calling file |
+| `ViaImport` | 0.93 | The calling file imports the module that defines it, or a Rust path names that module |
+| `UniqueSuffix` | 0.80 | The only definition with that name suffix in the repository |
+| `SameDir` | 0.55 | Several candidates; one sits in the caller's directory |
+| `Ambiguous` | 0.25 | Several equally plausible candidates |
+
+Only definitions in the caller's language family are candidates (TypeScript and JavaScript together; C and C++ together; Java, Kotlin and Scala together), so a TypeScript `enqueue()` never binds to a Rust `enqueue`.
+
+Reference shapes:
+
+| Shape | Example | Resolves to |
+|-------|---------|-------------|
+| `name` | `helper()` | The ranking above |
+| `module::name` | `crate::jobs::enqueue()`, `jobs::enqueue()` | A function whose file is that module (`jobs.rs`, `jobs/mod.rs`); a re-export from a submodule at lower confidence. `crate`, `self` and `super` segments and a leading crate name are skipped. A path into an external crate stays unresolved |
+| `Type::name` | `Wrapper::new()` | The method on that type, stored as `Wrapper.new`. An enum variant or external type stays unresolved |
+| `self.name` | `self.save()`, `this.save()` | The enclosing type's method, then its bases |
+| `.name` | `order.total()` | A method of that name when the receiver's type is unknown; common standard-library methods (`clone`, `unwrap`, `iter`, ...) are not recorded for Rust |
+
+Rust calls inside macro arguments (`assert!(verify())`, `format!("{}", name())`) are recorded like any other call. Generic arguments and turbofish (`parse::<u8>()`) are dropped; qualified-self paths (`<T as Trait>::f`) are not recorded.
+
 ## Graph Structure
 
 The graph is stored using an adjacency list representation:

@@ -242,11 +242,28 @@ fn save_graph_binary(path: &Path, graph: &arbor_graph::ArborGraph) -> Result<()>
     fs::write(&tmp_path, bytes)?;
     fs::rename(&tmp_path, &graph_path)?;
     record_indexed_head(path);
+    let _ = fs::write(graph_builder_path(path), arbor_graph::store::CACHE_VERSION);
     Ok(())
 }
 
 fn indexed_head_path(path: &Path) -> PathBuf {
     path.join(".arbor").join("graph.head")
+}
+
+fn graph_builder_path(path: &Path) -> PathBuf {
+    path.join(".arbor").join("graph.builder")
+}
+
+/// Whether the saved graph came from a different extractor: another Arbor
+/// version, or one from before graphs were stamped. Its edges were resolved
+/// by other rules, and without this check an upgrade kept answering with
+/// them until some source file happened to change.
+fn built_by_another_extractor(path: &Path) -> bool {
+    let has_graph = graph_binary_path(path).exists() || graph_snapshot_path(path).exists();
+    has_graph
+        && fs::read_to_string(graph_builder_path(path))
+            .map(|stamp| stamp.trim() != arbor_graph::store::CACHE_VERSION)
+            .unwrap_or(true)
 }
 
 fn current_head(path: &Path) -> Option<String> {
@@ -412,15 +429,22 @@ pub(crate) fn load_or_index_graph(path: &Path) -> Result<arbor_graph::ArborGraph
                 &current[..current.len().min(7)]
             );
         }
-    } else if moved.is_some() || cache_is_stale(path) {
-        if let Some((indexed, current)) = &moved {
-            eprintln!(
-                "note: HEAD moved from {} to {} since the last index; refreshing the graph.",
-                &indexed[..indexed.len().min(7)],
-                &current[..current.len().min(7)]
-            );
+    } else {
+        let other_extractor = built_by_another_extractor(path);
+        if moved.is_some() || other_extractor || cache_is_stale(path) {
+            if let Some((indexed, current)) = &moved {
+                eprintln!(
+                    "note: HEAD moved from {} to {} since the last index; refreshing the graph.",
+                    &indexed[..indexed.len().min(7)],
+                    &current[..current.len().min(7)]
+                );
+            } else if other_extractor {
+                eprintln!(
+                    "note: the saved graph was built by a different Arbor version; rebuilding it."
+                );
+            }
+            return refresh_graph(path);
         }
-        return refresh_graph(path);
     }
 
     if let Ok(graph) = load_graph_binary(path) {
@@ -4952,7 +4976,34 @@ pub fn agent_guard(path: &Path, max_blast_radius: usize) -> Result<()> {
 
 #[cfg(test)]
 mod staleness_tests {
-    use super::index_cache_in_use;
+    use super::{built_by_another_extractor, index_cache_in_use};
+
+    #[test]
+    fn a_graph_from_another_extractor_is_not_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let arbor = dir.path().join(".arbor");
+        std::fs::create_dir_all(&arbor).unwrap();
+        assert!(
+            !built_by_another_extractor(dir.path()),
+            "no graph yet: nothing to rebuild"
+        );
+
+        std::fs::write(arbor.join("graph.bin"), b"").unwrap();
+        assert!(
+            built_by_another_extractor(dir.path()),
+            "a graph saved before stamping existed"
+        );
+
+        std::fs::write(arbor.join("graph.builder"), "arbor-3.0.0").unwrap();
+        assert!(built_by_another_extractor(dir.path()), "an older release");
+
+        std::fs::write(
+            arbor.join("graph.builder"),
+            arbor_graph::store::CACHE_VERSION,
+        )
+        .unwrap();
+        assert!(!built_by_another_extractor(dir.path()));
+    }
 
     #[test]
     fn only_an_open_index_cache_counts_as_a_running_bridge() {

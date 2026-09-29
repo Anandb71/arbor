@@ -30,7 +30,7 @@ We are aggressively expanding language support. If you know Tree-sitter, we want
     ```
 
 2. **Pick a Task**
-    - Check [ROADMAP.md](docs/ROADMAP.md) for high-level goals.
+    - Check [ROADMAP.md](../docs/ROADMAP.md) for high-level goals.
     - Look for "Good First Issue" tags on GitHub.
 
 3. **Create a Branch**

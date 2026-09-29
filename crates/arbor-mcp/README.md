@@ -31,11 +31,26 @@ Compared with typical code-intel MCP servers, Arbor focuses on:
 
 ## MCP Tools
 
+Sixteen tools. Start with `get_map` or `get_architecture_overview`.
+
 | Tool | Description |
 |------|-------------|
-| `get_logic_path` | Generate an architectural brief for a symbol |
+| `get_map` | Ranked, token-budgeted skeleton of the codebase |
+| `get_architecture_overview` | Hotspots, module boundaries, entry points, languages, graph statistics |
+| `list_entry_points` | HTTP handlers, main functions, webhooks, jobs, CLI commands |
+| `search_symbols` | Fuzzy symbol search, with `a\|b` OR queries |
+| `get_callers` | Direct callers of a symbol |
+| `get_callees` | Direct callees of a symbol |
+| `get_file_graph` | Symbols and call edges within one file |
+| `get_node_detail` | File, line range, kind, role and centrality for one symbol |
+| `explain_symbol` | Token-bounded explanation of a symbol's role and connections |
+| `batch_query` | Several symbols in one call, optionally with callers and callees |
+| `get_logic_path` | Upstream and downstream brief for a symbol |
+| `analyze_impact` | Blast radius of changing a node, with confidence and roles |
+| `get_blast_radius` | Blast radius of the current uncommitted git changes |
 | `find_path` | Shortest path between two nodes |
-| `analyze_impact` | Predict blast radius of changes |
+| `get_knowledge_path` | Markdown logic path with wiki links, for knowledge sections |
+| `audit_security` | Paths from a symbol to sensitive sinks (queries, file I/O, network, exec) |
 
 ## Why MCP?
 
@@ -68,7 +83,7 @@ Inside Claude Code, run:
 
 ### Cursor / VS Code / Claude Desktop
 
-See full multi-client setup in [`docs/MCP_INTEGRATION.md`](../../docs/MCP_INTEGRATION.md).
+See full multi-client setup in [`docs/MCP_INTEGRATION.md`](https://github.com/Anandb71/arbor/blob/main/docs/MCP_INTEGRATION.md).
 
 ### Claude Desktop Config
 
