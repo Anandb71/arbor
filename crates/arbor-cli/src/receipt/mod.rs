@@ -149,12 +149,13 @@ fn project_root(path: &Path, input: &HookInput) -> Result<PathBuf> {
     crate::commands::resolve_project_path(&start)
 }
 
-/// Record the start of a turn. Silent by design: it runs on every request.
+/// Record the start of a turn. Silent on stdout by design: it runs on every
+/// request, and a hook's stdout is added to the agent's context.
 pub fn begin(path: &Path, agent: &str) -> Result<()> {
     let input = read_hook_input();
     let root = project_root(path, &input)?;
-    if !crate::commands::is_git_repo(&root) {
-        return Ok(());
+    if let Some(reason) = crate::commands::git_prerequisite_error(&root, "recording a receipt") {
+        return Err(reason.into());
     }
     let session = input.session_id.clone().unwrap_or_else(|| "manual".into());
     let tree = snapshot::snapshot(&root)?;
