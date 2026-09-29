@@ -492,4 +492,81 @@ mod tests {
         slow.write_all(b"POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 50\r\n\r\n{").await.unwrap();
         assert!(read_all(&mut slow).await.starts_with("HTTP/1.1 408"));
     }
+
+    /// Write `raw` on one connection and return everything the server sends
+    /// back before closing it.
+    async fn exchange(address: std::net::SocketAddr, raw: &str) -> String {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.write_all(raw.as_bytes()).await.unwrap();
+        read_all(&mut stream).await
+    }
+
+    fn responses(output: &str) -> usize {
+        output.matches("HTTP/1.1 ").count()
+    }
+
+    const HEAD: &str =
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n";
+
+    fn framed(body: &str) -> String {
+        format!("{HEAD}Content-Length: {}\r\n\r\n{body}", body.len())
+    }
+
+    /// Keep-alive is off, so each connection carries exactly one request.
+    /// That is what stops a mis-framed body from being read as a second,
+    /// smuggled request, so pin it: a pipelined request gets no answer.
+    #[tokio::test]
+    async fn one_connection_answers_one_request() {
+        let address = spawn(Limits::default()).await;
+        let output = exchange(address, &format!("{}{}", framed(LIST), framed(LIST))).await;
+        assert!(output.starts_with("HTTP/1.1 200"), "{output}");
+        assert_eq!(responses(&output), 1, "{output}");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_body_lengths_cannot_smuggle_a_request() {
+        let address = spawn(Limits::default()).await;
+
+        // Both headers: framed by Transfer-Encoding alone (RFC 9112 section
+        // 6.1). Content-Length would end the body after 5 bytes and leave the
+        // rest to be read as another request; nothing after it is answered.
+        let chunked = format!("{:x}\r\n{LIST}\r\n0\r\n\r\n", LIST.len());
+        let output = exchange(
+            address,
+            &format!(
+                "{HEAD}Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n{chunked}{}",
+                framed(LIST)
+            ),
+        )
+        .await;
+        assert!(output.starts_with("HTTP/1.1 200"), "{output}");
+        assert_eq!(responses(&output), 1, "{output}");
+
+        for (case, headers) in [
+            (
+                "conflicting lengths",
+                format!("Content-Length: {}\r\nContent-Length: 3\r\n", LIST.len()),
+            ),
+            ("non-numeric length", "Content-Length: abc\r\n".to_string()),
+        ] {
+            let output = exchange(address, &format!("{HEAD}{headers}\r\n{LIST}")).await;
+            assert!(output.starts_with("HTTP/1.1 400"), "{case}: {output}");
+            assert_eq!(responses(&output), 1, "{case}: {output}");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_requests_get_400() {
+        let address = spawn(Limits::default()).await;
+        for (case, raw) in [
+            (
+                "unsupported transfer coding",
+                format!("{HEAD}Transfer-Encoding: gzip\r\n\r\n{LIST}"),
+            ),
+            ("not HTTP at all", "NOT AN HTTP REQUEST\r\n\r\n".to_string()),
+        ] {
+            let output = exchange(address, &raw).await;
+            assert!(output.starts_with("HTTP/1.1 400"), "{case}: {output}");
+        }
+    }
 }
