@@ -498,12 +498,15 @@ fn run_git(path: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// What git can tell us about a project directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GitAvailability {
     /// No `git` executable could be started.
     Missing,
     /// Git runs, but the directory is not inside a work tree (or does not exist).
     NotARepository,
+    /// Git found a repository but would not use it, for example because of
+    /// "dubious ownership". Holds git's own explanation, which says how to fix it.
+    Refused(String),
     /// The directory is inside a git work tree.
     Repository,
 }
@@ -521,14 +524,28 @@ fn git_availability_with(program: &str, path: &Path) -> GitAvailability {
     match Command::new(program)
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(path)
+        // Untranslated, so "not a git repository" can be recognised below.
+        .env("LC_ALL", "C")
         .output()
     {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => GitAvailability::Missing,
+        Err(error) => GitAvailability::Refused(format!("git could not be started: {error}")),
         // Inside .git or a bare repository git succeeds but prints "false".
         Ok(output) if output.status.success() && output.stdout.trim_ascii() == b"true" => {
             GitAvailability::Repository
         }
-        _ => GitAvailability::NotARepository,
+        Ok(output) if output.status.success() => GitAvailability::NotARepository,
+        Ok(output) => classify_git_failure(&String::from_utf8_lossy(&output.stderr)),
+    }
+}
+
+/// Tell "no repository here" apart from git refusing the one it found.
+fn classify_git_failure(stderr: &str) -> GitAvailability {
+    let reason = stderr.trim();
+    if reason.is_empty() || reason.contains("not a git repository") {
+        GitAvailability::NotARepository
+    } else {
+        GitAvailability::Refused(reason.to_string())
     }
 }
 
@@ -558,7 +575,19 @@ fn git_prerequisite_message(
              Run it from your project's repository, or run `git init` there first.",
             path.display()
         )),
+        GitAvailability::Refused(reason) => Some(format!(
+            "{command} could not use the git repository at {}. Git said:\n{}",
+            path.display(),
+            indent(&reason)
+        )),
     }
+}
+
+fn indent(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Fail with an actionable message unless git is installed and `path` is a repository.
@@ -575,8 +604,48 @@ pub(crate) fn require_git_repo(path: &Path, command: &str) -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod git_prerequisite_tests {
-    use super::{git_availability_with, git_prerequisite_message, GitAvailability};
+    use super::{
+        classify_git_failure, git_availability_with, git_prerequisite_message, GitAvailability,
+    };
     use std::path::Path;
+
+    const DUBIOUS: &str = "fatal: detected dubious ownership in repository at '/work/app'\n\
+        '/work/app' is owned by:\n\t1000\nbut the current user is:\n\t0\n\
+        To add an exception for this directory, call:\n\n\
+        \tgit config --global --add safe.directory /work/app\n";
+
+    #[test]
+    fn git_refusing_a_repository_is_not_reported_as_no_repository() {
+        assert_eq!(
+            classify_git_failure(
+                "fatal: not a git repository (or any of the parent directories): .git\n"
+            ),
+            GitAvailability::NotARepository
+        );
+        assert_eq!(classify_git_failure(""), GitAvailability::NotARepository);
+        assert_eq!(
+            classify_git_failure(DUBIOUS),
+            GitAvailability::Refused(DUBIOUS.trim().to_string())
+        );
+    }
+
+    #[test]
+    fn a_refusal_passes_on_git_s_own_fix() {
+        let message = git_prerequisite_message(
+            classify_git_failure(DUBIOUS),
+            Path::new("app"),
+            "arbor diff",
+        )
+        .unwrap();
+        assert!(
+            message.starts_with("arbor diff could not use the git repository at app. Git said:\n"),
+            "{message}"
+        );
+        assert!(
+            message.contains("\n  \tgit config --global --add safe.directory /work/app"),
+            "{message}"
+        );
+    }
 
     const NO_SUCH_GIT: &str = "arbor-test-no-such-git-executable";
 

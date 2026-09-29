@@ -75,8 +75,13 @@ fn receipt_warning(scope: &Scope, git: GitAvailability) -> Option<String> {
              Run `git init` in it, or run this command in your project's repository.",
             root.display()
         )),
+        (Scope::Project(root), GitAvailability::Refused(reason)) => Some(format!(
+            "Receipts cannot use the git repository at {}. Git said:\n  {}",
+            root.display(),
+            reason.lines().collect::<Vec<_>>().join("\n  ")
+        )),
         // A global install runs in whichever project the agent opens.
-        (Scope::Global, GitAvailability::NotARepository) => None,
+        (Scope::Global, GitAvailability::NotARepository | GitAvailability::Refused(_)) => None,
     }
 }
 
@@ -101,11 +106,21 @@ mod tests {
         );
         let missing = receipt_warning(&project, GitAvailability::Missing).unwrap();
         assert!(missing.contains("PATH"), "{missing}");
+        let refused = receipt_warning(
+            &project,
+            GitAvailability::Refused("fatal: detected dubious ownership".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            refused.lines().nth(1),
+            Some("  fatal: detected dubious ownership")
+        );
     }
 
     #[test]
     fn a_global_install_only_warns_when_git_is_missing() {
         assert!(receipt_warning(&Scope::Global, GitAvailability::NotARepository).is_none());
+        assert!(receipt_warning(&Scope::Global, GitAvailability::Refused("x".into())).is_none());
         assert!(receipt_warning(&Scope::Global, GitAvailability::Missing).is_some());
     }
 }
