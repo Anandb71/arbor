@@ -26,7 +26,10 @@ const PERMISSIONS: &[&str] = &[
     "Bash(arbor entry-points *)",
     "Bash(arbor refactor *)",
     "Bash(arbor export *)",
-    "Bash(arbor receipt *)",
+    // Reading receipts is safe to run unprompted. `undo` changes files (and
+    // `--force` can discard later work), so Claude asks before running it.
+    "Bash(arbor receipt list *)",
+    "Bash(arbor receipt show *)",
 ];
 
 pub struct Claude;
@@ -405,4 +408,21 @@ fn ensure_permissions(settings: &mut Value) -> bool {
         }
     }
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PERMISSIONS;
+
+    #[test]
+    fn receipts_are_readable_without_a_prompt_but_undo_asks() {
+        assert!(PERMISSIONS.contains(&"Bash(arbor receipt list *)"));
+        assert!(PERMISSIONS.contains(&"Bash(arbor receipt show *)"));
+        // `undo` rewrites files (and `--force` can discard later work), so no
+        // allow-list entry may match it.
+        assert!(PERMISSIONS
+            .iter()
+            .all(|entry| !entry.starts_with("Bash(arbor receipt *")
+                && !entry.contains("receipt undo")));
+    }
 }
