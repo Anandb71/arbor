@@ -3,6 +3,7 @@ use crate::graph::ArborGraph;
 use arbor_core::CodeNode;
 use sled::{Batch, Db};
 use std::path::Path;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 /// Current cache format version. The cache stores parser output, so a change
@@ -35,42 +36,38 @@ impl GraphStore {
     /// Opens or creates a graph store at the specified path.
     /// Returns an error if the cache version doesn't match.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StoreError> {
-        let db = sled::open(path)?;
-        let store = Self { db };
-
-        // Check cache version
-        if let Some(version_bytes) = store.db.get("meta:version")? {
-            let version: String = bincode::deserialize(&version_bytes)?;
-            if version != CACHE_VERSION {
-                return Err(StoreError::VersionMismatch {
-                    expected: CACHE_VERSION.to_string(),
-                    found: version,
-                });
+        let db = open_db(path.as_ref())?;
+        match stored_version(&db)? {
+            Some(found) if found != CACHE_VERSION => Err(StoreError::VersionMismatch {
+                expected: CACHE_VERSION.to_string(),
+                found,
+            }),
+            Some(_) => Ok(Self { db }),
+            None => {
+                set_version(&db)?;
+                Ok(Self { db })
             }
-        } else {
-            // New cache, set version
-            let version_bytes = bincode::serialize(&CACHE_VERSION.to_string())?;
-            store.db.insert("meta:version", version_bytes)?;
         }
-
-        Ok(store)
     }
 
     /// Opens a store, clearing it if version mismatches.
+    ///
+    /// Everything goes through one handle. Dropping a sled handle releases
+    /// the directory lock only when its flusher thread exits, so re-opening
+    /// straight after `open` reported a mismatch could fail with "could not
+    /// acquire lock", on the first run after an upgrade.
     pub fn open_or_reset<P: AsRef<Path>>(path: P) -> Result<Self, StoreError> {
-        match Self::open(path.as_ref()) {
-            Ok(store) => Ok(store),
-            Err(StoreError::VersionMismatch { .. }) => {
-                // Clear and reopen
-                let db = sled::open(path.as_ref())?;
+        let db = open_db(path.as_ref())?;
+        match stored_version(&db)? {
+            Some(found) if found == CACHE_VERSION => {}
+            Some(_) => {
                 db.clear()?;
-                let version_bytes = bincode::serialize(&CACHE_VERSION.to_string())?;
-                db.insert("meta:version", version_bytes)?;
+                set_version(&db)?;
                 db.flush()?;
-                Ok(Self { db })
             }
-            Err(e) => Err(e),
+            None => set_version(&db)?,
         }
+        Ok(Self { db })
     }
 
     /// Gets the stored mtime for a file.
@@ -226,11 +223,77 @@ impl GraphStore {
     }
 }
 
+/// Open the sled database, waiting up to a second while a handle this
+/// process just dropped still holds the directory lock (sled releases it
+/// when that handle's flusher thread exits). A store held open by another
+/// process still fails, after the wait.
+fn open_db(path: &Path) -> Result<Db, StoreError> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match sled::open(path) {
+            Err(sled::Error::Io(error))
+                if error.to_string().contains("could not acquire lock")
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => return Ok(result?),
+        }
+    }
+}
+
+fn stored_version(db: &Db) -> Result<Option<String>, StoreError> {
+    match db.get("meta:version")? {
+        Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+fn set_version(db: &Db) -> Result<(), StoreError> {
+    db.insert(
+        "meta:version",
+        bincode::serialize(&CACHE_VERSION.to_string())?,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arbor_core::NodeKind;
     use tempfile::tempdir;
+
+    /// test_cache_version failed on CI when the second open found the lock
+    /// still held by the handle just dropped (#250). Repeat the sequence so a
+    /// missing wait shows up here rather than once in a while in CI.
+    #[test]
+    fn a_store_can_be_reopened_right_after_it_is_dropped() {
+        let dir = tempdir().unwrap();
+        for _ in 0..200 {
+            drop(GraphStore::open(dir.path()).unwrap());
+        }
+    }
+
+    #[test]
+    fn an_outdated_cache_is_cleared_without_reopening() {
+        let dir = tempdir().unwrap();
+        {
+            let db = sled::open(dir.path()).unwrap();
+            db.insert("meta:version", bincode::serialize("arbor-0.0.0").unwrap())
+                .unwrap();
+            db.insert("m:stale.rs", bincode::serialize(&1u64).unwrap())
+                .unwrap();
+            db.flush().unwrap();
+        }
+        // No pause after the drop above: a second sled::open inside
+        // open_or_reset could still find the directory locked.
+        let store = GraphStore::open_or_reset(dir.path()).unwrap();
+        assert_eq!(
+            stored_version(&store.db).unwrap().as_deref(),
+            Some(CACHE_VERSION)
+        );
+        assert_eq!(store.get_mtime("stale.rs").unwrap(), None);
+    }
 
     #[test]
     fn test_incremental_updates() {
