@@ -1,0 +1,23 @@
+{
+  "corpus_version": 1,
+  "language": "python",
+  "covers": ["monorepo layout", "vendored directory", "generated file"],
+  "symbols": [
+    "apps/web/checkout.py::total",
+    "packages/core/money.py::money_to_minor_units",
+    "gen/proto_defs.py::generated_stub"
+  ],
+  "symbols_forbidden": [
+    "vendor/lib/thirdparty.py::vendored_helper"
+  ],
+  "edges_expected": [
+    ["apps/web/checkout.py::total", "packages/core/money.py::money_to_minor_units"]
+  ],
+  "edges_forbidden": [
+    ["apps/web/checkout.py::total", "vendor/lib/thirdparty.py::vendored_helper"],
+    ["gen/proto_defs.py::generated_stub", "packages/core/money.py::money_to_minor_units"]
+  ],
+  "known_missing": [],
+  "known_extra": [],
+  "notes": "checkout.py resolves a core package by path insertion; vendor/ content is not indexed as project code; generated code is indexed but creates no edges."
+}

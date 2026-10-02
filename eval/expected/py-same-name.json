@@ -1,0 +1,19 @@
+{
+  "corpus_version": 1,
+  "language": "python",
+  "covers": ["same-name disambiguation", "import-aware edge filtering"],
+  "symbols": [
+    "a_util.py::format",
+    "b_util.py::format",
+    "service.py::render"
+  ],
+  "edges_expected": [
+    ["service.py::render", "a_util.py::format"]
+  ],
+  "edges_forbidden": [
+    ["service.py::render", "b_util.py::format"]
+  ],
+  "known_missing": [],
+  "known_extra": [],
+  "notes": "service imports format from a_util only; the b_util.format edge must never appear."
+}

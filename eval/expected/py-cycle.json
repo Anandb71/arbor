@@ -1,0 +1,19 @@
+{
+  "corpus_version": 1,
+  "language": "python",
+  "covers": ["mutual recursion across files", "cyclic call resolution"],
+  "symbols": [
+    "a.py::ping",
+    "b.py::pong",
+    "b.py::start"
+  ],
+  "edges_expected": [
+    ["a.py::ping", "b.py::pong"],
+    ["b.py::pong", "a.py::ping"],
+    ["b.py::start", "b.py::pong"]
+  ],
+  "edges_forbidden": [],
+  "known_missing": [],
+  "known_extra": [],
+  "notes": "a.py calls pong unqualified while b.py imports ping explicitly; both directions must resolve."
+}
