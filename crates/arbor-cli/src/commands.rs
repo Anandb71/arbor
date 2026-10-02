@@ -178,6 +178,23 @@ fn ensure_arbor_initialized(path: &Path) -> Result<bool> {
     init_arbor_dir(path)
 }
 
+/// What `.arbor/.gitignore` holds: everything in the folder is local state.
+const ARBOR_GITIGNORE: &str = concat!(
+    "# Arbor's local graph and receipts. Receipts include the text of your prompts.\n",
+    "# Keep them out of git. To share config.json, add a line: !config.json\n",
+    "*\n",
+);
+
+/// Keeps `.arbor/` out of git by giving it its own `.gitignore`, so one
+/// `git add -A` can't commit the graph or saved prompts. An existing file is
+/// left alone, and a failure to write it doesn't fail the command.
+pub(crate) fn ignore_arbor_dir(project: &Path) {
+    let gitignore = project.join(".arbor").join(".gitignore");
+    if !gitignore.exists() {
+        let _ = fs::write(gitignore, ARBOR_GITIGNORE);
+    }
+}
+
 /// Creates and populates `.arbor/` unconditionally. Used by the explicit
 /// `init`/`index`/`setup` commands, which always opt the user into indexing.
 fn init_arbor_dir(path: &Path) -> Result<bool> {
@@ -187,6 +204,8 @@ fn init_arbor_dir(path: &Path) -> Result<bool> {
     if !arbor_dir.exists() {
         fs::create_dir_all(&arbor_dir).map_err(|e| write_error(&arbor_dir, e))?;
     }
+    // Also on an existing folder, so projects indexed by an older Arbor get it.
+    ignore_arbor_dir(path);
 
     if !config_path.exists() {
         let default_config = serde_json::json!({
@@ -5214,6 +5233,53 @@ pub fn agent_guard(path: &Path, max_blast_radius: usize) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod gitignore_tests {
+    use super::{ignore_arbor_dir, init_arbor_dir};
+
+    #[test]
+    fn creating_the_arbor_folder_ignores_everything_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        init_arbor_dir(dir.path()).unwrap();
+        let ignore = std::fs::read_to_string(dir.path().join(".arbor/.gitignore")).unwrap();
+        assert!(
+            ignore.lines().any(|line| line == "*"),
+            "expected a catch-all pattern, got: {ignore:?}"
+        );
+    }
+
+    #[test]
+    fn a_folder_made_by_an_older_arbor_gets_the_ignore_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let arbor = dir.path().join(".arbor");
+        std::fs::create_dir_all(&arbor).unwrap();
+        std::fs::write(arbor.join("config.json"), "{}").unwrap();
+        init_arbor_dir(dir.path()).unwrap();
+        assert!(arbor.join(".gitignore").exists());
+    }
+
+    #[test]
+    fn an_existing_ignore_file_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let arbor = dir.path().join(".arbor");
+        std::fs::create_dir_all(&arbor).unwrap();
+        let own = "*\n!config.json\n";
+        std::fs::write(arbor.join(".gitignore"), own).unwrap();
+        ignore_arbor_dir(dir.path());
+        assert_eq!(
+            std::fs::read_to_string(arbor.join(".gitignore")).unwrap(),
+            own
+        );
+    }
+
+    #[test]
+    fn nothing_is_written_when_the_folder_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        ignore_arbor_dir(dir.path());
+        assert!(!dir.path().join(".arbor").exists());
+    }
 }
 
 #[cfg(test)]
