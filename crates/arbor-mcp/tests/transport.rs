@@ -199,7 +199,7 @@ async fn unknown_method_and_tool_return_errors_not_crashes() {
     let resp = client
         .request(1, "tools/call", json!({ "name": "nonexistent_tool" }))
         .await;
-    assert!(resp.get("error").is_some() || resp["result"].is_null() == false);
+    assert!(resp.get("error").is_some() || !resp["result"].is_null());
 
     let resp = client.request(2, "no/such_method", json!({})).await;
     assert_eq!(resp["error"]["code"], -32601);
