@@ -98,15 +98,40 @@ pub fn with_cache_meta(mut value: Value, ttl_ms: u64) -> Value {
     value
 }
 
-/// Server capabilities for MCP 2026-07-28.
+/// Extensions this server actually implements. Anything else a client asks
+/// for is not an optional extra it silently accepts — it is not advertised.
+pub const IMPLEMENTED_EXTENSIONS: &[&str] = &[EXT_TASKS, EXT_APPS];
+
+/// Extensions the client declared support for in `capabilities.extensions`.
+/// Returns `None` when the client did not declare the field at all, so the
+/// caller can keep advertising the full set for backward compatibility.
+pub fn client_declared_extensions(params: &Value) -> Option<Vec<String>> {
+    let ext = params.get("capabilities")?.get("extensions")?.as_object()?;
+    Some(ext.keys().cloned().collect())
+}
+
+/// Server capabilities for MCP 2026-07-28, narrowed to the extensions the
+/// client declared it understands when it declared any.
 pub fn server_capabilities() -> Value {
+    server_capabilities_for(None)
+}
+
+pub fn server_capabilities_for(client_extensions: Option<&[String]>) -> Value {
+    let supported: Vec<&&str> = match client_extensions {
+        Some(declared) => IMPLEMENTED_EXTENSIONS
+            .iter()
+            .filter(|ext| declared.iter().any(|d| d.as_str() == **ext))
+            .collect(),
+        None => IMPLEMENTED_EXTENSIONS.iter().collect(),
+    };
+    let extensions: serde_json::Map<String, Value> = supported
+        .into_iter()
+        .map(|ext| (ext.to_string(), json!({ "version": "1.0.0" })))
+        .collect();
     json!({
         "tools": { "listChanged": false },
         "resources": { "subscribe": false, "listChanged": false },
-        "extensions": {
-            EXT_TASKS: { "version": "1.0.0" },
-            EXT_APPS: { "version": "1.0.0" }
-        },
+        "extensions": Value::Object(extensions),
         "streaming": false,
         "pagination": true,
         "json": true
