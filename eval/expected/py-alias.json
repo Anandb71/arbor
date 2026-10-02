@@ -1,0 +1,18 @@
+{
+  "corpus_version": 1,
+  "language": "python",
+  "covers": ["import alias resolution", "from X import Y as Z"],
+  "symbols": [
+    "orders.py::total_cents",
+    "money.py::money_to_minor_units"
+  ],
+  "edges_expected": [
+    ["orders.py::total_cents", "money.py::money_to_minor_units"]
+  ],
+  "edges_forbidden": [],
+  "known_missing": [
+    ["orders.py::total_cents", "money.py::money_to_minor_units"]
+  ],
+  "known_extra": [],
+  "notes": "orders.py imports money_to_minor_units AS to_minor and calls to_minor(). Arbor 3.0.3 records no edge — aliased-name resolution is a real recall gap this corpus keeps visible. Remove the known_missing entry when the engine resolves it."
+}
