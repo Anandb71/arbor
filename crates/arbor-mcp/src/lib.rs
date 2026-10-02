@@ -56,6 +56,21 @@ pub(crate) enum HttpReply {
     Accepted,
 }
 
+/// Caps on client-supplied sizes so one request cannot inflate a response
+/// unboundedly.
+const MAX_LIST_LIMIT: usize = 500;
+const MAX_DEPTH: usize = 32;
+const MAX_TOKEN_BUDGET: usize = 64_000;
+
+/// Read a numeric argument with a default and a hard ceiling.
+fn bounded_usize(args: &Value, key: &str, default: usize, max: usize) -> usize {
+    args.get(key)
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(default)
+        .min(max)
+}
+
 pub struct McpServer {
     graph: SharedGraph,
     spotlight_handle: Option<SyncServerHandle>,
@@ -770,10 +785,7 @@ impl McpServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
-                let max_depth = arguments
-                    .get("max_depth")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(5) as usize;
+                let max_depth = bounded_usize(arguments, "max_depth", 5, MAX_DEPTH);
 
                 // Trigger Spotlight
                 self.trigger_spotlight(node_id).await;
@@ -1076,10 +1088,7 @@ impl McpServer {
                     .get("query")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let limit = arguments
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(20) as usize;
+                let limit = bounded_usize(arguments, "limit", 20, MAX_LIST_LIMIT);
                 let offset = arguments
                     .get("offset")
                     .and_then(|v| v.as_u64())
@@ -1233,10 +1242,7 @@ impl McpServer {
                 }
             }
             "get_map" => {
-                let token_budget = arguments
-                    .get("tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1024) as usize;
+                let token_budget = bounded_usize(arguments, "tokens", 1024, MAX_TOKEN_BUDGET);
                 let exclude_test = arguments
                     .get("exclude_test")
                     .and_then(|v| v.as_bool())
@@ -1249,10 +1255,7 @@ impl McpServer {
                     .get("offset")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
-                let limit = arguments
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(50) as usize;
+                let limit = bounded_usize(arguments, "limit", 50, MAX_LIST_LIMIT);
 
                 self.ensure_graph_centrality().await;
                 let graph = self.graph.read().await;
@@ -1287,10 +1290,7 @@ impl McpServer {
                 ))
             }
             "get_blast_radius" => {
-                let depth = arguments
-                    .get("max_depth")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(5) as usize;
+                let depth = bounded_usize(arguments, "max_depth", 5, MAX_DEPTH);
                 let format = arguments
                     .get("format")
                     .and_then(|v| v.as_str())
@@ -1474,10 +1474,7 @@ impl McpServer {
                         message: "Missing 'source' parameter".to_string(),
                         data: None,
                     })?;
-                let max_depth = arguments
-                    .get("max_depth")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(8) as usize;
+                let max_depth = bounded_usize(arguments, "max_depth", 8, MAX_DEPTH);
 
                 self.trigger_spotlight(source).await;
                 let graph = self.graph.read().await;
@@ -1552,10 +1549,7 @@ impl McpServer {
                 }
             }
             "get_architecture_overview" => {
-                let top_n = arguments
-                    .get("top_n")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(20) as usize;
+                let top_n = bounded_usize(arguments, "top_n", 20, MAX_LIST_LIMIT);
 
                 self.ensure_graph_centrality().await;
                 let graph = self.graph.read().await;
@@ -2524,6 +2518,23 @@ mod tool_tests {
             PROTOCOL_VERSION_LATEST
         );
         assert!(server.negotiated_protocol.read().await.is_none());
+    }
+
+    #[test]
+    fn bounded_numeric_arguments_clamp_to_caps() {
+        let args =
+            serde_json::json!({ "limit": 10_000_000, "max_depth": 10_000, "tokens": u64::MAX });
+        assert_eq!(
+            bounded_usize(&args, "limit", 20, MAX_LIST_LIMIT),
+            MAX_LIST_LIMIT
+        );
+        assert_eq!(bounded_usize(&args, "max_depth", 5, MAX_DEPTH), MAX_DEPTH);
+        assert_eq!(
+            bounded_usize(&args, "tokens", 1024, MAX_TOKEN_BUDGET),
+            MAX_TOKEN_BUDGET
+        );
+        let empty = serde_json::json!({});
+        assert_eq!(bounded_usize(&empty, "limit", 20, MAX_LIST_LIMIT), 20);
     }
 
     #[tokio::test]
