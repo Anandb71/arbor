@@ -173,6 +173,8 @@ pub fn begin(path: &Path, agent: &str) -> Result<()> {
     };
     let path = turn_path(&root, &session);
     std::fs::create_dir_all(path.parent().unwrap())?;
+    // The turn file holds the prompt; make sure git ignores it before it exists.
+    crate::commands::ignore_arbor_dir(&root);
     std::fs::write(path, serde_json::to_vec(&turn)?)?;
     Ok(())
 }
@@ -224,6 +226,7 @@ pub fn end(path: &Path, hook: bool, json: bool) -> Result<()> {
 fn save(root: &Path, receipt: &Receipt) -> Result<()> {
     let dir = receipts_dir(root);
     std::fs::create_dir_all(&dir)?;
+    crate::commands::ignore_arbor_dir(root);
     std::fs::write(
         dir.join(format!("{}.json", receipt.id)),
         serde_json::to_vec_pretty(receipt)?,
