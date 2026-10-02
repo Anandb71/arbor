@@ -74,7 +74,9 @@ case "$os" in
     ;;
 esac
 
-api_base="https://api.github.com/repos/Anandb71/arbor/releases"
+# Overridable so CI can exercise the real download/install path against a
+# local release fixture instead of the live GitHub API.
+api_base="${ARBOR_INSTALL_API_BASE:-https://api.github.com/repos/Anandb71/arbor/releases}"
 if [[ "$VERSION" == "latest" ]]; then
   release_url="${api_base}/latest"
 else
