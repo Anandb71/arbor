@@ -121,3 +121,82 @@ jobs:
           else
             ./target/release/arbor --version
           fi
+
+  # Exercise the published installer scripts end-to-end on a clean runner of
+  # each advertised OS, without touching the live GitHub Releases API: the
+  # freshly built binary is packaged under its release asset name and served
+  # by a loopback HTTP fixture that answers the releases/tags request.
+  installer-smoke:
+    name: Installer smoke (${{ matrix.os }})
+    needs: build-test-linux
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: bash scripts/ci/install-linux-deps.sh pkg-config libssl-dev build-essential cmake
+
+      - name: Build release CLI
+        run: cargo build --locked --release -p arbor-graph-cli
+
+      - name: Serve a local release fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p fixture/releases/tags fixture/releases/assets
+          echo '{"tag_name":"vci","assets":[]}' > fixture/releases/tags/vci
+          PY="$(command -v python3 || command -v python)"
+          "$PY" -m http.server 8123 --bind 127.0.0.1 --directory fixture &
+          echo $! > server.pid
+          for attempt in $(seq 1 30); do
+            curl -fsS -o /dev/null http://127.0.0.1:8123/releases/tags/vci && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8123/releases/tags/vci | grep -q '"tag_name":"vci"'
+
+      - name: install.sh installs the built binary (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -s)/$(uname -m)" in
+            Linux/x86_64) asset=arbor-linux-x86_64.tar.gz ;;
+            Darwin/arm64|Darwin/aarch64) asset=arbor-macos-aarch64.tar.gz ;;
+            Darwin/x86_64) asset=arbor-macos-x86_64.tar.gz ;;
+            *) echo "unexpected runner $(uname -s)/$(uname -m)" >&2; exit 1 ;;
+          esac
+          tar -czf "fixture/releases/assets/$asset" -C target/release arbor
+          python3 - "$asset" <<'PY'
+          import json,sys
+          asset=sys.argv[1]
+          meta={"tag_name":"vci","assets":[{"name":asset,"browser_download_url":f"http://127.0.0.1:8123/releases/assets/{asset}"}]}
+          open("fixture/releases/tags/vci","w").write(json.dumps(meta))
+          PY
+          ARBOR_INSTALL_API_BASE="http://127.0.0.1:8123/releases" \
+            bash scripts/install.sh --version vci --install-dir "$RUNNER_TEMP/arbor-bin"
+          "$RUNNER_TEMP/arbor-bin/arbor" --version
+
+      - name: install.ps1 installs the built binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target\release\arbor.exe -DestinationPath fixture\releases\assets\arbor-windows-x86_64.zip -Force
+          $meta = @{ tag_name = 'vci'; assets = @(@{ name = 'arbor-windows-x86_64.zip'; browser_download_url = 'http://127.0.0.1:8123/releases/assets/arbor-windows-x86_64.zip' }) }
+          $meta | ConvertTo-Json -Depth 4 | Set-Content fixture\releases\tags\vci
+          $env:ARBOR_INSTALL_API_BASE = 'http://127.0.0.1:8123/releases'
+          & scripts/install.ps1 -Version vci -InstallDir "$env:RUNNER_TEMP\arbor-bin" -Force
+          & "$env:RUNNER_TEMP\arbor-bin\arbor.exe" --version

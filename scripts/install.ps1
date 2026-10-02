@@ -27,7 +27,9 @@ function Resolve-AssetName {
 function Get-ReleaseMeta {
     param([string]$Version)
 
-    $base = "https://api.github.com/repos/Anandb71/arbor/releases"
+    # Overridable so CI can exercise the real download/install path against a
+    # local release fixture instead of the live GitHub API.
+    $base = if ($env:ARBOR_INSTALL_API_BASE) { $env:ARBOR_INSTALL_API_BASE } else { "https://api.github.com/repos/Anandb71/arbor/releases" }
     $url = if ($Version -eq "latest") { "$base/latest" } else { "$base/tags/$Version" }
 
     Write-Step "Resolving release metadata from GitHub API ($Version)..."
