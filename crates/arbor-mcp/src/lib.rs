@@ -17,9 +17,9 @@ mod tasks;
 
 pub use http::run_http_server;
 use protocol::{
-    discover_response, legacy_capabilities, parse_request_meta, resolve_protocol_version,
-    server_capabilities, with_cache_meta, DEFAULT_TTL_MS, PROTOCOL_VERSION_LATEST,
-    PROTOCOL_VERSION_LEGACY,
+    classify_protocol_version, discover_response, legacy_capabilities, parse_request_meta,
+    resolve_protocol_version, server_capabilities, with_cache_meta, DEFAULT_TTL_MS,
+    PROTOCOL_VERSION_LATEST, PROTOCOL_VERSION_LEGACY,
 };
 use tasks::TaskManager;
 
@@ -54,6 +54,21 @@ pub(crate) enum HttpReply {
     Json(u16, String),
     /// An accepted notification: `202 Accepted` with no body.
     Accepted,
+}
+
+/// Caps on client-supplied sizes so one request cannot inflate a response
+/// unboundedly.
+const MAX_LIST_LIMIT: usize = 500;
+const MAX_DEPTH: usize = 32;
+const MAX_TOKEN_BUDGET: usize = 64_000;
+
+/// Read a numeric argument with a default and a hard ceiling.
+fn bounded_usize(args: &Value, key: &str, default: usize, max: usize) -> usize {
+    args.get(key)
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(default)
+        .min(max)
 }
 
 pub struct McpServer {
@@ -170,6 +185,22 @@ impl McpServer {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("Failed to parse input: {}", e);
+                    // The client still needs the JSON-RPC parse error —
+                    // swallowing it would leave a pending request unanswered.
+                    let resp = JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32700,
+                            message: format!("Parse error: {}", e),
+                            data: None,
+                        }),
+                        id: None,
+                    };
+                    let json = serde_json::to_string(&resp)?;
+                    stdout.write_all(json.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
                     continue;
                 }
             };
@@ -203,7 +234,7 @@ impl McpServer {
             }
         };
 
-        match self.handle_request(req).await {
+        match self.handle_request_inner(req, false).await {
             Some(resp) => serde_json::to_string(&resp).unwrap_or_default(),
             None => "{}".to_string(),
         }
@@ -244,7 +275,7 @@ impl McpServer {
             Ok(req) => req,
             Err(e) => return invalid(-32600, format!("Invalid Request: {}", e)),
         };
-        match self.handle_request(req).await {
+        match self.handle_request_inner(req, false).await {
             Some(resp) => HttpReply::Json(200, serde_json::to_string(&resp).unwrap_or_default()),
             None => HttpReply::Accepted,
         }
@@ -289,10 +320,26 @@ impl McpServer {
     }
 
     async fn handle_request(&self, req: JsonRpcRequest) -> Option<JsonRpcResponse> {
+        self.handle_request_inner(req, true).await
+    }
+
+    /// `persistent` distinguishes stdio (one client owns the process, so
+    /// initialize negotiation is shared state) from HTTP (each connection
+    /// carries a single request, so negotiation must live in the request's
+    /// `_meta` and never on the shared server).
+    async fn handle_request_inner(
+        &self,
+        req: JsonRpcRequest,
+        persistent: bool,
+    ) -> Option<JsonRpcResponse> {
         let id = req.id.clone();
         let params = req.params.clone().unwrap_or(Value::Null);
         let meta = parse_request_meta(&params);
-        let negotiated = self.negotiated_protocol.read().await.clone();
+        let negotiated = if persistent {
+            self.negotiated_protocol.read().await.clone()
+        } else {
+            None
+        };
         let protocol = resolve_protocol_version(&meta, negotiated.as_deref());
 
         let result = match req.method.as_str() {
@@ -301,22 +348,34 @@ impl McpServer {
                     .get("protocolVersion")
                     .and_then(|v| v.as_str())
                     .unwrap_or(PROTOCOL_VERSION_LEGACY);
-                *self.negotiated_protocol.write().await = Some(client_version.to_string());
 
-                let caps = if client_version == PROTOCOL_VERSION_LATEST
-                    || client_version.starts_with("2026-")
-                {
+                let Some(classified) = classify_protocol_version(client_version) else {
+                    return Some(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32602,
+                            message: format!(
+                                "Unsupported protocolVersion {:?}; supported: {} or {} (any later dated version negotiates the latest)",
+                                client_version, PROTOCOL_VERSION_LEGACY, PROTOCOL_VERSION_LATEST
+                            ),
+                            data: None,
+                        }),
+                        id,
+                    });
+                };
+                if persistent {
+                    *self.negotiated_protocol.write().await = Some(client_version.to_string());
+                }
+
+                let caps = if classified == PROTOCOL_VERSION_LATEST {
                     server_capabilities()
                 } else {
                     legacy_capabilities()
                 };
 
                 Ok(json!({
-                    "protocolVersion": if client_version.starts_with("2026-") {
-                        PROTOCOL_VERSION_LATEST
-                    } else {
-                        PROTOCOL_VERSION_LEGACY
-                    },
+                    "protocolVersion": classified,
                     "capabilities": caps,
                     "serverInfo": {
                         "name": "arbor-mcp",
@@ -726,10 +785,7 @@ impl McpServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
-                let max_depth = arguments
-                    .get("max_depth")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(5) as usize;
+                let max_depth = bounded_usize(arguments, "max_depth", 5, MAX_DEPTH);
 
                 // Trigger Spotlight
                 self.trigger_spotlight(node_id).await;
@@ -1032,10 +1088,7 @@ impl McpServer {
                     .get("query")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let limit = arguments
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(20) as usize;
+                let limit = bounded_usize(arguments, "limit", 20, MAX_LIST_LIMIT);
                 let offset = arguments
                     .get("offset")
                     .and_then(|v| v.as_u64())
@@ -1189,10 +1242,7 @@ impl McpServer {
                 }
             }
             "get_map" => {
-                let token_budget = arguments
-                    .get("tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1024) as usize;
+                let token_budget = bounded_usize(arguments, "tokens", 1024, MAX_TOKEN_BUDGET);
                 let exclude_test = arguments
                     .get("exclude_test")
                     .and_then(|v| v.as_bool())
@@ -1205,10 +1255,7 @@ impl McpServer {
                     .get("offset")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
-                let limit = arguments
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(50) as usize;
+                let limit = bounded_usize(arguments, "limit", 50, MAX_LIST_LIMIT);
 
                 self.ensure_graph_centrality().await;
                 let graph = self.graph.read().await;
@@ -1243,10 +1290,7 @@ impl McpServer {
                 ))
             }
             "get_blast_radius" => {
-                let depth = arguments
-                    .get("max_depth")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(5) as usize;
+                let depth = bounded_usize(arguments, "max_depth", 5, MAX_DEPTH);
                 let format = arguments
                     .get("format")
                     .and_then(|v| v.as_str())
@@ -1430,10 +1474,7 @@ impl McpServer {
                         message: "Missing 'source' parameter".to_string(),
                         data: None,
                     })?;
-                let max_depth = arguments
-                    .get("max_depth")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(8) as usize;
+                let max_depth = bounded_usize(arguments, "max_depth", 8, MAX_DEPTH);
 
                 self.trigger_spotlight(source).await;
                 let graph = self.graph.read().await;
@@ -1508,10 +1549,7 @@ impl McpServer {
                 }
             }
             "get_architecture_overview" => {
-                let top_n = arguments
-                    .get("top_n")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(20) as usize;
+                let top_n = bounded_usize(arguments, "top_n", 20, MAX_LIST_LIMIT);
 
                 self.ensure_graph_centrality().await;
                 let graph = self.graph.read().await;
@@ -2404,6 +2442,99 @@ mod tool_tests {
             .await
             .unwrap();
         assert_eq!(resp.result.unwrap()["protocolVersion"], "2026-07-28");
+    }
+
+    #[tokio::test]
+    async fn test_initialize_rejects_malformed_protocol_version() {
+        let server = empty_server();
+        let resp = server
+            .handle_request(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "initialize".to_string(),
+                params: Some(json!({ "protocolVersion": "banana" })),
+                id: Some(json!(1)),
+            })
+            .await
+            .unwrap();
+        let error = resp.error.unwrap();
+        assert_eq!(error.code, -32602);
+        assert!(error.message.contains(PROTOCOL_VERSION_LATEST));
+    }
+
+    #[tokio::test]
+    async fn test_initialize_future_version_negotiates_latest() {
+        let server = empty_server();
+        let resp = server
+            .handle_request(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "initialize".to_string(),
+                params: Some(json!({ "protocolVersion": "2030-01-15" })),
+                id: Some(json!(1)),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.result.unwrap()["protocolVersion"],
+            PROTOCOL_VERSION_LATEST
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_legacy_version_gets_legacy_caps() {
+        let server = empty_server();
+        let resp = server
+            .handle_request(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "initialize".to_string(),
+                params: Some(json!({ "protocolVersion": "2025-03-26" })),
+                id: Some(json!(1)),
+            })
+            .await
+            .unwrap();
+        let result = resp.result.unwrap();
+        assert_eq!(result["protocolVersion"], PROTOCOL_VERSION_LEGACY);
+        assert!(result["capabilities"]["extensions"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_http_initialize_does_not_mutate_shared_negotiation() {
+        let server = empty_server();
+        // An HTTP-mode initialize must not write the shared negotiation state —
+        // a different connection's request would otherwise observe it.
+        let resp = server
+            .handle_request_inner(
+                JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    method: "initialize".to_string(),
+                    params: Some(json!({ "protocolVersion": PROTOCOL_VERSION_LATEST })),
+                    id: Some(json!(1)),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.result.unwrap()["protocolVersion"],
+            PROTOCOL_VERSION_LATEST
+        );
+        assert!(server.negotiated_protocol.read().await.is_none());
+    }
+
+    #[test]
+    fn bounded_numeric_arguments_clamp_to_caps() {
+        let args =
+            serde_json::json!({ "limit": 10_000_000, "max_depth": 10_000, "tokens": u64::MAX });
+        assert_eq!(
+            bounded_usize(&args, "limit", 20, MAX_LIST_LIMIT),
+            MAX_LIST_LIMIT
+        );
+        assert_eq!(bounded_usize(&args, "max_depth", 5, MAX_DEPTH), MAX_DEPTH);
+        assert_eq!(
+            bounded_usize(&args, "tokens", 1024, MAX_TOKEN_BUDGET),
+            MAX_TOKEN_BUDGET
+        );
+        let empty = serde_json::json!({});
+        assert_eq!(bounded_usize(&empty, "limit", 20, MAX_LIST_LIMIT), 20);
     }
 
     #[tokio::test]

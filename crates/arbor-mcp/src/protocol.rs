@@ -54,16 +54,36 @@ pub fn parse_request_meta(params: &Value) -> RequestMeta {
     }
 }
 
+/// Classify a client-reported protocol version.
+///
+/// `YYYY-*` versions at or after the latest release year map to the current
+/// protocol (a client built against a newer spec gets our best version, not a
+/// silent downgrade), earlier valid versions map to the legacy protocol, and
+/// anything that does not look like an ISO-date version returns `None` so the
+/// caller can reject it explicitly.
+pub fn classify_protocol_version(version: &str) -> Option<&'static str> {
+    let year: u32 = version.get(..4)?.parse().ok()?;
+    if !version
+        .get(..4)
+        .is_some_and(|y| y.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(if year >= 2026 {
+        PROTOCOL_VERSION_LATEST
+    } else {
+        PROTOCOL_VERSION_LEGACY
+    })
+}
+
 /// Resolve protocol version: prefer client `_meta`, fall back to initialize negotiation.
 pub fn resolve_protocol_version(meta: &RequestMeta, negotiated: Option<&str>) -> &'static str {
-    if let Some(v) = meta.protocol_version.as_deref() {
-        if v == PROTOCOL_VERSION_LATEST || v.starts_with("2026-") {
-            return PROTOCOL_VERSION_LATEST;
-        }
-    }
-    if let Some(v) = negotiated {
-        if v == PROTOCOL_VERSION_LATEST || v.starts_with("2026-") {
-            return PROTOCOL_VERSION_LATEST;
+    for v in [meta.protocol_version.as_deref(), negotiated]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(protocol) = classify_protocol_version(v) {
+            return protocol;
         }
     }
     PROTOCOL_VERSION_LEGACY
