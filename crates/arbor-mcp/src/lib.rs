@@ -17,9 +17,9 @@ mod tasks;
 
 pub use http::run_http_server;
 use protocol::{
-    classify_protocol_version, discover_response, legacy_capabilities, parse_request_meta,
-    resolve_protocol_version, server_capabilities, with_cache_meta, DEFAULT_TTL_MS,
-    PROTOCOL_VERSION_LATEST, PROTOCOL_VERSION_LEGACY,
+    classify_protocol_version, client_declared_extensions, discover_response, legacy_capabilities,
+    parse_request_meta, resolve_protocol_version, server_capabilities_for, with_cache_meta,
+    DEFAULT_TTL_MS, PROTOCOL_VERSION_LATEST, PROTOCOL_VERSION_LEGACY,
 };
 use tasks::TaskManager;
 
@@ -164,11 +164,25 @@ impl McpServer {
     }
 
     pub async fn run_stdio(&self) -> Result<()> {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::io::BufReader;
 
         let stdin = tokio::io::stdin();
-        let mut stdout = tokio::io::stdout();
-        let mut reader = BufReader::new(stdin);
+        let stdout = tokio::io::stdout();
+        self.serve_lines(BufReader::new(stdin), stdout).await
+    }
+
+    /// The stdio protocol loop over any reader/writer pair: newline-delimited
+    /// JSON-RPC, one response per request, nothing else on the writer. Tests
+    /// drive the real transport through a duplex channel.
+    pub async fn serve_lines<R, W>(&self, reader: R, writer: W) -> Result<()>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let mut stdout = writer;
+        let mut reader = reader;
         let mut line = String::new();
 
         loop {
@@ -369,7 +383,10 @@ impl McpServer {
                 }
 
                 let caps = if classified == PROTOCOL_VERSION_LATEST {
-                    server_capabilities()
+                    // Extensions are opt-in features: when the client declares
+                    // `capabilities.extensions`, advertise only the ones it
+                    // understands. Clients that omit the field get the full set.
+                    server_capabilities_for(client_declared_extensions(&params).as_deref())
                 } else {
                     legacy_capabilities()
                 };
