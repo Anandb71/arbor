@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Read-only projects:** failing to create `.arbor/`, `CLAUDE.md` or `.claude/settings.json` names the path and what to do, instead of a bare "Access is denied".
 - **`arbor hook claude` overwriting files:** an existing `CLAUDE.md` or `.claude/settings.json` that could not be read (for example, saved as UTF-16) was treated as empty and replaced. It is now left untouched and the install stops with an explanation.
 - **Linux binaries on older distributions (#242):** v3.0.3's Linux binaries needed glibc 2.39 and would not start on Ubuntu 22.04, Debian 12 or RHEL 9. They are now built in manylinux_2_28 and need glibc 2.28, and the build fails if that floor rises.
+- **`.arbor/` showing up in git (#233):** Arbor now writes `.arbor/.gitignore` whenever it creates or initialises the folder, including when a receipt creates it, so `git add -A` no longer picks up the graph or saved prompts. An existing `.arbor/.gitignore` is left alone. Files from `.arbor/` that you already committed stay tracked; remove them with `git rm -r --cached .arbor`.
 
 ### Added
 - **Release checks:** every binary runs a first-use smoke test on its own platform before anything is published, including Intel macOS, Linux arm64, AlmaLinux 8, Ubuntu 22.04 and Debian 12. Pull requests that change the release build or `Cargo.lock` run the same build and smoke test without publishing.
