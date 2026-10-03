@@ -5,25 +5,25 @@ class Arbor < Formula
   desc "Graph-native intelligence for codebases — know what breaks before you break it"
   homepage "https://github.com/Anandb71/arbor"
   license "MIT"
-  version "3.0.3"
+  version "3.0.4"
 
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/Anandb71/arbor/releases/download/v#{version}/arbor-macos-aarch64.tar.gz"
-      sha256 "178139614d0342fe6f6218c32bcff228b9e9a1fe8dd66b8c53b5ece6e2d3314c"
+      sha256 "914180b96348b01477b2ceaa97b62d60169a294a08aabbb967ae9dc8a647d798"
     else
       url "https://github.com/Anandb71/arbor/releases/download/v#{version}/arbor-macos-x86_64.tar.gz"
-      sha256 "7280a5d5fe999ca2fa4d0b5d2ee4cd87e176565ed538b33b7d129d503a614921"
+      sha256 "1026fe024abfe140174f14966afa3f2793049ed8693c037c2e0cfab4658848c6"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
       url "https://github.com/Anandb71/arbor/releases/download/v#{version}/arbor-linux-aarch64.tar.gz"
-      sha256 "d7423651cf52ae3fce56160066205c6c0f71a87dcb68adb1a1b7818d0a2befdc"
+      sha256 "08b79bf72ae7b7bc266158ded3604dd1f3c8cbe32c5c38cb086f21923dbf7878"
     else
       url "https://github.com/Anandb71/arbor/releases/download/v#{version}/arbor-linux-x86_64.tar.gz"
-      sha256 "d047de606bc3e1756f6ff1b0c5b3b8ba3d1d440b0bda08df9171184810f72137"
+      sha256 "67985904e7c96383a2e3665f3be46608dbbf8d05531cce5978b19a904c1174e0"
     end
   end
 
