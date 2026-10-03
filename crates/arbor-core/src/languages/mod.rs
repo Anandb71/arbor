@@ -13,6 +13,7 @@ mod heritage;
 mod java;
 mod python;
 mod rust;
+mod rust_receivers;
 mod typescript;
 
 use crate::fallback_parser::is_fallback_supported_extension;
