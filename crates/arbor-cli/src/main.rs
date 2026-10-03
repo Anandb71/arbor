@@ -12,6 +12,7 @@ mod audit;
 mod changes;
 mod commands;
 mod hook;
+mod hunk_lines;
 mod receipt;
 
 #[derive(Parser)]
