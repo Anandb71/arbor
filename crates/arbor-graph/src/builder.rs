@@ -8,8 +8,8 @@ use crate::edge::{Edge, EdgeKind};
 use crate::graph::{ArborGraph, NodeId};
 use crate::symbol_table::SymbolTable;
 use arbor_core::{
-    clean_type_name, field_type_ref, type_relation_ref, typed_receiver, CodeNode, NodeKind,
-    TypeRelationKind,
+    clean_type_name, field_type_ref, return_type_ref, type_relation_ref, typed_receiver, CodeNode,
+    NodeKind, TypeRelationKind,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -180,6 +180,7 @@ impl GraphBuilder {
                 if type_relation_ref(&reference).is_some()
                     || receiver_method(&reference).is_some()
                     || field_type_ref(&reference).is_some()
+                    || return_type_ref(&reference).is_some()
                 {
                     continue;
                 }
@@ -455,40 +456,50 @@ impl GraphBuilder {
     }
 
     /// Resolves a method call whose receiver type path the extractor read from
-    /// the code: `Draft`, or `AppState.draft` for a field of an `AppState`.
+    /// the code: `Draft`, `AppState.draft` for a field of an `AppState`, or
+    /// `prepare()` / `mac::Draft::capture().inner()` for what calls return.
     fn resolve_typed_receiver(&self, method: &str, receiver: &str, file: &Path) -> TypedReceiver {
         let mut segments = receiver.split('.');
         let Some(base) = segments.next() else {
             return TypedReceiver::Unknown;
         };
-        let Some(mut current) = self.resolve_type_name(base, file) else {
-            return if self.defines_type(base, file) {
-                TypedReceiver::Unknown
-            } else {
-                TypedReceiver::External
-            };
+        let mut current = match base.strip_suffix("()") {
+            Some(callee) => match self.returned_type(self.callable(callee, file)) {
+                Ok(id) => id,
+                Err(outcome) => return outcome,
+            },
+            None => match self.type_named(base, file) {
+                Ok(id) => id,
+                Err(outcome) => return outcome,
+            },
         };
-        for field in segments {
+        for segment in segments {
             let Some(node) = self.graph.get(current) else {
                 return TypedReceiver::Unknown;
             };
+            let owner_file = PathBuf::from(&node.file);
+            if let Some(called) = segment.strip_suffix("()") {
+                // `draft.inner().run()`: whatever `Draft::inner` returns.
+                let path = format!("{}::{called}", node.name);
+                current = match self.returned_type(self.callable(&path, &owner_file)) {
+                    Ok(id) => id,
+                    Err(outcome) => return outcome,
+                };
+                continue;
+            }
             let field_type = node
                 .references
                 .iter()
                 .filter_map(|reference| field_type_ref(reference))
-                .find(|(name, _)| *name == field)
+                .find(|(name, _)| *name == segment)
                 .map(|(_, type_name)| type_name.to_string());
             let Some(field_type) = field_type else {
                 return TypedReceiver::Unknown;
             };
-            let owner_file = PathBuf::from(&node.file);
-            match self.resolve_type_name(&field_type, &owner_file) {
-                Some(next) => current = next,
-                None if self.defines_type(&field_type, &owner_file) => {
-                    return TypedReceiver::Unknown
-                }
-                None => return TypedReceiver::External,
-            }
+            current = match self.type_named(&field_type, &owner_file) {
+                Ok(id) => id,
+                Err(outcome) => return outcome,
+            };
         }
 
         let Some(owner) = self.graph.get(current) else {
@@ -528,6 +539,61 @@ impl GraphBuilder {
         } else {
             TypedReceiver::Found(targets)
         }
+    }
+
+    /// One type node for `name`, or why there isn't one.
+    fn type_named(&self, name: &str, file: &Path) -> Result<NodeId, TypedReceiver> {
+        match self.resolve_type_name(name, file) {
+            Some(id) => Ok(id),
+            None if self.defines_type(name, file) => Err(TypedReceiver::Unknown),
+            None => Err(TypedReceiver::External),
+        }
+    }
+
+    /// The functions or methods a call path names: `prepare`, `drafts::load`,
+    /// `Draft::capture`.
+    fn callable(&self, path: &str, file: &Path) -> Vec<NodeId> {
+        let resolution = if path.contains("::") {
+            self.symbol_table.resolve_path(path, file)
+        } else {
+            let imports = self.import_map.get(&file.to_string_lossy().to_string());
+            self.symbol_table.resolve_ref_with_imports(path, file, imports)
+        };
+        resolution
+            .candidates()
+            .into_iter()
+            .filter(|id| {
+                self.graph
+                    .get(*id)
+                    .is_some_and(|n| matches!(n.kind, NodeKind::Function | NodeKind::Method))
+            })
+            .collect()
+    }
+
+    /// The type node the given functions return, when they agree on one.
+    fn returned_type(&self, functions: Vec<NodeId>) -> Result<NodeId, TypedReceiver> {
+        let mut returned: Option<(String, PathBuf)> = None;
+        for id in functions {
+            let Some(function) = self.graph.get(id) else {
+                continue;
+            };
+            let Some(type_name) = function.references.iter().find_map(|r| return_type_ref(r))
+            else {
+                // Unit, a primitive, a tuple or an unbounded generic.
+                return Err(TypedReceiver::Unknown);
+            };
+            match &returned {
+                Some((seen, _)) if seen != type_name => return Err(TypedReceiver::Unknown),
+                Some(_) => {}
+                None => returned = Some((type_name.to_string(), PathBuf::from(&function.file))),
+            }
+        }
+        // No project function by that name: an external call, whose result
+        // may still be a project type (`serde_json::from_str::<Draft>`).
+        let Some((type_name, file)) = returned else {
+            return Err(TypedReceiver::Unknown);
+        };
+        self.type_named(&type_name, &file)
     }
 
     /// Whether any type in the file's language is called `name`, even if the
@@ -1254,6 +1320,35 @@ mod tests {
         // Draft has no `flush` (a Deref target might): a weak name-based edge.
         assert_eq!(callees(&graph), ["Buffer.flush"]);
         assert!(only_edge_confidence(&graph) < TYPED_RECEIVER_CONFIDENCE);
+    }
+
+    #[test]
+    fn typed_receiver_follows_return_types() {
+        let mut b = GraphBuilder::new();
+        let mut prepare = CodeNode::new("prepare", "prepare", NodeKind::Function, "src/lib.rs")
+            .with_references(vec![arbor_core::returns_ref("Prepared")]);
+        prepare.line_end = 0;
+        b.add_nodes(vec![
+            CodeNode::new("on_key", "on_key", NodeKind::Function, "src/lib.rs").with_references(vec![
+                ".run_started@prepare()".to_string(),
+                ".flush@mac::Prepared::capture().buffer()".to_string(),
+            ]),
+            prepare,
+            CodeNode::new("Prepared", "Prepared", NodeKind::Struct, "src/mac.rs"),
+            CodeNode::new("Buffer", "Buffer", NodeKind::Struct, "src/buffer.rs"),
+            CodeNode::new("capture", "Prepared.capture", NodeKind::Method, "src/mac.rs")
+                .with_references(vec![arbor_core::returns_ref("Prepared")]),
+            CodeNode::new("buffer", "Prepared.buffer", NodeKind::Method, "src/mac.rs")
+                .with_references(vec![arbor_core::returns_ref("Buffer")]),
+            CodeNode::new("run_started", "Prepared.run_started", NodeKind::Method, "src/mac.rs"),
+            CodeNode::new("run_started", "Other.run_started", NodeKind::Method, "src/other.rs"),
+            CodeNode::new("run_started", "Third.run_started", NodeKind::Method, "src/third.rs"),
+            CodeNode::new("flush", "Buffer.flush", NodeKind::Method, "src/buffer.rs"),
+            CodeNode::new("flush", "Pipe.flush", NodeKind::Method, "src/pipe.rs"),
+            CodeNode::new("flush", "Sink.flush", NodeKind::Method, "src/sink.rs"),
+        ]);
+        let graph = b.build();
+        assert_eq!(callees(&graph), ["Buffer.flush", "Prepared.run_started"]);
     }
 
     #[test]
