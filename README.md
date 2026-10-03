@@ -28,7 +28,7 @@
   <sub>Simulated replay — the <code>arbor</code> commands and their output are real (tokio @ 178k LOC). Methodology: <a href="docs/BENCHMARKS.md">BENCHMARKS.md</a></sub>
 </p>
 
-> **v3.0.3** · Rust calls through module paths, macros and `self` are now edges. `arbor diff --base origin/main` reports a branch the way its pull request shows it, and a new function no longer inherits the blast radius of the file it lands in. Same-named symbols in different languages stay apart, and a graph built on another branch is refreshed instead of answered from. New: `arbor receipt`, a plain-English account of what each agent turn changed. [Release notes](docs/RELEASE_NOTES_v3.0.3.md)
+> **v3.0.4** · `arbor diff` counts only the symbols your change edits, ranked by how many callers each has, and impact comes from callers alone. Rust calls on method receivers (`draft.run_started()`) resolve through the receiver's type, `arbor doctor` and the installers catch an older `arbor` hiding on PATH, and one-shot commands stay quiet. [Release notes](docs/RELEASE_NOTES_v3.0.4.md)
 
 ---
 
@@ -49,7 +49,26 @@ Where the graph is *unsure*, it says so — edges carry a confidence, and ambigu
 
 ---
 
-## What's new in v3.0.3
+## What's new in v3.0.4
+
+A fix release, from a review that checked Arbor's answers on a real Tauri app
+by hand. Every item ships with a regression test.
+
+| Fix | What was wrong |
+|-----|----------------|
+| **`arbor diff` counts what you edited** | Editing a method also counted the class or `mod` around it, comment and attribute lines counted as code, and impact included everything the edited code calls. On a 3-file pull request with two edited functions, 3.0.3 reported 6 modified symbols and 58 impacted nodes; 3.0.4 reports 2 and 13. |
+| **Named symbols** | The report gave counts only. `diff` and `check` now list each modified symbol with its file, line and caller count, most-called first. |
+| **Rust method receivers** | `draft.run_started()` was dropped when several types defined `run_started`, so `arbor callers` showed none. The receiver's type is read from parameters, `let`s, `match` arms, fields and return types, across files. |
+| **Shadowed installs** | An old `arbor` earlier on PATH silently answered instead of the new one. `arbor doctor` and the installers now say so and how to remove it. |
+| **Quiet by default** | One-shot commands log warnings only; `-v` shows more. |
+| **Older Linux** | Linux binaries need glibc 2.28, not 2.39. |
+
+Also: clearer first-run errors, `arbor hook claude` never replaces a file it
+can't read, MCP protocol fixes, origin checks on the WebSocket servers, and
+signed provenance for every download. Cached graphs rebuild once on first use.
+
+<details>
+<summary><strong>v3.0.3</strong> (Rust calls through paths and macros, per-symbol diff, <code>--base</code>)</summary>
 
 A fix release. Every item below was a wrong answer, not a missing feature, and
 each ships with a regression test.
@@ -71,6 +90,8 @@ explains, in plain English, what changed and what was touched that you didn't
 ask for, with `arbor receipt undo` to put a turn back.
 
 Cached graphs from 3.0.0 are rebuilt automatically on first use.
+
+</details>
 
 <details>
 <summary><strong>v3.0.0 — The Right Node</strong> (symbol resolution consults the importing file)</summary>
@@ -356,7 +377,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: Anandb71/arbor@v3.0.3
+      - uses: Anandb71/arbor@v3.0.4
         with:
           command: check . --max-blast-radius 30 --markdown
           comment-on-pr: true

@@ -184,6 +184,6 @@ If `arbor check` fails, run focused tests before merge and include blast-radius 
 - [Supported Languages](./ADDING_LANGUAGES.md)
 - [MCP Protocol](./PROTOCOL.md)
 - [MCP Integration](./MCP_INTEGRATION.md)
-- [Release Notes (v3.0.3)](./RELEASE_NOTES_v3.0.3.md)
+- [Release Notes (v3.0.4)](./RELEASE_NOTES_v3.0.4.md)
 - [Changelog](../CHANGELOG.md)
 - [Glama MCP Directory Listing](https://glama.ai/mcp/servers/@Anandb71/arbor)
