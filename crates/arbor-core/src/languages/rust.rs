@@ -661,9 +661,11 @@ fn call_reference(function: &Node, source: &str, receivers: &Receivers) -> Optio
             method_reference(receiver.kind() == "self", &name)
         }
         // `parse::<u32>(s)` is a call to `parse`.
-        "generic_function" => {
-            call_reference(&function.child_by_field_name("function")?, source, receivers)
-        }
+        "generic_function" => call_reference(
+            &function.child_by_field_name("function")?,
+            source,
+            receivers,
+        ),
         // Closures, `(self.handler)(x)`, `f()()`: no stable name.
         _ => None,
     }
@@ -910,11 +912,17 @@ fn uncertain<U>(value: U, client: reqwest::Client) {
         let expect = |function: &str, wanted: &[&str]| {
             let refs = references_of(&nodes, function);
             for expected in wanted {
-                assert!(refs.iter().any(|r| r == expected), "{function}: missing {expected} in {refs:?}");
+                assert!(
+                    refs.iter().any(|r| r == expected),
+                    "{function}: missing {expected} in {refs:?}"
+                );
             }
         };
         // Parameters, through a reference and through Tauri's `State`.
-        expect("typed_parameter", &[".run_started@Draft", ".run_started@AppState.draft"]);
+        expect(
+            "typed_parameter",
+            &[".run_started@Draft", ".run_started@AppState.draft"],
+        );
         // A lock guard, a constructor with `?`, a struct literal, an
         // annotation through `Box`, `if let Some`, `app.state::<T>()` with a
         // map lookup, and a typed closure parameter.
@@ -979,9 +987,16 @@ impl Loader {
         // The function records what it returns, through `Option` and a path.
         assert!(refs("prepare_draft").contains(&"returns:PreparedDraft".to_string()));
         // `Result<Draft, Error>` returns the `Draft`, not the error.
-        assert!(refs("fetch").contains(&"returns:Draft".to_string()), "{:?}", refs("fetch"));
+        assert!(
+            refs("fetch").contains(&"returns:Draft".to_string()),
+            "{:?}",
+            refs("fetch")
+        );
         let run = refs("start_draft");
-        assert!(run.contains(&".run_started@prepare_draft()".to_string()), "{run:?}");
+        assert!(
+            run.contains(&".run_started@prepare_draft()".to_string()),
+            "{run:?}"
+        );
         assert!(
             run.contains(&".finish@drafts::mac::DraftRun::begin()".to_string()),
             "{run:?}"
@@ -991,7 +1006,10 @@ impl Loader {
         assert!(refs("run").contains(&".run_started@PendingDraft.receiver".to_string()));
         // `.await` passes through; a method result is followed by name.
         let fetch = refs("fetch");
-        assert!(fetch.contains(&".run_started@load().session()".to_string()), "{fetch:?}");
+        assert!(
+            fetch.contains(&".run_started@load().session()".to_string()),
+            "{fetch:?}"
+        );
         // `Self::` in an impl names the impl's type.
         assert!(refs("go").contains(&".run_started@Loader::open()".to_string()));
     }
@@ -1004,7 +1022,10 @@ impl Loader {
         // no type is claimed.
         assert!(refs.iter().any(|r| r == ".run_started"), "{refs:?}");
         // A function's result is typed by what the graph finds it returns.
-        let typed: Vec<&String> = refs.iter().filter(|r| r.starts_with(".run_started@")).collect();
+        let typed: Vec<&String> = refs
+            .iter()
+            .filter(|r| r.starts_with(".run_started@"))
+            .collect();
         assert_eq!(typed, [".run_started@load_draft()"], "{refs:?}");
         // An external type is still recorded; the graph drops it as external.
         assert!(refs.iter().any(|r| r == ".send_report@Client"), "{refs:?}");
@@ -1014,7 +1035,11 @@ impl Loader {
     fn struct_fields_record_the_type_a_method_reaches() {
         let nodes = parse(RECEIVERS);
         let state = nodes.iter().find(|n| n.name == "AppState").unwrap();
-        for expected in ["field:draft:Draft", "field:backup:Draft", "field:drafts:Draft"] {
+        for expected in [
+            "field:draft:Draft",
+            "field:backup:Draft",
+            "field:drafts:Draft",
+        ] {
             assert!(
                 state.references.iter().any(|r| r == expected),
                 "missing {expected} in {:?}",
@@ -1022,7 +1047,10 @@ impl Loader {
             );
         }
         // A primitive has no methods of the project's.
-        assert!(!state.references.iter().any(|r| r.starts_with("field:count:")));
+        assert!(!state
+            .references
+            .iter()
+            .any(|r| r.starts_with("field:count:")));
     }
 
     #[test]

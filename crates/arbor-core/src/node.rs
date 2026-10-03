@@ -582,7 +582,10 @@ mod tests {
 
     #[test]
     fn field_and_typed_receiver_refs_round_trip() {
-        assert_eq!(field_type_ref(&field_ref("draft", "Draft")), Some(("draft", "Draft")));
+        assert_eq!(
+            field_type_ref(&field_ref("draft", "Draft")),
+            Some(("draft", "Draft"))
+        );
         assert_eq!(field_type_ref("field:draft"), None);
         assert_eq!(field_type_ref("draft"), None);
         assert_eq!(

@@ -119,7 +119,14 @@ const PASS_THROUGH: &[&str] = &[
 
 /// Constructors that wrap their argument: `Some(draft)`, `Arc::new(draft)`.
 const WRAPPING_CALLS: &[&str] = &[
-    "Arc::new", "Box::new", "Mutex::new", "Ok", "Rc::new", "RefCell::new", "RwLock::new", "Some",
+    "Arc::new",
+    "Box::new",
+    "Mutex::new",
+    "Ok",
+    "Rc::new",
+    "RefCell::new",
+    "RwLock::new",
+    "Some",
 ];
 
 /// Associated functions that return `Self` (possibly in a `Result`, which `?`
@@ -320,7 +327,7 @@ impl<'s> Receivers<'s> {
                     let wrapped = if FIRST_ARGUMENT.contains(&base_name) {
                         types.next()?
                     } else {
-                        types.last()?
+                        types.next_back()?
                     };
                     self.core_type(&wrapped)
                 } else {
@@ -329,7 +336,9 @@ impl<'s> Receivers<'s> {
             }
             // `&mut dyn RunObserver`, `impl RunObserver`: the trait.
             "dynamic_type" | "abstract_type" => {
-                let bound = node.child_by_field_name("trait").or_else(|| node.named_child(0))?;
+                let bound = node
+                    .child_by_field_name("trait")
+                    .or_else(|| node.named_child(0))?;
                 self.core_type(&bound)
             }
             "array_type" => self.core_type(&node.child_by_field_name("element")?),
@@ -345,7 +354,8 @@ impl<'s> Receivers<'s> {
                 };
                 match parameter.kind() {
                     "type_identifier" => {
-                        self.generics.insert(self.text(&parameter).to_string(), None);
+                        self.generics
+                            .insert(self.text(&parameter).to_string(), None);
                     }
                     "constrained_type_parameter" => {
                         let Some(left) = parameter.child_by_field_name("left") else {
@@ -377,7 +387,9 @@ impl<'s> Receivers<'s> {
                     continue;
                 };
                 let name = self.text(&left).to_string();
-                let bound = bounds.named_child(0).and_then(|first| self.bound_name(&first));
+                let bound = bounds
+                    .named_child(0)
+                    .and_then(|first| self.bound_name(&first));
                 if let Some(slot) = self.generics.get_mut(&name) {
                     if slot.is_none() {
                         *slot = bound;
@@ -453,7 +465,9 @@ impl<'s> Receivers<'s> {
                 }
             }
             "mut_pattern" | "ref_pattern" => {
-                if let Some(inner) = pattern.named_child(pattern.named_child_count().saturating_sub(1)) {
+                if let Some(inner) =
+                    pattern.named_child(pattern.named_child_count().saturating_sub(1))
+                {
                     self.bind_pattern(&inner, type_path);
                 }
             }
@@ -593,9 +607,7 @@ pub(super) fn struct_field_refs(item: &Node, source: &str, self_type: &str) -> V
     if let Some(parameters) = item.child_by_field_name("type_parameters") {
         for i in 0..parameters.named_child_count() {
             if let Some(parameter) = parameters.named_child(i) {
-                let name = parameter
-                    .child_by_field_name("left")
-                    .unwrap_or(parameter);
+                let name = parameter.child_by_field_name("left").unwrap_or(parameter);
                 generics.insert(source[name.byte_range()].to_string(), None);
             }
         }
@@ -621,7 +633,10 @@ pub(super) fn struct_field_refs(item: &Node, source: &str, self_type: &str) -> V
             continue;
         };
         if let Some(type_name) = receivers.core_type(&ty) {
-            refs.push(crate::node::field_ref(&source[name.byte_range()], &type_name));
+            refs.push(crate::node::field_ref(
+                &source[name.byte_range()],
+                &type_name,
+            ));
         }
     }
     refs

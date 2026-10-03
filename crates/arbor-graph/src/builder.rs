@@ -192,7 +192,11 @@ impl GraphBuilder {
                         TypedReceiver::Found(targets) => {
                             for to_idx in targets {
                                 if to_idx != from_idx {
-                                    edges_to_add.push((from_idx, to_idx, TYPED_RECEIVER_CONFIDENCE));
+                                    edges_to_add.push((
+                                        from_idx,
+                                        to_idx,
+                                        TYPED_RECEIVER_CONFIDENCE,
+                                    ));
                                 }
                             }
                             continue;
@@ -512,12 +516,14 @@ impl GraphBuilder {
             owners.extend(self.implementors(&owner.name, &owner_file));
         } else {
             // A method from a trait the type implements (a default body).
-            owners.extend(owner.references.iter().filter_map(|reference| {
-                match type_relation_ref(reference) {
-                    Some((TypeRelationKind::Implements, name)) => Some(name.to_string()),
-                    _ => None,
-                }
-            }));
+            owners.extend(
+                owner.references.iter().filter_map(|reference| {
+                    match type_relation_ref(reference) {
+                        Some((TypeRelationKind::Implements, name)) => Some(name.to_string()),
+                        _ => None,
+                    }
+                }),
+            );
         }
         let mut targets = Vec::new();
         for owner_name in owners {
@@ -557,7 +563,8 @@ impl GraphBuilder {
             self.symbol_table.resolve_path(path, file)
         } else {
             let imports = self.import_map.get(&file.to_string_lossy().to_string());
-            self.symbol_table.resolve_ref_with_imports(path, file, imports)
+            self.symbol_table
+                .resolve_ref_with_imports(path, file, imports)
         };
         resolution
             .candidates()
@@ -1238,9 +1245,19 @@ mod tests {
             CodeNode::new("AppState", "AppState", NodeKind::Struct, "src/state.rs")
                 .with_references(vec![arbor_core::field_ref("draft", "Draft")]),
             CodeNode::new("Draft", "Draft", NodeKind::Struct, "src/draft.rs"),
-            CodeNode::new("Telemetry", "Telemetry", NodeKind::Struct, "src/telemetry.rs"),
+            CodeNode::new(
+                "Telemetry",
+                "Telemetry",
+                NodeKind::Struct,
+                "src/telemetry.rs",
+            ),
             CodeNode::new("Logger", "Logger", NodeKind::Struct, "src/observer.rs"),
-            CodeNode::new("RunObserver", "RunObserver", NodeKind::Interface, "src/observer.rs"),
+            CodeNode::new(
+                "RunObserver",
+                "RunObserver",
+                NodeKind::Interface,
+                "src/observer.rs",
+            ),
         ];
         nodes[4].add_type_relation(TypeRelationKind::Implements, "RunObserver");
         nodes[3].add_type_relation(TypeRelationKind::Implements, "RunObserver");
@@ -1295,7 +1312,10 @@ mod tests {
     #[test]
     fn trait_typed_receiver_reaches_each_implementor() {
         let graph = receiver_fixture(&[".run_started@RunObserver"]);
-        assert_eq!(callees(&graph), ["Logger.run_started", "Telemetry.run_started"]);
+        assert_eq!(
+            callees(&graph),
+            ["Logger.run_started", "Telemetry.run_started"]
+        );
     }
 
     #[test]
@@ -1329,20 +1349,42 @@ mod tests {
             .with_references(vec![arbor_core::returns_ref("Prepared")]);
         prepare.line_end = 0;
         b.add_nodes(vec![
-            CodeNode::new("on_key", "on_key", NodeKind::Function, "src/lib.rs").with_references(vec![
-                ".run_started@prepare()".to_string(),
-                ".flush@mac::Prepared::capture().buffer()".to_string(),
-            ]),
+            CodeNode::new("on_key", "on_key", NodeKind::Function, "src/lib.rs").with_references(
+                vec![
+                    ".run_started@prepare()".to_string(),
+                    ".flush@mac::Prepared::capture().buffer()".to_string(),
+                ],
+            ),
             prepare,
             CodeNode::new("Prepared", "Prepared", NodeKind::Struct, "src/mac.rs"),
             CodeNode::new("Buffer", "Buffer", NodeKind::Struct, "src/buffer.rs"),
-            CodeNode::new("capture", "Prepared.capture", NodeKind::Method, "src/mac.rs")
-                .with_references(vec![arbor_core::returns_ref("Prepared")]),
+            CodeNode::new(
+                "capture",
+                "Prepared.capture",
+                NodeKind::Method,
+                "src/mac.rs",
+            )
+            .with_references(vec![arbor_core::returns_ref("Prepared")]),
             CodeNode::new("buffer", "Prepared.buffer", NodeKind::Method, "src/mac.rs")
                 .with_references(vec![arbor_core::returns_ref("Buffer")]),
-            CodeNode::new("run_started", "Prepared.run_started", NodeKind::Method, "src/mac.rs"),
-            CodeNode::new("run_started", "Other.run_started", NodeKind::Method, "src/other.rs"),
-            CodeNode::new("run_started", "Third.run_started", NodeKind::Method, "src/third.rs"),
+            CodeNode::new(
+                "run_started",
+                "Prepared.run_started",
+                NodeKind::Method,
+                "src/mac.rs",
+            ),
+            CodeNode::new(
+                "run_started",
+                "Other.run_started",
+                NodeKind::Method,
+                "src/other.rs",
+            ),
+            CodeNode::new(
+                "run_started",
+                "Third.run_started",
+                NodeKind::Method,
+                "src/third.rs",
+            ),
             CodeNode::new("flush", "Buffer.flush", NodeKind::Method, "src/buffer.rs"),
             CodeNode::new("flush", "Pipe.flush", NodeKind::Method, "src/pipe.rs"),
             CodeNode::new("flush", "Sink.flush", NodeKind::Method, "src/sink.rs"),
@@ -1353,7 +1395,10 @@ mod tests {
 
     #[test]
     fn field_types_are_not_calls() {
-        assert!(callees(&receiver_fixture(&[])).is_empty(), "a field: reference is not a call");
+        assert!(
+            callees(&receiver_fixture(&[])).is_empty(),
+            "a field: reference is not a call"
+        );
     }
 
     #[test]
