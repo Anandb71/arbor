@@ -79,6 +79,42 @@ pub const EXTENDS_REF_PREFIX: &str = "extends:";
 /// Prefix on [`CodeNode::references`] for an implemented interface or trait.
 pub const IMPLEMENTS_REF_PREFIX: &str = "implements:";
 
+/// Prefix for a field's type stored on a struct node: `field:draft:Draft`.
+///
+/// The type is the one a method call on the field reaches, with references,
+/// smart pointers, locks and containers already stripped (`Mutex<Draft>` and
+/// `Option<Box<Draft>>` both record `Draft`). The graph builder follows these
+/// to resolve `state.draft.run_started()` when `state`'s struct lives in
+/// another file.
+pub const FIELD_REF_PREFIX: &str = "field:";
+
+/// Encodes a struct field's type as a reference.
+pub fn field_ref(field: &str, type_name: &str) -> String {
+    format!("{FIELD_REF_PREFIX}{field}:{type_name}")
+}
+
+/// Splits a `field:name:Type` reference into the field name and its type.
+pub fn field_type_ref(reference: &str) -> Option<(&str, &str)> {
+    let (field, type_name) = reference.strip_prefix(FIELD_REF_PREFIX)?.split_once(':')?;
+    (!field.is_empty() && !type_name.is_empty()).then_some((field, type_name))
+}
+
+/// Encodes a method call whose receiver's type is known from the code:
+/// `.run_started@Draft`, or `.run_started@AppState.draft` for a call on a
+/// field of a value of type `AppState`.
+///
+/// A plain `.name` reference means the receiver's type is unknown.
+pub fn typed_receiver_ref(method: &str, receiver_type: &str) -> String {
+    format!(".{method}@{receiver_type}")
+}
+
+/// Splits a typed receiver reference into the method name and the receiver's
+/// type path (`Type` or `Type.field.field`).
+pub fn typed_receiver(reference: &str) -> Option<(&str, &str)> {
+    let (method, receiver) = reference.strip_prefix('.')?.split_once('@')?;
+    (!method.is_empty() && !receiver.is_empty()).then_some((method, receiver))
+}
+
 /// A type relationship stored on a node until the graph builder resolves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeRelationKind {
@@ -521,6 +557,21 @@ mod tests {
         let id1 = CodeNode::compute_id("a.rs", "main", NodeKind::Function);
         let id2 = CodeNode::compute_id("b.rs", "main", NodeKind::Function);
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn field_and_typed_receiver_refs_round_trip() {
+        assert_eq!(field_type_ref(&field_ref("draft", "Draft")), Some(("draft", "Draft")));
+        assert_eq!(field_type_ref("field:draft"), None);
+        assert_eq!(field_type_ref("draft"), None);
+        assert_eq!(
+            typed_receiver(&typed_receiver_ref("run_started", "AppState.draft")),
+            Some(("run_started", "AppState.draft"))
+        );
+        // A plain unknown-receiver call and a `self` call are not typed.
+        assert_eq!(typed_receiver(".run_started"), None);
+        assert_eq!(typed_receiver("self.run_started"), None);
+        assert_eq!(type_relation_ref(&field_ref("draft", "Draft")), None);
     }
 
     #[test]
