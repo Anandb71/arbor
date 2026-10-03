@@ -99,9 +99,30 @@ pub fn field_type_ref(reference: &str) -> Option<(&str, &str)> {
     (!field.is_empty() && !type_name.is_empty()).then_some((field, type_name))
 }
 
+/// Prefix for the type a function returns, stored on its node:
+/// `returns:PreparedDraft` for `-> Option<mac::PreparedDraft>`.
+/// Stripped like a field type, with `Self` already replaced by the impl type.
+pub const RETURNS_REF_PREFIX: &str = "returns:";
+
+/// Encodes a function's (stripped) return type as a reference.
+pub fn returns_ref(type_name: &str) -> String {
+    format!("{RETURNS_REF_PREFIX}{type_name}")
+}
+
+/// The return type recorded by a `returns:Type` reference.
+pub fn return_type_ref(reference: &str) -> Option<&str> {
+    reference
+        .strip_prefix(RETURNS_REF_PREFIX)
+        .filter(|type_name| !type_name.is_empty())
+}
+
 /// Encodes a method call whose receiver's type is known from the code:
 /// `.run_started@Draft`, or `.run_started@AppState.draft` for a call on a
 /// field of a value of type `AppState`.
+///
+/// The type path starts at a type name or at a call whose return type
+/// decides it (`prepare()`, `mac::Draft::capture()`), then reads fields
+/// (`.draft`) and method results (`.load()`) in order.
 ///
 /// A plain `.name` reference means the receiver's type is unknown.
 pub fn typed_receiver_ref(method: &str, receiver_type: &str) -> String {
@@ -572,6 +593,12 @@ mod tests {
         assert_eq!(typed_receiver(".run_started"), None);
         assert_eq!(typed_receiver("self.run_started"), None);
         assert_eq!(type_relation_ref(&field_ref("draft", "Draft")), None);
+        assert_eq!(return_type_ref(&returns_ref("Draft")), Some("Draft"));
+        assert_eq!(return_type_ref("returns:"), None);
+        assert_eq!(
+            typed_receiver(".run_started@mac::Draft::capture().load()"),
+            Some(("run_started", "mac::Draft::capture().load()"))
+        );
     }
 
     #[test]
