@@ -6,7 +6,8 @@
 use super::rust_receivers::{struct_field_refs, Receivers};
 use crate::languages::LanguageParser;
 use crate::node::{
-    clean_type_name, typed_receiver_ref, CodeNode, NodeKind, TypeRelationKind, Visibility,
+    clean_type_name, returns_ref, typed_receiver_ref, CodeNode, NodeKind, TypeRelationKind,
+    Visibility,
 };
 use tree_sitter::{Language, Node, Tree};
 
@@ -257,7 +258,15 @@ fn extract_function(
     // Extract references. A method call on a receiver whose type the code
     // states is recorded with that type, so it resolves to one definition.
     let receivers = Receivers::of_function(node, source, context);
-    let references = extract_call_references(node, source, &receivers);
+    let mut references = extract_call_references(node, source, &receivers);
+    // What a call to this function hands back, so `let d = prepare()?;`
+    // elsewhere can type `d`.
+    if let Some(returned) = node
+        .child_by_field_name("return_type")
+        .and_then(|return_type| receivers.core_type(&return_type))
+    {
+        references.push(returns_ref(&returned));
+    }
 
     Some(
         CodeNode::new(&name, &qualified_name, kind, file_path)
@@ -924,17 +933,79 @@ fn uncertain<U>(value: U, client: reqwest::Client) {
         expect("traits", &[".run_started@RunObserver"]);
     }
 
+    // The shapes from a real review: a draft prepared by a helper, then
+    // started from a `let … else` and from a channel inside a `match`.
+    const CALL_RESULTS: &str = r#"
+fn prepare_draft(handle: &AppHandle) -> Option<drafts::mac::PreparedDraft> {
+    None
+}
+struct PendingDraft {
+    receiver: std::sync::mpsc::Receiver<Option<drafts::mac::PreparedDraft>>,
+}
+impl PendingDraft {
+    fn run(self) {
+        match self.receiver.recv() {
+            Ok(Some(draft)) => draft.run_started(run),
+            Ok(None) | Err(_) => run.finish("failed"),
+        }
+    }
+}
+fn start_draft(handle: &AppHandle) {
+    let Some(run) = drafts::mac::DraftRun::begin(handle) else {
+        return;
+    };
+    let Some(draft) = prepare_draft(handle) else {
+        run.finish("failed", 0, None);
+        return;
+    };
+    draft.run_started(run);
+}
+async fn fetch(client: &Client) -> Result<Draft, Error> {
+    let loaded = load(client).await?;
+    loaded.session().run_started(1);
+}
+struct Loader;
+impl Loader {
+    fn go() {
+        Self::open().run_started(2);
+    }
+}
+"#;
+
+    #[test]
+    fn call_results_type_their_receivers() {
+        let nodes = parse(CALL_RESULTS);
+        let refs = |name: &str| references_of(&nodes, name).to_vec();
+        // The function records what it returns, through `Option` and a path.
+        assert!(refs("prepare_draft").contains(&"returns:PreparedDraft".to_string()));
+        // `Result<Draft, Error>` returns the `Draft`, not the error.
+        assert!(refs("fetch").contains(&"returns:Draft".to_string()), "{:?}", refs("fetch"));
+        let run = refs("start_draft");
+        assert!(run.contains(&".run_started@prepare_draft()".to_string()), "{run:?}");
+        assert!(
+            run.contains(&".finish@drafts::mac::DraftRun::begin()".to_string()),
+            "{run:?}"
+        );
+        // A field typed by a channel of `Option<…>`, through `recv()` and
+        // the nested `Ok(Some(draft))` arm.
+        assert!(refs("run").contains(&".run_started@PendingDraft.receiver".to_string()));
+        // `.await` passes through; a method result is followed by name.
+        let fetch = refs("fetch");
+        assert!(fetch.contains(&".run_started@load().session()".to_string()), "{fetch:?}");
+        // `Self::` in an impl names the impl's type.
+        assert!(refs("go").contains(&".run_started@Loader::open()".to_string()));
+    }
+
     #[test]
     fn uncertain_receivers_stay_unknown() {
         let nodes = parse(RECEIVERS);
         let refs = references_of(&nodes, "uncertain");
-        // Shadowed with two types, an unbounded generic, a function's return
-        // value and a loop variable: no type is claimed.
+        // Shadowed with two types, an unbounded generic and a loop variable:
+        // no type is claimed.
         assert!(refs.iter().any(|r| r == ".run_started"), "{refs:?}");
-        assert!(
-            !refs.iter().any(|r| r.starts_with(".run_started@")),
-            "no receiver type should be guessed: {refs:?}"
-        );
+        // A function's result is typed by what the graph finds it returns.
+        let typed: Vec<&String> = refs.iter().filter(|r| r.starts_with(".run_started@")).collect();
+        assert_eq!(typed, [".run_started@load_draft()"], "{refs:?}");
         // An external type is still recorded; the graph drops it as external.
         assert!(refs.iter().any(|r| r == ".send_report@Client"), "{refs:?}");
     }

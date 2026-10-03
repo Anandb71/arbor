@@ -7,20 +7,23 @@
 //!
 //! - a parameter: `fn on_key(draft: &mut Draft)`, `state: State<'_, AppState>`
 //! - a `let`: `let d: Draft = ...`, `let d = Draft::new()?`, `Draft { .. }`
-//! - an `if let Some(d) = state.draft.as_mut()` or a typed closure parameter
+//! - an `if let Some(d) = state.draft.as_mut()`, a `let Some(d) = f() else`,
+//!   a `match` arm such as `Ok(Some(d))`, or a typed closure parameter
 //! - a field: `state.draft.lock().unwrap()` reaches `AppState`'s `draft`
+//! - a call: `prepare_draft(handle)` or `Draft::capture(db)` returns one
 //!
-//! The answer is a type path: a base type plus any fields read from it
-//! (`AppState.draft`). Field types live on struct nodes (see
-//! [`crate::node::field_ref`]), so the builder can follow a path into a
-//! struct defined in another file. References, smart pointers, locks,
-//! `Option` and collections are seen through, because a method a project
-//! defines is reached on what they contain.
+//! The answer is a type path: a type name or a call, then any fields and
+//! method results read from it (`AppState.draft`, `prepare_draft()`,
+//! `Draft::capture().inner()`). Field and return types live on struct and
+//! function nodes (see [`crate::node::field_ref`] and
+//! [`crate::node::returns_ref`]), so the builder can follow a path across
+//! files. References, smart pointers, locks, channels, `Option`, `Result`
+//! and collections are seen through, because a method a project defines is
+//! reached on what they contain.
 //!
 //! Anything uncertain gives no answer and the call falls back to name-based
 //! resolution: a name bound to two different types in one function, a
-//! generic parameter without a trait bound, or an expression whose type
-//! depends on a function's return value.
+//! generic parameter without a trait bound, or a loop variable.
 
 use std::collections::HashMap;
 
@@ -38,6 +41,7 @@ const WRAPPERS: &[&str] = &[
     "HashMap",
     "HashSet",
     "IndexMap",
+    "JoinHandle",
     "LinkedList",
     "Mutex",
     "MutexGuard",
@@ -46,20 +50,28 @@ const WRAPPERS: &[&str] = &[
     "OnceLock",
     "Pin",
     "Rc",
+    "Receiver",
     "Ref",
     "RefCell",
     "RefMut",
     "RwLock",
     "RwLockReadGuard",
     "RwLockWriteGuard",
+    "Result",
     "State",
+    "UnboundedReceiver",
     "Vec",
     "VecDeque",
     "Weak",
 ];
 
+/// Wrappers whose wrapped value is the *first* type argument
+/// (`Result<Draft, Error>`); the rest use their last one.
+const FIRST_ARGUMENT: &[&str] = &["Result"];
+
 /// Methods that hand back what their receiver wraps: `lock().unwrap()`,
-/// `as_mut()`, `get_mut(&id)`. Their result has the receiver's (stripped) type.
+/// `as_mut()`, `get_mut(&id)`, `recv()`. Their result has the receiver's
+/// (stripped) type.
 const PASS_THROUGH: &[&str] = &[
     "as_deref",
     "as_deref_mut",
@@ -67,6 +79,7 @@ const PASS_THROUGH: &[&str] = &[
     "as_ref",
     "blocking_lock",
     "blocking_read",
+    "blocking_recv",
     "blocking_write",
     "borrow",
     "borrow_mut",
@@ -80,20 +93,33 @@ const PASS_THROUGH: &[&str] = &[
     "get_mut",
     "get_or_init",
     "inner",
+    "join",
     "last",
     "last_mut",
     "lock",
+    "ok",
     "read",
+    "recv",
+    "recv_timeout",
+    "take",
     "to_owned",
     "try_borrow",
     "try_borrow_mut",
     "try_lock",
     "try_read",
+    "try_recv",
     "try_write",
     "unwrap",
+    "unwrap_or",
     "unwrap_or_default",
+    "unwrap_or_else",
     "upgrade",
     "write",
+];
+
+/// Constructors that wrap their argument: `Some(draft)`, `Arc::new(draft)`.
+const WRAPPING_CALLS: &[&str] = &[
+    "Arc::new", "Box::new", "Mutex::new", "Ok", "Rc::new", "RefCell::new", "RwLock::new", "Some",
 ];
 
 /// Associated functions that return `Self` (possibly in a `Result`, which `?`
@@ -158,7 +184,7 @@ impl<'s> Receivers<'s> {
                 Some(format!("{base}.{}", self.text(&field)))
             }
             "call_expression" => self.call_type(node),
-            "try_expression" | "parenthesized_expression" => {
+            "try_expression" | "parenthesized_expression" | "await_expression" => {
                 self.expression_type(&node.named_child(0)?)
             }
             "reference_expression" => self.expression_type(&node.child_by_field_name("value")?),
@@ -177,14 +203,32 @@ impl<'s> Receivers<'s> {
     fn call_type(&self, call: &Node) -> Option<String> {
         let function = call.child_by_field_name("function")?;
         match function.kind() {
-            // `state.draft.lock()`, `slot.as_mut()`
+            // `state.draft.lock()` and `slot.as_mut()` give what they wrap;
+            // `draft.inner()` gives whatever `Draft::inner` returns.
             "field_expression" => {
                 let method = function.child_by_field_name("field")?;
-                if PASS_THROUGH.contains(&self.text(&method)) {
-                    self.expression_type(&function.child_by_field_name("value")?)
-                } else {
-                    None
+                if method.kind() != "field_identifier" {
+                    return None;
                 }
+                let base = self.expression_type(&function.child_by_field_name("value")?)?;
+                let name = self.text(&method);
+                if PASS_THROUGH.contains(&name) {
+                    Some(base)
+                } else {
+                    Some(format!("{base}.{name}()"))
+                }
+            }
+            // `prepare_draft(handle)`, `Some(draft)`
+            "identifier" => {
+                let name = self.text(&function);
+                if WRAPPING_CALLS.contains(&name) {
+                    return self.first_argument_type(call);
+                }
+                // A closure held in a local isn't a function the graph knows.
+                if self.bindings.contains_key(name) {
+                    return None;
+                }
+                Some(format!("{name}()"))
             }
             // `app.state::<AppState>()` (Tauri's managed state)
             "generic_function" => {
@@ -197,17 +241,46 @@ impl<'s> Receivers<'s> {
                 let argument = arguments.named_child(0)?;
                 self.core_type(&argument)
             }
-            // `Draft::new()`, `Self::default()`
+            // `Draft::new()` and `Self::default()` give the type itself;
+            // `mac::Draft::capture(db)` and `drafts::load()` give their
+            // declared return type.
             "scoped_identifier" => {
                 let name = function.child_by_field_name("name")?;
-                if !is_constructor(self.text(&name)) {
-                    return None;
-                }
                 let path = function.child_by_field_name("path")?;
-                self.type_name_text(&path)
+                let path_text = self.text(&path);
+                let owner = path_text.rsplit("::").next().unwrap_or(path_text);
+                if WRAPPING_CALLS.contains(&format!("{owner}::{}", self.text(&name)).as_str()) {
+                    return self.first_argument_type(call);
+                }
+                if is_constructor(self.text(&name)) {
+                    if let Some(own) = self.type_name_text(&path) {
+                        return Some(own);
+                    }
+                }
+                let mut segments: Vec<String> = Vec::new();
+                for segment in path_text.split("::") {
+                    let segment = segment.split('<').next().unwrap_or(segment).trim();
+                    if segment.is_empty() || segment.starts_with('<') {
+                        return None;
+                    }
+                    if !segment.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        return None;
+                    }
+                    if segment == "Self" {
+                        segments.push(self.self_type.clone()?);
+                    } else {
+                        segments.push(segment.to_string());
+                    }
+                }
+                Some(format!("{}::{}()", segments.join("::"), self.text(&name)))
             }
             _ => None,
         }
+    }
+
+    fn first_argument_type(&self, call: &Node) -> Option<String> {
+        let arguments = call.child_by_field_name("arguments")?;
+        self.expression_type(&arguments.named_child(0)?)
     }
 
     /// `Draft`, `Self`, or the last segment of `crate::draft::Draft`, when it
@@ -241,11 +314,15 @@ impl<'s> Receivers<'s> {
                 let base_name = self.text(&base).rsplit("::").next().unwrap_or_default();
                 if WRAPPERS.contains(&base_name) {
                     let arguments = node.child_by_field_name("type_arguments")?;
-                    let last = (0..arguments.named_child_count())
+                    let mut types = (0..arguments.named_child_count())
                         .filter_map(|i| arguments.named_child(i))
-                        .filter(|argument| argument.kind() != "lifetime")
-                        .last()?;
-                    self.core_type(&last)
+                        .filter(|argument| argument.kind() != "lifetime");
+                    let wrapped = if FIRST_ARGUMENT.contains(&base_name) {
+                        types.next()?
+                    } else {
+                        types.last()?
+                    };
+                    self.core_type(&wrapped)
                 } else {
                     self.type_name_text(&base)
                 }
@@ -370,6 +447,11 @@ impl<'s> Receivers<'s> {
                 let name = self.text(pattern).to_string();
                 self.bind(&name, type_path);
             }
+            "match_pattern" => {
+                if let Some(inner) = pattern.named_child(0) {
+                    self.bind_pattern(&inner, type_path);
+                }
+            }
             "mut_pattern" | "ref_pattern" => {
                 if let Some(inner) = pattern.named_child(pattern.named_child_count().saturating_sub(1)) {
                     self.bind_pattern(&inner, type_path);
@@ -463,12 +545,29 @@ impl<'s> Receivers<'s> {
                     }
                 }
             }
-            "match_arm" => {
-                if let Some(pattern) = node.child_by_field_name("pattern") {
-                    self.bind_names_unknown(&pattern);
+            // `match self.receiver.recv() { Ok(Some(draft)) => ... }`
+            "match_expression" => {
+                let value = node.child_by_field_name("value");
+                if let Some(value) = &value {
+                    self.collect_bindings(value);
                 }
-                if let Some(value) = node.child_by_field_name("value") {
-                    self.collect_bindings(&value);
+                let type_path = value.and_then(|value| self.expression_type(&value));
+                let Some(body) = node.child_by_field_name("body") else {
+                    return;
+                };
+                for i in 0..body.named_child_count() {
+                    let Some(arm) = body.named_child(i) else {
+                        continue;
+                    };
+                    if arm.kind() != "match_arm" {
+                        continue;
+                    }
+                    if let Some(pattern) = arm.child_by_field_name("pattern") {
+                        self.bind_pattern(&pattern, type_path.clone());
+                    }
+                    if let Some(value) = arm.child_by_field_name("value") {
+                        self.collect_bindings(&value);
+                    }
                 }
             }
             _ => {
