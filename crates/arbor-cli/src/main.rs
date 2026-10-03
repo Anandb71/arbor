@@ -631,11 +631,32 @@ fn main() {
     }
 }
 
+/// The log filter for this run: `RUST_LOG` if set, else `debug` with `-v`,
+/// `info` for a server and `warn` for everything else.
+fn log_filter(verbose: bool, long_running: bool, env: Option<String>) -> String {
+    match env.filter(|value| !value.trim().is_empty()) {
+        Some(value) => value,
+        None if verbose => "debug".to_string(),
+        None if long_running => "info".to_string(),
+        None => "warn".to_string(),
+    }
+}
+
 async fn run() {
     let cli = Cli::parse();
 
-    // Set up logging
-    let filter = if cli.verbose { "debug" } else { "info" };
+    // Logs go to stderr and never mix with a report on stdout. A one-shot
+    // command already says what it did on stdout, so by default it logs only
+    // warnings; servers keep their lifecycle lines. `-v` shows everything and
+    // `RUST_LOG` overrides both.
+    let long_running = matches!(
+        cli.command,
+        Commands::Serve { .. }
+            | Commands::Viz { .. }
+            | Commands::Bridge { .. }
+            | Commands::Gui { .. }
+    );
+    let filter = log_filter(cli.verbose, long_running, std::env::var("RUST_LOG").ok());
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -818,5 +839,22 @@ async fn run() {
     if let Err(e) = result {
         eprintln!("{} {}", "error:".red().bold(), e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::log_filter;
+
+    #[test]
+    fn one_shot_commands_log_only_warnings() {
+        assert_eq!(log_filter(false, false, None), "warn");
+        assert_eq!(log_filter(false, true, None), "info");
+        assert_eq!(log_filter(true, false, None), "debug");
+        assert_eq!(
+            log_filter(false, false, Some("arbor=trace".into())),
+            "arbor=trace"
+        );
+        assert_eq!(log_filter(true, false, Some("  ".into())), "debug");
     }
 }
