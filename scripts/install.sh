@@ -147,4 +147,17 @@ case ":$PATH:" in
     ;;
 esac
 
+# A shell runs the first `arbor` on PATH; an older install there (often a
+# `cargo install` in ~/.cargo/bin) would keep answering instead of this one.
+resolved="$(command -v arbor 2>/dev/null || true)"
+if [ -n "$resolved" ] && [ "$resolved" != "$target_bin" ]; then
+  installed_version="$("$target_bin" --version 2>/dev/null | awk '{print $2}')"
+  resolved_version="$("$resolved" --version 2>/dev/null | awk '{print $2}')"
+  if [ -n "$resolved_version" ] && [ "$resolved_version" != "$installed_version" ]; then
+    echo "Warning: \`arbor\` on your PATH is $resolved (v$resolved_version), not this v$installed_version."
+    echo "Your shell will keep running it. Remove it (for a cargo install: cargo uninstall arbor-graph-cli)"
+    echo "or put ${target_dir} earlier on PATH."
+  fi
+fi
+
 echo "Run: arbor --version"

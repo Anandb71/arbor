@@ -109,6 +109,18 @@ try {
 
     Add-ToPathIfMissing -Dir $targetDir
 
+    # A shell runs the first `arbor` on PATH; an older install there (often a
+    # `cargo install` in ~/.cargo/bin) would keep answering instead of this one.
+    $resolved = Get-Command arbor -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($resolved -and ($resolved.Source -ne $targetExe)) {
+        $installedVersion = ((& $targetExe --version) -split ' ')[-1]
+        $resolvedVersion = ((& $resolved.Source --version 2>$null) -split ' ')[-1]
+        if ($resolvedVersion -and ($resolvedVersion -ne $installedVersion)) {
+            Write-Host "Warning: ``arbor`` on your PATH is $($resolved.Source) (v$resolvedVersion), not this v$installedVersion." -ForegroundColor Yellow
+            Write-Host "Your shell will keep running it. Remove it (for a cargo install: cargo uninstall arbor-graph-cli) or put $targetDir earlier on PATH." -ForegroundColor Yellow
+        }
+    }
+
     Write-Step "Install complete."
     Write-Host "Run: arbor --version" -ForegroundColor Green
 }
