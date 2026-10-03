@@ -520,6 +520,12 @@ fn language_family(path: &Path) -> Option<&'static str> {
 }
 
 /// Unknown extensions on either side don't filter anything out.
+/// Whether two files are in the same language family (an unknown extension
+/// matches anything).
+pub(crate) fn same_language(a: &Path, b: &Path) -> bool {
+    same_family(language_family(a), b)
+}
+
 fn same_family(family: Option<&'static str>, file: &Path) -> bool {
     match (family, language_family(file)) {
         (Some(a), Some(b)) => a == b,
