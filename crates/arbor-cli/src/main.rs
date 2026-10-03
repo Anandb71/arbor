@@ -13,6 +13,7 @@ mod changes;
 mod commands;
 mod hook;
 mod hunk_lines;
+mod install_check;
 mod receipt;
 
 #[derive(Parser)]

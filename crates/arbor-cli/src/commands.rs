@@ -2458,6 +2458,32 @@ pub async fn check_health(path: Option<&Path>) -> Result<()> {
         env!("CARGO_PKG_VERSION")
     );
 
+    // An older `arbor` earlier on PATH runs instead of a newer install.
+    let installs = crate::install_check::installs_on_path();
+    if let Some(newer) = crate::install_check::shadowed_newer(&installs) {
+        all_ok = false;
+        let first = &installs[0];
+        println!(
+            "{} `arbor` runs {} {}, which hides {} {} later on PATH",
+            "✗".red(),
+            first.path.display(),
+            crate::install_check::format_version(first.version),
+            newer.path.display(),
+            crate::install_check::format_version(newer.version),
+        );
+        println!(
+            "  Remove the older one ({}) or move its directory after the newer one on PATH.",
+            crate::install_check::removal_hint(&first.path)
+        );
+    } else if installs.len() > 1 {
+        println!(
+            "{} {} `arbor` executables on PATH; the first, {}, is the newest",
+            "•".blue(),
+            installs.len(),
+            installs[0].path.display()
+        );
+    }
+
     // 0. Check git repo
     if is_git_repo(&workspace_root) {
         println!("{} Git repository detected", "✓".green());
