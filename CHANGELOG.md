@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.4] - 2026-10-03
+
+A fix release. See [docs/RELEASE_NOTES_v3.0.4.md](docs/RELEASE_NOTES_v3.0.4.md).
+
 ### Fixed
 - **First run without git or a repository:** `arbor diff`, `check`, `summary`, `agent review` and `agent guard` now say whether git is missing from PATH, the folder is outside a repository, or git refused the repository (quoting git, which names the fix, such as `safe.directory`). They check this before the index, so the reason is the real one and a failed run no longer creates `.arbor/`. The `.git` folder and bare repositories are no longer mistaken for work trees.
 - **Receipts that could not record:** `arbor hook claude` warns at install time when receipts cannot work there, and `receipt begin` writes the reason to stderr instead of returning silently.
@@ -17,12 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`arbor diff` counting containers and comments:** a module, class, trait, struct or enum no longer counts as modified when every changed line inside it belongs to one of its members, and a hunk that only adds comments, blank lines or an item's doc comment no longer implicates anything; an attribute or decorator counts as a change to its item. On a real three-file PR the report went from 6 modified symbols (four of them `mod` blocks) to the 2 functions it edited.
 - **`arbor diff` impact counting callees:** impact, files likely to need updates and entrypoints now come from callers only. Editing a function can't break what it calls; counting those made 8 edited startup symbols report 944 impacted nodes instead of 3.
 - **Noisy output:** one-shot commands log warnings only (servers keep their lifecycle lines, `-v` shows more, `RUST_LOG` overrides). Logs always go to stderr.
+- **Receipts missing an edit on Linux (#246):** seeding the receipt snapshot from a copy of git's index lost git's racy-clean check on Linux, where the copy gets a new timestamp, so an edit made right after the snapshot could be missed. The snapshot now keeps that check.
+- **First run after an upgrade (#251):** clearing an outdated graph cache re-opened the store right after dropping its handle, and sled could still hold the directory lock ("could not acquire lock … WouldBlock"). The cache is now checked, cleared and re-stamped through one handle.
+- **MCP protocol (#254, #256):** `initialize` rejects a malformed `protocolVersion` with `-32602` naming the supported versions, and maps any dated version from 2026 on to the current protocol. On HTTP, one connection's negotiation no longer changes what another sees. Over stdio a malformed line gets a `-32700` response instead of leaving the client waiting. Declared extensions are intersected with the implemented ones.
 - **`.arbor/` showing up in git (#233):** Arbor now writes `.arbor/.gitignore` whenever it creates or initialises the folder, including when a receipt creates it, so `git add -A` no longer picks up the graph or saved prompts. An existing `.arbor/.gitignore` is left alone. Files from `.arbor/` that you already committed stay tracked; remove them with `git rm -r --cached .arbor`.
 
 ### Added
 - **Named symbols in `arbor diff` and `check`:** each modified symbol is listed with its file, line and direct caller count, most-called first (top 12 in the text report, a table in `--markdown`, all in `--json` as `modified`).
 - **Shadowed installs:** `arbor doctor` fails when an older `arbor` earlier on PATH runs instead of a newer install, and says how to remove it. The npm postinstall, `install.sh` and `install.ps1` warn about the same thing after installing. A leftover `cargo install` of 1.9.0 had kept answering after npm installed 3.0.3, giving its file-level diff (377 symbols for a 3-file change) and 100,000 warning lines.
 - **Release checks:** every binary runs a first-use smoke test on its own platform before anything is published, including Intel macOS, Linux arm64, AlmaLinux 8, Ubuntu 22.04 and Debian 12. Pull requests that change the release build or `Cargo.lock` run the same build and smoke test without publishing.
+- **Provenance for npm and GHCR (#247):** the npm package is published with provenance and the container image carries a signed SLSA attestation.
+- **Installer and accuracy checks in CI (#255, #257):** `install.sh` and `install.ps1` install a locally served release on Linux, macOS and Windows runners on every pull request, and a versioned evaluation corpus checks the graph's recall and precision against hand-derived truth.
 - **Verifiable downloads:** releases publish `SHA256SUMS` and a signed build provenance attestation for each archive (`gh attestation verify <archive> --repo Anandb71/arbor`).
 
 ### Security
