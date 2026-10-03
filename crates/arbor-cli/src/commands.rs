@@ -23,6 +23,9 @@ struct DiffSummary {
     /// Symbols the change introduces. Nothing existing calls them yet.
     added_symbols: usize,
     added_names: Vec<String>,
+    /// Each modified symbol with where it is and how many non-test callers
+    /// it has, busiest first: where a reviewer should look.
+    modified: Vec<ModifiedSymbol>,
     /// `(path, "Added" | "Modified" | "Renamed")` for each changed file.
     file_status: Vec<(String, &'static str)>,
     deleted_files: Vec<String>,
@@ -38,6 +41,31 @@ struct DiffSummary {
     files_likely_updates: usize,
     blast_radius_nodes: usize,
     mermaid_diagram: Option<String>,
+}
+
+/// A symbol the change edited, for the report.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ModifiedSymbol {
+    name: String,
+    file: String,
+    line: u32,
+    direct_callers: usize,
+}
+
+/// `file` relative to `root`, with forward slashes, for display.
+fn display_path(file: &str, root: &Path) -> String {
+    // Windows' extended-length prefix (`\\?\C:\...`) never reaches a reader.
+    let file = normalize_slashes(file)
+        .trim_start_matches("//?/")
+        .to_string();
+    let root = normalize_slashes(&root.to_string_lossy());
+    let root = root.trim_start_matches("//?/").trim_end_matches('/');
+    let relative = if file.len() > root.len() && file[..root.len()].eq_ignore_ascii_case(root) {
+        file[root.len()..].trim_start_matches('/')
+    } else {
+        file.as_str()
+    };
+    relative.to_string()
 }
 
 const ROOT_MARKERS: &[&str] = &[
@@ -938,9 +966,14 @@ fn compute_diff_summary(
     let mut affected_nodes = std::collections::HashSet::new();
     let mut affected_files = std::collections::HashSet::new();
     let mut tests_exercising = std::collections::HashSet::new();
+    let mut modified = Vec::new();
 
+    // Impact is what may break: the callers of the edited code, directly or
+    // through other callers. What the edited code itself calls is unchanged
+    // by the edit, so it is not counted.
     for node_id in changed_node_ids.iter().copied() {
         let analysis = graph.analyze_impact(node_id, max_depth);
+        let mut own_direct = 0;
 
         for up in &analysis.upstream {
             if is_test_file(&up.node_info.file) {
@@ -950,20 +983,29 @@ fn compute_diff_summary(
             affected_nodes.insert(up.node_info.id.clone());
             affected_files.insert(up.node_info.file.clone());
             if up.hop_distance <= 1 {
+                own_direct += 1;
                 direct_callers.insert(up.node_info.id.clone());
             } else {
                 indirect_callers.insert(up.node_info.id.clone());
             }
         }
 
-        for down in &analysis.downstream {
-            if is_test_file(&down.node_info.file) {
-                continue;
-            }
-            affected_nodes.insert(down.node_info.id.clone());
-            affected_files.insert(down.node_info.file.clone());
+        if let Some(node) = graph.get(node_id) {
+            modified.push(ModifiedSymbol {
+                name: node.qualified_name.clone(),
+                file: display_path(&node.file, project_root),
+                line: node.line_start,
+                direct_callers: own_direct,
+            });
         }
     }
+    // Busiest first, then by place, so the order is stable.
+    modified.sort_by(|a, b| {
+        b.direct_callers
+            .cmp(&a.direct_callers)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+    });
 
     let entrypoints_affected = affected_nodes
         .iter()
@@ -1054,6 +1096,7 @@ fn compute_diff_summary(
         modified_symbols: changed_node_ids.len(),
         added_symbols: 0,
         added_names: Vec::new(),
+        modified,
         deleted_files: Vec::new(),
         compared: String::new(),
         tests_exercising: tests_exercising.len(),
@@ -1143,6 +1186,7 @@ fn print_diff_summary(summary: &DiffSummary) {
             }
         );
     }
+    print_modified_symbols(&summary.modified);
     println!();
     println!("Impact of the modified symbols (new code has no existing callers):");
     println!("  • {} direct callers", summary.direct_callers);
@@ -1160,6 +1204,35 @@ fn print_diff_summary(summary: &DiffSummary) {
         println!(
             "  • {} tests exercise the modified code (worth running; not counted as impact)",
             summary.tests_exercising
+        );
+    }
+}
+
+/// How many modified symbols the text report names before summarizing.
+const MODIFIED_SHOWN: usize = 12;
+
+fn print_modified_symbols(modified: &[ModifiedSymbol]) {
+    if modified.is_empty() {
+        return;
+    }
+    println!("  modified, most-called first:");
+    for symbol in modified.iter().take(MODIFIED_SHOWN) {
+        let callers = match symbol.direct_callers {
+            0 => "no callers".to_string(),
+            1 => "1 caller".to_string(),
+            n => format!("{n} callers"),
+        };
+        println!(
+            "    • {}  {}  {}",
+            symbol.name.cyan(),
+            format!("{}:{}", symbol.file, symbol.line).dimmed(),
+            callers
+        );
+    }
+    if modified.len() > MODIFIED_SHOWN {
+        println!(
+            "    and {} more (--json lists all)",
+            modified.len() - MODIFIED_SHOWN
         );
     }
 }
@@ -1187,6 +1260,21 @@ fn print_diff_markdown(summary: &DiffSummary) {
     // Changed files table
     println!("### Changed Files\n");
     print_file_table(summary);
+
+    if !summary.modified.is_empty() {
+        println!("\n### Modified Symbols\n");
+        println!("| Symbol | Location | Direct callers |");
+        println!("|--------|----------|----------------|");
+        for symbol in summary.modified.iter().take(25) {
+            println!(
+                "| `{}` | `{}:{}` | {} |",
+                symbol.name, symbol.file, symbol.line, symbol.direct_callers
+            );
+        }
+        if summary.modified.len() > 25 {
+            println!("\n_and {} more_", summary.modified.len() - 25);
+        }
+    }
 
     if let Some(ref diagram) = summary.mermaid_diagram {
         println!("\n### 📊 Visual Impact Graph\n");
@@ -1756,6 +1844,7 @@ pub fn diff(
             "modified_symbols": summary.modified_symbols,
             "added_symbols": summary.added_symbols,
             "new_symbols": summary.added_names,
+            "modified": summary.modified,
             "impact": {
                 "direct_callers": summary.direct_callers,
                 "indirect_callers": summary.indirect_callers,
@@ -1815,6 +1904,7 @@ pub fn check(
                 "modified_symbols": summary.modified_symbols,
                 "added_symbols": summary.added_symbols,
                 "new_symbols": summary.added_names,
+                "modified": summary.modified,
                 "direct_callers": summary.direct_callers,
                 "indirect_callers": summary.indirect_callers,
                 "api_entrypoints_affected": summary.entrypoints_affected,
@@ -2367,6 +2457,32 @@ pub async fn check_health(path: Option<&Path>) -> Result<()> {
         "✓".green(),
         env!("CARGO_PKG_VERSION")
     );
+
+    // An older `arbor` earlier on PATH runs instead of a newer install.
+    let installs = crate::install_check::installs_on_path();
+    if let Some(newer) = crate::install_check::shadowed_newer(&installs) {
+        all_ok = false;
+        let first = &installs[0];
+        println!(
+            "{} `arbor` runs {} {}, which hides {} {} later on PATH",
+            "✗".red(),
+            first.path.display(),
+            crate::install_check::format_version(first.version),
+            newer.path.display(),
+            crate::install_check::format_version(newer.version),
+        );
+        println!(
+            "  Remove the older one ({}) or move its directory after the newer one on PATH.",
+            crate::install_check::removal_hint(&first.path)
+        );
+    } else if installs.len() > 1 {
+        println!(
+            "{} {} `arbor` executables on PATH; the first, {}, is the newest",
+            "•".blue(),
+            installs.len(),
+            installs[0].path.display()
+        );
+    }
 
     // 0. Check git repo
     if is_git_repo(&workspace_root) {

@@ -337,7 +337,9 @@ fn parse_patch(patch: &str) -> Vec<PatchEntry> {
         rename_to: Option<String>,
         created: bool,
         deleted: bool,
-        hunks: Vec<String>,
+        hunks: Vec<crate::hunk_lines::Hunk>,
+        /// Inside a hunk body, where `--- x` is a removed line, not a header.
+        in_hunk: bool,
     }
     fn finish(current: Option<Current>, out: &mut Vec<PatchEntry>) {
         let Some(c) = current else {
@@ -359,10 +361,13 @@ fn parse_patch(patch: &str) -> Vec<PatchEntry> {
         } else {
             FileStatus::Modified
         };
+        // Only lines that change code: a hunk adding a doc comment, an
+        // attribute and a blank line around a new function touches the
+        // function, not the module that holds it.
         let ranges = c
             .hunks
             .iter()
-            .flat_map(|header| arbor_graph::parse_unified_diff_ranges(header, &path))
+            .flat_map(|hunk| crate::hunk_lines::code_ranges(hunk, &path))
             .collect();
         let old_path = c.rename_from.or(c.old).filter(|old| old != &path);
         out.push(PatchEntry::Changed(ChangedFile {
@@ -386,6 +391,7 @@ fn parse_patch(patch: &str) -> Vec<PatchEntry> {
                 created: false,
                 deleted: false,
                 hunks: Vec::new(),
+                in_hunk: false,
             });
             continue;
         }
@@ -393,7 +399,19 @@ fn parse_patch(patch: &str) -> Vec<PatchEntry> {
             continue;
         };
         if line.starts_with("@@") {
-            c.hunks.push(line.to_string());
+            c.in_hunk = true;
+            c.hunks.push(crate::hunk_lines::Hunk {
+                header: line.to_string(),
+                ..Default::default()
+            });
+        } else if c.in_hunk {
+            if let Some(hunk) = c.hunks.last_mut() {
+                if let Some(added) = line.strip_prefix('+') {
+                    hunk.added.push(added.to_string());
+                } else if let Some(removed) = line.strip_prefix('-') {
+                    hunk.removed.push(removed.to_string());
+                }
+            }
         } else if line.starts_with("new file mode") {
             c.created = true;
         } else if line.starts_with("deleted file mode") {
@@ -481,6 +499,39 @@ diff --git \"a/src/we\\\"ird.rs\" \"b/src/we\\\"ird.rs\"
 +++ \"b/src/we\\\"ird.rs\"
 @@ -1 +1 @@
 ";
+
+    #[test]
+    fn hunk_bodies_are_not_headers_and_count_only_code() {
+        // A removed line `-- old` appears as `--- old`, and an added `++ x`
+        // as `+++ x`: neither is a file header inside a hunk.
+        let patch = "\
+diff --git a/src/q.rs b/src/q.rs
+--- a/src/q.rs
++++ b/src/q.rs
+@@ -2 +2 @@ mod tests {
+--- old
++++ new
+@@ -9,0 +10,4 @@ mod tests {
++    /// Documents the test.
++    #[test]
++    fn added() {}
++
+";
+        let entries = parse_patch(patch);
+        let [PatchEntry::Changed(file)] = entries.as_slice() else {
+            panic!("one changed file expected, got {}", entries.len());
+        };
+        assert_eq!(file.path, "src/q.rs");
+        assert_eq!(file.old_path, None);
+        let ranges: Vec<(u32, u32)> = file
+            .ranges
+            .iter()
+            .map(|r| (r.start_line, r.end_line))
+            .collect();
+        // The first hunk replaces code; the second counts the function, not
+        // its doc comment, its attribute or the blank line.
+        assert_eq!(ranges, [(2, 2), (12, 12)]);
+    }
 
     #[test]
     fn patches_split_into_files_statuses_and_ranges() {

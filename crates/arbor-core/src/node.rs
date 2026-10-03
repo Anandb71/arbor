@@ -79,6 +79,63 @@ pub const EXTENDS_REF_PREFIX: &str = "extends:";
 /// Prefix on [`CodeNode::references`] for an implemented interface or trait.
 pub const IMPLEMENTS_REF_PREFIX: &str = "implements:";
 
+/// Prefix for a field's type stored on a struct node: `field:draft:Draft`.
+///
+/// The type is the one a method call on the field reaches, with references,
+/// smart pointers, locks and containers already stripped (`Mutex<Draft>` and
+/// `Option<Box<Draft>>` both record `Draft`). The graph builder follows these
+/// to resolve `state.draft.run_started()` when `state`'s struct lives in
+/// another file.
+pub const FIELD_REF_PREFIX: &str = "field:";
+
+/// Encodes a struct field's type as a reference.
+pub fn field_ref(field: &str, type_name: &str) -> String {
+    format!("{FIELD_REF_PREFIX}{field}:{type_name}")
+}
+
+/// Splits a `field:name:Type` reference into the field name and its type.
+pub fn field_type_ref(reference: &str) -> Option<(&str, &str)> {
+    let (field, type_name) = reference.strip_prefix(FIELD_REF_PREFIX)?.split_once(':')?;
+    (!field.is_empty() && !type_name.is_empty()).then_some((field, type_name))
+}
+
+/// Prefix for the type a function returns, stored on its node:
+/// `returns:PreparedDraft` for `-> Option<mac::PreparedDraft>`.
+/// Stripped like a field type, with `Self` already replaced by the impl type.
+pub const RETURNS_REF_PREFIX: &str = "returns:";
+
+/// Encodes a function's (stripped) return type as a reference.
+pub fn returns_ref(type_name: &str) -> String {
+    format!("{RETURNS_REF_PREFIX}{type_name}")
+}
+
+/// The return type recorded by a `returns:Type` reference.
+pub fn return_type_ref(reference: &str) -> Option<&str> {
+    reference
+        .strip_prefix(RETURNS_REF_PREFIX)
+        .filter(|type_name| !type_name.is_empty())
+}
+
+/// Encodes a method call whose receiver's type is known from the code:
+/// `.run_started@Draft`, or `.run_started@AppState.draft` for a call on a
+/// field of a value of type `AppState`.
+///
+/// The type path starts at a type name or at a call whose return type
+/// decides it (`prepare()`, `mac::Draft::capture()`), then reads fields
+/// (`.draft`) and method results (`.load()`) in order.
+///
+/// A plain `.name` reference means the receiver's type is unknown.
+pub fn typed_receiver_ref(method: &str, receiver_type: &str) -> String {
+    format!(".{method}@{receiver_type}")
+}
+
+/// Splits a typed receiver reference into the method name and the receiver's
+/// type path (`Type` or `Type.field.field`).
+pub fn typed_receiver(reference: &str) -> Option<(&str, &str)> {
+    let (method, receiver) = reference.strip_prefix('.')?.split_once('@')?;
+    (!method.is_empty() && !receiver.is_empty()).then_some((method, receiver))
+}
+
 /// A type relationship stored on a node until the graph builder resolves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeRelationKind {
@@ -521,6 +578,30 @@ mod tests {
         let id1 = CodeNode::compute_id("a.rs", "main", NodeKind::Function);
         let id2 = CodeNode::compute_id("b.rs", "main", NodeKind::Function);
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn field_and_typed_receiver_refs_round_trip() {
+        assert_eq!(
+            field_type_ref(&field_ref("draft", "Draft")),
+            Some(("draft", "Draft"))
+        );
+        assert_eq!(field_type_ref("field:draft"), None);
+        assert_eq!(field_type_ref("draft"), None);
+        assert_eq!(
+            typed_receiver(&typed_receiver_ref("run_started", "AppState.draft")),
+            Some(("run_started", "AppState.draft"))
+        );
+        // A plain unknown-receiver call and a `self` call are not typed.
+        assert_eq!(typed_receiver(".run_started"), None);
+        assert_eq!(typed_receiver("self.run_started"), None);
+        assert_eq!(type_relation_ref(&field_ref("draft", "Draft")), None);
+        assert_eq!(return_type_ref(&returns_ref("Draft")), Some("Draft"));
+        assert_eq!(return_type_ref("returns:"), None);
+        assert_eq!(
+            typed_receiver(".run_started@mac::Draft::capture().load()"),
+            Some(("run_started", "mac::Draft::capture().load()"))
+        );
     }
 
     #[test]

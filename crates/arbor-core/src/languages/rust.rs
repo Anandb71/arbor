@@ -3,8 +3,12 @@
 //! Handles .rs files and extracts functions, structs, enums, traits,
 //! and impl blocks.
 
+use super::rust_receivers::{struct_field_refs, Receivers};
 use crate::languages::LanguageParser;
-use crate::node::{clean_type_name, CodeNode, NodeKind, TypeRelationKind, Visibility};
+use crate::node::{
+    clean_type_name, returns_ref, typed_receiver_ref, CodeNode, NodeKind, TypeRelationKind,
+    Visibility,
+};
 use tree_sitter::{Language, Node, Tree};
 
 pub struct RustParser;
@@ -251,8 +255,18 @@ fn extract_function(
     // Build signature
     let signature = build_function_signature(node, source, &name);
 
-    // Extract references
-    let references = extract_call_references(node, source);
+    // Extract references. A method call on a receiver whose type the code
+    // states is recorded with that type, so it resolves to one definition.
+    let receivers = Receivers::of_function(node, source, context);
+    let mut references = extract_call_references(node, source, &receivers);
+    // What a call to this function hands back, so `let d = prepare()?;`
+    // elsewhere can type `d`.
+    if let Some(returned) = node
+        .child_by_field_name("return_type")
+        .and_then(|return_type| receivers.core_type(&return_type))
+    {
+        references.push(returns_ref(&returned));
+    }
 
     Some(
         CodeNode::new(&name, &qualified_name, kind, file_path)
@@ -283,7 +297,10 @@ fn extract_struct(node: &Node, source: &str, file_path: &str) -> Option<CodeNode
             )
             .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
             .with_column(name_node.start_position().column as u32)
-            .with_visibility(visibility),
+            .with_visibility(visibility)
+            // Field types let `state.draft.run_started()` resolve through
+            // this struct from any file.
+            .with_references(struct_field_refs(node, source, &name)),
     )
 }
 
@@ -582,20 +599,20 @@ const STD_METHODS: &[&str] = &[
 /// Extracts function call references in the shapes the graph builder
 /// resolves: `name`, `module::name`, `Type::name`, `self.name`, and `.name`
 /// for a method on a receiver whose type isn't known.
-fn extract_call_references(node: &Node, source: &str) -> Vec<String> {
+fn extract_call_references(node: &Node, source: &str, receivers: &Receivers) -> Vec<String> {
     let mut refs = Vec::new();
-    collect_calls(node, source, &mut refs);
+    collect_calls(node, source, receivers, &mut refs);
     refs.sort();
     refs.dedup();
     refs
 }
 
-fn collect_calls(node: &Node, source: &str, refs: &mut Vec<String>) {
+fn collect_calls(node: &Node, source: &str, receivers: &Receivers, refs: &mut Vec<String>) {
     stacker::maybe_grow(64 * 1024, 4 * 1024 * 1024, || {
         match node.kind() {
             "call_expression" => {
                 if let Some(function) = node.child_by_field_name("function") {
-                    refs.extend(call_reference(&function, source));
+                    refs.extend(call_reference(&function, source, receivers));
                 }
             }
             // A macro's arguments are unparsed tokens, not expressions, so a
@@ -617,14 +634,14 @@ fn collect_calls(node: &Node, source: &str, refs: &mut Vec<String>) {
         }
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
-                collect_calls(&child, source, refs);
+                collect_calls(&child, source, receivers, refs);
             }
         }
     });
 }
 
 /// The reference for the `function` of a `call_expression`, if it names one.
-fn call_reference(function: &Node, source: &str) -> Option<String> {
+fn call_reference(function: &Node, source: &str, receivers: &Receivers) -> Option<String> {
     match function.kind() {
         "identifier" => Some(get_text(function, source)),
         "scoped_identifier" => path_reference(&get_text(function, source)),
@@ -635,10 +652,20 @@ fn call_reference(function: &Node, source: &str) -> Option<String> {
                 return None;
             }
             let receiver = function.child_by_field_name("value")?;
-            method_reference(receiver.kind() == "self", &get_text(&field, source))
+            let name = get_text(&field, source);
+            if receiver.kind() != "self" && !STD_METHODS.contains(&name.as_str()) {
+                if let Some(receiver_type) = receivers.type_of(&receiver) {
+                    return Some(typed_receiver_ref(&name, &receiver_type));
+                }
+            }
+            method_reference(receiver.kind() == "self", &name)
         }
         // `parse::<u32>(s)` is a call to `parse`.
-        "generic_function" => call_reference(&function.child_by_field_name("function")?, source),
+        "generic_function" => call_reference(
+            &function.child_by_field_name("function")?,
+            source,
+            receivers,
+        ),
         // Closures, `(self.handler)(x)`, `f()()`: no stable name.
         _ => None,
     }
@@ -796,7 +823,7 @@ impl Provider {
             "crate::app::create_project",
             "Provider::new",
             "Vec::with_capacity",
-            ".fetch_ledger",
+            ".fetch_ledger@Store",
             "parse",
             "tokio::spawn",
             "worker::run",
@@ -828,6 +855,202 @@ impl Provider {
                 "missing {expected} in {refs:?}"
             );
         }
+    }
+
+    const RECEIVERS: &str = r#"
+pub struct AppState {
+    draft: Mutex<Draft>,
+    backup: Option<Box<Draft>>,
+    drafts: HashMap<u32, Draft>,
+    count: u32,
+}
+struct Session { state: Arc<AppState> }
+impl Session {
+    fn tick(&mut self) {
+        self.state.draft.lock().unwrap().run_started(9);
+    }
+}
+fn typed_parameter(mut draft: &mut Draft, state: State<'_, AppState>) {
+    draft.run_started(1);
+    state.draft.lock().unwrap().run_started(2);
+}
+fn locals(state: &AppState, app: AppHandle) {
+    let mut guard = state.draft.lock().unwrap();
+    guard.run_started(3);
+    let fresh = Draft::new()?;
+    fresh.run_started(4);
+    let literal = Draft { runs: 0 };
+    literal.run_started(5);
+    let annotated: Box<Draft> = make();
+    annotated.run_started(6);
+    if let Some(saved) = state.backup.as_mut() {
+        saved.run_started(7);
+    }
+    let managed = app.state::<AppState>();
+    managed.drafts.get_mut(&1).unwrap().run_started(8);
+    let handler = |d: &mut Draft| d.run_started(10);
+}
+fn traits<T: RunObserver>(observer: &mut T, dynamic: &mut dyn RunObserver) {
+    observer.run_started(11);
+    dynamic.run_started(12);
+}
+fn uncertain<U>(value: U, client: reqwest::Client) {
+    let shadowed = Draft::new();
+    let shadowed = Telemetry::new();
+    shadowed.run_started(13);
+    value.run_started(14);
+    let loaded = load_draft();
+    loaded.run_started(15);
+    for item in items { item.run_started(16); }
+    client.send_report();
+}
+"#;
+
+    #[test]
+    fn method_calls_record_the_receiver_type_the_code_states() {
+        let nodes = parse(RECEIVERS);
+        let expect = |function: &str, wanted: &[&str]| {
+            let refs = references_of(&nodes, function);
+            for expected in wanted {
+                assert!(
+                    refs.iter().any(|r| r == expected),
+                    "{function}: missing {expected} in {refs:?}"
+                );
+            }
+        };
+        // Parameters, through a reference and through Tauri's `State`.
+        expect(
+            "typed_parameter",
+            &[".run_started@Draft", ".run_started@AppState.draft"],
+        );
+        // A lock guard, a constructor with `?`, a struct literal, an
+        // annotation through `Box`, `if let Some`, `app.state::<T>()` with a
+        // map lookup, and a typed closure parameter.
+        expect(
+            "locals",
+            &[
+                ".run_started@AppState.draft",
+                ".run_started@Draft",
+                ".run_started@AppState.backup",
+                ".run_started@AppState.drafts",
+            ],
+        );
+        // `self.field` goes through the impl's own type.
+        expect("tick", &[".run_started@Session.state.draft"]);
+        // A bounded generic and a trait object resolve to the trait.
+        expect("traits", &[".run_started@RunObserver"]);
+    }
+
+    // The shapes from a real review: a draft prepared by a helper, then
+    // started from a `let … else` and from a channel inside a `match`.
+    const CALL_RESULTS: &str = r#"
+fn prepare_draft(handle: &AppHandle) -> Option<drafts::mac::PreparedDraft> {
+    None
+}
+struct PendingDraft {
+    receiver: std::sync::mpsc::Receiver<Option<drafts::mac::PreparedDraft>>,
+}
+impl PendingDraft {
+    fn run(self) {
+        match self.receiver.recv() {
+            Ok(Some(draft)) => draft.run_started(run),
+            Ok(None) | Err(_) => run.finish("failed"),
+        }
+    }
+}
+fn start_draft(handle: &AppHandle) {
+    let Some(run) = drafts::mac::DraftRun::begin(handle) else {
+        return;
+    };
+    let Some(draft) = prepare_draft(handle) else {
+        run.finish("failed", 0, None);
+        return;
+    };
+    draft.run_started(run);
+}
+async fn fetch(client: &Client) -> Result<Draft, Error> {
+    let loaded = load(client).await?;
+    loaded.session().run_started(1);
+}
+struct Loader;
+impl Loader {
+    fn go() {
+        Self::open().run_started(2);
+    }
+}
+"#;
+
+    #[test]
+    fn call_results_type_their_receivers() {
+        let nodes = parse(CALL_RESULTS);
+        let refs = |name: &str| references_of(&nodes, name).to_vec();
+        // The function records what it returns, through `Option` and a path.
+        assert!(refs("prepare_draft").contains(&"returns:PreparedDraft".to_string()));
+        // `Result<Draft, Error>` returns the `Draft`, not the error.
+        assert!(
+            refs("fetch").contains(&"returns:Draft".to_string()),
+            "{:?}",
+            refs("fetch")
+        );
+        let run = refs("start_draft");
+        assert!(
+            run.contains(&".run_started@prepare_draft()".to_string()),
+            "{run:?}"
+        );
+        assert!(
+            run.contains(&".finish@drafts::mac::DraftRun::begin()".to_string()),
+            "{run:?}"
+        );
+        // A field typed by a channel of `Option<…>`, through `recv()` and
+        // the nested `Ok(Some(draft))` arm.
+        assert!(refs("run").contains(&".run_started@PendingDraft.receiver".to_string()));
+        // `.await` passes through; a method result is followed by name.
+        let fetch = refs("fetch");
+        assert!(
+            fetch.contains(&".run_started@load().session()".to_string()),
+            "{fetch:?}"
+        );
+        // `Self::` in an impl names the impl's type.
+        assert!(refs("go").contains(&".run_started@Loader::open()".to_string()));
+    }
+
+    #[test]
+    fn uncertain_receivers_stay_unknown() {
+        let nodes = parse(RECEIVERS);
+        let refs = references_of(&nodes, "uncertain");
+        // Shadowed with two types, an unbounded generic and a loop variable:
+        // no type is claimed.
+        assert!(refs.iter().any(|r| r == ".run_started"), "{refs:?}");
+        // A function's result is typed by what the graph finds it returns.
+        let typed: Vec<&String> = refs
+            .iter()
+            .filter(|r| r.starts_with(".run_started@"))
+            .collect();
+        assert_eq!(typed, [".run_started@load_draft()"], "{refs:?}");
+        // An external type is still recorded; the graph drops it as external.
+        assert!(refs.iter().any(|r| r == ".send_report@Client"), "{refs:?}");
+    }
+
+    #[test]
+    fn struct_fields_record_the_type_a_method_reaches() {
+        let nodes = parse(RECEIVERS);
+        let state = nodes.iter().find(|n| n.name == "AppState").unwrap();
+        for expected in [
+            "field:draft:Draft",
+            "field:backup:Draft",
+            "field:drafts:Draft",
+        ] {
+            assert!(
+                state.references.iter().any(|r| r == expected),
+                "missing {expected} in {:?}",
+                state.references
+            );
+        }
+        // A primitive has no methods of the project's.
+        assert!(!state
+            .references
+            .iter()
+            .any(|r| r.starts_with("field:count:")));
     }
 
     #[test]

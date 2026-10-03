@@ -76,10 +76,41 @@ async function main() {
     }
 
     console.log("Arbor installed successfully!");
+    warnIfShadowed();
   } catch (err) {
     console.error("Failed to install Arbor binary:", err.message);
     console.error("Fallback: cargo install arbor-graph-cli");
     process.exit(1);
+  }
+}
+
+// A shell runs the first `arbor` on PATH. An older install there (often a
+// `cargo install` in ~/.cargo/bin) keeps answering after this one is
+// installed, silently. Say so. Advisory only: never fail the install.
+function warnIfShadowed() {
+  try {
+    const finder = process.platform === "win32" ? "where arbor" : "command -v arbor";
+    const found = execSync(finder, { stdio: ["ignore", "pipe", "ignore"] })
+      .toString()
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .filter((line) => process.platform !== "win32" || /\.(exe|cmd|bat)$/i.test(line));
+    if (found.length === 0) return;
+    const first = found[0];
+    const banner = execSync(`"${first}" --version`, {
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5000,
+    }).toString();
+    const version = (banner.match(/\d+\.\d+\.\d+/) || [])[0];
+    if (!version || version === VERSION) return;
+    console.warn("");
+    console.warn(`Warning: \`arbor\` on your PATH is ${first} (v${version}), not this v${VERSION}.`);
+    console.warn("Your shell will keep running the older one. Remove it (for a cargo install:");
+    console.warn("cargo uninstall arbor-graph-cli) or put npm's global bin directory earlier on PATH.");
+    console.warn("");
+  } catch (_) {
+    // Advisory only.
   }
 }
 

@@ -7,7 +7,10 @@
 use crate::edge::{Edge, EdgeKind};
 use crate::graph::{ArborGraph, NodeId};
 use crate::symbol_table::SymbolTable;
-use arbor_core::{clean_type_name, type_relation_ref, CodeNode, NodeKind, TypeRelationKind};
+use arbor_core::{
+    clean_type_name, field_type_ref, return_type_ref, type_relation_ref, typed_receiver, CodeNode,
+    NodeKind, TypeRelationKind,
+};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use tracing::debug;
@@ -23,6 +26,22 @@ const MAX_UNKNOWN_RECEIVER_FANOUT: usize = 2;
 /// (`userService.findOne()`). The method name is real evidence, but which
 /// `findOne` it reaches is a guess.
 const UNKNOWN_RECEIVER_PENALTY: f32 = 0.55;
+
+/// Confidence for a call whose receiver's type was read from the code
+/// (`draft: &mut Draft`). Inferred, so a little below a written path.
+const TYPED_RECEIVER_CONFIDENCE: f32 = 0.9;
+
+/// How a call on a typed receiver (`.run_started@AppState.draft`) resolved.
+enum TypedReceiver {
+    /// The method on the receiver's type, or on each implementor of a trait.
+    Found(Vec<NodeId>),
+    /// The type isn't defined in this project (`reqwest::Client`): the
+    /// method is external too, and must not bind to a same-named project one.
+    External,
+    /// The type is known but its method isn't (a trait default elsewhere, a
+    /// `Deref` target, a struct from a macro). Fall back to the method name.
+    Unknown,
+}
 
 /// Builds an ArborGraph from parsed code nodes.
 pub struct GraphBuilder {
@@ -158,17 +177,44 @@ impl GraphBuilder {
                 // [`resolve_inheritance`](Self::resolve_inheritance), where an
                 // override can hide a base method. Falling through to a bare
                 // name here would attach the edge to the wrong definition.
-                if type_relation_ref(&reference).is_some() || receiver_method(&reference).is_some()
+                if type_relation_ref(&reference).is_some()
+                    || receiver_method(&reference).is_some()
+                    || field_type_ref(&reference).is_some()
+                    || return_type_ref(&reference).is_some()
                 {
                     continue;
+                }
+
+                // `.run_started@AppState.draft`: the receiver's type is known,
+                // so the call reaches that type's method and nothing else.
+                if let Some((method, receiver)) = typed_receiver(&reference) {
+                    match self.resolve_typed_receiver(method, receiver, &from_file) {
+                        TypedReceiver::Found(targets) => {
+                            for to_idx in targets {
+                                if to_idx != from_idx {
+                                    edges_to_add.push((
+                                        from_idx,
+                                        to_idx,
+                                        TYPED_RECEIVER_CONFIDENCE,
+                                    ));
+                                }
+                            }
+                            continue;
+                        }
+                        TypedReceiver::External => continue,
+                        TypedReceiver::Unknown => {}
+                    }
                 }
 
                 // A leading `.` marks a call on a receiver whose type we could
                 // not determine (`userService.findOne()`). Resolve it by method
                 // name, but never let it claim the confidence of a real match.
-                let (lookup, receiver_unknown) = match reference.strip_prefix('.') {
-                    Some(method) => (method, true),
-                    None => (reference.as_str(), false),
+                let (lookup, receiver_unknown) = match typed_receiver(&reference) {
+                    Some((method, _)) => (method, true),
+                    None => match reference.strip_prefix('.') {
+                        Some(method) => (method, true),
+                        None => (reference.as_str(), false),
+                    },
                 };
 
                 if lookup.is_empty() {
@@ -411,6 +457,185 @@ impl GraphBuilder {
             self.graph
                 .add_edge(from, to, Edge::new(kind).with_confidence(confidence));
         }
+    }
+
+    /// Resolves a method call whose receiver type path the extractor read from
+    /// the code: `Draft`, `AppState.draft` for a field of an `AppState`, or
+    /// `prepare()` / `mac::Draft::capture().inner()` for what calls return.
+    fn resolve_typed_receiver(&self, method: &str, receiver: &str, file: &Path) -> TypedReceiver {
+        let mut segments = receiver.split('.');
+        let Some(base) = segments.next() else {
+            return TypedReceiver::Unknown;
+        };
+        let mut current = match base.strip_suffix("()") {
+            Some(callee) => match self.returned_type(self.callable(callee, file)) {
+                Ok(id) => id,
+                Err(outcome) => return outcome,
+            },
+            None => match self.type_named(base, file) {
+                Ok(id) => id,
+                Err(outcome) => return outcome,
+            },
+        };
+        for segment in segments {
+            let Some(node) = self.graph.get(current) else {
+                return TypedReceiver::Unknown;
+            };
+            let owner_file = PathBuf::from(&node.file);
+            if let Some(called) = segment.strip_suffix("()") {
+                // `draft.inner().run()`: whatever `Draft::inner` returns.
+                let path = format!("{}::{called}", node.name);
+                current = match self.returned_type(self.callable(&path, &owner_file)) {
+                    Ok(id) => id,
+                    Err(outcome) => return outcome,
+                };
+                continue;
+            }
+            let field_type = node
+                .references
+                .iter()
+                .filter_map(|reference| field_type_ref(reference))
+                .find(|(name, _)| *name == segment)
+                .map(|(_, type_name)| type_name.to_string());
+            let Some(field_type) = field_type else {
+                return TypedReceiver::Unknown;
+            };
+            current = match self.type_named(&field_type, &owner_file) {
+                Ok(id) => id,
+                Err(outcome) => return outcome,
+            };
+        }
+
+        let Some(owner) = self.graph.get(current) else {
+            return TypedReceiver::Unknown;
+        };
+        let owner_file = PathBuf::from(&owner.file);
+        let mut owners = vec![owner.name.clone()];
+        if owner.kind == NodeKind::Interface {
+            // `obs: &mut dyn RunObserver`: any implementor's method may run.
+            owners.extend(self.implementors(&owner.name, &owner_file));
+        } else {
+            // A method from a trait the type implements (a default body).
+            owners.extend(
+                owner.references.iter().filter_map(|reference| {
+                    match type_relation_ref(reference) {
+                        Some((TypeRelationKind::Implements, name)) => Some(name.to_string()),
+                        _ => None,
+                    }
+                }),
+            );
+        }
+        let mut targets = Vec::new();
+        for owner_name in owners {
+            let resolution = self
+                .symbol_table
+                .resolve_path(&format!("{owner_name}::{method}"), &owner_file);
+            for id in resolution.candidates() {
+                let is_method = self
+                    .graph
+                    .get(id)
+                    .is_some_and(|n| matches!(n.kind, NodeKind::Method | NodeKind::Function));
+                if is_method && !targets.contains(&id) {
+                    targets.push(id);
+                }
+            }
+        }
+        if targets.is_empty() || targets.len() > MAX_AMBIGUOUS_FANOUT {
+            TypedReceiver::Unknown
+        } else {
+            TypedReceiver::Found(targets)
+        }
+    }
+
+    /// One type node for `name`, or why there isn't one.
+    fn type_named(&self, name: &str, file: &Path) -> Result<NodeId, TypedReceiver> {
+        match self.resolve_type_name(name, file) {
+            Some(id) => Ok(id),
+            None if self.defines_type(name, file) => Err(TypedReceiver::Unknown),
+            None => Err(TypedReceiver::External),
+        }
+    }
+
+    /// The functions or methods a call path names: `prepare`, `drafts::load`,
+    /// `Draft::capture`.
+    fn callable(&self, path: &str, file: &Path) -> Vec<NodeId> {
+        let resolution = if path.contains("::") {
+            self.symbol_table.resolve_path(path, file)
+        } else {
+            let imports = self.import_map.get(&file.to_string_lossy().to_string());
+            self.symbol_table
+                .resolve_ref_with_imports(path, file, imports)
+        };
+        resolution
+            .candidates()
+            .into_iter()
+            .filter(|id| {
+                self.graph
+                    .get(*id)
+                    .is_some_and(|n| matches!(n.kind, NodeKind::Function | NodeKind::Method))
+            })
+            .collect()
+    }
+
+    /// The type node the given functions return, when they agree on one.
+    fn returned_type(&self, functions: Vec<NodeId>) -> Result<NodeId, TypedReceiver> {
+        let mut returned: Option<(String, PathBuf)> = None;
+        for id in functions {
+            let Some(function) = self.graph.get(id) else {
+                continue;
+            };
+            let Some(type_name) = function.references.iter().find_map(|r| return_type_ref(r))
+            else {
+                // Unit, a primitive, a tuple or an unbounded generic.
+                return Err(TypedReceiver::Unknown);
+            };
+            match &returned {
+                Some((seen, _)) if seen != type_name => return Err(TypedReceiver::Unknown),
+                Some(_) => {}
+                None => returned = Some((type_name.to_string(), PathBuf::from(&function.file))),
+            }
+        }
+        // No project function by that name: an external call, whose result
+        // may still be a project type (`serde_json::from_str::<Draft>`).
+        let Some((type_name, file)) = returned else {
+            return Err(TypedReceiver::Unknown);
+        };
+        self.type_named(&type_name, &file)
+    }
+
+    /// Whether any type in the file's language is called `name`, even if the
+    /// name is too ambiguous to pick one.
+    fn defines_type(&self, name: &str, file: &Path) -> bool {
+        self.symbol_table
+            .resolve_ref_with_imports(name, file, None)
+            .candidates()
+            .into_iter()
+            .any(|id| {
+                self.graph
+                    .get(id)
+                    .is_some_and(|node| is_inheritable_type(node.kind) && node.name == name)
+            })
+    }
+
+    /// Names of the types in `file`'s language that implement trait `name`.
+    fn implementors(&self, name: &str, file: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        for idx in self.graph.node_indexes() {
+            let Some(node) = self.graph.get(idx) else {
+                continue;
+            };
+            let implements = node.references.iter().any(|reference| {
+                matches!(type_relation_ref(reference),
+                    Some((TypeRelationKind::Implements, target)) if target == name)
+            });
+            if implements
+                && crate::symbol_table::same_language(file, Path::new(&node.file))
+                && !found.contains(&node.name)
+            {
+                found.push(node.name.clone());
+            }
+        }
+        found
     }
 
     /// Resolves a base or interface name to one type node.
@@ -1008,6 +1233,171 @@ mod tests {
         assert!(
             confidence > 0.0 && confidence < Edge::CONFIDENT_THRESHOLD,
             "edge should exist but not be treated as proven, got {confidence}"
+        );
+    }
+
+    /// `run_started` on three types, plus a trait two of them implement.
+    fn receiver_fixture(caller_refs: &[&str]) -> ArborGraph {
+        let mut b = GraphBuilder::new();
+        let mut nodes = vec![
+            CodeNode::new("on_key", "on_key", NodeKind::Function, "src/lib.rs")
+                .with_references(caller_refs.iter().map(|r| r.to_string()).collect()),
+            CodeNode::new("AppState", "AppState", NodeKind::Struct, "src/state.rs")
+                .with_references(vec![arbor_core::field_ref("draft", "Draft")]),
+            CodeNode::new("Draft", "Draft", NodeKind::Struct, "src/draft.rs"),
+            CodeNode::new(
+                "Telemetry",
+                "Telemetry",
+                NodeKind::Struct,
+                "src/telemetry.rs",
+            ),
+            CodeNode::new("Logger", "Logger", NodeKind::Struct, "src/observer.rs"),
+            CodeNode::new(
+                "RunObserver",
+                "RunObserver",
+                NodeKind::Interface,
+                "src/observer.rs",
+            ),
+        ];
+        nodes[4].add_type_relation(TypeRelationKind::Implements, "RunObserver");
+        nodes[3].add_type_relation(TypeRelationKind::Implements, "RunObserver");
+        for (owner, file) in [
+            ("Draft", "src/draft.rs"),
+            ("Telemetry", "src/telemetry.rs"),
+            ("Logger", "src/observer.rs"),
+        ] {
+            nodes.push(CodeNode::new(
+                "run_started",
+                format!("{owner}.run_started"),
+                NodeKind::Method,
+                file,
+            ));
+        }
+        b.add_nodes(nodes);
+        b.build()
+    }
+
+    fn callees(graph: &ArborGraph) -> Vec<String> {
+        use petgraph::visit::EdgeRef;
+        let mut names: Vec<String> = graph
+            .graph
+            .edge_references()
+            .filter(|edge| edge.weight().kind == EdgeKind::Calls)
+            .filter_map(|edge| graph.get(edge.target()).map(|n| n.qualified_name.clone()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn typed_receiver_reaches_only_its_own_type() {
+        // Name-based resolution sees three `run_started` and links none.
+        assert!(callees(&receiver_fixture(&[".run_started"])).is_empty());
+        let graph = receiver_fixture(&[".run_started@Draft"]);
+        assert_eq!(callees(&graph), ["Draft.run_started"]);
+        let call = graph
+            .graph
+            .edge_weights()
+            .find(|edge| edge.kind == EdgeKind::Calls)
+            .expect("the call edge");
+        assert!((call.confidence - TYPED_RECEIVER_CONFIDENCE).abs() < 1e-6);
+    }
+
+    #[test]
+    fn typed_receiver_follows_fields_into_other_files() {
+        let graph = receiver_fixture(&[".run_started@AppState.draft"]);
+        assert_eq!(callees(&graph), ["Draft.run_started"]);
+    }
+
+    #[test]
+    fn trait_typed_receiver_reaches_each_implementor() {
+        let graph = receiver_fixture(&[".run_started@RunObserver"]);
+        assert_eq!(
+            callees(&graph),
+            ["Logger.run_started", "Telemetry.run_started"]
+        );
+    }
+
+    #[test]
+    fn external_receiver_never_binds_to_a_project_method() {
+        // `client.run_started()` on `reqwest::Client` is not Draft's method.
+        assert!(callees(&receiver_fixture(&[".run_started@Client"])).is_empty());
+    }
+
+    #[test]
+    fn project_type_without_the_method_falls_back_to_the_name() {
+        // A field this struct doesn't declare: the type is no longer known,
+        // so the call is resolved by name (here: too ambiguous to link).
+        assert!(callees(&receiver_fixture(&[".run_started@AppState.missing"])).is_empty());
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            CodeNode::new("on_key", "on_key", NodeKind::Function, "src/lib.rs")
+                .with_references(vec![".flush@Draft".to_string()]),
+            CodeNode::new("Draft", "Draft", NodeKind::Struct, "src/draft.rs"),
+            CodeNode::new("flush", "Buffer.flush", NodeKind::Method, "src/buffer.rs"),
+        ]);
+        let graph = b.build();
+        // Draft has no `flush` (a Deref target might): a weak name-based edge.
+        assert_eq!(callees(&graph), ["Buffer.flush"]);
+        assert!(only_edge_confidence(&graph) < TYPED_RECEIVER_CONFIDENCE);
+    }
+
+    #[test]
+    fn typed_receiver_follows_return_types() {
+        let mut b = GraphBuilder::new();
+        let mut prepare = CodeNode::new("prepare", "prepare", NodeKind::Function, "src/lib.rs")
+            .with_references(vec![arbor_core::returns_ref("Prepared")]);
+        prepare.line_end = 0;
+        b.add_nodes(vec![
+            CodeNode::new("on_key", "on_key", NodeKind::Function, "src/lib.rs").with_references(
+                vec![
+                    ".run_started@prepare()".to_string(),
+                    ".flush@mac::Prepared::capture().buffer()".to_string(),
+                ],
+            ),
+            prepare,
+            CodeNode::new("Prepared", "Prepared", NodeKind::Struct, "src/mac.rs"),
+            CodeNode::new("Buffer", "Buffer", NodeKind::Struct, "src/buffer.rs"),
+            CodeNode::new(
+                "capture",
+                "Prepared.capture",
+                NodeKind::Method,
+                "src/mac.rs",
+            )
+            .with_references(vec![arbor_core::returns_ref("Prepared")]),
+            CodeNode::new("buffer", "Prepared.buffer", NodeKind::Method, "src/mac.rs")
+                .with_references(vec![arbor_core::returns_ref("Buffer")]),
+            CodeNode::new(
+                "run_started",
+                "Prepared.run_started",
+                NodeKind::Method,
+                "src/mac.rs",
+            ),
+            CodeNode::new(
+                "run_started",
+                "Other.run_started",
+                NodeKind::Method,
+                "src/other.rs",
+            ),
+            CodeNode::new(
+                "run_started",
+                "Third.run_started",
+                NodeKind::Method,
+                "src/third.rs",
+            ),
+            CodeNode::new("flush", "Buffer.flush", NodeKind::Method, "src/buffer.rs"),
+            CodeNode::new("flush", "Pipe.flush", NodeKind::Method, "src/pipe.rs"),
+            CodeNode::new("flush", "Sink.flush", NodeKind::Method, "src/sink.rs"),
+        ]);
+        let graph = b.build();
+        assert_eq!(callees(&graph), ["Buffer.flush", "Prepared.run_started"]);
+    }
+
+    #[test]
+    fn field_types_are_not_calls() {
+        assert!(
+            callees(&receiver_fixture(&[])).is_empty(),
+            "a field: reference is not a call"
         );
     }
 

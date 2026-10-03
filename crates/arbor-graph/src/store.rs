@@ -14,7 +14,7 @@ use thiserror::Error;
 ///
 /// The CLI also stamps saved graphs with it, so a graph built by a different
 /// extractor is rebuilt rather than reused after an upgrade.
-pub const CACHE_VERSION: &str = concat!("arbor-", env!("CARGO_PKG_VERSION"), "+extract-2");
+pub const CACHE_VERSION: &str = concat!("arbor-", env!("CARGO_PKG_VERSION"), "+extract-3");
 
 #[derive(Error, Debug)]
 pub enum StoreError {

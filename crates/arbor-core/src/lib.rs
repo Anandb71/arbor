@@ -26,7 +26,8 @@ pub mod parser_v2;
 pub use error::{ParseError, Result};
 pub use languages::LanguageParser;
 pub use node::{
-    clean_type_name, type_relation_ref, CodeNode, NodeKind, TypeRelationKind, Visibility,
+    clean_type_name, field_ref, field_type_ref, return_type_ref, returns_ref, type_relation_ref,
+    typed_receiver, typed_receiver_ref, CodeNode, NodeKind, TypeRelationKind, Visibility,
 };
 pub use parser::{detect_language, parse_file, parse_source};
 pub use parser_v2::{ArborParser, ParseResult, RelationType, SymbolRelation};
