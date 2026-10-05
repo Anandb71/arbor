@@ -200,3 +200,38 @@ jobs:
           $env:ARBOR_INSTALL_API_BASE = 'http://127.0.0.1:8123/releases'
           & scripts/install.ps1 -Version vci -InstallDir "$env:RUNNER_TEMP\arbor-bin" -Force
           & "$env:RUNNER_TEMP\arbor-bin\arbor.exe" --version
+
+  npm-smoke:
+    name: npm install smoke (${{ matrix.os }})
+    needs: build-test-linux
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install the published npm CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g @anandb71/arbor-cli
+          command -v arbor
+          arbor --version
+
+      - name: Index a fixture through the installed binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/npm-smoke-fixture"
+          cd "$RUNNER_TEMP/npm-smoke-fixture"
+          printf 'def helper():\n    return 1\n\ndef main():\n    helper()\n' > app.py
+          arbor init .
+          arbor index .
+          arbor query "helper" . --json | grep -q helper
