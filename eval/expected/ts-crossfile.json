@@ -1,0 +1,4 @@
+{
+  "symbols": ["app.ts::label", "format.ts::formatName"],
+  "edges_expected": [["app.ts::label", "format.ts::formatName"]]
+}

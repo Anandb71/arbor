@@ -1,0 +1,37 @@
+{
+  "symbols": [
+    "itsdangerous/encoding.py::base64_decode",
+    "itsdangerous/encoding.py::base64_encode",
+    "itsdangerous/encoding.py::bytes_to_int",
+    "itsdangerous/encoding.py::int_to_bytes",
+    "itsdangerous/encoding.py::want_bytes",
+    "itsdangerous/signer.py::_lazy_sha1",
+    "itsdangerous/signer.py::_make_keys_list"
+  ],
+  "edges_expected": [
+    ["itsdangerous/encoding.py::base64_decode", "itsdangerous/encoding.py::want_bytes"],
+    ["itsdangerous/encoding.py::base64_decode", "itsdangerous/exc.py::BadData"],
+    ["itsdangerous/encoding.py::base64_encode", "itsdangerous/encoding.py::want_bytes"],
+    ["itsdangerous/encoding.py::bytes_to_int", "itsdangerous/encoding.py::_bytes_to_int"],
+    ["itsdangerous/encoding.py::int_to_bytes", "itsdangerous/encoding.py::_int_to_bytes"],
+    ["itsdangerous/exc.py::__init__", "itsdangerous/exc.py::__init__"],
+    ["itsdangerous/signer.py::__init__", "itsdangerous/encoding.py::want_bytes"],
+    ["itsdangerous/signer.py::__init__", "itsdangerous/signer.py::HMACAlgorithm"],
+    ["itsdangerous/signer.py::__init__", "itsdangerous/signer.py::_make_keys_list"],
+    ["itsdangerous/signer.py::_make_keys_list", "itsdangerous/encoding.py::want_bytes"],
+    ["itsdangerous/signer.py::derive_key", "itsdangerous/encoding.py::want_bytes"],
+    ["itsdangerous/signer.py::get_signature", "itsdangerous/encoding.py::base64_encode"],
+    ["itsdangerous/signer.py::get_signature", "itsdangerous/encoding.py::want_bytes"],
+    ["itsdangerous/signer.py::get_signature", "itsdangerous/signer.py::derive_key"],
+    ["itsdangerous/signer.py::sign", "itsdangerous/encoding.py::want_bytes"],
+    ["itsdangerous/signer.py::sign", "itsdangerous/signer.py::get_signature"],
+    ["itsdangerous/signer.py::unsign", "itsdangerous/encoding.py::want_bytes"],
+    ["itsdangerous/signer.py::unsign", "itsdangerous/exc.py::BadSignature"],
+    ["itsdangerous/signer.py::unsign", "itsdangerous/signer.py::verify_signature"],
+    ["itsdangerous/signer.py::validate", "itsdangerous/signer.py::unsign"],
+    ["itsdangerous/signer.py::verify_signature", "itsdangerous/encoding.py::base64_decode"],
+    ["itsdangerous/signer.py::verify_signature", "itsdangerous/encoding.py::want_bytes"],
+    ["itsdangerous/signer.py::verify_signature", "itsdangerous/signer.py::derive_key"],
+    ["itsdangerous/signer.py::verify_signature", "itsdangerous/signer.py::get_signature"]
+  ]
+}

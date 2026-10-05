@@ -6,10 +6,15 @@
 //! and `known_extra` record today's deltas: a regression adding to either set
 //! fails, and so does a fix that removes a recorded gap without updating the
 //! expectation file.
+//!
+//! A fixture that contains `before/` and `after/` subdirectories is a
+//! controlled change: each state is indexed independently and compared
+//! against `expected/<name>.json`'s `states` map, so renames, deletions and
+//! removed exports are recorded per revision instead of flattened into one.
 
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -38,6 +43,13 @@ struct Expected {
     known_extra: Vec<[String; 2]>,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ExpectedFile {
+    States { states: BTreeMap<String, Expected> },
+    Single(Expected),
+}
+
 fn rel(file: &str, root: &Path) -> String {
     let path = Path::new(file);
     path.strip_prefix(root)
@@ -46,13 +58,12 @@ fn rel(file: &str, root: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// Index one fixture copy and return its symbol set and call-edge set as
+/// Index one directory copy and return its symbol set and call-edge set as
 /// `file::name` pairs.
-fn index_fixture(name: &str) -> (BTreeSet<String>, BTreeSet<(String, String)>) {
-    let source = repo_root().join("eval/corpus").join(name);
-    let tmp = std::env::temp_dir().join(format!("arbor-eval-{name}"));
+fn index_dir(source: &Path, tag: &str) -> (BTreeSet<String>, BTreeSet<(String, String)>) {
+    let tmp = std::env::temp_dir().join(format!("arbor-eval-{tag}"));
     let _ = fs::remove_dir_all(&tmp);
-    copy_dir(&source, &tmp);
+    copy_dir(source, &tmp);
 
     let status = Command::new(env!("CARGO_BIN_EXE_arbor"))
         .args(["index", ".", "--no-cache"])
@@ -61,7 +72,7 @@ fn index_fixture(name: &str) -> (BTreeSet<String>, BTreeSet<(String, String)>) {
         .expect("spawn arbor index");
     assert!(
         status.status.success(),
-        "arbor index failed on {name}: {}",
+        "arbor index failed on {tag}: {}",
         String::from_utf8_lossy(&status.stderr)
     );
 
@@ -118,6 +129,86 @@ fn pair(edge: &[String; 2]) -> (String, String) {
     (edge[0].clone(), edge[1].clone())
 }
 
+/// Diff one indexed state against its recorded truth, appending failures.
+fn compare_state(
+    label: &str,
+    expected: &Expected,
+    symbols: &BTreeSet<String>,
+    edges: &BTreeSet<(String, String)>,
+    failures: &mut Vec<String>,
+) {
+    for sym in &expected.symbols {
+        if !symbols.contains(sym) {
+            failures.push(format!("{label}: expected symbol missing: {sym}"));
+        }
+    }
+    for sym in &expected.symbols_forbidden {
+        if symbols.contains(sym) {
+            failures.push(format!("{label}: forbidden symbol present: {sym}"));
+        }
+    }
+
+    let expected_set: BTreeSet<(String, String)> =
+        expected.edges_expected.iter().map(pair).collect();
+    let forbidden: BTreeSet<(String, String)> = expected.edges_forbidden.iter().map(pair).collect();
+    let known_missing: BTreeSet<(String, String)> =
+        expected.known_missing.iter().map(pair).collect();
+    let known_extra: BTreeSet<(String, String)> = expected.known_extra.iter().map(pair).collect();
+
+    let missed: Vec<_> = expected_set.difference(edges).collect();
+    let incorrect: Vec<_> = edges.difference(&expected_set).collect();
+    for edge in &missed {
+        if !known_missing.contains(*edge) {
+            failures.push(format!(
+                "{label}: missed relationship (recall): {} -> {}",
+                edge.0, edge.1
+            ));
+        }
+    }
+    for edge in &incorrect {
+        if forbidden.contains(*edge) {
+            failures.push(format!(
+                "{label}: forbidden edge present (precision): {} -> {}",
+                edge.0, edge.1
+            ));
+        } else if !known_extra.contains(*edge) {
+            failures.push(format!(
+                "{label}: unexpected edge (precision): {} -> {}",
+                edge.0, edge.1
+            ));
+        }
+    }
+    // Self-healing: a recorded gap that the engine now gets right must be
+    // removed from known_missing; a recorded false positive that stops being
+    // produced must be removed from known_extra.
+    for edge in &known_missing {
+        if edges.contains(edge) {
+            failures.push(format!(
+                "{label}: known-miss resolved — drop it from expected: {} -> {}",
+                edge.0, edge.1
+            ));
+        }
+    }
+    for edge in &known_extra {
+        if !edges.contains(edge) {
+            failures.push(format!(
+                "{label}: known-extra no longer produced — drop it from expected: {} -> {}",
+                edge.0, edge.1
+            ));
+        }
+    }
+
+    println!(
+        "eval {label}: symbols={} edges={} missed={} incorrect={} (recorded: {} missing, {} extra)",
+        symbols.len(),
+        edges.len(),
+        missed.len(),
+        incorrect.len(),
+        known_missing.len(),
+        known_extra.len(),
+    );
+}
+
 #[test]
 fn corpus_graphs_match_recorded_truth() {
     let eval_dir = repo_root().join("eval");
@@ -135,76 +226,43 @@ fn corpus_graphs_match_recorded_truth() {
 
     let mut failures = Vec::new();
     for name in &fixtures {
-        let expected: Expected = serde_json::from_str(
+        let expected_file: ExpectedFile = serde_json::from_str(
             &fs::read_to_string(eval_dir.join("expected").join(format!("{name}.json")))
                 .expect("expected file"),
         )
         .unwrap();
-        let (symbols, edges) = index_fixture(name);
+        let source = eval_dir.join("corpus").join(name);
 
-        for sym in &expected.symbols {
-            if !symbols.contains(sym) {
-                failures.push(format!("{name}: expected symbol missing: {sym}"));
+        match expected_file {
+            ExpectedFile::States { states } => {
+                for state in ["before", "after"] {
+                    let dir = source.join(state);
+                    assert!(
+                        dir.is_dir(),
+                        "{name}: expected/ records a {state} state but corpus/{name}/{state} is missing"
+                    );
+                    let expected = states.get(state).unwrap_or_else(|| {
+                        panic!("{name}: corpus/{name}/{state} exists but expected/{name}.json has no states.{state}")
+                    });
+                    let (symbols, edges) = index_dir(&dir, &format!("{name}-{state}"));
+                    compare_state(
+                        &format!("{name}:{state}"),
+                        expected,
+                        &symbols,
+                        &edges,
+                        &mut failures,
+                    );
+                }
+            }
+            ExpectedFile::Single(expected) => {
+                assert!(
+                    !source.join("before").is_dir() && !source.join("after").is_dir(),
+                    "{name}: corpus/{name} has before/after states but expected/{name}.json is single-state"
+                );
+                let (symbols, edges) = index_dir(&source, name);
+                compare_state(name, &expected, &symbols, &edges, &mut failures);
             }
         }
-        for sym in &expected.symbols_forbidden {
-            if symbols.contains(sym) {
-                failures.push(format!("{name}: forbidden symbol present: {sym}"));
-            }
-        }
-
-        let expected_set: BTreeSet<(String, String)> =
-            expected.edges_expected.iter().map(pair).collect();
-        let forbidden: BTreeSet<(String, String)> =
-            expected.edges_forbidden.iter().map(pair).collect();
-        let known_missing: BTreeSet<(String, String)> =
-            expected.known_missing.iter().map(pair).collect();
-        let known_extra: BTreeSet<(String, String)> =
-            expected.known_extra.iter().map(pair).collect();
-
-        let missed: Vec<_> = expected_set.difference(&edges).collect();
-        let incorrect: Vec<_> = edges.difference(&expected_set).collect();
-        for edge in &missed {
-            if !known_missing.contains(*edge) {
-                failures.push(format!(
-                    "{name}: missed relationship (recall): {} -> {}",
-                    edge.0, edge.1
-                ));
-            }
-        }
-        for edge in &incorrect {
-            if forbidden.contains(*edge) {
-                failures.push(format!(
-                    "{name}: forbidden edge present (precision): {} -> {}",
-                    edge.0, edge.1
-                ));
-            } else if !known_extra.contains(*edge) {
-                failures.push(format!(
-                    "{name}: unexpected edge (precision): {} -> {}",
-                    edge.0, edge.1
-                ));
-            }
-        }
-        // Self-healing: a recorded gap that the engine now gets right must be
-        // removed from known_missing.
-        for edge in &known_missing {
-            if edges.contains(edge) {
-                failures.push(format!(
-                    "{name}: known-miss resolved — drop it from expected/{name}.json: {} -> {}",
-                    edge.0, edge.1
-                ));
-            }
-        }
-
-        println!(
-            "eval {name}: symbols={} edges={} missed={} incorrect={} (recorded: {} missing, {} extra)",
-            symbols.len(),
-            edges.len(),
-            missed.len(),
-            incorrect.len(),
-            known_missing.len(),
-            known_extra.len(),
-        );
     }
     assert!(
         failures.is_empty(),
