@@ -234,4 +234,4 @@ jobs:
           printf 'def helper():\n    return 1\n\ndef main():\n    helper()\n' > app.py
           arbor init .
           arbor index .
-          arbor query "helper" . --json | grep -q helper
+          arbor query "helper" . | grep -q helper
