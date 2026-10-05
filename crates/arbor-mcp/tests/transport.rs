@@ -255,3 +255,68 @@ async fn client_disconnect_ends_the_server_cleanly() {
     );
     assert!(result.unwrap().unwrap().is_ok());
 }
+
+#[tokio::test]
+async fn tool_responses_carry_project_relative_paths() {
+    let mut graph = arbor_graph::ArborGraph::new();
+    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let absolute = project_root.join("src/lib.rs");
+    let mut node = arbor_core::CodeNode::new(
+        "helper",
+        "helper",
+        arbor_core::NodeKind::Function,
+        absolute.to_string_lossy(),
+    );
+    node.line_start = 10;
+    graph.add_node(node);
+    let server = McpServer::with_project(Arc::new(RwLock::new(graph)), project_root);
+    let (client_read, server_write) = duplex(64 * 1024);
+    let (server_read, client_write) = duplex(64 * 1024);
+    let task = tokio::spawn(async move {
+        server
+            .serve_lines(BufReader::new(server_read), server_write)
+            .await
+    });
+    let mut client = Client {
+        write: client_write,
+        lines: BufReader::new(client_read).lines(),
+        task,
+    };
+    let resp = client
+        .request(
+            1,
+            "tools/call",
+            json!({ "name": "search_symbols", "arguments": { "query": "helper" } }),
+        )
+        .await;
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("src/lib.rs"),
+        "expected relative path in tool output: {text}"
+    );
+    assert!(
+        !text.contains("Temp") && !text.contains("Repos") && !text.contains("\\"),
+        "tool output leaked an absolute path: {text}"
+    );
+}
+
+#[tokio::test]
+async fn namespaced_protocol_meta_resolves_on_stateless_requests() {
+    let mut client = Client::connect();
+    // Namespaced _meta per the 2026-07-28 protocol must be honored.
+    let resp = client
+        .request(
+            1,
+            "tools/list",
+            json!({ "_meta": { "io.modelcontextprotocol/protocolVersion": LATEST } }),
+        )
+        .await;
+    // The namespaced key must have resolved to LATEST — only then is the
+    // cache contract (`cacheScope` + `ttlMs`) attached to the result.
+    assert_eq!(resp["result"]["cacheScope"], "server");
+    assert_eq!(resp["result"]["ttlMs"], 300_000);
+}
