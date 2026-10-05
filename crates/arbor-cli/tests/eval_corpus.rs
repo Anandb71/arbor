@@ -60,16 +60,18 @@ fn rel(file: &str, root: &Path) -> String {
 
 /// Index one directory copy and return its symbol set and call-edge set as
 /// `file::name` pairs.
-fn index_dir(source: &Path, tag: &str) -> (BTreeSet<String>, BTreeSet<(String, String)>) {
+fn index_dir(source: &Path, tag: &str) -> (BTreeSet<String>, BTreeSet<(String, String)>, u128) {
     let tmp = std::env::temp_dir().join(format!("arbor-eval-{tag}"));
     let _ = fs::remove_dir_all(&tmp);
     copy_dir(source, &tmp);
 
+    let started = std::time::Instant::now();
     let status = Command::new(env!("CARGO_BIN_EXE_arbor"))
         .args(["index", ".", "--no-cache"])
         .current_dir(&tmp)
         .output()
         .expect("spawn arbor index");
+    let index_ms = started.elapsed().as_millis();
     assert!(
         status.status.success(),
         "arbor index failed on {tag}: {}",
@@ -109,7 +111,7 @@ fn index_dir(source: &Path, tag: &str) -> (BTreeSet<String>, BTreeSet<(String, S
             edges.insert((ids[s as usize].clone(), ids[t as usize].clone()));
         }
     }
-    (symbols, edges)
+    (symbols, edges, index_ms)
 }
 
 fn copy_dir(src: &Path, dst: &Path) {
@@ -135,6 +137,7 @@ fn compare_state(
     expected: &Expected,
     symbols: &BTreeSet<String>,
     edges: &BTreeSet<(String, String)>,
+    index_ms: u128,
     failures: &mut Vec<String>,
 ) {
     for sym in &expected.symbols {
@@ -199,9 +202,10 @@ fn compare_state(
     }
 
     println!(
-        "eval {label}: symbols={} edges={} missed={} incorrect={} (recorded: {} missing, {} extra)",
+        "eval {label}: symbols={} edges={} index_ms={} missed={} incorrect={} (recorded: {} missing, {} extra)",
         symbols.len(),
         edges.len(),
+        index_ms,
         missed.len(),
         incorrect.len(),
         known_missing.len(),
@@ -244,12 +248,13 @@ fn corpus_graphs_match_recorded_truth() {
                     let expected = states.get(state).unwrap_or_else(|| {
                         panic!("{name}: corpus/{name}/{state} exists but expected/{name}.json has no states.{state}")
                     });
-                    let (symbols, edges) = index_dir(&dir, &format!("{name}-{state}"));
+                    let (symbols, edges, index_ms) = index_dir(&dir, &format!("{name}-{state}"));
                     compare_state(
                         &format!("{name}:{state}"),
                         expected,
                         &symbols,
                         &edges,
+                        index_ms,
                         &mut failures,
                     );
                 }
@@ -259,8 +264,8 @@ fn corpus_graphs_match_recorded_truth() {
                     !source.join("before").is_dir() && !source.join("after").is_dir(),
                     "{name}: corpus/{name} has before/after states but expected/{name}.json is single-state"
                 );
-                let (symbols, edges) = index_dir(&source, name);
-                compare_state(name, &expected, &symbols, &edges, &mut failures);
+                let (symbols, edges, index_ms) = index_dir(&source, name);
+                compare_state(name, &expected, &symbols, &edges, index_ms, &mut failures);
             }
         }
     }
