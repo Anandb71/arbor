@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arbor_graph::{
@@ -161,6 +161,16 @@ impl McpServer {
                 eprintln!("Spotlight: {} in {}", node.name, node.file);
             }
         }
+    }
+
+    /// Paths that leave the server in tool responses are project-relative —
+    /// absolute local paths are internal detail, not part of the contract.
+    fn rel_path(&self, file: &str) -> String {
+        Path::new(file)
+            .strip_prefix(&self.project_root)
+            .unwrap_or_else(|_| Path::new(file))
+            .to_string_lossy()
+            .replace('\\', "/")
     }
 
     pub async fn run_stdio(&self) -> Result<()> {
@@ -832,7 +842,7 @@ impl McpServer {
                                     "id": n.node_info.id,
                                     "name": n.node_info.name,
                                     "kind": n.node_info.kind,
-                                    "file": n.node_info.file,
+                                    "file": self.rel_path(&n.node_info.file),
                                     "severity": n.severity.as_str(),
                                     "hop_distance": n.hop_distance,
                                     "entry_edge": n.entry_edge.to_string()
@@ -848,7 +858,7 @@ impl McpServer {
                                     "id": n.node_info.id,
                                     "name": n.node_info.name,
                                     "kind": n.node_info.kind,
-                                    "file": n.node_info.file,
+                                    "file": self.rel_path(&n.node_info.file),
                                     "severity": n.severity.as_str(),
                                     "hop_distance": n.hop_distance,
                                     "entry_edge": n.entry_edge.to_string()
@@ -864,7 +874,7 @@ impl McpServer {
                                         "id": analysis.target.id,
                                         "name": analysis.target.name,
                                         "kind": analysis.target.kind,
-                                        "file": analysis.target.file
+                                        "file": self.rel_path(&analysis.target.file)
                                     },
                                     "confidence": {
                                         "level": confidence.level.to_string(),
@@ -967,7 +977,7 @@ impl McpServer {
                             "id": n.id,
                             "name": n.name,
                             "kind": n.kind.to_string(),
-                            "file": n.file,
+                            "file": self.rel_path(&n.file),
                             "line": n.line_start
                         })
                     })
@@ -1019,7 +1029,7 @@ impl McpServer {
                                     "id": n.id,
                                     "name": n.name,
                                     "kind": n.kind.to_string(),
-                                    "file": n.file,
+                                    "file": self.rel_path(&n.file),
                                     "line": n.line_start
                                 })
                             })
@@ -1071,7 +1081,7 @@ impl McpServer {
                                     "id": n.id,
                                     "name": n.name,
                                     "kind": n.kind.to_string(),
-                                    "file": n.file,
+                                    "file": self.rel_path(&n.file),
                                     "line": n.line_start
                                 })
                             })
@@ -1121,7 +1131,7 @@ impl McpServer {
                             "id": n.id,
                             "name": n.name,
                             "kind": n.kind.to_string(),
-                            "file": n.file,
+                            "file": self.rel_path(&n.file),
                             "line": n.line_start
                         })
                     })
@@ -1241,7 +1251,7 @@ impl McpServer {
                                 "id": node.id,
                                 "name": node.name,
                                 "kind": node.kind.to_string(),
-                                "file": node.file,
+                                "file": self.rel_path(&node.file),
                                 "line_start": node.line_start,
                                 "line_end": node.line_end,
                                 "signature": node.signature,
@@ -1540,7 +1550,7 @@ impl McpServer {
                                 flagged_paths.push(json!({
                                     "symbol": dep_node.name,
                                     "kind": dep_node.kind.to_string(),
-                                    "file": dep_node.file,
+                                    "file": self.rel_path(&dep_node.file),
                                     "line": dep_node.line_start,
                                     "hop_distance": hop_distance
                                 }));
@@ -1581,7 +1591,7 @@ impl McpServer {
                                 "id": node.id,
                                 "name": node.name,
                                 "kind": node.kind.to_string(),
-                                "file": node.file,
+                                "file": self.rel_path(&node.file),
                                 "centrality": centrality
                             })
                         })
@@ -1596,7 +1606,7 @@ impl McpServer {
                         json!({
                             "name": n.name,
                             "kind": n.kind.to_string(),
-                            "file": n.file
+                            "file": self.rel_path(&n.file)
                         })
                     })
                     .collect();
@@ -1669,7 +1679,7 @@ impl McpServer {
                                     "id": node.id,
                                     "name": node.name,
                                     "kind": node.kind.to_string(),
-                                    "file": node.file,
+                                    "file": self.rel_path(&node.file),
                                     "line_start": node.line_start,
                                     "line_end": node.line_end,
                                     "centrality": graph.centrality(idx)
@@ -1678,14 +1688,14 @@ impl McpServer {
                                 if include_callers {
                                     let callers = graph.get_callers(idx);
                                     detail["callers"] = json!(callers.iter().map(|n| {
-                                        json!({ "id": n.id, "name": n.name, "kind": n.kind.to_string(), "file": n.file })
+                                        json!({ "id": n.id, "name": n.name, "kind": n.kind.to_string(), "file": self.rel_path(&n.file) })
                                     }).collect::<Vec<_>>());
                                 }
 
                                 if include_callees {
                                     let callees = graph.get_callees(idx);
                                     detail["callees"] = json!(callees.iter().map(|n| {
-                                        json!({ "id": n.id, "name": n.name, "kind": n.kind.to_string(), "file": n.file })
+                                        json!({ "id": n.id, "name": n.name, "kind": n.kind.to_string(), "file": self.rel_path(&n.file) })
                                     }).collect::<Vec<_>>());
                                 }
 
@@ -2122,7 +2132,7 @@ impl McpServer {
                             "id": n.id,
                             "name": n.name,
                             "kind": n.kind.to_string(),
-                            "file": n.file
+                            "file": self.rel_path(&n.file)
                         })
                     })
                     .collect();
@@ -2137,7 +2147,7 @@ impl McpServer {
                                 "id": node.id,
                                 "name": node.name,
                                 "kind": node.kind.to_string(),
-                                "file": node.file,
+                                "file": self.rel_path(&node.file),
                                 "centrality": centrality
                             })
                         })

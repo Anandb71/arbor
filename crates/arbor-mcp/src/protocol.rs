@@ -34,8 +34,12 @@ pub fn parse_request_meta(params: &Value) -> RequestMeta {
     };
 
     RequestMeta {
+        // The 2026-07-28 protocol namespaces its stateless key
+        // (`io.modelcontextprotocol/protocolVersion`); flat keys stay as
+        // fallbacks for clients that already send them.
         protocol_version: meta
-            .get("protocolVersion")
+            .get("io.modelcontextprotocol/protocolVersion")
+            .or_else(|| meta.get("protocolVersion"))
             .or_else(|| meta.get("protocol_version"))
             .and_then(|v| v.as_str())
             .map(str::to_string),

@@ -39,6 +39,8 @@ accepted. (`extensions_are_narrowed_to_what_the_client_declared`,
 | `tasks/cancel` on an unknown task | handled, not `-32601` | `every_advertised_extension_has_a_real_method` |
 | Client disconnect / EOF | server exits cleanly | `client_disconnect_ends_the_server_cleanly` |
 | `resources/list` → `resources/read` | `ui://arbor/*` contents round-trip | `resources_list_and_read_round_trip` |
+| `_meta.io.modelcontextprotocol/protocolVersion` | namespaced key resolves the per-request protocol (flat keys kept as fallback) | `namespaced_protocol_meta_resolves_on_stateless_requests` |
+| node paths in tool output | project-relative (`src/lib.rs`), never absolute | `tool_responses_carry_project_relative_paths` |
 
 ## Transports
 
