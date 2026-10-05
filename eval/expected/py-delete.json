@@ -1,0 +1,17 @@
+{
+  "states": {
+    "before": {
+      "symbols": ["helper.py::assist", "helper.py::keep_me", "main.py::process"],
+      "edges_expected": [
+        ["main.py::process", "helper.py::assist"],
+        ["main.py::process", "helper.py::keep_me"]
+      ]
+    },
+    "after": {
+      "symbols": ["helper.py::keep_me", "main.py::process"],
+      "symbols_forbidden": ["helper.py::assist"],
+      "edges_expected": [["main.py::process", "helper.py::keep_me"]],
+      "edges_forbidden": [["main.py::process", "helper.py::assist"]]
+    }
+  }
+}

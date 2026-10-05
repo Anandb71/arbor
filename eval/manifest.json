@@ -1,11 +1,68 @@
 {
-  "version": 1,
-  "description": "Versioned evaluation corpus. expected/<name>.json is hand-audited truth for the fixture in corpus/<name>; known_missing/known_extra record the engine's current deltas so regressions fail and fixes must retire entries.",
+  "version": 2,
+  "description": "Versioned evaluation corpus. expected/<name>.json is hand-audited truth for the fixture in corpus/<name>; known_missing/known_extra record the engine's current deltas so regressions fail and fixes must retire entries. Fixtures with before/ and after/ subdirectories are controlled changes \u2014 each state is indexed and compared independently (renames, deletions, removed exports, base-only code).",
   "fixtures": [
-    { "name": "py-crossfile", "language": "python", "covers": "cross-file calls, callers, genexpr attribution" },
-    { "name": "py-alias", "language": "python", "covers": "import-alias resolution (currently a recorded miss)" },
-    { "name": "py-same-name", "language": "python", "covers": "same-name disambiguation via import filtering" },
-    { "name": "py-cycle", "language": "python", "covers": "cross-file cyclic calls" },
-    { "name": "mono-mixed", "language": "python", "covers": "monorepo layout, vendored dir, generated file" }
+    {
+      "name": "py-crossfile",
+      "language": "python",
+      "covers": "cross-file calls, callers, genexpr attribution"
+    },
+    {
+      "name": "py-alias",
+      "language": "python",
+      "covers": "import-alias resolution (currently a recorded miss)"
+    },
+    {
+      "name": "py-same-name",
+      "language": "python",
+      "covers": "same-name disambiguation via import filtering"
+    },
+    {
+      "name": "py-cycle",
+      "language": "python",
+      "covers": "cross-file cyclic calls"
+    },
+    {
+      "name": "mono-mixed",
+      "language": "python",
+      "covers": "monorepo layout, vendored dir, generated file"
+    },
+    {
+      "name": "py-rename",
+      "language": "python",
+      "states": [
+        "before",
+        "after"
+      ],
+      "covers": "file rename keeping symbol and re-attaching the cross-file edge"
+    },
+    {
+      "name": "py-delete",
+      "language": "python",
+      "states": [
+        "before",
+        "after"
+      ],
+      "covers": "function deleted from a surviving file; stale edge and symbol must vanish"
+    },
+    {
+      "name": "py-export-removed",
+      "language": "python",
+      "states": [
+        "before",
+        "after"
+      ],
+      "covers": "package re-export removed; stale edge is a recorded precision miss"
+    },
+    {
+      "name": "ts-crossfile",
+      "language": "typescript",
+      "covers": "named ES import and cross-file call resolution"
+    },
+    {
+      "name": "py-real-slice",
+      "language": "python",
+      "covers": "real repository code (pallets/itsdangerous exc+encoding+signer, BSD-3-Clause) with real cross-file calls"
+    }
   ]
 }
