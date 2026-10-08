@@ -88,7 +88,7 @@ cargo install arbor-graph-cli
 crates.io can lag the GitHub releases. Check with `cargo search arbor-graph-cli`; if it is behind the [latest release](https://github.com/Anandb71/arbor/releases/latest), build the release tag from source instead:
 
 ```bash
-cargo install --git https://github.com/Anandb71/arbor --tag v3.0.4 arbor-graph-cli
+cargo install --git https://github.com/Anandb71/arbor --tag v3.0.5 arbor-graph-cli
 ```
 
 Run `arbor --version` afterwards. An older `arbor` earlier on your `PATH` (for example in `~/.cargo/bin`) wins over a newer one elsewhere. The crates.io crate named plain `arbor` is an unrelated project.
