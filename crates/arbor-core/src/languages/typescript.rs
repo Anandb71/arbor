@@ -25,8 +25,36 @@ impl LanguageParser for TypeScriptParser {
         let mut nodes = Vec::new();
         let root = tree.root_node();
         extract_from_node(&root, source, file_path, &mut nodes, None);
+        distinguish_repeated_tests(&mut nodes, file_path);
         nodes
     }
+}
+
+/// Two tests in one file may share a title. Give each repeat its line, so
+/// ids stay distinct while a unique title keeps its plain name.
+fn distinguish_repeated_tests(nodes: &mut [CodeNode], file_path: &str) {
+    let mut seen = std::collections::HashMap::<String, usize>::new();
+    for node in nodes.iter() {
+        if is_test_block_name(&node.name) {
+            *seen.entry(node.qualified_name.clone()).or_default() += 1;
+        }
+    }
+    for node in nodes.iter_mut() {
+        if is_test_block_name(&node.name)
+            && seen
+                .get(&node.qualified_name)
+                .is_some_and(|count| *count > 1)
+        {
+            node.qualified_name = format!("{} (line {})", node.qualified_name, node.line_start);
+            node.id = CodeNode::compute_id(file_path, &node.qualified_name, node.kind);
+        }
+    }
+}
+
+fn is_test_block_name(name: &str) -> bool {
+    TEST_BLOCKS
+        .iter()
+        .any(|block| name == *block || name.starts_with(&format!("{block}: ")))
 }
 
 /// TSX, JSX and JavaScript: the same extraction on the grammar that parses JSX.
@@ -113,6 +141,15 @@ fn extract_from_node(
 
             "import_statement" => {
                 if let Some(code_node) = extract_import(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // A test or hook body is an anonymous callback, so without a node
+            // of its own its calls belonged to nothing and every Jest, Vitest
+            // and Mocha test was invisible to `callers` (#235).
+            "call_expression" => {
+                if let Some(code_node) = extract_test_block(node, source, file_path) {
                     nodes.push(code_node);
                 }
             }
@@ -217,6 +254,78 @@ fn extract_arrow_function(node: &Node, source: &str, file_path: &str) -> Option<
         }
     }
     None
+}
+
+/// Test and hook calls whose callback runs as a test. Containers such as
+/// `describe` are left out: their bodies hold the tests, which get nodes of
+/// their own, and counting both would report each test twice.
+const TEST_BLOCKS: &[&str] = &[
+    "it",
+    "test",
+    "specify",
+    "bench",
+    "beforeEach",
+    "afterEach",
+    "beforeAll",
+    "afterAll",
+    "before",
+    "after",
+];
+
+/// The test-runner function a call goes through: `it`, `it.only`,
+/// `test.skip`, or `test.each(rows)` all name a test block.
+fn test_callee(callee: &Node, source: &str) -> Option<&'static str> {
+    let mut current = *callee;
+    loop {
+        match current.kind() {
+            "identifier" => {
+                let name = get_text(&current, source);
+                return TEST_BLOCKS.iter().find(|block| **block == name).copied();
+            }
+            "member_expression" => current = current.child_by_field_name("object")?,
+            "call_expression" => current = current.child_by_field_name("function")?,
+            _ => return None,
+        }
+    }
+}
+
+/// `it("accepts two", () => { ... })` becomes a function named
+/// `it: accepts two` that owns the calls in its callback.
+fn extract_test_block(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
+    let callee = node.child_by_field_name("function")?;
+    let block = test_callee(&callee, source)?;
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut title = None;
+    let mut callback = None;
+    for i in 0..arguments.named_child_count() {
+        let argument = arguments.named_child(i)?;
+        match argument.kind() {
+            "string" | "template_string" if title.is_none() => {
+                let text = get_text(&argument, source);
+                let trimmed = text.trim_matches(|c| matches!(c, '"' | '\'' | '`'));
+                title = Some(trimmed.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+            "arrow_function" | "function" | "function_expression" => callback = Some(argument),
+            _ => {}
+        }
+    }
+    let callback = callback?;
+    let label = match title.filter(|title| !title.is_empty()) {
+        Some(title) => {
+            let title: String = title.chars().take(80).collect();
+            format!("{block}: {title}")
+        }
+        None => block.to_string(),
+    };
+    let line = node.start_position().row as u32 + 1;
+    Some(
+        CodeNode::new(&label, &label, NodeKind::Function, file_path)
+            .with_lines(line, node.end_position().row as u32 + 1)
+            .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
+            .with_column(callee.start_position().column as u32)
+            .with_visibility(Visibility::Private)
+            .with_references(extract_call_references(&callback, source)),
+    )
 }
 
 fn extract_class(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
@@ -802,5 +911,131 @@ mod callee_tests {
     #[test]
     fn trailing_dot_is_not_a_method() {
         assert_eq!(classify_callee("obj."), None);
+    }
+}
+
+#[cfg(test)]
+mod test_block_tests {
+    use super::TypeScriptParser;
+    use crate::languages::LanguageParser;
+    use crate::node::{CodeNode, NodeKind};
+
+    fn parse(source: &str, file: &str) -> Vec<CodeNode> {
+        let parser = TypeScriptParser;
+        let mut ts = tree_sitter::Parser::new();
+        ts.set_language(&parser.language()).unwrap();
+        let tree = ts.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{file} did not parse cleanly"
+        );
+        parser.extract_nodes(&tree, source, file)
+    }
+
+    fn block<'a>(nodes: &'a [CodeNode], name: &str) -> &'a CodeNode {
+        nodes
+            .iter()
+            .find(|node| node.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name} missing: {:?}",
+                    nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+                )
+            })
+    }
+
+    /// The repro from #235: calls inside `it` and `test` callbacks belong to the test.
+    #[test]
+    fn calls_inside_test_callbacks_belong_to_the_test() {
+        let source = r#"
+import { decide } from './policy';
+
+describe('decide', () => {
+  it('accepts two', () => {
+    expect(decide(2)).toBe(true);
+  });
+});
+
+test('rejects zero', function () {
+  expect(decide(0)).toBe(false);
+});
+
+function namedHelper() {
+  return decide(5);
+}
+"#;
+        let nodes = parse(source, "src/policy.test.ts");
+        let accepts = block(&nodes, "it: accepts two");
+        assert_eq!(accepts.kind, NodeKind::Function);
+        assert!(
+            accepts.references.contains(&"decide".to_string()),
+            "{:?}",
+            accepts.references
+        );
+        assert_eq!(accepts.line_start, 5);
+        let rejects = block(&nodes, "test: rejects zero");
+        assert!(rejects.references.contains(&"decide".to_string()));
+        assert!(block(&nodes, "namedHelper")
+            .references
+            .contains(&"decide".to_string()));
+        // `describe` holds tests; it is not a test itself.
+        assert!(nodes.iter().all(|node| !node.name.starts_with("describe")));
+    }
+
+    #[test]
+    fn runner_variants_hooks_and_repeated_titles_are_distinct_tests() {
+        let source = r#"
+beforeEach(() => { resetDatabase(); });
+it.only('works', async () => { await load(); });
+test.skip('works', () => { load(); });
+test.each([[1], [2]])('handles %i', (n) => { handle(n); });
+it(`template ${name}`, () => { render(); });
+it('has no callback');
+it('works', () => { again(); });
+"#;
+        let nodes = parse(source, "src/a.test.ts");
+        assert!(block(&nodes, "beforeEach")
+            .references
+            .contains(&"resetDatabase".to_string()));
+        // `it.only('works')` and `it('works')` share a name; `test.skip('works')` doesn't.
+        let works: Vec<_> = nodes
+            .iter()
+            .filter(|node| node.name == "it: works")
+            .collect();
+        assert_eq!(works.len(), 2);
+        assert_ne!(
+            works[0].id, works[1].id,
+            "same title on different lines keeps distinct ids"
+        );
+        assert_eq!(works[0].qualified_name, "it: works (line 3)");
+        assert_eq!(works[1].qualified_name, "it: works (line 8)");
+        assert_eq!(block(&nodes, "test: works").qualified_name, "test: works");
+        assert_eq!(
+            block(&nodes, "beforeEach").qualified_name,
+            "beforeEach",
+            "a unique test keeps its plain name"
+        );
+        assert!(block(&nodes, "test: handles %i")
+            .references
+            .contains(&"handle".to_string()));
+        assert!(block(&nodes, "it: template ${name}")
+            .references
+            .contains(&"render".to_string()));
+        assert!(
+            nodes.iter().all(|node| node.name != "it: has no callback"),
+            "a call without a callback runs nothing"
+        );
+    }
+
+    #[test]
+    fn ordinary_calls_with_callbacks_are_not_tests() {
+        let source =
+            "items.forEach((item) => { use(item); });\nsetTimeout(() => { tick(); }, 10);\n";
+        let nodes = parse(source, "src/a.ts");
+        assert!(
+            nodes.is_empty(),
+            "{:?}",
+            nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
     }
 }
