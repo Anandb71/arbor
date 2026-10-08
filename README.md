@@ -28,7 +28,7 @@
   <sub>Simulated replay — the <code>arbor</code> commands and their output are real (tokio @ 178k LOC). Methodology: <a href="docs/BENCHMARKS.md">BENCHMARKS.md</a></sub>
 </p>
 
-> **v3.0.4** · `arbor diff` counts only the symbols your change edits, ranked by how many callers each has, and impact comes from callers alone. Rust calls on method receivers (`draft.run_started()`) resolve through the receiver's type, `arbor doctor` and the installers catch an older `arbor` hiding on PATH, and one-shot commands stay quiet. [Release notes](docs/RELEASE_NOTES_v3.0.4.md)
+> **v3.0.5** · Tests in TypeScript and JavaScript count: calls inside `describe`/`it`/`test` callbacks now belong to the test, so `arbor callers`, `diff` and `check` see Jest, Vitest and Mocha tests. MCP tool output uses project-relative paths. [Release notes](docs/RELEASE_NOTES_v3.0.5.md)
 
 ---
 
@@ -49,23 +49,17 @@ Where the graph is *unsure*, it says so — edges carry a confidence, and ambigu
 
 ---
 
-## What's new in v3.0.4
+## What's new in v3.0.5
 
-A fix release, from a review that checked Arbor's answers on a real Tauri app
-by hand. Every item ships with a regression test.
+A fix release: tests written in TypeScript and JavaScript now count.
 
 | Fix | What was wrong |
 |-----|----------------|
-| **`arbor diff` counts what you edited** | Editing a method also counted the class or `mod` around it, comment and attribute lines counted as code, and impact included everything the edited code calls. On a 3-file pull request with two edited functions, 3.0.3 reported 6 modified symbols and 58 impacted nodes; 3.0.4 reports 2 and 13. |
-| **Named symbols** | The report gave counts only. `diff` and `check` now list each modified symbol with its file, line and caller count, most-called first. |
-| **Rust method receivers** | `draft.run_started()` was dropped when several types defined `run_started`, so `arbor callers` showed none. The receiver's type is read from parameters, `let`s, `match` arms, fields and return types, across files. |
-| **Shadowed installs** | An old `arbor` earlier on PATH silently answered instead of the new one. `arbor doctor` and the installers now say so and how to remove it. |
-| **Quiet by default** | One-shot commands log warnings only; `-v` shows more. |
-| **Older Linux** | Linux binaries need glibc 2.28, not 2.39. |
+| **Jest, Vitest and Mocha tests are callers** | Calls inside `describe`/`it`/`test` callbacks belonged to no symbol, so `arbor callers` missed every test and `diff`/`check` reported that nothing tested a change. Each test and hook is now a function named after it, such as `it: accepts two`, that owns the calls in its callback. On the repro in #235, `arbor callers decide` went from 2 callers to 4. |
+| **Project-relative MCP paths** | Tool output could include absolute paths from your machine. Every file path is now relative to the project, and the namespaced `io.modelcontextprotocol/protocolVersion` request key is read first. |
 
-Also: clearer first-run errors, `arbor hook claude` never replaces a file it
-can't read, MCP protocol fixes, origin checks on the WebSocket servers, and
-signed provenance for every download. Cached graphs rebuild once on first use.
+Cached graphs rebuild once on first use (`extract-4`). See the
+[3.0.4 release notes](docs/RELEASE_NOTES_v3.0.4.md) for the previous release.
 
 <details>
 <summary><strong>v3.0.3</strong> (Rust calls through paths and macros, per-symbol diff, <code>--base</code>)</summary>
@@ -377,7 +371,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: Anandb71/arbor@v3.0.4
+      - uses: Anandb71/arbor@v3.0.5
         with:
           command: check . --max-blast-radius 30 --markdown
           comment-on-pr: true
