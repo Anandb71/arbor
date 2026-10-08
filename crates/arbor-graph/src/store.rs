@@ -10,11 +10,12 @@ use thiserror::Error;
 /// to what the parsers extract must invalidate it too, not only a release:
 /// bump `extract-N` whenever extracted nodes or references change shape.
 /// (Revision 2: Rust calls are normalized to `module::fn` / `Type::fn` /
-/// `self.m` / `.m`, and calls inside macros are recorded.)
+/// `self.m` / `.m`, and calls inside macros are recorded. Revision 4: TS/JS
+/// test and hook callbacks become `it: <title>` nodes that own their calls.)
 ///
 /// The CLI also stamps saved graphs with it, so a graph built by a different
 /// extractor is rebuilt rather than reused after an upgrade.
-pub const CACHE_VERSION: &str = concat!("arbor-", env!("CARGO_PKG_VERSION"), "+extract-3");
+pub const CACHE_VERSION: &str = concat!("arbor-", env!("CARGO_PKG_VERSION"), "+extract-4");
 
 #[derive(Error, Debug)]
 pub enum StoreError {

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Tests in TypeScript and JavaScript were invisible (#235):** calls inside `describe`/`it`/`test` callbacks belonged to no symbol, so `arbor callers` missed every Jest, Vitest and Mocha test and `diff`/`check` reported changes as having no tests exercising them. Each `it`, `test`, `specify` and `bench` call, and each `beforeEach`/`afterEach`/`beforeAll`/`afterAll`/`before`/`after` hook, is now a function named after the test, such as `it: accepts two`, that owns the calls in its callback. `.only`, `.skip` and `test.each(rows)(...)` are included; `describe` blocks are containers and get no node of their own. A title repeated in one file gets its line, such as `it: works (line 8)`. Indexes rebuild once (`extract-4`).
+
 ## [3.0.4] - 2026-10-03
 
 A fix release. See [docs/RELEASE_NOTES_v3.0.4.md](docs/RELEASE_NOTES_v3.0.4.md).
