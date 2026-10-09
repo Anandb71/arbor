@@ -6,10 +6,10 @@
 
 use crate::edge::{Edge, EdgeKind};
 use crate::graph::{ArborGraph, NodeId};
-use crate::symbol_table::SymbolTable;
+use crate::symbol_table::{Resolution, SymbolTable};
 use arbor_core::{
-    clean_type_name, field_type_ref, return_type_ref, type_relation_ref, typed_receiver, CodeNode,
-    NodeKind, TypeRelationKind,
+    clean_type_name, field_type_ref, import_alias, return_type_ref, type_relation_ref,
+    typed_receiver, CodeNode, NodeKind, TypeRelationKind,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -70,6 +70,15 @@ pub struct GraphBuilder {
     /// those calls at parse time, this is reserved for future use when we add
     /// a richer call-site representation.
     namespace_imports: HashMap<String, HashMap<String, String>>,
+
+    /// Aliased imports: file → local name → the name the module defines.
+    ///
+    /// Example:
+    ///   `from money import money_to_minor_units as to_minor`
+    ///   → import_aliases["orders.py"]["to_minor"] = "money_to_minor_units"
+    ///
+    /// The module is in `import_map` under the same local name.
+    import_aliases: HashMap<String, HashMap<String, String>>,
 }
 
 impl Default for GraphBuilder {
@@ -86,6 +95,7 @@ impl GraphBuilder {
             name_to_id: HashMap::new(),
             import_map: HashMap::new(),
             namespace_imports: HashMap::new(),
+            import_aliases: HashMap::new(),
         }
     }
 
@@ -111,12 +121,27 @@ impl GraphBuilder {
                             .entry(file.clone())
                             .or_default()
                             .insert(alias.to_string(), module.clone());
+                    } else if let Some((local, imported)) = import_alias(imported_name) {
+                        // `from money import money_to_minor_units as to_minor`:
+                        // calls use `to_minor`, the module defines the other.
+                        self.import_map
+                            .entry(file.clone())
+                            .or_default()
+                            .insert(local.to_string(), module.clone());
+                        self.import_aliases
+                            .entry(file.clone())
+                            .or_default()
+                            .insert(local.to_string(), imported.to_string());
                     } else {
                         // `import { name } from 'module'` or `import DefaultName from 'module'`
                         self.import_map
                             .entry(file.clone())
                             .or_default()
                             .insert(imported_name.clone(), module.clone());
+                        // A later plain import of the same name rebinds it.
+                        if let Some(aliases) = self.import_aliases.get_mut(&file) {
+                            aliases.remove(imported_name);
+                        }
                     }
                 }
                 // Import nodes are intentionally NOT added to the graph.
@@ -227,14 +252,27 @@ impl GraphBuilder {
                 // falls through to SameDir and attaches the edge to whichever
                 // definition happens to sit in the caller's own directory.
                 let file_imports = self.import_map.get(&from_file_str);
+                // `to_minor()` after `from money import money_to_minor_units
+                // as to_minor` calls money's function. Nothing is named
+                // `to_minor`, so looking it up finds nothing, or a same-named
+                // function in another module.
+                let alias = if receiver_unknown {
+                    None
+                } else {
+                    self.resolve_alias(lookup, &from_file, &from_file_str)
+                };
                 // `jobs::enqueue` / `Provider::new` name where the definition
                 // lives; matching only the last segment would drop the call or
                 // bind it to a same-named function in the wrong module.
-                let resolution = if !receiver_unknown && lookup.contains("::") {
-                    self.symbol_table.resolve_path(lookup, &from_file)
-                } else {
-                    self.symbol_table
-                        .resolve_ref_with_imports(lookup, &from_file, file_imports)
+                let resolution = match alias {
+                    Some(resolution) => resolution,
+                    None if !receiver_unknown && lookup.contains("::") => {
+                        self.symbol_table.resolve_path(lookup, &from_file)
+                    }
+                    None => {
+                        self.symbol_table
+                            .resolve_ref_with_imports(lookup, &from_file, file_imports)
+                    }
                 };
 
                 if !resolution.is_resolved() {
@@ -328,6 +366,31 @@ impl GraphBuilder {
                 Edge::new(EdgeKind::Calls).with_confidence(confidence),
             );
         }
+    }
+
+    /// Resolves `reference` through the caller file's aliased import of it.
+    ///
+    /// `None` when the name is not an alias there, or when the caller's own
+    /// file defines it: a local definition shadows an import, aliased or not.
+    fn resolve_alias(
+        &self,
+        reference: &str,
+        from_file: &Path,
+        from_file_str: &str,
+    ) -> Option<Resolution> {
+        let imported = self.import_aliases.get(from_file_str)?.get(reference)?;
+        let module = self.import_map.get(from_file_str)?.get(reference)?;
+        let defined_here = self
+            .symbol_table
+            .get_file_exports(&from_file.to_path_buf())
+            .is_some_and(|fqns| fqns.iter().any(|fqn| fqn == reference));
+        if defined_here {
+            return None;
+        }
+        Some(
+            self.symbol_table
+                .resolve_imported(imported, module, from_file),
+        )
     }
 
     /// Downgrades (rather than drops) an edge whose name is not imported.
@@ -1184,6 +1247,74 @@ mod tests {
                 .and_then(|m| m.get("types")),
             Some(&"@babel/types".to_string())
         );
+    }
+
+    #[test]
+    fn test_alias_import_map() {
+        let mut builder = GraphBuilder::new();
+        let import_node = CodeNode::new("money", "money", NodeKind::Import, "orders.py")
+            .with_references(vec!["alias:to_minor:money_to_minor_units".to_string()]);
+        builder.add_nodes(vec![import_node]);
+        assert_eq!(
+            builder
+                .import_map
+                .get("orders.py")
+                .and_then(|m| m.get("to_minor")),
+            Some(&"money".to_string())
+        );
+        assert_eq!(
+            builder
+                .import_aliases
+                .get("orders.py")
+                .and_then(|m| m.get("to_minor")),
+            Some(&"money_to_minor_units".to_string())
+        );
+    }
+
+    #[test]
+    fn aliased_call_reaches_the_imported_name_with_import_confidence() {
+        let mut builder = GraphBuilder::new();
+        let import = CodeNode::new("money", "money", NodeKind::Import, "orders.py")
+            .with_references(vec!["alias:to_minor:money_to_minor_units".to_string()]);
+        let caller = CodeNode::new(
+            "total_cents",
+            "total_cents",
+            NodeKind::Function,
+            "orders.py",
+        )
+        .with_references(vec!["to_minor".to_string()]);
+        let callee = CodeNode::new(
+            "money_to_minor_units",
+            "money_to_minor_units",
+            NodeKind::Function,
+            "money.py",
+        );
+        builder.add_nodes(vec![import, caller, callee]);
+        let graph = builder.build();
+        assert!(
+            only_edge_confidence(&graph) >= 0.95,
+            "an aliased import is as strong as an unaliased one"
+        );
+    }
+
+    /// `from a import x as y` then `from b import y`: the last binding wins.
+    #[test]
+    fn a_plain_import_rebinds_an_earlier_alias() {
+        let mut builder = GraphBuilder::new();
+        let aliased = CodeNode::new("a", "a", NodeKind::Import, "main.py")
+            .with_references(vec!["alias:y:x".to_string()]);
+        let plain = CodeNode::new("b", "b", NodeKind::Import, "main.py")
+            .with_references(vec!["y".to_string()]);
+        let caller = CodeNode::new("run", "run", NodeKind::Function, "main.py")
+            .with_references(vec!["y".to_string()]);
+        let x = CodeNode::new("x", "x", NodeKind::Function, "a.py");
+        let y = CodeNode::new("y", "y", NodeKind::Function, "b.py");
+        builder.add_nodes(vec![aliased, plain, caller, x, y]);
+        let graph = builder.build();
+        let edges = graph.export_edges();
+        assert_eq!(edges.len(), 1, "{edges:?}");
+        let target = graph.get_index(&edges[0].target).expect("target");
+        assert_eq!(graph.get(target).unwrap().file, "b.py");
     }
 
     #[test]

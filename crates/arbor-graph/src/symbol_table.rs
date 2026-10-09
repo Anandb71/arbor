@@ -326,6 +326,50 @@ impl SymbolTable {
         Resolution::Ambiguous(candidates.into_iter().map(|e| e.id).collect())
     }
 
+    /// Resolves `name` imported from `module` under another name
+    /// (`from money import money_to_minor_units as to_minor`).
+    ///
+    /// The import says where the definition lives, so only definitions of
+    /// `name` in that module are candidates: the module's own file first, then
+    /// anything inside a package of that name. A same-named function elsewhere
+    /// is not the target, and a module this project doesn't define (`numpy`)
+    /// leaves the call unresolved. A relative import of the package itself
+    /// (`from . import f as g`) names no module, so every definition is a
+    /// candidate and the caller's directory breaks ties.
+    ///
+    /// An import binds a module-level name, so `name` is matched exactly and a
+    /// method (`Class.name`) is never a candidate. Neither is the importing
+    /// file: in a wrapper that keeps the imported function's name
+    /// (`from money import f as _f` then `def f(): _f()`), `_f` is money's.
+    pub fn resolve_imported(&self, name: &str, module: &str, context_file: &Path) -> Resolution {
+        let family = language_family(context_file);
+        let defined: Vec<&SymbolEntry> = self
+            .by_fqn
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|e| same_family(family, &e.file) && e.file != context_file)
+            .collect();
+
+        let wanted = normalize_module_path(module);
+        if wanted.is_empty() {
+            return pick(defined, context_file, Resolution::UniqueSuffix);
+        }
+        let in_module: Vec<&SymbolEntry> = defined
+            .iter()
+            .copied()
+            .filter(|e| module_is(e, &wanted))
+            .collect();
+        if !in_module.is_empty() {
+            return pick(in_module, context_file, Resolution::ViaImport);
+        }
+        let in_package: Vec<&SymbolEntry> = defined
+            .into_iter()
+            .filter(|e| entry_belongs_to_module(e, &wanted))
+            .collect();
+        pick(in_package, context_file, Resolution::ViaImport)
+    }
+
     /// Resolves a `::` path reference: `jobs::enqueue`, `Provider::new`,
     /// `crate::db::queries::get_user`, `my_app::app::create`.
     ///
@@ -899,5 +943,94 @@ mod import_resolution_tests {
         assert!(segment_aligned_contains("x.deep.l0.m14", "deep.l0.m14"));
         assert!(!segment_aligned_contains("x.deep.l0.m140", "deep.l0.m14"));
         assert!(!segment_aligned_contains("x.deep.l0.m1", "deep.l0.m14"));
+    }
+
+    fn money_table() -> SymbolTable {
+        let mut table = SymbolTable::default();
+        table.insert(
+            "convert".to_string(),
+            nid(0),
+            PathBuf::from("billing/money.py"),
+        );
+        table.insert(
+            "convert".to_string(),
+            nid(1),
+            PathBuf::from("legacy/money.py"),
+        );
+        table.insert(
+            "convert".to_string(),
+            nid(2),
+            PathBuf::from("payments/rates/convert_impl.py"),
+        );
+        table.insert(
+            "Ledger.convert".to_string(),
+            nid(3),
+            PathBuf::from("ledger.py"),
+        );
+        table
+    }
+
+    #[test]
+    fn an_aliased_import_resolves_in_the_named_module_only() {
+        let table = money_table();
+        let caller = Path::new("app/orders.py");
+        assert_eq!(
+            table.resolve_imported("convert", "billing.money", caller),
+            Resolution::ViaImport(nid(0))
+        );
+        assert_eq!(
+            table.resolve_imported("convert", "legacy.money", caller),
+            Resolution::ViaImport(nid(1))
+        );
+    }
+
+    /// `from payments import convert as c`, where `payments/__init__.py`
+    /// re-exports it from a submodule.
+    #[test]
+    fn an_aliased_import_from_a_package_reaches_its_submodule() {
+        let table = money_table();
+        assert_eq!(
+            table.resolve_imported("convert", "payments", Path::new("app/orders.py")),
+            Resolution::ViaImport(nid(2))
+        );
+    }
+
+    #[test]
+    fn an_aliased_import_from_an_external_module_is_unresolved() {
+        let table = money_table();
+        assert_eq!(
+            table.resolve_imported("convert", "numpy", Path::new("app/orders.py")),
+            Resolution::Unresolved
+        );
+    }
+
+    /// `from . import convert as c` names no module: the caller's directory
+    /// decides, and the caller itself is never the import.
+    #[test]
+    fn a_relative_package_alias_prefers_the_callers_directory() {
+        let table = money_table();
+        assert_eq!(
+            table.resolve_imported("convert", ".", Path::new("legacy/orders.py")),
+            Resolution::SameDir(nid(1))
+        );
+        assert_eq!(
+            table.resolve_imported("convert", ".", Path::new("legacy/money.py")),
+            Resolution::Ambiguous(vec![nid(0), nid(2)])
+        );
+    }
+
+    #[test]
+    fn methods_and_other_languages_are_not_imported_names() {
+        let mut table = SymbolTable::default();
+        table.insert(
+            "Ledger.convert".to_string(),
+            nid(0),
+            PathBuf::from("money.py"),
+        );
+        table.insert("convert".to_string(), nid(1), PathBuf::from("money.ts"));
+        assert_eq!(
+            table.resolve_imported("convert", "money", Path::new("orders.py")),
+            Resolution::Unresolved
+        );
     }
 }
