@@ -13,6 +13,11 @@
       "covers": "import-alias resolution (from X import Y as Z)"
     },
     {
+      "name": "py-alias-shadow",
+      "language": "python",
+      "covers": "alias named like another project function; same imported name in two modules"
+    },
+    {
       "name": "py-same-name",
       "language": "python",
       "covers": "same-name disambiguation via import filtering"
