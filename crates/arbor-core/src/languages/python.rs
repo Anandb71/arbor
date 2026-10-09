@@ -4,7 +4,7 @@
 //! straightforward with clear function and class boundaries.
 
 use crate::languages::LanguageParser;
-use crate::node::{CodeNode, NodeKind, Visibility};
+use crate::node::{import_alias_ref, CodeNode, NodeKind, Visibility};
 use tree_sitter::{Language, Node, Tree};
 
 pub struct PythonParser;
@@ -211,6 +211,8 @@ fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode
 /// Examples:
 ///   `from django.http import HttpResponse` → references: ["HttpResponse"]
 ///   `from .utils import helper, format_output` → references: ["helper", "format_output"]
+///   `from money import money_to_minor_units as to_minor`
+///     → references: ["alias:to_minor:money_to_minor_units"]
 ///   `from typing import *` → references: ["*"]
 fn extract_from_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
     let module_node = node.child_by_field_name("module_name")?;
@@ -240,17 +242,9 @@ fn extract_from_import(node: &Node, source: &str, file_path: &str) -> Option<Cod
                 "dotted_name" | "identifier" => {
                     imported_names.push(child_text);
                 }
-                // `from X import Y as Z` — use the local name Z
+                // `from X import Y as Z`
                 "aliased_import" => {
-                    let local = child
-                        .child_by_field_name("alias")
-                        .map(|n| get_text(&n, source))
-                        .or_else(|| {
-                            child
-                                .child_by_field_name("name")
-                                .map(|n| get_text(&n, source))
-                        });
-                    if let Some(name) = local {
+                    if let Some(name) = aliased_import(&child, source) {
                         imported_names.push(name);
                     }
                 }
@@ -263,14 +257,7 @@ fn extract_from_import(node: &Node, source: &str, file_path: &str) -> Option<Cod
                                     imported_names.push(get_text(&item, source));
                                 }
                                 "aliased_import" => {
-                                    let local = item
-                                        .child_by_field_name("alias")
-                                        .map(|n| get_text(&n, source))
-                                        .or_else(|| {
-                                            item.child_by_field_name("name")
-                                                .map(|n| get_text(&n, source))
-                                        });
-                                    if let Some(name) = local {
+                                    if let Some(name) = aliased_import(&item, source) {
                                         imported_names.push(name);
                                     }
                                 }
@@ -293,6 +280,23 @@ fn extract_from_import(node: &Node, source: &str, file_path: &str) -> Option<Cod
             .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
             .with_references(imported_names),
     )
+}
+
+/// `Y as Z` in `from X import Y as Z`: calls use `Z`, and `X` defines `Y`,
+/// so both are recorded (`alias:Z:Y`). `Y as Y` is a plain import.
+fn aliased_import(node: &Node, source: &str) -> Option<String> {
+    let imported = node
+        .child_by_field_name("name")
+        .map(|n| get_text(&n, source));
+    let local = node
+        .child_by_field_name("alias")
+        .map(|n| get_text(&n, source));
+    match (local, imported) {
+        (Some(local), Some(imported)) if local != imported => {
+            Some(import_alias_ref(&local, &imported))
+        }
+        (local, imported) => local.or(imported),
+    }
 }
 
 fn extract_assignment(node: Node, source: &str, file_path: &str) -> Option<CodeNode> {
@@ -559,6 +563,52 @@ class Leaf(Derived):
         let b = refs.iter().position(|r| r == "extends:B").unwrap();
         let c = refs.iter().position(|r| r == "extends:C").unwrap();
         assert!(b < c);
+    }
+
+    fn import_refs(source: &str) -> Vec<(String, Vec<String>)> {
+        parse(source)
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Import)
+            .map(|n| (n.name, n.references))
+            .collect()
+    }
+
+    /// #258: the local name alone lost what the module defines.
+    #[test]
+    fn aliased_imports_keep_the_imported_name() {
+        let refs = import_refs(
+            "\
+from money import money_to_minor_units as to_minor
+from billing.money import scale as s, rate
+from .money import (
+    convert as to_cents,
+    round_half as half,
+)
+from money import fmt as fmt
+",
+        );
+        assert_eq!(
+            refs,
+            vec![
+                (
+                    "money".to_string(),
+                    vec!["alias:to_minor:money_to_minor_units".to_string()]
+                ),
+                (
+                    "billing.money".to_string(),
+                    vec!["alias:s:scale".to_string(), "rate".to_string()]
+                ),
+                (
+                    ".money".to_string(),
+                    vec![
+                        "alias:to_cents:convert".to_string(),
+                        "alias:half:round_half".to_string()
+                    ]
+                ),
+                // `fmt as fmt` binds the imported name itself.
+                ("money".to_string(), vec!["fmt".to_string()]),
+            ]
+        );
     }
 
     #[test]
