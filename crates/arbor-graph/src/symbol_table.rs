@@ -333,9 +333,12 @@ impl SymbolTable {
     /// `name` in that module are candidates: the module's own file first, then
     /// anything inside a package of that name. A same-named function elsewhere
     /// is not the target, and a module this project doesn't define (`numpy`)
-    /// leaves the call unresolved. A relative import of the package itself
-    /// (`from . import f as g`) names no module, so every definition is a
-    /// candidate and the caller's directory breaks ties.
+    /// leaves the call unresolved.
+    ///
+    /// A relative module (`./format`, `../route`, `.money`, `..core.money`)
+    /// names one place, read from the importing file's directory, so a
+    /// same-named file elsewhere (every `route.ts` in a Next.js app) is never a
+    /// candidate.
     ///
     /// An import binds a module-level name, so `name` is matched exactly and a
     /// method (`Class.name`) is never a candidate. Neither is the importing
@@ -351,9 +354,31 @@ impl SymbolTable {
             .filter(|e| same_family(family, &e.file) && e.file != context_file)
             .collect();
 
+        if module.starts_with('.') {
+            let Some(target) = relative_module_path(module, context_file) else {
+                return Resolution::Unresolved;
+            };
+            let in_module: Vec<&SymbolEntry> = defined
+                .iter()
+                .copied()
+                .filter(|e| is_module_file(&e.file, &target))
+                .collect();
+            if !in_module.is_empty() {
+                return pick(in_module, context_file, Resolution::ViaImport);
+            }
+            if target.as_os_str().is_empty() {
+                return Resolution::Unresolved;
+            }
+            let in_package: Vec<&SymbolEntry> = defined
+                .into_iter()
+                .filter(|e| e.file.starts_with(&target))
+                .collect();
+            return pick(in_package, context_file, Resolution::ViaImport);
+        }
+
         let wanted = normalize_module_path(module);
         if wanted.is_empty() {
-            return pick(defined, context_file, Resolution::UniqueSuffix);
+            return Resolution::Unresolved;
         }
         let in_module: Vec<&SymbolEntry> = defined
             .iter()
@@ -504,6 +529,59 @@ fn normalize_module_path(raw: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// The path, without extension, that a relative import names, read from the
+/// importing file's directory: `./format` and `../route` in TypeScript and
+/// JavaScript, `.money` and `..core.money` in Python (one dot is the
+/// importing file's package, each further dot its parent). `None` when the
+/// import climbs out of the tree.
+fn relative_module_path(module: &str, context_file: &Path) -> Option<PathBuf> {
+    let mut path = context_file.parent()?.to_path_buf();
+    if module.contains('/') {
+        for segment in module.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    if !path.pop() {
+                        return None;
+                    }
+                }
+                name => path.push(name),
+            }
+        }
+        // `./format.js` names `format.ts` under TypeScript's ESM resolution.
+        if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts")
+        ) {
+            path.set_extension("");
+        }
+        return Some(path);
+    }
+
+    let rest = module.strip_prefix('.')?;
+    let name = rest.trim_start_matches('.');
+    for _ in 0..rest.len() - name.len() {
+        if !path.pop() {
+            return None;
+        }
+    }
+    for segment in name.split('.').filter(|s| !s.is_empty()) {
+        path.push(segment);
+    }
+    Some(path)
+}
+
+/// Is `file` the module at `target`: `target.ts` / `target.py`, or the
+/// package's own `index` / `__init__` file?
+fn is_module_file(file: &Path, target: &Path) -> bool {
+    file.with_extension("").as_path() == target
+        || (file.parent() == Some(target)
+            && matches!(
+                file.file_stem().and_then(|s| s.to_str()),
+                Some("index" | "__init__")
+            ))
 }
 
 /// Picks among entries that all match the reference equally well: one is
@@ -1004,18 +1082,72 @@ mod import_resolution_tests {
         );
     }
 
-    /// `from . import convert as c` names no module: the caller's directory
-    /// decides, and the caller itself is never the import.
+    /// Relative Python modules are read from the importing file's package.
+    /// The importing file itself is never the import.
     #[test]
-    fn a_relative_package_alias_prefers_the_callers_directory() {
+    fn a_relative_python_alias_is_read_from_the_importing_package() {
         let table = money_table();
         assert_eq!(
             table.resolve_imported("convert", ".", Path::new("legacy/orders.py")),
-            Resolution::SameDir(nid(1))
+            Resolution::ViaImport(nid(1))
+        );
+        assert_eq!(
+            table.resolve_imported("convert", ".money", Path::new("billing/orders.py")),
+            Resolution::ViaImport(nid(0))
+        );
+        assert_eq!(
+            table.resolve_imported("convert", "..money", Path::new("billing/api/orders.py")),
+            Resolution::ViaImport(nid(0))
         );
         assert_eq!(
             table.resolve_imported("convert", ".", Path::new("legacy/money.py")),
-            Resolution::Ambiguous(vec![nid(0), nid(2)])
+            Resolution::Unresolved
+        );
+        // `shop/money.py` does not exist; `billing` and `legacy` are not it.
+        assert_eq!(
+            table.resolve_imported("convert", ".money", Path::new("shop/orders.py")),
+            Resolution::Unresolved
+        );
+    }
+
+    #[test]
+    fn a_relative_typescript_alias_is_read_from_the_importing_directory() {
+        let mut table = SymbolTable::default();
+        table.insert(
+            "convert".to_string(),
+            nid(0),
+            PathBuf::from("src/format.ts"),
+        );
+        table.insert(
+            "convert".to_string(),
+            nid(1),
+            PathBuf::from("lib/format.ts"),
+        );
+        table.insert(
+            "convert".to_string(),
+            nid(2),
+            PathBuf::from("src/utils/index.ts"),
+        );
+        let caller = Path::new("src/app.ts");
+        assert_eq!(
+            table.resolve_imported("convert", "./format", caller),
+            Resolution::ViaImport(nid(0))
+        );
+        assert_eq!(
+            table.resolve_imported("convert", "../lib/format.js", caller),
+            Resolution::ViaImport(nid(1))
+        );
+        assert_eq!(
+            table.resolve_imported("convert", "./utils", caller),
+            Resolution::ViaImport(nid(2))
+        );
+        assert_eq!(
+            table.resolve_imported("convert", "./missing", caller),
+            Resolution::Unresolved
+        );
+        assert_eq!(
+            table.resolve_imported("convert", "../../../format", caller),
+            Resolution::Unresolved
         );
     }
 
