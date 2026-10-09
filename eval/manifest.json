@@ -18,6 +18,11 @@
       "covers": "alias named like another project function; same imported name in two modules"
     },
     {
+      "name": "py-alias-dotted",
+      "language": "python",
+      "covers": "aliases from a dotted module (pkg.mod) and a relative module (.mod)"
+    },
+    {
       "name": "py-same-name",
       "language": "python",
       "covers": "same-name disambiguation via import filtering"
