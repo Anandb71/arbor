@@ -70,6 +70,11 @@
       "covers": "named ES import and cross-file call resolution"
     },
     {
+      "name": "ts-alias",
+      "language": "typescript",
+      "covers": "aliased named import (import { X as Y }) named like another project function"
+    },
+    {
       "name": "py-real-slice",
       "language": "python",
       "covers": "real repository code (pallets/itsdangerous exc+encoding+signer, BSD-3-Clause) with real cross-file calls"
