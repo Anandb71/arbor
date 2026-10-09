@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- **Calls through aliased imports (#258):** after `from money import money_to_minor_units as to_minor`, a call to `to_minor()` recorded no edge, because the import kept only the local name. When another file defined a function named like the alias, the call was bound to that function at full confidence instead. Python's `from X import Y as Z` and TypeScript and JavaScript's `import { Y as Z }` now record the imported name, so the call reaches `Y` in the module the import names, including dotted (`pkg.mod`) and relative (`.mod`) modules. An alias imported from a module outside the project links nothing, and a function the caller's own file defines under the alias name still wins. Indexes rebuild once (`extract-5`).
+- **Calls through aliased imports (#258):** after `from money import money_to_minor_units as to_minor`, a call to `to_minor()` recorded no edge, because the import kept only the local name. When another file defined a function named like the alias, the call was bound to that function at full confidence instead. Python's `from X import Y as Z` and TypeScript and JavaScript's `import { Y as Z }` now record the imported name, so the call reaches `Y` in the module the import names. Dotted modules (`pkg.mod`) are supported, and relative ones (`.mod`, `../route`) are read from the importing file's directory, so a same-named module elsewhere is never the target. An alias imported from a module outside the project links nothing, and a function the caller's own file defines under the alias name still wins. Indexes rebuild once (`extract-5`).
 
 ## [3.0.5] - 2026-10-09
 
