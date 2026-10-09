@@ -2168,4 +2168,53 @@ def money_to_minor_units(amount):
             edges(&["compat.py::money_to_minor_units -> money.py::money_to_minor_units"])
         );
     }
+
+    /// As with an unaliased import, a definition in the caller's own file
+    /// outranks the import.
+    #[test]
+    fn a_local_definition_of_the_alias_name_still_shadows_the_import() {
+        let graph = index(&[
+            ("money.py", MONEY),
+            (
+                "orders.py",
+                "\
+from money import money_to_minor_units as to_minor
+
+
+def to_minor(amount, currency):
+    return amount
+
+
+def total_cents(amount):
+    return to_minor(amount, \"USD\")
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["orders.py::total_cents -> orders.py::to_minor"])
+        );
+    }
+
+    /// `numpy` is not in the project, so its `array` is not the project's.
+    #[test]
+    fn an_alias_of_an_external_name_links_nothing() {
+        let graph = index(&[
+            (
+                "helpers.py",
+                "def array(values):\n    return list(values)\n",
+            ),
+            (
+                "calc.py",
+                "\
+from numpy import array as arr
+
+
+def build(values):
+    return arr(values)
+",
+            ),
+        ]);
+        assert_eq!(calls(&graph), edges(&[]));
+    }
 }
