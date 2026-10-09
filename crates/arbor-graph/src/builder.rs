@@ -2348,4 +2348,34 @@ def build(values):
         ]);
         assert_eq!(calls(&graph), edges(&[]));
     }
+
+    /// `import { formatName as fmt } from "./format"` has the same gap: the
+    /// import recorded only `fmt`.
+    #[test]
+    fn typescript_named_import_alias_reaches_the_imported_function() {
+        let graph = index(&[
+            (
+                "format.ts",
+                "export function formatName(first: string, last: string): string {\n  return `${last}, ${first}`;\n}\n",
+            ),
+            (
+                "legacy/fmt.ts",
+                "export function fmt(value: string): string {\n  return value;\n}\n",
+            ),
+            (
+                "app.ts",
+                "\
+import { formatName as fmt } from \"./format\";
+
+export function label(first: string, last: string): string {
+  return fmt(first, last);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["app.ts::label -> format.ts::formatName"])
+        );
+    }
 }
