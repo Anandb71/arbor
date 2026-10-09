@@ -11,11 +11,12 @@ use thiserror::Error;
 /// bump `extract-N` whenever extracted nodes or references change shape.
 /// (Revision 2: Rust calls are normalized to `module::fn` / `Type::fn` /
 /// `self.m` / `.m`, and calls inside macros are recorded. Revision 4: TS/JS
-/// test and hook callbacks become `it: <title>` nodes that own their calls.)
+/// test and hook callbacks become `it: <title>` nodes that own their calls.
+/// Revision 5: aliased imports record the imported name, `alias:local:name`.)
 ///
 /// The CLI also stamps saved graphs with it, so a graph built by a different
 /// extractor is rebuilt rather than reused after an upgrade.
-pub const CACHE_VERSION: &str = concat!("arbor-", env!("CARGO_PKG_VERSION"), "+extract-4");
+pub const CACHE_VERSION: &str = concat!("arbor-", env!("CARGO_PKG_VERSION"), "+extract-5");
 
 #[derive(Error, Debug)]
 pub enum StoreError {
