@@ -1941,3 +1941,231 @@ mod rust_path_tests {
         );
     }
 }
+
+/// `from money import money_to_minor_units as to_minor` makes `to_minor()` a
+/// call to `money.money_to_minor_units` (#258).
+#[cfg(test)]
+mod import_alias_tests {
+    use super::*;
+    use petgraph::visit::{EdgeRef, IntoEdgeReferences};
+    use std::collections::BTreeSet;
+
+    /// Parses each `(path, source)` with its real language parser and builds
+    /// the graph, as `arbor index` does.
+    fn index(files: &[(&str, &str)]) -> ArborGraph {
+        let mut builder = GraphBuilder::new();
+        for (path, source) in files {
+            let ext = Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .expect("extension");
+            let parser = arbor_core::languages::get_parser(ext).expect("parser");
+            builder
+                .add_nodes(arbor_core::parse_source(source, path, parser.as_ref()).expect("parse"));
+        }
+        builder.build()
+    }
+
+    /// Every call edge, as `file::name -> file::name`.
+    fn calls(graph: &ArborGraph) -> BTreeSet<String> {
+        graph
+            .graph
+            .edge_references()
+            .filter(|e| e.weight().kind == EdgeKind::Calls)
+            .map(|e| {
+                let from = &graph.graph[e.source()];
+                let to = &graph.graph[e.target()];
+                format!("{}::{} -> {}::{}", from.file, from.name, to.file, to.name)
+            })
+            .collect()
+    }
+
+    fn edges(expected: &[&str]) -> BTreeSet<String> {
+        expected.iter().map(|e| e.to_string()).collect()
+    }
+
+    const MONEY: &str = "\
+def money_to_minor_units(amount, currency):
+    return int(round(amount * 100))
+
+
+def minor_unit_scale(currency):
+    return 2
+";
+
+    /// The eval corpus repro (`eval/corpus/py-alias`).
+    #[test]
+    fn aliased_import_call_reaches_the_imported_function() {
+        let graph = index(&[
+            ("money.py", MONEY),
+            (
+                "orders.py",
+                "\
+from money import money_to_minor_units as to_minor
+
+
+def total_cents(items):
+    return sum(to_minor(item[\"price\"], \"USD\") for item in items)
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["orders.py::total_cents -> money.py::money_to_minor_units"])
+        );
+    }
+
+    #[test]
+    fn alias_from_a_dotted_module_reaches_that_module_only() {
+        let graph = index(&[
+            ("billing/money.py", MONEY),
+            ("legacy/money.py", MONEY),
+            (
+                "app/orders.py",
+                "\
+from billing.money import money_to_minor_units as to_minor
+
+
+def total_cents(items):
+    return sum(to_minor(item, \"USD\") for item in items)
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["app/orders.py::total_cents -> billing/money.py::money_to_minor_units"])
+        );
+    }
+
+    #[test]
+    fn alias_from_a_relative_module_reaches_the_sibling_module() {
+        let graph = index(&[
+            ("shop/money.py", MONEY),
+            ("other/money.py", MONEY),
+            (
+                "shop/orders.py",
+                "\
+from .money import money_to_minor_units as to_minor
+
+
+def total_cents(items):
+    return sum(to_minor(item, \"USD\") for item in items)
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["shop/orders.py::total_cents -> shop/money.py::money_to_minor_units"])
+        );
+    }
+
+    #[test]
+    fn several_aliases_in_one_import_each_reach_their_own_target() {
+        let graph = index(&[
+            ("money.py", MONEY),
+            (
+                "orders.py",
+                "\
+from money import money_to_minor_units as to_minor, minor_unit_scale as scale
+
+
+def total_cents(amount):
+    return to_minor(amount, \"USD\") * scale(\"USD\")
+",
+            ),
+            (
+                "invoices.py",
+                "\
+from money import (
+    money_to_minor_units as cents,
+    minor_unit_scale as digits,
+)
+
+
+def invoice_total(amount):
+    return cents(amount, \"EUR\") + digits(\"EUR\")
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "invoices.py::invoice_total -> money.py::minor_unit_scale",
+                "invoices.py::invoice_total -> money.py::money_to_minor_units",
+                "orders.py::total_cents -> money.py::minor_unit_scale",
+                "orders.py::total_cents -> money.py::money_to_minor_units",
+            ])
+        );
+    }
+
+    /// `fmt_b.fmt` shares the alias's name. Resolving the local name instead
+    /// of the imported one binds the call to it.
+    #[test]
+    fn alias_reaches_its_target_not_a_function_named_like_the_alias() {
+        let graph = index(&[
+            ("fmt_a.py", "def render(value):\n    return f\"A{value}\"\n"),
+            ("fmt_b.py", "def fmt(value):\n    return f\"B{value}\"\n"),
+            (
+                "app.py",
+                "\
+from fmt_a import render as fmt
+
+
+def show(value):
+    return fmt(value)
+",
+            ),
+        ]);
+        assert_eq!(calls(&graph), edges(&["app.py::show -> fmt_a.py::render"]));
+    }
+
+    /// Only a call creates an edge: `scale` is imported and never called, and
+    /// `describe` calls neither alias.
+    #[test]
+    fn an_alias_that_is_never_called_adds_no_edge() {
+        let graph = index(&[
+            ("money.py", MONEY),
+            (
+                "orders.py",
+                "\
+from money import money_to_minor_units as to_minor, minor_unit_scale as scale
+
+
+def total_cents(amount):
+    return to_minor(amount, \"USD\")
+
+
+def describe(order):
+    return str(order)
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["orders.py::total_cents -> money.py::money_to_minor_units"])
+        );
+    }
+
+    /// A compatibility wrapper that keeps the imported function's name. The
+    /// import names another module, so the call is not a call to itself.
+    #[test]
+    fn a_wrapper_named_like_the_imported_function_reaches_the_import() {
+        let graph = index(&[
+            ("money.py", MONEY),
+            (
+                "compat.py",
+                "\
+from money import money_to_minor_units as _impl
+
+
+def money_to_minor_units(amount):
+    return _impl(amount, \"USD\")
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["compat.py::money_to_minor_units -> money.py::money_to_minor_units"])
+        );
+    }
+}
