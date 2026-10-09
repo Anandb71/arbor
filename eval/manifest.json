@@ -10,7 +10,7 @@
     {
       "name": "py-alias",
       "language": "python",
-      "covers": "import-alias resolution (currently a recorded miss)"
+      "covers": "import-alias resolution (from X import Y as Z)"
     },
     {
       "name": "py-same-name",
