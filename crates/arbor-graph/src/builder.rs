@@ -2378,4 +2378,82 @@ export function label(first: string, last: string): string {
             edges(&["app.ts::label -> format.ts::formatName"])
         );
     }
+
+    /// `../route` is one file, read from the importing file's directory. A
+    /// Next.js app has a `route.ts` per endpoint, each exporting `POST`.
+    #[test]
+    fn a_relative_typescript_alias_reaches_only_the_file_it_names() {
+        let post = "export async function POST(req: Request) {\n  return req;\n}\n";
+        let graph = index(&[
+            ("app/api/subscribe/route.ts", post),
+            ("app/api/waitlist/route.ts", post),
+            ("app/api/admin/route.ts", post),
+            (
+                "app/api/subscribe/__tests__/route.test.ts",
+                "\
+import { POST as subscribe } from \"../route\";
+
+export async function postsTheForm(req: Request) {
+  return subscribe(req);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "app/api/subscribe/__tests__/route.test.ts::postsTheForm -> app/api/subscribe/route.ts::POST"
+            ])
+        );
+    }
+
+    /// `..money` is the parent package's `money`, not any `money.py`.
+    #[test]
+    fn a_relative_python_alias_reaches_only_the_module_it_names() {
+        let graph = index(&[
+            ("shop/money.py", MONEY),
+            ("other/money.py", MONEY),
+            (
+                "shop/checkout/orders.py",
+                "\
+from ..money import money_to_minor_units as to_minor
+
+
+def total_cents(amount):
+    return to_minor(amount, \"USD\")
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["shop/checkout/orders.py::total_cents -> shop/money.py::money_to_minor_units"])
+        );
+    }
+
+    /// `subscribe/route.ts` only re-exports `POST` from another file, so the
+    /// name is not defined where the import points. Nothing else named `POST`
+    /// is the target.
+    #[test]
+    fn a_relative_alias_to_a_re_export_links_nothing_else() {
+        let post = "export async function POST(req: Request) {\n  return req;\n}\n";
+        let graph = index(&[
+            (
+                "app/api/subscribe/route.ts",
+                "export { POST } from \"../waitlist/route\";\n",
+            ),
+            ("app/api/admin/route.ts", post),
+            ("app/api/reports/route.ts", post),
+            (
+                "app/api/subscribe/__tests__/route.test.ts",
+                "\
+import { POST as subscribe } from \"../route\";
+
+export async function postsTheForm(req: Request) {
+  return subscribe(req);
+}
+",
+            ),
+        ]);
+        assert_eq!(calls(&graph), edges(&[]));
+    }
 }
