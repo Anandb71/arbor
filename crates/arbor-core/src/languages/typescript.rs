@@ -7,7 +7,7 @@
 //! files anyway.
 
 use crate::languages::LanguageParser;
-use crate::node::{CodeNode, NodeKind, Visibility};
+use crate::node::{import_alias_ref, CodeNode, NodeKind, Visibility};
 use tree_sitter::{Language, Node, Tree};
 
 pub struct TypeScriptParser;
@@ -433,6 +433,7 @@ fn extract_type_alias(node: &Node, source: &str, file_path: &str) -> Option<Code
 /// The imported names are stored in `references` so the graph builder can build an
 /// import map for import-aware edge resolution. Format:
 ///   - Named import  `{ X }`       → "X"
+///   - Aliased       `{ X as Y }`  → "alias:Y:X"
 ///   - Default import `import X`   → "X"
 ///   - Namespace     `* as X`      → "*as:X"  (graph builder resolves X.method() calls)
 fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
@@ -460,12 +461,7 @@ fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode
                             for k in 0..child.child_count() {
                                 if let Some(spec) = child.child(k) {
                                     if spec.kind() == "import_specifier" {
-                                        // Use the local alias if present, otherwise the original name
-                                        let local = spec
-                                            .child_by_field_name("alias")
-                                            .or_else(|| spec.child_by_field_name("name"))
-                                            .map(|n| get_text(&n, source));
-                                        if let Some(n) = local {
+                                        if let Some(n) = import_specifier(&spec, source) {
                                             imported_names.push(n);
                                         }
                                     }
@@ -501,6 +497,24 @@ fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode
             .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
             .with_references(imported_names),
     )
+}
+
+/// `A as B` in `import { A as B }`: calls use `B`, and the module exports
+/// `A`, so both are recorded (`alias:B:A`). `{ A }`, `{ A as A }` and
+/// `{ default as B }` record the local name, as a default import does.
+fn import_specifier(spec: &Node, source: &str) -> Option<String> {
+    let imported = spec
+        .child_by_field_name("name")
+        .map(|n| get_text(&n, source));
+    let local = spec
+        .child_by_field_name("alias")
+        .map(|n| get_text(&n, source));
+    match (local, imported) {
+        (Some(local), Some(imported)) if local != imported && imported != "default" => {
+            Some(import_alias_ref(&local, &imported))
+        }
+        (local, imported) => local.or(imported),
+    }
 }
 
 // ============================================================================
@@ -1036,6 +1050,36 @@ it('works', () => { again(); });
             nodes.is_empty(),
             "{:?}",
             nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// #258: `{ formatName as fmt }` recorded only `fmt`.
+    #[test]
+    fn aliased_named_imports_keep_the_imported_name() {
+        let source = "\
+import { formatName as fmt, parse } from './format';
+import { a as a, default as Widget } from '../ui/widget';
+import Default, { b as c } from './lib';
+import * as types from '@babel/types';
+";
+        let imports: Vec<(String, Vec<String>)> = parse(source, "src/app.ts")
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Import)
+            .map(|n| (n.name, n.references))
+            .collect();
+        let owned = |refs: &[&str]| refs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            imports,
+            vec![
+                (
+                    "./format".to_string(),
+                    owned(&["alias:fmt:formatName", "parse"])
+                ),
+                // `a as a` binds the imported name; `default` names no export.
+                ("../ui/widget".to_string(), owned(&["a", "Widget"])),
+                ("./lib".to_string(), owned(&["Default", "alias:c:b"])),
+                ("@babel/types".to_string(), owned(&["*as:types"])),
+            ]
         );
     }
 }

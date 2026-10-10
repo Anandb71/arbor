@@ -10,9 +10,7 @@
     ["orders.py::total_cents", "money.py::money_to_minor_units"]
   ],
   "edges_forbidden": [],
-  "known_missing": [
-    ["orders.py::total_cents", "money.py::money_to_minor_units"]
-  ],
+  "known_missing": [],
   "known_extra": [],
-  "notes": "orders.py imports money_to_minor_units AS to_minor and calls to_minor(). Arbor 3.0.3 records no edge — aliased-name resolution is a real recall gap this corpus keeps visible. Remove the known_missing entry when the engine resolves it."
+  "notes": "orders.py imports money_to_minor_units AS to_minor and calls to_minor(). Arbor 3.0.3 to 3.0.5 recorded no edge because the import kept only the local name; since #258 the import records the imported name too, so the alias call reaches money.py."
 }

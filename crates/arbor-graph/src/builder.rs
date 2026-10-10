@@ -6,10 +6,10 @@
 
 use crate::edge::{Edge, EdgeKind};
 use crate::graph::{ArborGraph, NodeId};
-use crate::symbol_table::SymbolTable;
+use crate::symbol_table::{Resolution, SymbolTable};
 use arbor_core::{
-    clean_type_name, field_type_ref, return_type_ref, type_relation_ref, typed_receiver, CodeNode,
-    NodeKind, TypeRelationKind,
+    clean_type_name, field_type_ref, import_alias, return_type_ref, type_relation_ref,
+    typed_receiver, CodeNode, NodeKind, TypeRelationKind,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -70,6 +70,15 @@ pub struct GraphBuilder {
     /// those calls at parse time, this is reserved for future use when we add
     /// a richer call-site representation.
     namespace_imports: HashMap<String, HashMap<String, String>>,
+
+    /// Aliased imports: file → local name → the name the module defines.
+    ///
+    /// Example:
+    ///   `from money import money_to_minor_units as to_minor`
+    ///   → import_aliases["orders.py"]["to_minor"] = "money_to_minor_units"
+    ///
+    /// The module is in `import_map` under the same local name.
+    import_aliases: HashMap<String, HashMap<String, String>>,
 }
 
 impl Default for GraphBuilder {
@@ -86,6 +95,7 @@ impl GraphBuilder {
             name_to_id: HashMap::new(),
             import_map: HashMap::new(),
             namespace_imports: HashMap::new(),
+            import_aliases: HashMap::new(),
         }
     }
 
@@ -111,12 +121,27 @@ impl GraphBuilder {
                             .entry(file.clone())
                             .or_default()
                             .insert(alias.to_string(), module.clone());
+                    } else if let Some((local, imported)) = import_alias(imported_name) {
+                        // `from money import money_to_minor_units as to_minor`:
+                        // calls use `to_minor`, the module defines the other.
+                        self.import_map
+                            .entry(file.clone())
+                            .or_default()
+                            .insert(local.to_string(), module.clone());
+                        self.import_aliases
+                            .entry(file.clone())
+                            .or_default()
+                            .insert(local.to_string(), imported.to_string());
                     } else {
                         // `import { name } from 'module'` or `import DefaultName from 'module'`
                         self.import_map
                             .entry(file.clone())
                             .or_default()
                             .insert(imported_name.clone(), module.clone());
+                        // A later plain import of the same name rebinds it.
+                        if let Some(aliases) = self.import_aliases.get_mut(&file) {
+                            aliases.remove(imported_name);
+                        }
                     }
                 }
                 // Import nodes are intentionally NOT added to the graph.
@@ -227,14 +252,27 @@ impl GraphBuilder {
                 // falls through to SameDir and attaches the edge to whichever
                 // definition happens to sit in the caller's own directory.
                 let file_imports = self.import_map.get(&from_file_str);
+                // `to_minor()` after `from money import money_to_minor_units
+                // as to_minor` calls money's function. Nothing is named
+                // `to_minor`, so looking it up finds nothing, or a same-named
+                // function in another module.
+                let alias = if receiver_unknown {
+                    None
+                } else {
+                    self.resolve_alias(lookup, &from_file, &from_file_str)
+                };
                 // `jobs::enqueue` / `Provider::new` name where the definition
                 // lives; matching only the last segment would drop the call or
                 // bind it to a same-named function in the wrong module.
-                let resolution = if !receiver_unknown && lookup.contains("::") {
-                    self.symbol_table.resolve_path(lookup, &from_file)
-                } else {
-                    self.symbol_table
-                        .resolve_ref_with_imports(lookup, &from_file, file_imports)
+                let resolution = match alias {
+                    Some(resolution) => resolution,
+                    None if !receiver_unknown && lookup.contains("::") => {
+                        self.symbol_table.resolve_path(lookup, &from_file)
+                    }
+                    None => {
+                        self.symbol_table
+                            .resolve_ref_with_imports(lookup, &from_file, file_imports)
+                    }
                 };
 
                 if !resolution.is_resolved() {
@@ -328,6 +366,31 @@ impl GraphBuilder {
                 Edge::new(EdgeKind::Calls).with_confidence(confidence),
             );
         }
+    }
+
+    /// Resolves `reference` through the caller file's aliased import of it.
+    ///
+    /// `None` when the name is not an alias there, or when the caller's own
+    /// file defines it: a local definition shadows an import, aliased or not.
+    fn resolve_alias(
+        &self,
+        reference: &str,
+        from_file: &Path,
+        from_file_str: &str,
+    ) -> Option<Resolution> {
+        let imported = self.import_aliases.get(from_file_str)?.get(reference)?;
+        let module = self.import_map.get(from_file_str)?.get(reference)?;
+        let defined_here = self
+            .symbol_table
+            .get_file_exports(&from_file.to_path_buf())
+            .is_some_and(|fqns| fqns.iter().any(|fqn| fqn == reference));
+        if defined_here {
+            return None;
+        }
+        Some(
+            self.symbol_table
+                .resolve_imported(imported, module, from_file),
+        )
     }
 
     /// Downgrades (rather than drops) an edge whose name is not imported.
@@ -1187,6 +1250,74 @@ mod tests {
     }
 
     #[test]
+    fn test_alias_import_map() {
+        let mut builder = GraphBuilder::new();
+        let import_node = CodeNode::new("money", "money", NodeKind::Import, "orders.py")
+            .with_references(vec!["alias:to_minor:money_to_minor_units".to_string()]);
+        builder.add_nodes(vec![import_node]);
+        assert_eq!(
+            builder
+                .import_map
+                .get("orders.py")
+                .and_then(|m| m.get("to_minor")),
+            Some(&"money".to_string())
+        );
+        assert_eq!(
+            builder
+                .import_aliases
+                .get("orders.py")
+                .and_then(|m| m.get("to_minor")),
+            Some(&"money_to_minor_units".to_string())
+        );
+    }
+
+    #[test]
+    fn aliased_call_reaches_the_imported_name_with_import_confidence() {
+        let mut builder = GraphBuilder::new();
+        let import = CodeNode::new("money", "money", NodeKind::Import, "orders.py")
+            .with_references(vec!["alias:to_minor:money_to_minor_units".to_string()]);
+        let caller = CodeNode::new(
+            "total_cents",
+            "total_cents",
+            NodeKind::Function,
+            "orders.py",
+        )
+        .with_references(vec!["to_minor".to_string()]);
+        let callee = CodeNode::new(
+            "money_to_minor_units",
+            "money_to_minor_units",
+            NodeKind::Function,
+            "money.py",
+        );
+        builder.add_nodes(vec![import, caller, callee]);
+        let graph = builder.build();
+        assert!(
+            only_edge_confidence(&graph) >= 0.95,
+            "an aliased import is as strong as an unaliased one"
+        );
+    }
+
+    /// `from a import x as y` then `from b import y`: the last binding wins.
+    #[test]
+    fn a_plain_import_rebinds_an_earlier_alias() {
+        let mut builder = GraphBuilder::new();
+        let aliased = CodeNode::new("a", "a", NodeKind::Import, "main.py")
+            .with_references(vec!["alias:y:x".to_string()]);
+        let plain = CodeNode::new("b", "b", NodeKind::Import, "main.py")
+            .with_references(vec!["y".to_string()]);
+        let caller = CodeNode::new("run", "run", NodeKind::Function, "main.py")
+            .with_references(vec!["y".to_string()]);
+        let x = CodeNode::new("x", "x", NodeKind::Function, "a.py");
+        let y = CodeNode::new("y", "y", NodeKind::Function, "b.py");
+        builder.add_nodes(vec![aliased, plain, caller, x, y]);
+        let graph = builder.build();
+        let edges = graph.export_edges();
+        assert_eq!(edges.len(), 1, "{edges:?}");
+        let target = graph.get_index(&edges[0].target).expect("target");
+        assert_eq!(graph.get(target).unwrap().file, "b.py");
+    }
+
+    #[test]
     fn test_build_empty_graph() {
         let builder = GraphBuilder::new();
         let graph = builder.build();
@@ -1939,5 +2070,390 @@ mod rust_path_tests {
             callers_of(&graph, "owner_of", "src/payments/checkout.rs"),
             vec!["order_history"]
         );
+    }
+}
+
+/// `from money import money_to_minor_units as to_minor` makes `to_minor()` a
+/// call to `money.money_to_minor_units` (#258).
+#[cfg(test)]
+mod import_alias_tests {
+    use super::*;
+    use petgraph::visit::{EdgeRef, IntoEdgeReferences};
+    use std::collections::BTreeSet;
+
+    /// Parses each `(path, source)` with its real language parser and builds
+    /// the graph, as `arbor index` does.
+    fn index(files: &[(&str, &str)]) -> ArborGraph {
+        let mut builder = GraphBuilder::new();
+        for (path, source) in files {
+            let ext = Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .expect("extension");
+            let parser = arbor_core::languages::get_parser(ext).expect("parser");
+            builder
+                .add_nodes(arbor_core::parse_source(source, path, parser.as_ref()).expect("parse"));
+        }
+        builder.build()
+    }
+
+    /// Every call edge, as `file::name -> file::name`.
+    fn calls(graph: &ArborGraph) -> BTreeSet<String> {
+        graph
+            .graph
+            .edge_references()
+            .filter(|e| e.weight().kind == EdgeKind::Calls)
+            .map(|e| {
+                let from = &graph.graph[e.source()];
+                let to = &graph.graph[e.target()];
+                format!("{}::{} -> {}::{}", from.file, from.name, to.file, to.name)
+            })
+            .collect()
+    }
+
+    fn edges(expected: &[&str]) -> BTreeSet<String> {
+        expected.iter().map(|e| e.to_string()).collect()
+    }
+
+    const MONEY: &str = "\
+def money_to_minor_units(amount, currency):
+    return int(round(amount * 100))
+
+
+def minor_unit_scale(currency):
+    return 2
+";
+
+    /// The eval corpus repro (`eval/corpus/py-alias`).
+    #[test]
+    fn aliased_import_call_reaches_the_imported_function() {
+        let graph = index(&[
+            ("money.py", MONEY),
+            (
+                "orders.py",
+                "\
+from money import money_to_minor_units as to_minor
+
+
+def total_cents(items):
+    return sum(to_minor(item[\"price\"], \"USD\") for item in items)
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["orders.py::total_cents -> money.py::money_to_minor_units"])
+        );
+    }
+
+    #[test]
+    fn alias_from_a_dotted_module_reaches_that_module_only() {
+        let graph = index(&[
+            ("billing/money.py", MONEY),
+            ("legacy/money.py", MONEY),
+            (
+                "app/orders.py",
+                "\
+from billing.money import money_to_minor_units as to_minor
+
+
+def total_cents(items):
+    return sum(to_minor(item, \"USD\") for item in items)
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["app/orders.py::total_cents -> billing/money.py::money_to_minor_units"])
+        );
+    }
+
+    #[test]
+    fn alias_from_a_relative_module_reaches_the_sibling_module() {
+        let graph = index(&[
+            ("shop/money.py", MONEY),
+            ("other/money.py", MONEY),
+            (
+                "shop/orders.py",
+                "\
+from .money import money_to_minor_units as to_minor
+
+
+def total_cents(items):
+    return sum(to_minor(item, \"USD\") for item in items)
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["shop/orders.py::total_cents -> shop/money.py::money_to_minor_units"])
+        );
+    }
+
+    #[test]
+    fn several_aliases_in_one_import_each_reach_their_own_target() {
+        let graph = index(&[
+            ("money.py", MONEY),
+            (
+                "orders.py",
+                "\
+from money import money_to_minor_units as to_minor, minor_unit_scale as scale
+
+
+def total_cents(amount):
+    return to_minor(amount, \"USD\") * scale(\"USD\")
+",
+            ),
+            (
+                "invoices.py",
+                "\
+from money import (
+    money_to_minor_units as cents,
+    minor_unit_scale as digits,
+)
+
+
+def invoice_total(amount):
+    return cents(amount, \"EUR\") + digits(\"EUR\")
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "invoices.py::invoice_total -> money.py::minor_unit_scale",
+                "invoices.py::invoice_total -> money.py::money_to_minor_units",
+                "orders.py::total_cents -> money.py::minor_unit_scale",
+                "orders.py::total_cents -> money.py::money_to_minor_units",
+            ])
+        );
+    }
+
+    /// `fmt_b.fmt` shares the alias's name. Resolving the local name instead
+    /// of the imported one binds the call to it.
+    #[test]
+    fn alias_reaches_its_target_not_a_function_named_like_the_alias() {
+        let graph = index(&[
+            ("fmt_a.py", "def render(value):\n    return f\"A{value}\"\n"),
+            ("fmt_b.py", "def fmt(value):\n    return f\"B{value}\"\n"),
+            (
+                "app.py",
+                "\
+from fmt_a import render as fmt
+
+
+def show(value):
+    return fmt(value)
+",
+            ),
+        ]);
+        assert_eq!(calls(&graph), edges(&["app.py::show -> fmt_a.py::render"]));
+    }
+
+    /// Only a call creates an edge: `scale` is imported and never called, and
+    /// `describe` calls neither alias.
+    #[test]
+    fn an_alias_that_is_never_called_adds_no_edge() {
+        let graph = index(&[
+            ("money.py", MONEY),
+            (
+                "orders.py",
+                "\
+from money import money_to_minor_units as to_minor, minor_unit_scale as scale
+
+
+def total_cents(amount):
+    return to_minor(amount, \"USD\")
+
+
+def describe(order):
+    return str(order)
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["orders.py::total_cents -> money.py::money_to_minor_units"])
+        );
+    }
+
+    /// A compatibility wrapper that keeps the imported function's name. The
+    /// import names another module, so the call is not a call to itself.
+    #[test]
+    fn a_wrapper_named_like_the_imported_function_reaches_the_import() {
+        let graph = index(&[
+            ("money.py", MONEY),
+            (
+                "compat.py",
+                "\
+from money import money_to_minor_units as _impl
+
+
+def money_to_minor_units(amount):
+    return _impl(amount, \"USD\")
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["compat.py::money_to_minor_units -> money.py::money_to_minor_units"])
+        );
+    }
+
+    /// As with an unaliased import, a definition in the caller's own file
+    /// outranks the import.
+    #[test]
+    fn a_local_definition_of_the_alias_name_still_shadows_the_import() {
+        let graph = index(&[
+            ("money.py", MONEY),
+            (
+                "orders.py",
+                "\
+from money import money_to_minor_units as to_minor
+
+
+def to_minor(amount, currency):
+    return amount
+
+
+def total_cents(amount):
+    return to_minor(amount, \"USD\")
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["orders.py::total_cents -> orders.py::to_minor"])
+        );
+    }
+
+    /// `numpy` is not in the project, so its `array` is not the project's.
+    #[test]
+    fn an_alias_of_an_external_name_links_nothing() {
+        let graph = index(&[
+            (
+                "helpers.py",
+                "def array(values):\n    return list(values)\n",
+            ),
+            (
+                "calc.py",
+                "\
+from numpy import array as arr
+
+
+def build(values):
+    return arr(values)
+",
+            ),
+        ]);
+        assert_eq!(calls(&graph), edges(&[]));
+    }
+
+    /// `import { formatName as fmt } from "./format"` has the same gap: the
+    /// import recorded only `fmt`.
+    #[test]
+    fn typescript_named_import_alias_reaches_the_imported_function() {
+        let graph = index(&[
+            (
+                "format.ts",
+                "export function formatName(first: string, last: string): string {\n  return `${last}, ${first}`;\n}\n",
+            ),
+            (
+                "legacy/fmt.ts",
+                "export function fmt(value: string): string {\n  return value;\n}\n",
+            ),
+            (
+                "app.ts",
+                "\
+import { formatName as fmt } from \"./format\";
+
+export function label(first: string, last: string): string {
+  return fmt(first, last);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["app.ts::label -> format.ts::formatName"])
+        );
+    }
+
+    /// `../route` is one file, read from the importing file's directory. A
+    /// Next.js app has a `route.ts` per endpoint, each exporting `POST`.
+    #[test]
+    fn a_relative_typescript_alias_reaches_only_the_file_it_names() {
+        let post = "export async function POST(req: Request) {\n  return req;\n}\n";
+        let graph = index(&[
+            ("app/api/subscribe/route.ts", post),
+            ("app/api/waitlist/route.ts", post),
+            ("app/api/admin/route.ts", post),
+            (
+                "app/api/subscribe/__tests__/route.test.ts",
+                "\
+import { POST as subscribe } from \"../route\";
+
+export async function postsTheForm(req: Request) {
+  return subscribe(req);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "app/api/subscribe/__tests__/route.test.ts::postsTheForm -> app/api/subscribe/route.ts::POST"
+            ])
+        );
+    }
+
+    /// `..money` is the parent package's `money`, not any `money.py`.
+    #[test]
+    fn a_relative_python_alias_reaches_only_the_module_it_names() {
+        let graph = index(&[
+            ("shop/money.py", MONEY),
+            ("other/money.py", MONEY),
+            (
+                "shop/checkout/orders.py",
+                "\
+from ..money import money_to_minor_units as to_minor
+
+
+def total_cents(amount):
+    return to_minor(amount, \"USD\")
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["shop/checkout/orders.py::total_cents -> shop/money.py::money_to_minor_units"])
+        );
+    }
+
+    /// `subscribe/route.ts` only re-exports `POST` from another file, so the
+    /// name is not defined where the import points. Nothing else named `POST`
+    /// is the target.
+    #[test]
+    fn a_relative_alias_to_a_re_export_links_nothing_else() {
+        let post = "export async function POST(req: Request) {\n  return req;\n}\n";
+        let graph = index(&[
+            (
+                "app/api/subscribe/route.ts",
+                "export { POST } from \"../waitlist/route\";\n",
+            ),
+            ("app/api/admin/route.ts", post),
+            ("app/api/reports/route.ts", post),
+            (
+                "app/api/subscribe/__tests__/route.test.ts",
+                "\
+import { POST as subscribe } from \"../route\";
+
+export async function postsTheForm(req: Request) {
+  return subscribe(req);
+}
+",
+            ),
+        ]);
+        assert_eq!(calls(&graph), edges(&[]));
     }
 }

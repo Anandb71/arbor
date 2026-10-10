@@ -1,0 +1,24 @@
+{
+  "corpus_version": 1,
+  "language": "python",
+  "covers": ["import alias resolution", "alias named like another function", "same imported name in two modules"],
+  "symbols": [
+    "orders.py::total_cents",
+    "report.py::summary",
+    "money.py::money_to_minor_units",
+    "legacy_money.py::money_to_minor_units",
+    "convert.py::to_minor"
+  ],
+  "edges_expected": [
+    ["orders.py::total_cents", "money.py::money_to_minor_units"],
+    ["report.py::summary", "convert.py::to_minor"]
+  ],
+  "edges_forbidden": [
+    ["orders.py::total_cents", "convert.py::to_minor"],
+    ["orders.py::total_cents", "legacy_money.py::money_to_minor_units"],
+    ["report.py::summary", "money.py::money_to_minor_units"]
+  ],
+  "known_missing": [],
+  "known_extra": [],
+  "notes": "orders.py imports money.money_to_minor_units AS to_minor; convert.py defines a real to_minor that report.py imports and calls. The alias call must reach money.py, not convert.to_minor (Arbor 3.0.5 bound it there at confidence 1.0) and not legacy_money's same-named function."
+}

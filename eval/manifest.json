@@ -10,7 +10,17 @@
     {
       "name": "py-alias",
       "language": "python",
-      "covers": "import-alias resolution (currently a recorded miss)"
+      "covers": "import-alias resolution (from X import Y as Z)"
+    },
+    {
+      "name": "py-alias-shadow",
+      "language": "python",
+      "covers": "alias named like another project function; same imported name in two modules"
+    },
+    {
+      "name": "py-alias-dotted",
+      "language": "python",
+      "covers": "aliases from a dotted module (pkg.mod) and a relative module (.mod)"
     },
     {
       "name": "py-same-name",
@@ -58,6 +68,11 @@
       "name": "ts-crossfile",
       "language": "typescript",
       "covers": "named ES import and cross-file call resolution"
+    },
+    {
+      "name": "ts-alias",
+      "language": "typescript",
+      "covers": "aliased named import (import { X as Y }) named like another project function"
     },
     {
       "name": "py-real-slice",
