@@ -154,6 +154,21 @@ fn callers_not_found_symbol() {
 }
 
 #[test]
+fn refactor_not_found_symbol() {
+    let temp = setup_rust_project();
+    let dir = temp.path();
+
+    let output = run_arbor(dir, &["refactor", "nonexistent_xyz", "."]);
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Couldn't find")
+            && (stdout.contains("Did you mean") || stdout.contains("No similar symbols found")),
+        "expected similar-symbol hint on stdout, got: {stdout}"
+    );
+}
+
+#[test]
 fn callees_finds_direct_callees() {
     let temp = setup_rust_project();
     let dir = temp.path();

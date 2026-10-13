@@ -2635,16 +2635,12 @@ pub fn refactor(
             if !json_output {
                 report_symbol_ambiguity(&graph, target, idx, &others);
             }
-            Some(idx)
+            idx
         }
-        Err(_) => None,
-    };
-
-    let node_idx = match node_idx {
-        Some(idx) => idx,
-        None => {
-            // Smart fallback: suggest similar symbols
-            return suggest_similar_symbols(&graph, target);
+        Err(e) => {
+            // Keep the similar-symbol hint; the original Err makes exit 1.
+            let _ = suggest_similar_symbols(&graph, target);
+            return Err(e);
         }
     };
 
