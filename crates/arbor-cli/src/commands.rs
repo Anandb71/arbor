@@ -2638,8 +2638,9 @@ pub fn refactor(
             idx
         }
         Err(e) => {
-            // Keep the similar-symbol hint; the original Err makes exit 1.
-            let _ = suggest_similar_symbols(&graph, target);
+            if !json_output {
+                let _ = suggest_similar_symbols(&graph, target);
+            }
             return Err(e);
         }
     };

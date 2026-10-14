@@ -166,6 +166,25 @@ fn refactor_not_found_symbol() {
             && (stdout.contains("Did you mean") || stdout.contains("No similar symbols found")),
         "expected similar-symbol hint on stdout, got: {stdout}"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not found"),
+        "expected 'not found' error, got: {stderr}"
+    );
+
+    let json_output = run_arbor(dir, &["refactor", "nonexistent_xyz", ".", "--json"]);
+    assert!(!json_output.status.success());
+    let json_stdout = String::from_utf8_lossy(&json_output.stdout);
+    assert_eq!(
+        json_stdout.as_ref(),
+        "",
+        "expected empty stdout for --json, got: {json_stdout}"
+    );
+    let json_stderr = String::from_utf8_lossy(&json_output.stderr);
+    assert!(
+        json_stderr.contains("not found"),
+        "expected 'not found' error, got: {json_stderr}"
+    );
 }
 
 #[test]
