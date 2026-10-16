@@ -15,6 +15,7 @@ mod hook;
 mod hunk_lines;
 mod install_check;
 mod receipt;
+mod usages;
 
 #[derive(Parser)]
 #[command(name = "arbor")]
@@ -352,6 +353,21 @@ enum Commands {
         /// Path to analyze (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+    },
+
+    /// Find OpenAI, Anthropic and Gemini SDK calls (Python): routing, model IDs and gaps
+    Usages {
+        /// Directory or file to scan (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Only this provider's SDK
+        #[arg(long, value_enum)]
+        sdk: Option<usages::SdkFilter>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show direct callers of a symbol (who calls this?)
@@ -773,6 +789,7 @@ async fn run() {
             format,
             path,
         } => commands::audit(&sink, depth, &format, &path),
+        Commands::Usages { path, sdk, json } => usages::run(&path, sdk, json),
         Commands::Callers { symbol, path, json } => commands::callers(&symbol, &path, json),
         Commands::Callees { symbol, path, json } => commands::callees(&symbol, &path, json),
         Commands::EntryPoints { path, json } => commands::entry_points(&path, json),
