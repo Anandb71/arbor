@@ -1273,3 +1273,19 @@ def respond(model, choices):
     assert!(typed.kwargs.contains(&"model".to_string()));
     assert!(typed.values.is_empty());
 }
+
+#[test]
+fn legacy_gemini_embedding_with_kwargs_is_a_splat_gap() {
+    let found = usages(
+        r#"
+import google.generativeai as genai
+
+def embed(**kwargs):
+    return genai.embed_content(**kwargs)
+"#,
+    );
+    let gap = &gaps(&found, GapKind::UnresolvedModel)[0];
+    assert_eq!(gap.reason, "splat");
+    assert_eq!(gap.sdk, Some(Sdk::Google));
+    assert!(call(&found, "genai.embed_content").request);
+}
