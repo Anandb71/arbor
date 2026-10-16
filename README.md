@@ -261,7 +261,7 @@ arbor bridge --http --port 3333
 
 Templates: [`templates/mcp/`](templates/mcp/) · Setup scripts: `scripts/setup-mcp.sh` · `scripts/setup-mcp.ps1`
 
-### 16 MCP tools
+### 17 MCP tools
 
 | Tier | Tools | Use when |
 |------|-------|----------|
@@ -269,6 +269,7 @@ Templates: [`templates/mcp/`](templates/mcp/) · Setup scripts: `scripts/setup-m
 | **Surgical** | `list_entry_points` · `get_callers` · `get_callees` · `search_symbols` · `get_file_graph` · `get_node_detail` | Navigate to a specific symbol or file |
 | **Broad** | `get_logic_path` · `analyze_impact` · `find_path` · `get_knowledge_path` | Trace dependencies, blast radius, paths |
 | **Agent-native** | `get_blast_radius` · `explain_symbol` · `audit_security` · `get_architecture_overview` · `batch_query` | PR impact, onboarding, security audit, bulk lookup |
+| **SDK usage** | `find_api_usages` | Where the code calls the OpenAI, Anthropic or Gemini SDKs, with routing and model IDs (Python) |
 
 Every tool returns `{ ok, tool, data, meta: { suggested_next_tool, suggested_next_args } }` so agents chain calls without re-prompting.
 
@@ -289,6 +290,7 @@ Every tool returns `{ ok, tool, data, meta: { suggested_next_tool, suggested_nex
 | `arbor inspect <sym>` | Full symbol detail |
 | `arbor path <a> <b>` | Shortest call-graph path |
 | `arbor refactor <sym>` | Blast radius before refactoring |
+| `arbor usages` | OpenAI, Anthropic and Gemini SDK calls in Python: client routing (direct, Azure, custom `base_url`, Bedrock, Vertex), model IDs and typed gaps. `--sdk openai\|anthropic\|google`, `--json` |
 | `arbor diff` | Git-change impact report, per symbol: new symbols carry no blast radius. `--base <ref>` compares against the merge base (what a PR shows), `--staged` only staged changes |
 | `arbor check` | CI safety gate (`--max-blast-radius N`, `--base <ref>`) |
 | `arbor summary` | Auto-generate PR description (`--base <ref>`) |

@@ -31,7 +31,7 @@ Compared with typical code-intel MCP servers, Arbor focuses on:
 
 ## MCP Tools
 
-Sixteen tools. Start with `get_map` or `get_architecture_overview`.
+Seventeen tools. Start with `get_map` or `get_architecture_overview`.
 
 | Tool | Description |
 |------|-------------|
@@ -51,6 +51,7 @@ Sixteen tools. Start with `get_map` or `get_architecture_overview`.
 | `find_path` | Shortest path between two nodes |
 | `get_knowledge_path` | Markdown logic path with wiki links, for knowledge sections |
 | `audit_security` | Paths from a symbol to sensitive sinks (queries, file I/O, network, exec) |
+| `find_api_usages` | OpenAI, Anthropic and Gemini SDK call sites (Python) with routing, model IDs and typed gaps; reads files, no graph needed |
 
 ## Why MCP?
 

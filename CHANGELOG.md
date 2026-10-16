@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`arbor usages` and the MCP tool `find_api_usages`:** where a Python project calls the OpenAI, Anthropic and Gemini SDKs (`google.genai` and the legacy `google.generativeai`). Each call has its file, line and column, enclosing function, keyword-argument names and the client's routing: `openai_direct`, `azure_openai`, `custom_base_url` (any `base_url`/`api_base`), `anthropic_direct`, `anthropic_bedrock`, `anthropic_vertex`, `google_genai`, `google_generativeai_legacy` or `unknown`. Values are captured only for `model`, `engine`, `deployment_id` and `model_name`, from string literals or same-file constants, and never for a key that looks like a credential. What cannot be resolved is a typed gap (`unresolved_model`, `unknown_client_factory`, `ambiguous_client`, `dynamic_dispatch`, `vendored_path`); `venv`, `site-packages`, `node_modules` and other vendored directories are excluded and counted. `--sdk` filters by provider and `--json` is always valid JSON. Graph extraction and the cache are unchanged.
+
 ## [3.0.5] - 2026-10-09
 
 A fix release. See [docs/RELEASE_NOTES_v3.0.5.md](docs/RELEASE_NOTES_v3.0.5.md).
