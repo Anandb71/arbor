@@ -561,6 +561,110 @@ impl McpServer {
         })
     }
 
+    /// `find_api_usages`: the `arbor usages` scan, paginated, with every path
+    /// relative to the project root.
+    async fn find_api_usages(&self, args: &Value) -> Value {
+        const TOOL: &str = "find_api_usages";
+        let sdk = match args.get("sdk").and_then(|v| v.as_str()) {
+            None => None,
+            Some(name) => match arbor_core::usages::Sdk::parse(name) {
+                Some(sdk) => Some(sdk),
+                None => {
+                    return Self::err_envelope(
+                        TOOL,
+                        &format!("unknown sdk '{name}': use openai, anthropic or google"),
+                    )
+                }
+            },
+        };
+        let relative = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let relative_path = Path::new(relative);
+        let escapes = relative_path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        });
+        if escapes {
+            return Self::err_envelope(
+                TOOL,
+                "path must be relative to the project root and stay inside it",
+            );
+        }
+        let offset = bounded_usize(args, "offset", 0, usize::MAX);
+        let limit = bounded_usize(args, "limit", 100, MAX_LIST_LIMIT).max(1);
+
+        let target = self.project_root.join(relative_path);
+        let options = arbor_watcher::UsageScanOptions {
+            sdk,
+            display_root: Some(relative.to_string()),
+            ..arbor_watcher::UsageScanOptions::default()
+        };
+        let scanned =
+            tokio::task::spawn_blocking(move || arbor_watcher::scan_usages(&target, &options))
+                .await;
+        let mut report = match scanned {
+            Ok(Ok(report)) => report,
+            Ok(Err(error)) => {
+                let shown = if relative.is_empty() { "." } else { relative };
+                return Self::err_envelope(TOOL, &format!("cannot scan '{shown}': {error}"));
+            }
+            Err(error) => return Self::err_envelope(TOOL, &format!("scan failed: {error}")),
+        };
+        if relative.is_empty() {
+            report.root = ".".to_string();
+        }
+
+        let total = report.usages.len();
+        let page: Vec<_> = report
+            .usages
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect();
+        let has_more = offset.saturating_add(page.len()) < total;
+        let clients_total = report.clients.len();
+        let gaps_total = report.gaps.len();
+        report.clients.truncate(MAX_LIST_LIMIT);
+        report.gaps.truncate(MAX_LIST_LIMIT);
+
+        let next_symbol = page.iter().find_map(|call| call.symbol.clone());
+        let data = json!({
+            "root": report.root,
+            "sdk": report.sdk,
+            "summary": report.summary,
+            "usages": page,
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "hasMore": has_more,
+            "clients": report.clients,
+            "clients_total": clients_total,
+            "gaps": report.gaps,
+            "gaps_total": gaps_total,
+            "skipped": report.skipped,
+        });
+        let node_count = self.graph.read().await.node_count();
+        match next_symbol {
+            // Who reaches this SDK call? The graph answers from here.
+            Some(symbol) => Self::ok_envelope(
+                TOOL,
+                data,
+                node_count,
+                "get_callers",
+                json!({ "symbol": symbol }),
+            ),
+            None => Self::ok_envelope(TOOL, data, node_count, "get_map", json!({})),
+        }
+    }
+
     fn list_tools(&self) -> Result<Value, JsonRpcError> {
         Ok(json!({
             "tools": [
@@ -750,6 +854,20 @@ impl McpServer {
                     "_meta": apps::ui_meta(apps::UI_ARCHITECTURE_MAP)
                 },
                 {
+                    "name": "find_api_usages",
+                    "description": "Finds calls to the OpenAI, Anthropic and Gemini SDKs in Python files: each call with file, line, enclosing symbol, client routing (openai_direct, azure_openai, custom_base_url, anthropic_bedrock, anthropic_vertex, google_genai...) and the model IDs passed as string literals or same-file constants. Also returns client constructions, typed gaps for what could not be resolved (models from env/config, unknown client factories, getattr) and vendored directories that were skipped. Use INSTEAD of grep to find where a deprecated model or SDK is used. Reads files directly; does not need the graph. Never returns credential values.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "sdk": { "type": "string", "enum": ["openai", "anthropic", "google"], "description": "Only this provider's SDK" },
+                            "path": { "type": "string", "description": "Project-relative directory or file to scan (default: the whole project)" },
+                            "offset": { "type": "integer", "description": "Pagination offset for usages (default: 0)", "default": 0 },
+                            "limit": { "type": "integer", "description": "Max usages per page (default: 100)", "default": 100 }
+                        }
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+                },
+                {
                     "name": "batch_query",
                     "description": "Query multiple symbols in a single call. Returns node details for all matched symbols, reducing round-trips. Optionally includes callers/callees for each.",
                     "inputSchema": {
@@ -778,6 +896,11 @@ impl McpServer {
             })?;
 
         let arguments = params.get("arguments").unwrap_or(&Value::Null);
+
+        // Reads source files directly, so it answers before indexing finishes.
+        if name == "find_api_usages" {
+            return Ok(self.find_api_usages(arguments).await);
+        }
 
         // If the graph is empty, return a task handle instead of erroring (Tasks extension)
         if self.graph.read().await.node_count() == 0 {
@@ -2219,6 +2342,90 @@ mod tool_tests {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
         McpServer::with_project(shared, project_root)
+    }
+
+    fn tool_envelope(result: Value) -> Value {
+        let text = result["content"][0]["text"].as_str().unwrap().to_string();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn find_api_usages_scans_files_without_waiting_for_the_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("svc")).unwrap();
+        std::fs::write(
+            dir.path().join("svc/llm.py"),
+            "from openai import OpenAI\nclient = OpenAI(api_key=\"sk-test-NOT-A-REAL-KEY\")\n\ndef ask():\n    return client.chat.completions.create(model=\"gpt-3.5-turbo\", messages=[])\n",
+        )
+        .unwrap();
+        // An empty graph: other tools would return a task handle.
+        let shared: SharedGraph = Arc::new(RwLock::new(ArborGraph::new()));
+        let server = McpServer::with_project(shared, dir.path().to_path_buf());
+
+        let result = server
+            .call_tool(json!({ "name": "find_api_usages", "arguments": {} }))
+            .await
+            .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("sk-test-NOT-A-REAL-KEY"));
+        assert!(!text.contains(&dir.path().display().to_string()));
+        let envelope = tool_envelope(result);
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["tool"], "find_api_usages");
+        let data = &envelope["data"];
+        assert_eq!(data["root"], ".");
+        assert_eq!(data["total"], 1);
+        assert_eq!(data["hasMore"], false);
+        let usage = &data["usages"][0];
+        assert_eq!(usage["file"], "svc/llm.py");
+        assert_eq!(usage["routing"], "openai_direct");
+        assert_eq!(usage["values"][0]["value"], "gpt-3.5-turbo");
+        assert_eq!(envelope["meta"]["suggested_next_tool"], "get_callers");
+        assert_eq!(envelope["meta"]["suggested_next_args"]["symbol"], "ask");
+
+        let scoped = tool_envelope(
+            server
+                .call_tool(json!({
+                    "name": "find_api_usages",
+                    "arguments": { "path": "svc", "sdk": "anthropic" }
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(scoped["data"]["root"], "svc");
+        assert_eq!(scoped["data"]["total"], 0);
+
+        for (args, error) in [
+            (json!({ "path": "../elsewhere" }), "stay inside"),
+            (json!({ "sdk": "cohere" }), "unknown sdk"),
+            (json!({ "path": "missing" }), "cannot scan"),
+        ] {
+            let failed = tool_envelope(
+                server
+                    .call_tool(json!({ "name": "find_api_usages", "arguments": args }))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(failed["ok"], false);
+            assert!(
+                failed["error"].as_str().unwrap().contains(error),
+                "{failed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_list_has_seventeen_tools_including_find_api_usages() {
+        let server = empty_server();
+        let tools = server.list_tools().unwrap();
+        let names: Vec<&str> = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 17);
+        assert!(names.contains(&"find_api_usages"));
     }
 
     #[tokio::test]
