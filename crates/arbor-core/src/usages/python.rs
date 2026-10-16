@@ -2,31 +2,44 @@
 //!
 //! Two passes over the tree-sitter tree:
 //!
-//! 1. **Collect.** Scopes (module, class, function), imports, every
-//!    assignment target (names, `self.x`, class attributes, `with ... as`,
-//!    walrus, `global`), parameters, every call and every attribute chain
-//!    that is used as a value.
+//! 1. **Collect.** One iterative walk records scopes (module, class,
+//!    function, lambda), imports, every assignment target (names, `self.x`,
+//!    class attributes, `with ... as`, walrus, `global`), parameters, every
+//!    call, every attribute chain used as a value, and where each binding
+//!    takes effect. Parent kinds and field names travel down the walk, so no
+//!    node is asked for its parent: tree-sitter answers that by descending
+//!    from the root, which made deep trees quadratic.
 //! 2. **Analyze.** Each call's callee is evaluated against those bindings.
 //!    A chain rooted at a tracked SDK binding becomes a construction or a
 //!    call; an SDK-shaped chain on an unknown receiver, `getattr` on a
 //!    tracked binding and an unresolved model value become typed gaps.
 //!
-//! Names resolve the way Python scopes them, approximately: function locals,
-//! parameters and imports shadow enclosing functions, class bodies are
-//! skipped from inside methods, `global` re-homes an assignment to the
-//! module, and a name assigned more than once combines every value it is
-//! given. Assignment order and control flow are not modelled.
+//! Names resolve the way Python scopes them, approximately: function and
+//! lambda locals, parameters and imports shadow enclosing functions, class
+//! bodies are skipped from inside methods, and `global` re-homes an
+//! assignment to the module. Within one scope a use sees its reaching
+//! definitions: the nearest definition that dominates it in straight-line
+//! code, every definition between that one and the use (in a branch), later
+//! ones in a loop around the use, and `global` assignments made by
+//! functions. A use from a nested function or lambda sees the definitions
+//! that reach the end of the binding scope. With no dominating definition,
+//! or past the search limits, every definition of the name counts.
+//!
+//! An untyped parameter used as a client resolves when every call to its
+//! function in this file passes the same tracked client. Other files may
+//! call it too; resolution is per file.
 
 use super::{
-    is_secret_key, is_value_key, model_family, BindingKind, CapturedValue, ClientConstruction,
-    ClientScope, FileUsages, GapKind, Receiver, Routing, Sdk, SdkCall, SdkImport, Span, UsageGap,
-    ValueOrigin,
+    is_capturable_value, is_credential_value, is_identifier_key, is_secret_key, is_value_key,
+    model_family, BindingKind, CapturedValue, ClientConstruction, ClientScope, FileUsages, GapKind,
+    Receiver, Routing, Sdk, SdkCall, SdkImport, Span, UsageGap, ValueOrigin,
 };
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use tree_sitter::{Node, Tree};
 
-/// A file mentioning none of these cannot report anything, so it is not
-/// walked at all.
+/// A file mentioning none of these cannot report anything, so it is neither
+/// parsed nor walked.
 const PREFILTER: &[&str] = &[
     "openai",
     "anthropic",
@@ -40,6 +53,12 @@ const PREFILTER: &[&str] = &[
     "generate_content",
     "embed_content",
 ];
+
+/// Whether `source` mentions anything the extractor tracks. A file that does
+/// not reports nothing, so callers may skip parsing it.
+pub fn may_use_sdk(source: &str) -> bool {
+    PREFILTER.iter().any(|needle| source.contains(needle))
+}
 
 /// Last member names that send a request to the provider (resource verbs and
 /// the Gemini/PaLM call names). A call ending in one is an [`SdkCall::request`];
@@ -59,6 +78,10 @@ const REQUEST_METHODS: &[&str] = &[
     "content",
     "completion",
     "completion_stream",
+    "generate",
+    "edit",
+    "create_variation",
+    "connect",
     "generate_content",
     "generate_content_async",
     "generate_content_stream",
@@ -67,6 +90,7 @@ const REQUEST_METHODS: &[&str] = &[
     "batch_embed_contents",
     "count_tokens",
     "count_tokens_async",
+    "count_text_tokens",
     "compute_tokens",
     "send_message",
     "send_message_async",
@@ -103,14 +127,28 @@ const MODEL_BEARING: &[&str] = &[
     "responses.parse",
     "responses.stream",
     "embeddings.create",
+    "images.generate",
+    "images.edit",
+    "images.create_variation",
+    "audio.transcriptions.create",
+    "audio.translations.create",
+    "audio.speech.create",
+    "moderations.create",
+    "fine_tuning.jobs.create",
+    "assistants.create",
+    "runs.create",
+    "realtime.connect",
     "messages.create",
     "messages.stream",
     "messages.count_tokens",
     "models.generate_content",
     "models.generate_content_stream",
+    "models.generate_images",
+    "models.generate_videos",
     "embed_content",
     "generate_embeddings",
     "generate_text",
+    "count_text_tokens",
     "chats.create",
     "ChatCompletion.create",
     "ChatCompletion.acreate",
@@ -120,18 +158,51 @@ const MODEL_BEARING: &[&str] = &[
     "GenerativeModel",
 ];
 
-/// Maximum evaluation depth; deeper chains are treated as unresolved.
+/// Members that wrap a resource without changing the request
+/// (`client.chat.completions.with_raw_response.create`).
+const RESPONSE_WRAPPERS: &[&str] = &["with_raw_response", "with_streaming_response"];
+
+/// Legacy `google.generativeai` functions whose first positional argument is
+/// the model (`genai.embed_content("models/embedding-001", text)`).
+const LEGACY_POSITIONAL_MODEL: &[&str] = &[
+    "embed_content",
+    "embed_content_async",
+    "generate_embeddings",
+    "count_text_tokens",
+];
+
+/// Calls whose `default=` (or second positional argument) is the fallback of
+/// an environment lookup: python-decouple and django-environ.
+const CONFIG_LOOKUPS: &[&str] = &["config", "decouple.config", "env", "env.str"];
+
+/// Maximum expression depth within one evaluation; deeper chains are
+/// treated as unresolved. Every name resolution starts a fresh budget, so a
+/// name's value never depends on how deep its first use was.
 const MAX_DEPTH: u32 = 64;
+/// Maximum nesting of name, attribute and caller resolutions.
+const MAX_NAME_DEPTH: u32 = 64;
+/// Inheritance search bounds: base-class hops, classes visited per lookup and
+/// bases read per class. Real hierarchies are far smaller; a pathological
+/// file (every class listing every class as a base) stays linear.
+const MAX_BASE_DEPTH: u32 = 8;
+const MAX_CLASSES_VISITED: usize = 64;
+const MAX_BASES: usize = 32;
+/// Definitions a reaching-definition search may look at before it gives up
+/// and counts every definition of the name.
+const MAX_REACH_SCAN: usize = 64;
 
 /// Extracts SDK usages from a parsed Python file.
 pub fn extract(tree: &Tree, source: &str, file_path: &str) -> FileUsages {
-    if !PREFILTER.iter().any(|needle| source.contains(needle)) {
+    if !may_use_sdk(source) {
         return FileUsages::new(file_path, "python");
     }
     let mut cx = Ctx::new(source, file_path);
     cx.collect(tree.root_node());
+    cx.index_definitions();
     cx.analyze();
-    cx.finish()
+    let mut found = cx.finish();
+    found.syntax_errors = tree.root_node().has_error();
+    found
 }
 
 // ============================================================================
@@ -253,7 +324,7 @@ impl ClientClass {
 
     /// Routing from the constructor and its keyword names.
     fn routing(self, kwargs: &[String], splat: bool) -> Routing {
-        let custom = kwargs.iter().any(|k| k == "base_url" || k == "api_base");
+        let custom = kwargs.iter().any(|k| is_base_url_key(k));
         // `OpenAI(provider=bedrock(...))` hands requests to a platform adapter.
         let adapter = kwargs.iter().any(|k| k == "provider");
         match self.family {
@@ -281,6 +352,10 @@ impl ClientClass {
     }
 }
 
+fn is_base_url_key(key: &str) -> bool {
+    key == "base_url" || key == "api_base"
+}
+
 /// The provider an SDK-shaped chain on an unknown receiver most likely
 /// belongs to, and whether the shape alone is distinctive enough to report.
 fn sdk_shape(chain: &str) -> Option<(Sdk, bool)> {
@@ -301,6 +376,13 @@ fn sdk_shape(chain: &str) -> Option<(Sdk, bool)> {
         ".responses.stream",
         ".completions.create",
         ".embeddings.create",
+        ".images.generate",
+        ".images.edit",
+        ".images.create_variation",
+        ".audio.transcriptions.create",
+        ".audio.translations.create",
+        ".audio.speech.create",
+        ".realtime.connect",
         "ChatCompletion.create",
         "ChatCompletion.acreate",
         "Completion.create",
@@ -313,6 +395,7 @@ fn sdk_shape(chain: &str) -> Option<(Sdk, bool)> {
         ".messages.stream",
         ".messages.count_tokens",
     ];
+    let chain = strip_wrappers(chain);
     if GOOGLE.iter().any(|s| chain.ends_with(s)) {
         Some((Sdk::Google, true))
     } else if OPENAI.iter().any(|s| chain.ends_with(s)) {
@@ -322,6 +405,14 @@ fn sdk_shape(chain: &str) -> Option<(Sdk, bool)> {
     } else {
         None
     }
+}
+
+/// A dotted path without the response wrappers.
+fn strip_wrappers(path: &str) -> String {
+    path.split('.')
+        .filter(|segment| !RESPONSE_WRAPPERS.contains(segment))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 // ============================================================================
@@ -429,6 +520,7 @@ impl Val {
 }
 
 /// Why an allowlisted value did not resolve, and the expression's shape.
+#[derive(Debug, Clone)]
 struct Unresolved {
     reason: &'static str,
     shape: String,
@@ -459,22 +551,41 @@ impl Unresolved {
             "attribute" => "an attribute of another object",
             "subscript" => "looked up by subscript",
             "conditional" => "chosen at run time",
-            "parameter" => "a parameter with no literal default",
+            "parameter" => "a parameter whose default is not a resolvable string",
             "reassigned" => "assigned more than once",
             "imported_name" => "imported from another module",
             "unbound" => "not defined in this file",
             "splat" => "possibly passed through **kwargs",
+            "credential" => {
+                "credential-shaped (a secret-like name or value), so it is never captured"
+            }
             _ => "not a string literal",
         }
     }
 }
 
 /// A captured value before it is attached to a key.
+#[derive(Debug)]
 struct Resolved {
     value: String,
     origin: ValueOrigin,
     name: Option<String>,
     span: Span,
+    /// For an [`ValueOrigin::EnvDefault`] fallback: why the deployed value is
+    /// still unknown (the call keeps an `unresolved_model` gap).
+    caveat: Option<Unresolved>,
+}
+
+impl Resolved {
+    /// Names `name` as the binding the value came through: the value's own
+    /// name when it was written inline there, and the gap of its fallback.
+    fn through(mut self, name: &str, origin: ValueOrigin) -> Self {
+        if self.name.is_none() || self.origin == origin {
+            self.name = Some(name.to_string());
+        }
+        self.caveat = self.caveat.map(|caveat| caveat.via(name));
+        self
+    }
 }
 
 // ============================================================================
@@ -488,6 +599,21 @@ enum ScopeKind {
     Function,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotKind {
+    Positional,
+    PositionalOnly,
+    KeywordOnly,
+    VarArgs,
+    VarKwargs,
+}
+
+#[derive(Debug, Clone)]
+struct Slot {
+    name: String,
+    kind: SlotKind,
+}
+
 struct Scope {
     kind: ScopeKind,
     parent: Option<usize>,
@@ -495,27 +621,124 @@ struct Scope {
     class: Option<usize>,
     /// The symbol name the graph uses for this scope (`Bot.ask`).
     symbol: Option<String>,
-    /// For a class: its own name.
+    /// For a class or function: its own name.
     name: String,
     globals: HashSet<String>,
     /// For a class: base class names as written.
     bases: Vec<String>,
+    /// Byte range of the scope's node.
+    start: usize,
+    end: usize,
+    /// For a function or lambda: its parameters in order.
+    slots: Vec<Slot>,
+    /// Decorated with something other than `staticmethod`/`classmethod`, so
+    /// a framework may call it.
+    decorated: bool,
+    staticmethod: bool,
+    lambda: bool,
+}
+
+impl Scope {
+    fn new(kind: ScopeKind, parent: Option<usize>, start: usize, end: usize) -> Self {
+        Self {
+            kind,
+            parent,
+            class: None,
+            symbol: None,
+            name: String::new(),
+            globals: HashSet::new(),
+            bases: Vec::new(),
+            start,
+            end,
+            slots: Vec::new(),
+            decorated: false,
+            staticmethod: false,
+            lambda: false,
+        }
+    }
+}
+
+/// Where a definition takes effect.
+#[derive(Clone, Copy, Debug)]
+struct Place {
+    /// The byte offset after which the binding exists.
+    at: usize,
+    /// The byte range it certainly holds in, in straight-line code (the rest
+    /// of its block after its statement). `None` for bindings that do not
+    /// dominate what follows (walrus, loop targets).
+    region: Option<(usize, usize)>,
+    /// The outermost loop around the definition in its scope.
+    outer_loop: Option<(usize, usize)>,
+}
+
+impl Place {
+    /// Whether the binding certainly holds at `pos`. The end is inclusive
+    /// so that the end of a scope (where a nested function's use is
+    /// resolved) is covered.
+    fn dominates(&self, pos: usize) -> bool {
+        self.region
+            .is_some_and(|(start, end)| start <= pos && pos <= end)
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Assign<'t> {
+    id: usize,
     /// The scope the value expression lives in.
     scope: usize,
     value: Option<Node<'t>>,
     annotation: Option<Node<'t>>,
     /// Bound by a loop, an unpacking or an augmented assignment.
     unknowable: bool,
+    place: Place,
 }
 
 #[derive(Clone, Copy)]
 struct Param<'t> {
     annotation: Option<Node<'t>>,
     default: Option<Node<'t>>,
+}
+
+#[derive(Clone)]
+struct ImportDef {
+    val: Val,
+    place: Place,
+}
+
+#[derive(Clone)]
+struct OtherImport {
+    module: String,
+    place: Place,
+}
+
+/// One definition of a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DefRef {
+    Import(usize),
+    Other(usize),
+    Param,
+    Assign(usize),
+}
+
+#[derive(Clone, Copy)]
+struct DefPos {
+    place: Place,
+    def: DefRef,
+}
+
+/// Every definition of one name in its scope, by position.
+struct DefIndex {
+    /// Definitions made in the binding scope itself, sorted by `place.at`.
+    local: Vec<DefPos>,
+    /// `global` assignments made by other functions: they may run at any time.
+    foreign: Vec<DefRef>,
+    total: usize,
+}
+
+/// The definitions that reach a use.
+enum Reach {
+    All,
+    Subset(Vec<DefRef>),
 }
 
 /// A `x.attr = value` whose object is not `self`/`cls`/a class, checked later
@@ -528,63 +751,175 @@ struct ConfigAssign<'t> {
     scope: usize,
 }
 
+/// Calls of a function or method name, and whether the name is also used as
+/// a value (passed, stored, decorated, rebound).
+#[derive(Default)]
+struct Uses<'t> {
+    calls: Vec<(Node<'t>, usize)>,
+    escapes: bool,
+}
+
+/// One node of the collection walk, with the context its ancestors give it.
+#[derive(Clone, Copy)]
+struct Frame<'t> {
+    node: Node<'t>,
+    scope: usize,
+    parent: Option<Node<'t>>,
+    field: Option<&'static str>,
+    /// End of the enclosing block (or module).
+    block_end: usize,
+    /// The statement of that block this node is part of; `None` when the
+    /// node is the statement.
+    stmt: Option<(usize, usize)>,
+    /// Outermost loop around the node in its scope.
+    outer_loop: Option<(usize, usize)>,
+}
+
+/// A dict literal reached through names and subscripts.
+struct DictRef<'t> {
+    node: Node<'t>,
+    scope: usize,
+    /// How the code names it (`PARAMS`, `CONFIG["openai"]`), `None` inline.
+    name: Option<String>,
+    origin: ValueOrigin,
+}
+
+enum Lookup<'t> {
+    Found(Node<'t>),
+    Absent,
+    Unknown,
+}
+
+/// A dict literal read once: where each key's last entry is, and the
+/// entries a `**` expansion needs. Lookups are then constant time however
+/// large the literal and however often it is used.
+struct DictSummary<'t> {
+    last: HashMap<String, (usize, Node<'t>)>,
+    /// Index of the last entry that could not be read (`**other`, a computed
+    /// key): it may override any key before it.
+    last_unknown: Option<usize>,
+    /// Identifier-keyed entries a `**` expansion reads (allowlisted keys,
+    /// base URLs, containers), the last one per key, at most 256.
+    expansion: Vec<(String, Node<'t>)>,
+    /// Part of the dict could not be read, or the expansion list was cut.
+    opaque: bool,
+}
+
+/// The pairs of a dict expanded with `**`.
+struct Expansion<'t> {
+    pairs: Vec<(String, Node<'t>)>,
+    scope: usize,
+    name: Option<String>,
+    origin: ValueOrigin,
+    /// Part of it could not be read (`**other`, a computed key).
+    opaque: bool,
+}
+
+/// Where a parameter's argument is in one call.
+enum ArgFor<'t> {
+    Found(Node<'t>),
+    Missing,
+    Unknown,
+}
+
 type Key = (usize, String);
 
 struct Ctx<'t> {
     src: &'t str,
     file: String,
+    ascii: bool,
+    /// Continuation bytes before each 64-byte block, for character columns.
+    cont_blocks: Vec<u32>,
     scopes: Vec<Scope>,
     /// Tracked imports, keyed by the scope they bind in: a function for an
     /// import inside its body, the module for everything else.
-    imports: HashMap<Key, Vec<Val>>,
+    imports: HashMap<Key, Vec<ImportDef>>,
     /// Other imports (for gap details), keyed the same way.
-    other_imports: HashMap<Key, String>,
+    other_imports: HashMap<Key, Vec<OtherImport>>,
     sdk_imported: HashSet<Sdk>,
     assigns: HashMap<Key, Vec<Assign<'t>>>,
     attr_assigns: HashMap<Key, Vec<Assign<'t>>>,
     params: HashMap<Key, Param<'t>>,
+    /// Function definitions, keyed by the scope their name binds in.
+    functions: HashMap<Key, Vec<usize>>,
     classes_by_name: HashMap<String, Vec<usize>>,
     config_assigns: Vec<ConfigAssign<'t>>,
     calls: Vec<(Node<'t>, usize)>,
     refs: Vec<(Node<'t>, usize)>,
     call_scope: HashMap<usize, usize>,
+    /// Parents of calls and of the wrappers between a call and its binding.
+    parents: HashMap<usize, Node<'t>>,
+    name_uses: HashMap<&'t str, Uses<'t>>,
+    attr_uses: HashMap<&'t str, Uses<'t>>,
+    /// Names whose dict may change after its literal (`D[k] = v`, `D.update`).
+    mutated: HashSet<&'t str>,
+    def_index: HashMap<Key, DefIndex>,
     constructions: HashMap<usize, usize>,
     name_memo: HashMap<Key, Val>,
     attr_memo: HashMap<Key, Val>,
-    visiting: HashSet<(bool, usize, String)>,
+    def_memo: HashMap<usize, Val>,
+    call_memo: HashMap<(usize, usize), Val>,
+    dict_cache: HashMap<usize, Rc<DictSummary<'t>>>,
+    attr_lookup_memo: HashMap<Key, Vec<Assign<'t>>>,
+    caller_memo: HashMap<Key, Option<Val>>,
+    /// Resolutions in progress: (kind, scope or id, name).
+    visiting: HashSet<(u8, usize, String)>,
+    /// Current nesting of name resolutions, and how many were cut off at
+    /// [`MAX_NAME_DEPTH`]; a value computed across a cut-off is not memoized.
+    name_depth: u32,
+    cutoffs: u64,
+    next_id: usize,
     openai_routing: Routing,
     out: FileUsages,
 }
 
 impl<'t> Ctx<'t> {
     fn new(src: &'t str, file: &str) -> Self {
+        let ascii = src.is_ascii();
+        let mut cont_blocks = Vec::new();
+        if !ascii {
+            let mut total = 0u32;
+            cont_blocks.push(0);
+            for chunk in src.as_bytes().chunks(64) {
+                total += chunk.iter().filter(|b| (**b & 0xC0) == 0x80).count() as u32;
+                cont_blocks.push(total);
+            }
+        }
         Self {
             src,
             file: file.to_string(),
-            scopes: vec![Scope {
-                kind: ScopeKind::Module,
-                parent: None,
-                class: None,
-                symbol: None,
-                name: String::new(),
-                globals: HashSet::new(),
-                bases: Vec::new(),
-            }],
+            ascii,
+            cont_blocks,
+            scopes: vec![Scope::new(ScopeKind::Module, None, 0, src.len())],
             imports: HashMap::new(),
             other_imports: HashMap::new(),
             sdk_imported: HashSet::new(),
             assigns: HashMap::new(),
             attr_assigns: HashMap::new(),
             params: HashMap::new(),
+            functions: HashMap::new(),
             classes_by_name: HashMap::new(),
             config_assigns: Vec::new(),
             calls: Vec::new(),
             refs: Vec::new(),
             call_scope: HashMap::new(),
+            parents: HashMap::new(),
+            name_uses: HashMap::new(),
+            attr_uses: HashMap::new(),
+            mutated: HashSet::new(),
+            def_index: HashMap::new(),
             constructions: HashMap::new(),
             name_memo: HashMap::new(),
             attr_memo: HashMap::new(),
+            def_memo: HashMap::new(),
+            call_memo: HashMap::new(),
+            dict_cache: HashMap::new(),
+            attr_lookup_memo: HashMap::new(),
+            caller_memo: HashMap::new(),
             visiting: HashSet::new(),
+            name_depth: 0,
+            cutoffs: 0,
+            next_id: 0,
             openai_routing: Routing::OpenaiDirect,
             out: FileUsages::new(file, "python"),
         }
@@ -608,18 +943,34 @@ impl<'t> Ctx<'t> {
     }
 
     /// 1-based column in Unicode scalar values for a byte offset whose
-    /// tree-sitter column (in bytes) is `byte_column`.
+    /// tree-sitter column (in bytes) is `byte_column`. Constant time per
+    /// call, so a long minified line is not rescanned for every record.
     fn char_column(&self, byte: usize, byte_column: usize) -> u32 {
+        if self.ascii {
+            return byte_column as u32 + 1;
+        }
         let line_start = byte.saturating_sub(byte_column);
-        self.src
-            .get(line_start..byte)
-            .map(|prefix| prefix.chars().count())
-            .unwrap_or(byte_column) as u32
-            + 1
+        let continuation = self.continuation_before(byte) - self.continuation_before(line_start);
+        (byte_column - continuation.min(byte_column)) as u32 + 1
+    }
+
+    fn continuation_before(&self, at: usize) -> usize {
+        let at = at.min(self.src.len());
+        let block = at / 64;
+        let base = self.cont_blocks.get(block).copied().unwrap_or(0) as usize;
+        base + self.src.as_bytes()[block * 64..at]
+            .iter()
+            .filter(|b| (**b & 0xC0) == 0x80)
+            .count()
     }
 
     fn symbol(&self, scope: usize) -> Option<String> {
         self.scopes[scope].symbol.clone()
+    }
+
+    fn fresh_id(&mut self) -> usize {
+        self.next_id += 1;
+        self.next_id
     }
 
     // ------------------------------------------------------------------
@@ -627,64 +978,270 @@ impl<'t> Ctx<'t> {
     // ------------------------------------------------------------------
 
     fn collect(&mut self, root: Node<'t>) {
-        let mut stack = vec![(root, 0usize)];
-        while let Some((node, scope)) = stack.pop() {
+        self.scopes[0].start = root.start_byte();
+        self.scopes[0].end = root.end_byte();
+        let mut stack = vec![Frame {
+            node: root,
+            scope: 0,
+            parent: None,
+            field: None,
+            block_end: root.end_byte(),
+            stmt: None,
+            outer_loop: None,
+        }];
+        while let Some(frame) = stack.pop() {
+            let node = frame.node;
+            let scope = frame.scope;
+            let stmt = frame.stmt.unwrap_or((node.start_byte(), node.end_byte()));
+            // A statement-level binding holds from the end of its statement
+            // to the end of its block.
+            let place = Place {
+                at: stmt.1,
+                region: Some((stmt.1, frame.block_end)),
+                outer_loop: frame.outer_loop,
+            };
             let mut inner = scope;
-            match node.kind() {
-                "function_definition" => inner = self.enter_function(node, scope),
-                "class_definition" => inner = self.enter_class(node, scope),
-                "import_statement" => self.import_statement(node, scope),
-                "import_from_statement" => self.import_from(node, scope),
-                "assignment" => {
-                    if let Some(left) = node.child_by_field_name("left") {
-                        let value = node.child_by_field_name("right");
-                        let annotation = node.child_by_field_name("type");
-                        self.record_target(left, value, annotation, scope, false);
+            let mut child_loop = frame.outer_loop;
+            if node.is_named() {
+                match node.kind() {
+                    "function_definition" => {
+                        inner = self.enter_function(node, scope, frame.parent);
+                        child_loop = None;
                     }
-                }
-                "augmented_assignment" => {
-                    if let Some(left) = node.child_by_field_name("left") {
-                        self.record_target(left, None, None, scope, true);
+                    "class_definition" => {
+                        inner = self.enter_class(node, scope);
+                        child_loop = None;
                     }
-                }
-                "with_item" => self.record_with_item(node, scope),
-                "named_expression" => {
-                    if let Some(name) = node.child_by_field_name("name") {
-                        let value = node.child_by_field_name("value");
-                        self.record_target(name, value, None, scope, false);
+                    "lambda" => {
+                        inner = self.enter_lambda(node, scope);
+                        child_loop = None;
                     }
-                }
-                "for_statement" | "for_in_clause" => {
-                    if let Some(left) = node.child_by_field_name("left") {
-                        self.record_target(left, None, None, scope, true);
+                    "for_statement" | "while_statement" => {
+                        if child_loop.is_none() {
+                            child_loop = Some((node.start_byte(), node.end_byte()));
+                        }
+                        if let Some(left) = node.child_by_field_name("left") {
+                            let place = Place {
+                                at: left.end_byte(),
+                                region: None,
+                                outer_loop: child_loop,
+                            };
+                            self.record_target(left, None, None, scope, true, place);
+                        }
                     }
-                }
-                "global_statement" => {
-                    if self.scopes[scope].kind == ScopeKind::Function {
-                        for i in 0..node.named_child_count() {
-                            if let Some(name) = node.named_child(i) {
+                    "for_in_clause" => {
+                        if let Some(left) = node.child_by_field_name("left") {
+                            let place = Place {
+                                at: left.end_byte(),
+                                region: None,
+                                outer_loop: frame.outer_loop,
+                            };
+                            self.record_target(left, None, None, scope, true, place);
+                        }
+                    }
+                    "import_statement" => self.import_statement(node, scope, place),
+                    "import_from_statement" => self.import_from(node, scope, place),
+                    "assignment" => {
+                        if let Some(left) = node.child_by_field_name("left") {
+                            let value = node.child_by_field_name("right");
+                            let annotation = node.child_by_field_name("type");
+                            self.record_target(left, value, annotation, scope, false, place);
+                        }
+                    }
+                    "augmented_assignment" => {
+                        if let Some(left) = node.child_by_field_name("left") {
+                            self.record_target(left, None, None, scope, true, place);
+                        }
+                    }
+                    "with_item" => {
+                        // Bound before the body runs, for the rest of the block.
+                        let place = Place {
+                            at: node.end_byte(),
+                            region: Some((node.end_byte(), frame.block_end)),
+                            outer_loop: frame.outer_loop,
+                        };
+                        self.record_with_item(node, scope, place);
+                    }
+                    "named_expression" => {
+                        if let Some(name) = node.child_by_field_name("name") {
+                            let value = node.child_by_field_name("value");
+                            let place = Place {
+                                at: node.end_byte(),
+                                region: None,
+                                outer_loop: frame.outer_loop,
+                            };
+                            self.record_target(name, value, None, scope, false, place);
+                        }
+                    }
+                    "global_statement" => {
+                        if self.scopes[scope].kind == ScopeKind::Function {
+                            for name in named_children(node) {
                                 let name = self.text(name).to_string();
                                 self.scopes[scope].globals.insert(name);
                             }
                         }
                     }
+                    "delete_statement" => {
+                        for target in named_children(node) {
+                            self.note_subscript_target(target);
+                        }
+                    }
+                    "call" => {
+                        self.calls.push((node, scope));
+                        self.call_scope.insert(node.id(), scope);
+                        if let Some(parent) = frame.parent {
+                            self.parents.insert(node.id(), parent);
+                        }
+                        self.note_dict_mutation(node);
+                    }
+                    "parenthesized_expression"
+                    | "boolean_operator"
+                    | "conditional_expression"
+                    | "await" => {
+                        if let Some(parent) = frame.parent {
+                            self.parents.insert(node.id(), parent);
+                        }
+                    }
+                    "attribute" => {
+                        if is_value_reference(frame.parent, frame.field) {
+                            self.refs.push((node, scope));
+                        }
+                        self.note_attr_use(node, &frame, scope);
+                    }
+                    "identifier" => self.note_name_use(node, &frame, scope),
+                    _ => {}
                 }
-                "call" => {
-                    self.calls.push((node, scope));
-                    self.call_scope.insert(node.id(), scope);
-                }
-                "attribute" if is_value_reference(node) => self.refs.push((node, scope)),
-                _ => {}
             }
-            for i in (0..node.child_count()).rev() {
-                if let Some(child) = node.child(i) {
-                    stack.push((child, inner));
+            let (block_end, child_stmt) = match node.kind() {
+                "module" | "block" => (node.end_byte(), None),
+                _ => (frame.block_end, Some(stmt)),
+            };
+            // Punctuation and keywords carry nothing: only named children
+            // are walked, which also keeps the stack small on deep chains.
+            for (child, field) in children_with_fields(node).into_iter().rev() {
+                if !child.is_named() {
+                    continue;
                 }
+                stack.push(Frame {
+                    node: child,
+                    scope: inner,
+                    parent: Some(node),
+                    field,
+                    block_end,
+                    stmt: child_stmt,
+                    outer_loop: child_loop,
+                });
             }
         }
     }
 
-    fn enter_function(&mut self, node: Node<'t>, parent: usize) -> usize {
+    /// Records a call or value use of a bare name, for resolving parameters
+    /// from in-file callers.
+    fn note_name_use(&mut self, node: Node<'t>, frame: &Frame<'t>, scope: usize) {
+        let Some(parent) = frame.parent else {
+            return;
+        };
+        let declaration = match (parent.kind(), frame.field) {
+            ("call", Some("function")) => {
+                let name = self.text(node);
+                self.name_uses
+                    .entry(name)
+                    .or_default()
+                    .calls
+                    .push((parent, scope));
+                return;
+            }
+            ("function_definition" | "class_definition", Some("name"))
+            | ("keyword_argument", Some("name"))
+            | ("attribute", Some("attribute"))
+            | ("default_parameter" | "typed_default_parameter", Some("name")) => true,
+            (
+                "parameters"
+                | "lambda_parameters"
+                | "typed_parameter"
+                | "list_splat_pattern"
+                | "dictionary_splat_pattern"
+                | "dotted_name"
+                | "aliased_import"
+                | "import_from_statement"
+                | "global_statement"
+                | "nonlocal_statement",
+                _,
+            ) => true,
+            _ => false,
+        };
+        if !declaration {
+            let name = self.text(node);
+            self.name_uses.entry(name).or_default().escapes = true;
+        }
+    }
+
+    /// Records a call or value use of `x.name`, for resolving method
+    /// parameters from in-file callers.
+    fn note_attr_use(&mut self, node: Node<'t>, frame: &Frame<'t>, scope: usize) {
+        let Some(attr) = node.child_by_field_name("attribute") else {
+            return;
+        };
+        let name = self.text(attr);
+        let uses = self.attr_uses.entry(name).or_default();
+        match frame.parent {
+            Some(parent) if parent.kind() == "call" && frame.field == Some("function") => {
+                uses.calls.push((parent, scope));
+            }
+            _ => uses.escapes = true,
+        }
+    }
+
+    /// `D[k] = v`, `del D[k]`: the dict literal bound to `D` is not final.
+    fn note_subscript_target(&mut self, target: Node<'t>) {
+        if target.kind() != "subscript" {
+            return;
+        }
+        if let Some(object) = target.child_by_field_name("value") {
+            if object.kind() == "identifier" {
+                let name = self.text(object);
+                self.mutated.insert(name);
+            }
+        }
+    }
+
+    /// `D.update(...)`, `D.setdefault(...)`, `D.pop(...)`...
+    fn note_dict_mutation(&mut self, call: Node<'t>) {
+        let Some(function) = call.child_by_field_name("function") else {
+            return;
+        };
+        if function.kind() != "attribute" {
+            return;
+        }
+        let (Some(object), Some(attr)) = (
+            function.child_by_field_name("object"),
+            function.child_by_field_name("attribute"),
+        ) else {
+            return;
+        };
+        if object.kind() == "identifier"
+            && matches!(
+                self.text(attr),
+                "update"
+                    | "setdefault"
+                    | "pop"
+                    | "popitem"
+                    | "clear"
+                    | "__setitem__"
+                    | "__delitem__"
+            )
+        {
+            let name = self.text(object);
+            self.mutated.insert(name);
+        }
+    }
+
+    fn enter_function(
+        &mut self,
+        node: Node<'t>,
+        parent: usize,
+        wrapper: Option<Node<'t>>,
+    ) -> usize {
         let name = node
             .child_by_field_name("name")
             .map(|n| self.text(n).to_string())
@@ -699,16 +1256,60 @@ impl<'t> Ctx<'t> {
             Some(class) => format!("{}.{}", self.scopes[class].name, name),
             None => name.clone(),
         };
+        let mut scope = Scope::new(
+            ScopeKind::Function,
+            Some(parent),
+            node.start_byte(),
+            node.end_byte(),
+        );
+        scope.class = class;
+        scope.symbol = Some(symbol);
+        scope.name = name.clone();
+        if let Some(wrapper) = wrapper.filter(|w| w.kind() == "decorated_definition") {
+            for decorator in named_children(wrapper) {
+                if decorator.kind() != "decorator" {
+                    continue;
+                }
+                match decorator.named_child(0).map(|d| self.text(d)) {
+                    Some("staticmethod") => scope.staticmethod = true,
+                    Some("classmethod") => {}
+                    _ => scope.decorated = true,
+                }
+            }
+        }
         let id = self.scopes.len();
-        self.scopes.push(Scope {
-            kind: ScopeKind::Function,
-            parent: Some(parent),
-            class,
-            symbol: Some(symbol),
-            name,
-            globals: HashSet::new(),
-            bases: Vec::new(),
-        });
+        self.scopes.push(scope);
+        if let Some(params) = node.child_by_field_name("parameters") {
+            self.record_params(params, id);
+        }
+        // A method binds in its class; any other `def` where an import would.
+        let home = match self.scopes[parent].kind {
+            ScopeKind::Class => parent,
+            _ => self.import_home(parent, &name),
+        };
+        self.functions.entry((home, name)).or_default().push(id);
+        id
+    }
+
+    fn enter_lambda(&mut self, node: Node<'t>, parent: usize) -> usize {
+        let class = match self.scopes[parent].kind {
+            ScopeKind::Class => Some(parent),
+            _ => self.scopes[parent].class,
+        };
+        let mut scope = Scope::new(
+            ScopeKind::Function,
+            Some(parent),
+            node.start_byte(),
+            node.end_byte(),
+        );
+        scope.class = class;
+        // The graph has no node for a lambda: calls in it belong to the
+        // enclosing function.
+        scope.symbol = self.scopes[parent].symbol.clone();
+        scope.name = "<lambda>".to_string();
+        scope.lambda = true;
+        let id = self.scopes.len();
+        self.scopes.push(scope);
         if let Some(params) = node.child_by_field_name("parameters") {
             self.record_params(params, id);
         }
@@ -716,34 +1317,65 @@ impl<'t> Ctx<'t> {
     }
 
     fn record_params(&mut self, params: Node<'t>, scope: usize) {
-        for i in 0..params.named_child_count() {
-            let Some(param) = params.named_child(i) else {
-                continue;
-            };
-            let (name, annotation, default) = match param.kind() {
-                "identifier" => (Some(param), None, None),
+        let mut kind = SlotKind::Positional;
+        let mut slots: Vec<Slot> = Vec::new();
+        for param in named_children(params) {
+            let (name, annotation, default, slot) = match param.kind() {
+                "identifier" => (Some(param), None, None, kind),
                 "typed_parameter" => {
-                    let name = (0..param.named_child_count())
-                        .filter_map(|j| param.named_child(j))
-                        .find(|c| c.kind() == "identifier");
-                    (name, param.child_by_field_name("type"), None)
+                    let inner = param.named_child(0);
+                    let (name, slot) = match inner.map(|n| n.kind()) {
+                        Some("list_splat_pattern") => {
+                            kind = SlotKind::KeywordOnly;
+                            (inner.and_then(|n| n.named_child(0)), SlotKind::VarArgs)
+                        }
+                        Some("dictionary_splat_pattern") => {
+                            (inner.and_then(|n| n.named_child(0)), SlotKind::VarKwargs)
+                        }
+                        _ => (inner, kind),
+                    };
+                    (name, param.child_by_field_name("type"), None, slot)
                 }
                 "default_parameter" => (
                     param.child_by_field_name("name"),
                     None,
                     param.child_by_field_name("value"),
+                    kind,
                 ),
                 "typed_default_parameter" => (
                     param.child_by_field_name("name"),
                     param.child_by_field_name("type"),
                     param.child_by_field_name("value"),
+                    kind,
                 ),
-                "list_splat_pattern" | "dictionary_splat_pattern" => {
-                    (param.named_child(0), None, None)
+                "list_splat_pattern" => {
+                    kind = SlotKind::KeywordOnly;
+                    (param.named_child(0), None, None, SlotKind::VarArgs)
                 }
-                _ => (None, None, None),
+                "dictionary_splat_pattern" => {
+                    (param.named_child(0), None, None, SlotKind::VarKwargs)
+                }
+                "keyword_separator" => {
+                    kind = SlotKind::KeywordOnly;
+                    continue;
+                }
+                "positional_separator" => {
+                    for slot in &mut slots {
+                        if slot.kind == SlotKind::Positional {
+                            slot.kind = SlotKind::PositionalOnly;
+                        }
+                    }
+                    continue;
+                }
+                // A tuple parameter (Python 2) still takes a position.
+                _ => (None, None, None, kind),
             };
-            if let Some(name) = name.filter(|n| n.kind() == "identifier") {
+            let name = name.filter(|n| n.kind() == "identifier");
+            slots.push(Slot {
+                name: name.map(|n| self.text(n).to_string()).unwrap_or_default(),
+                kind: slot,
+            });
+            if let Some(name) = name {
                 let key = (scope, self.text(name).to_string());
                 self.params.insert(
                     key,
@@ -754,6 +1386,7 @@ impl<'t> Ctx<'t> {
                 );
             }
         }
+        self.scopes[scope].slots = slots;
     }
 
     fn enter_class(&mut self, node: Node<'t>, parent: usize) -> usize {
@@ -763,29 +1396,29 @@ impl<'t> Ctx<'t> {
             .unwrap_or_default();
         let mut bases = Vec::new();
         if let Some(list) = node.child_by_field_name("superclasses") {
-            for i in 0..list.named_child_count() {
-                if let Some(base) = list.named_child(i) {
-                    if matches!(base.kind(), "identifier" | "attribute") {
-                        bases.push(self.text(base).to_string());
-                    }
+            for base in named_children(list) {
+                if matches!(base.kind(), "identifier" | "attribute") {
+                    bases.push(self.text(base).to_string());
                 }
             }
         }
         let id = self.scopes.len();
-        self.scopes.push(Scope {
-            kind: ScopeKind::Class,
-            parent: Some(parent),
-            class: Some(id),
-            symbol: Some(name.clone()),
-            name: name.clone(),
-            globals: HashSet::new(),
-            bases,
-        });
+        let mut scope = Scope::new(
+            ScopeKind::Class,
+            Some(parent),
+            node.start_byte(),
+            node.end_byte(),
+        );
+        scope.class = Some(id);
+        scope.symbol = Some(name.clone());
+        scope.name = name.clone();
+        scope.bases = bases;
+        self.scopes.push(scope);
         self.classes_by_name.entry(name).or_default().push(id);
         id
     }
 
-    fn record_with_item(&mut self, node: Node<'t>, scope: usize) {
+    fn record_with_item(&mut self, node: Node<'t>, scope: usize, place: Place) {
         let Some(value) = node.child_by_field_name("value") else {
             return;
         };
@@ -797,7 +1430,7 @@ impl<'t> Ctx<'t> {
             .child_by_field_name("alias")
             .and_then(|alias| alias.named_child(0));
         if let Some(target) = target {
-            self.record_target(target, expr, None, scope, false);
+            self.record_target(target, expr, None, scope, false, place);
         }
     }
 
@@ -808,12 +1441,29 @@ impl<'t> Ctx<'t> {
         annotation: Option<Node<'t>>,
         scope: usize,
         unknowable: bool,
+        place: Place,
+    ) {
+        stacker::maybe_grow(64 * 1024, 2 * 1024 * 1024, || {
+            self.record_target_inner(target, value, annotation, scope, unknowable, place)
+        })
+    }
+
+    fn record_target_inner(
+        &mut self,
+        target: Node<'t>,
+        value: Option<Node<'t>>,
+        annotation: Option<Node<'t>>,
+        scope: usize,
+        unknowable: bool,
+        place: Place,
     ) {
         let assign = Assign {
+            id: self.fresh_id(),
             scope,
             value,
             annotation,
             unknowable,
+            place,
         };
         match target.kind() {
             "identifier" => {
@@ -864,6 +1514,7 @@ impl<'t> Ctx<'t> {
                     scope,
                 });
             }
+            "subscript" => self.note_subscript_target(target),
             "pattern_list"
             | "tuple_pattern"
             | "list_pattern"
@@ -871,19 +1522,18 @@ impl<'t> Ctx<'t> {
             | "list"
             | "list_splat_pattern"
             | "parenthesized_expression" => {
-                for i in 0..target.named_child_count() {
-                    if let Some(child) = target.named_child(i) {
-                        self.record_target(child, None, None, scope, true);
-                    }
+                for child in named_children(target) {
+                    self.record_target(child, None, None, scope, true, place);
                 }
             }
             _ => {}
         }
     }
 
-    /// The scope an import or assignment of `name` in `scope` binds in:
-    /// the function itself (unless the name is declared `global`), else the
-    /// module. Class-body imports are treated as module-level.
+    /// The scope an import or definition of `name` in `scope` binds in:
+    /// the function itself (unless the name is declared `global`), a class
+    /// for a method, else the module. Class-body imports are treated as
+    /// module-level.
     fn import_home(&self, scope: usize, name: &str) -> usize {
         let current = &self.scopes[scope];
         if current.kind == ScopeKind::Function && !current.globals.contains(name) {
@@ -893,12 +1543,15 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    fn other_import(&mut self, scope: usize, local: String, module: String) {
+    fn other_import(&mut self, scope: usize, local: String, module: String, place: Place) {
         let home = self.import_home(scope, &local);
-        self.other_imports.insert((home, local), module);
+        self.other_imports
+            .entry((home, local))
+            .or_default()
+            .push(OtherImport { module, place });
     }
 
-    fn import_statement(&mut self, node: Node<'t>, scope: usize) {
+    fn import_statement(&mut self, node: Node<'t>, scope: usize, place: Place) {
         let mut cursor = node.walk();
         let names: Vec<Node<'t>> = node.children_by_field_name("name", &mut cursor).collect();
         for item in names {
@@ -918,7 +1571,7 @@ impl<'t> Ctx<'t> {
                     Some(alias) => self.text(alias).to_string(),
                     None => module.split('.').next().unwrap_or("").to_string(),
                 };
-                self.other_import(scope, local, module);
+                self.other_import(scope, local, module, place);
                 continue;
             };
             let (local, val) = match alias {
@@ -948,11 +1601,11 @@ impl<'t> Ctx<'t> {
                 name: None,
                 kind: BindingKind::Module,
             };
-            self.add_import(binding, val, scope, item);
+            self.add_import(binding, val, scope, item, place);
         }
     }
 
-    fn import_from(&mut self, node: Node<'t>, scope: usize) {
+    fn import_from(&mut self, node: Node<'t>, scope: usize, place: Place) {
         let Some(module_node) = node.child_by_field_name("module_name") else {
             return;
         };
@@ -961,8 +1614,8 @@ impl<'t> Ctx<'t> {
 
         let mut cursor = node.walk();
         let names: Vec<Node<'t>> = node.children_by_field_name("name", &mut cursor).collect();
-        let wildcard = (0..node.named_child_count())
-            .filter_map(|i| node.named_child(i))
+        let wildcard = named_children(node)
+            .iter()
             .any(|c| c.kind() == "wildcard_import");
 
         let target = if relative {
@@ -975,10 +1628,10 @@ impl<'t> Ctx<'t> {
             if let Some((pkg, _)) = target {
                 for class in CLASSES.iter().filter(|c| c.pkg == pkg) {
                     let key = (self.import_home(scope, class.name), class.name.to_string());
-                    self.imports
-                        .entry(key)
-                        .or_default()
-                        .push(Val::Class(*class));
+                    self.imports.entry(key).or_default().push(ImportDef {
+                        val: Val::Class(*class),
+                        place,
+                    });
                 }
                 let binding = Binding {
                     local: "*",
@@ -1014,7 +1667,7 @@ impl<'t> Ctx<'t> {
                     "genai" => Pkg::GoogleGenai,
                     "generativeai" => Pkg::GoogleGenerativeai,
                     _ => {
-                        self.other_import(scope, local, module.clone());
+                        self.other_import(scope, local, module.clone(), place);
                         continue;
                     }
                 };
@@ -1029,12 +1682,12 @@ impl<'t> Ctx<'t> {
                     name: Some(name),
                     kind: BindingKind::Module,
                 };
-                self.add_import(binding, val, scope, item);
+                self.add_import(binding, val, scope, item, place);
                 continue;
             }
 
             let Some((pkg, rest)) = target.clone() else {
-                self.other_import(scope, local, module.clone());
+                self.other_import(scope, local, module.clone(), place);
                 continue;
             };
             let (val, kind) = match client_class(pkg, &name) {
@@ -1052,17 +1705,27 @@ impl<'t> Ctx<'t> {
                 name: Some(name),
                 kind,
             };
-            self.add_import(binding, val, scope, item);
+            self.add_import(binding, val, scope, item, place);
         }
     }
 
     /// Binds a tracked import in the scope it appears in and records it.
-    fn add_import(&mut self, binding: Binding<'_>, val: Val, scope: usize, node: Node<'t>) {
+    fn add_import(
+        &mut self,
+        binding: Binding<'_>,
+        val: Val,
+        scope: usize,
+        node: Node<'t>,
+        place: Place,
+    ) {
         let key = (
             self.import_home(scope, binding.local),
             binding.local.to_string(),
         );
-        self.imports.entry(key).or_default().push(val);
+        self.imports
+            .entry(key)
+            .or_default()
+            .push(ImportDef { val, place });
         self.record_import(binding, node);
     }
 
@@ -1079,6 +1742,149 @@ impl<'t> Ctx<'t> {
             file: self.file.clone(),
             span,
         });
+    }
+
+    /// Orders every name's definitions by position, for reaching-definition
+    /// queries.
+    fn index_definitions(&mut self) {
+        let mut keys: HashSet<Key> = HashSet::new();
+        keys.extend(self.imports.keys().cloned());
+        keys.extend(self.other_imports.keys().cloned());
+        keys.extend(self.params.keys().cloned());
+        keys.extend(self.assigns.keys().cloned());
+        for key in keys {
+            let home = key.0;
+            let mut local = Vec::new();
+            let mut foreign = Vec::new();
+            for (i, import) in self.imports.get(&key).into_iter().flatten().enumerate() {
+                local.push(DefPos {
+                    place: import.place,
+                    def: DefRef::Import(i),
+                });
+            }
+            for (i, import) in self
+                .other_imports
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                local.push(DefPos {
+                    place: import.place,
+                    def: DefRef::Other(i),
+                });
+            }
+            if self.params.contains_key(&key) {
+                let scope = &self.scopes[home];
+                local.push(DefPos {
+                    place: Place {
+                        at: scope.start,
+                        region: Some((scope.start, scope.end)),
+                        outer_loop: None,
+                    },
+                    def: DefRef::Param,
+                });
+            }
+            for (i, assign) in self.assigns.get(&key).into_iter().flatten().enumerate() {
+                if assign.scope == home {
+                    local.push(DefPos {
+                        place: assign.place,
+                        def: DefRef::Assign(i),
+                    });
+                } else {
+                    foreign.push(DefRef::Assign(i));
+                }
+            }
+            local.sort_by_key(|d| d.place.at);
+            let total = local.len() + foreign.len();
+            self.def_index.insert(
+                key,
+                DefIndex {
+                    local,
+                    foreign,
+                    total,
+                },
+            );
+        }
+    }
+
+    /// The definitions of `key` that reach byte `pos` of its scope (`None`:
+    /// the end of the scope, for a use from a nested function).
+    fn reaching(&self, key: &Key, pos: Option<usize>) -> Reach {
+        let Some(index) = self.def_index.get(key) else {
+            return Reach::All;
+        };
+        if index.total <= 1 {
+            return Reach::All;
+        }
+        let pos = pos.unwrap_or(self.scopes[key.0].end);
+        let local = &index.local;
+        let before = local.partition_point(|d| d.place.at <= pos);
+        let mut nearest = None;
+        for (steps, i) in (0..before).rev().enumerate() {
+            if steps >= MAX_REACH_SCAN {
+                return Reach::All;
+            }
+            if local[i].place.dominates(pos) {
+                nearest = Some(i);
+                break;
+            }
+        }
+        let first = match nearest {
+            Some(i) => i,
+            None if before > MAX_REACH_SCAN => return Reach::All,
+            None => 0,
+        };
+        let mut chosen: Vec<DefRef> = local[first..before].iter().map(|d| d.def).collect();
+        // A later definition inside a loop around the use reaches it on the
+        // next iteration.
+        if let Some(loop_end) = local
+            .get(before)
+            .and_then(|d| d.place.outer_loop)
+            .filter(|(start, end)| *start <= pos && pos < *end)
+            .map(|(_, end)| end)
+        {
+            for d in &local[before..] {
+                if d.place.at > loop_end {
+                    break;
+                }
+                if chosen.len() >= MAX_REACH_SCAN {
+                    return Reach::All;
+                }
+                chosen.push(d.def);
+            }
+        }
+        chosen.extend(index.foreign.iter().copied());
+        if chosen.is_empty() || chosen.len() >= index.total {
+            Reach::All
+        } else {
+            Reach::Subset(chosen)
+        }
+    }
+
+    /// Every definition of `key`, in a fixed order.
+    fn all_defs(&self, key: &Key) -> Vec<DefRef> {
+        let mut defs = Vec::new();
+        defs.extend((0..self.imports.get(key).map_or(0, Vec::len)).map(DefRef::Import));
+        defs.extend((0..self.other_imports.get(key).map_or(0, Vec::len)).map(DefRef::Other));
+        if self.params.contains_key(key) {
+            defs.push(DefRef::Param);
+        }
+        defs.extend((0..self.assigns.get(key).map_or(0, Vec::len)).map(DefRef::Assign));
+        defs
+    }
+
+    /// The definitions of `name` a use at `pos` in `scope` sees, and the key
+    /// they belong to.
+    fn defs_at(&self, name: &str, scope: usize, pos: usize) -> (Key, Vec<DefRef>) {
+        let home = self.binding_scope(name, scope);
+        let key = (home, name.to_string());
+        let pos = (scope == home).then_some(pos);
+        let defs = match self.reaching(&key, pos) {
+            Reach::All => self.all_defs(&key),
+            Reach::Subset(defs) => defs,
+        };
+        (key, defs)
     }
 
     // ------------------------------------------------------------------
@@ -1098,7 +1904,7 @@ impl<'t> Ctx<'t> {
         match node.kind() {
             "identifier" => {
                 let name = self.text(node).to_string();
-                self.resolve_name(&name, scope, depth + 1)
+                self.resolve_name(&name, scope, node.start_byte())
             }
             "attribute" => {
                 let (Some(object), Some(attr)) = (
@@ -1109,17 +1915,25 @@ impl<'t> Ctx<'t> {
                 };
                 let attr = self.text(attr).to_string();
                 if let Some(class) = self.class_receiver(object, scope) {
-                    return self.resolve_attr(class, &attr, depth + 1);
+                    return self.resolve_attr(class, &attr);
                 }
                 let base = self.eval(object, scope, depth + 1);
                 self.member(base, &attr)
             }
             "call" => {
+                // Each call is evaluated once per scope: a chain of calls
+                // (`x.a().b().c()...`) is then linear, not quadratic.
+                let key = (node.id(), scope);
+                if let Some(val) = self.call_memo.get(&key) {
+                    return val.clone();
+                }
                 let Some(function) = node.child_by_field_name("function") else {
                     return Val::untracked(Origin::Other);
                 };
                 let callee = self.eval(function, scope, depth + 1);
-                self.apply_call(callee, node, scope, depth + 1)
+                let val = self.apply_call(callee, node, scope, depth + 1);
+                self.call_memo.insert(key, val.clone());
+                val
             }
             "parenthesized_expression" | "await" => match node.named_child(0) {
                 Some(inner) => self.eval(inner, scope, depth + 1),
@@ -1140,12 +1954,10 @@ impl<'t> Ctx<'t> {
             }
             "conditional_expression" => {
                 // `a if cond else b`: the first and last named children.
-                let count = node.named_child_count();
+                let children = named_children(node);
                 let mut vals = Vec::new();
-                for i in [0, count.saturating_sub(1)] {
-                    if let Some(side) = node.named_child(i) {
-                        vals.push(self.eval(side, scope, depth + 1));
-                    }
+                for side in [children.first(), children.last()].into_iter().flatten() {
+                    vals.push(self.eval(*side, scope, depth + 1));
                 }
                 combine(vals)
             }
@@ -1193,13 +2005,15 @@ impl<'t> Ctx<'t> {
         false
     }
 
-    /// Whether scope `s` itself binds `name` (assignment, parameter or import).
+    /// Whether scope `s` itself binds `name` (assignment, parameter, import
+    /// or `def`).
     fn binds(&self, s: usize, name: &str) -> bool {
         let key = (s, name.to_string());
         self.assigns.contains_key(&key)
             || self.params.contains_key(&key)
             || self.imports.contains_key(&key)
             || self.other_imports.contains_key(&key)
+            || self.functions.contains_key(&key)
     }
 
     /// The scope whose binding of `name` is visible from `scope`.
@@ -1233,72 +2047,279 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    fn resolve_name(&mut self, name: &str, scope: usize, depth: u32) -> Val {
+    /// Enters a nested name resolution; `false` past [`MAX_NAME_DEPTH`].
+    fn enter_name(&mut self) -> bool {
+        if self.name_depth >= MAX_NAME_DEPTH {
+            self.cutoffs += 1;
+            return false;
+        }
+        self.name_depth += 1;
+        true
+    }
+
+    fn leave_name(&mut self) {
+        self.name_depth -= 1;
+    }
+
+    /// The value of `name` used at byte `pos` of `scope`.
+    fn resolve_name(&mut self, name: &str, scope: usize, pos: usize) -> Val {
+        if !self.enter_name() {
+            return Val::untracked(Origin::Other);
+        }
         let home = self.binding_scope(name, scope);
         let key = (home, name.to_string());
-        if let Some(val) = self.name_memo.get(&key) {
-            return val.clone();
-        }
-        let guard = (false, home, name.to_string());
-        if !self.visiting.insert(guard.clone()) {
-            return Val::untracked(Origin::Cycle);
-        }
-
-        let mut vals = Vec::new();
-        if let Some(imports) = self.imports.get(&key) {
-            vals.extend(imports.iter().cloned());
-        }
-        if let Some(param) = self.params.get(&key).copied() {
-            vals.push(self.param_value(name, param, home, depth));
-        }
-        let assigns = self.assigns.get(&key).cloned().unwrap_or_default();
-        for assign in assigns {
-            vals.push(self.assign_value(assign, depth));
-        }
-        let val = if vals.is_empty() {
-            match self.other_imports.get(&key) {
-                Some(module) => Val::untracked(Origin::Imported {
-                    module: module.clone(),
-                }),
-                None => Val::untracked(Origin::Unbound),
+        let pos = (scope == home).then_some(pos);
+        let val = match self.reaching(&key, pos) {
+            Reach::All => self.resolve_all(key),
+            Reach::Subset(defs) => {
+                let vals = self.def_values(&key, &defs);
+                if vals.is_empty() {
+                    self.no_value(&key, &defs)
+                } else {
+                    combine(vals)
+                }
             }
-        } else {
-            combine(vals)
         };
-
-        self.visiting.remove(&guard);
-        self.name_memo.insert(key, val.clone());
+        self.leave_name();
         val
     }
 
-    fn param_value(&mut self, name: &str, param: Param<'t>, scope: usize, depth: u32) -> Val {
+    /// Every definition of `key` combined, memoized.
+    fn resolve_all(&mut self, key: Key) -> Val {
+        if let Some(val) = self.name_memo.get(&key) {
+            return val.clone();
+        }
+        let guard = (0u8, key.0, key.1.clone());
+        if !self.visiting.insert(guard.clone()) {
+            return Val::untracked(Origin::Cycle);
+        }
+        let cutoffs = self.cutoffs;
+        let defs = self.all_defs(&key);
+        let vals = self.def_values(&key, &defs);
+        let val = if vals.is_empty() {
+            self.no_value(&key, &defs)
+        } else {
+            combine(vals)
+        };
+        self.visiting.remove(&guard);
+        if self.cutoffs == cutoffs {
+            self.name_memo.insert(key, val.clone());
+        }
+        val
+    }
+
+    /// Values of the tracked imports, parameter and assignments among `defs`.
+    /// Other imports matter only when nothing else binds the name.
+    fn def_values(&mut self, key: &Key, defs: &[DefRef]) -> Vec<Val> {
+        let mut vals = Vec::new();
+        for def in defs {
+            match *def {
+                DefRef::Import(i) => {
+                    if let Some(import) = self.imports.get(key).and_then(|v| v.get(i)) {
+                        vals.push(import.val.clone());
+                    }
+                }
+                DefRef::Other(_) => {}
+                DefRef::Param => {
+                    if let Some(param) = self.params.get(key).copied() {
+                        vals.push(self.param_value(&key.1, param, key.0));
+                    }
+                }
+                DefRef::Assign(i) => {
+                    if let Some(assign) = self.assigns.get(key).and_then(|v| v.get(i)).copied() {
+                        vals.push(self.assign_value_memo(assign));
+                    }
+                }
+            }
+        }
+        vals
+    }
+
+    fn no_value(&self, key: &Key, defs: &[DefRef]) -> Val {
+        let module = defs.iter().find_map(|def| match def {
+            DefRef::Other(i) => self
+                .other_imports
+                .get(key)
+                .and_then(|v| v.get(*i))
+                .map(|o| o.module.clone()),
+            _ => None,
+        });
+        match module {
+            Some(module) => Val::untracked(Origin::Imported { module }),
+            None => Val::untracked(Origin::Unbound),
+        }
+    }
+
+    fn assign_value_memo(&mut self, assign: Assign<'t>) -> Val {
+        if let Some(val) = self.def_memo.get(&assign.id) {
+            return val.clone();
+        }
+        let guard = (2u8, assign.id, String::new());
+        if !self.visiting.insert(guard.clone()) {
+            return Val::untracked(Origin::Cycle);
+        }
+        let cutoffs = self.cutoffs;
+        let val = self.assign_value(assign);
+        self.visiting.remove(&guard);
+        if self.cutoffs == cutoffs {
+            self.def_memo.insert(assign.id, val.clone());
+        }
+        val
+    }
+
+    fn param_value(&mut self, name: &str, param: Param<'t>, scope: usize) -> Val {
         if let Some(annotation) = param.annotation {
-            if let Some(val) = self.typed(annotation, scope, depth) {
+            if let Some(val) = self.typed(annotation, scope) {
                 return val;
             }
         }
         if let Some(default) = param.default {
             let parent = self.scopes[scope].parent.unwrap_or(0);
-            let val = self.eval(default, parent, depth + 1);
+            let val = self.eval(default, parent, 0);
             if matches!(val, Val::Client { .. }) {
                 return val;
             }
+        }
+        if let Some(val) = self.param_from_callers(scope, name) {
+            return val;
         }
         Val::untracked(Origin::Parameter {
             name: name.to_string(),
         })
     }
 
-    fn assign_value(&mut self, assign: Assign<'t>, depth: u32) -> Val {
+    /// The client every in-file call of `func` passes for parameter `name`,
+    /// when they all pass the same one. `None` when the function may be
+    /// called from elsewhere in the file (stored, passed, decorated, called
+    /// on another object) or when the callers disagree.
+    fn param_from_callers(&mut self, func: usize, name: &str) -> Option<Val> {
+        let key = (func, name.to_string());
+        if let Some(found) = self.caller_memo.get(&key) {
+            return found.clone();
+        }
+        let guard = (3u8, func, name.to_string());
+        if !self.visiting.insert(guard.clone()) {
+            return Some(Val::untracked(Origin::Cycle));
+        }
+        if !self.enter_name() {
+            self.visiting.remove(&guard);
+            return None;
+        }
+        let cutoffs = self.cutoffs;
+        let found = self.callers_agree(func, name);
+        self.leave_name();
+        self.visiting.remove(&guard);
+        if self.cutoffs == cutoffs {
+            self.caller_memo.insert(key, found.clone());
+        }
+        found
+    }
+
+    fn callers_agree(&mut self, func: usize, name: &str) -> Option<Val> {
+        let scope = &self.scopes[func];
+        if scope.lambda || scope.decorated {
+            return None;
+        }
+        let parent = scope.parent?;
+        let fname = scope.name.clone();
+        let method = self.scopes[parent].kind == ScopeKind::Class;
+        let shift = usize::from(method && !scope.staticmethod);
+        let index = scope.slots.iter().position(|s| s.name == name)?;
+        let slot = scope.slots[index].kind;
+        if index < shift || matches!(slot, SlotKind::VarArgs | SlotKind::VarKwargs) {
+            return None;
+        }
+        let position =
+            matches!(slot, SlotKind::Positional | SlotKind::PositionalOnly).then(|| index - shift);
+        let keyword = (slot != SlotKind::PositionalOnly).then_some(name);
+
+        let calls: Vec<(Node<'t>, usize)> = if method {
+            let uses = self.attr_uses.get(fname.as_str())?;
+            if uses.escapes {
+                return None;
+            }
+            let mut calls = Vec::new();
+            for &(call, call_scope) in &uses.calls {
+                let object = call
+                    .child_by_field_name("function")
+                    .and_then(|f| f.child_by_field_name("object"))?;
+                let on_self = object.kind() == "identifier"
+                    && matches!(self.text(object), "self" | "cls")
+                    && self.scopes[call_scope].class == Some(parent);
+                if !on_self {
+                    return None;
+                }
+                calls.push((call, call_scope));
+            }
+            calls
+        } else {
+            let home = self.import_home(parent, &fname);
+            let key = (home, fname.clone());
+            let only_def = self.functions.get(&key).map_or(0, Vec::len) == 1
+                && !self.assigns.contains_key(&key)
+                && !self.imports.contains_key(&key)
+                && !self.other_imports.contains_key(&key)
+                && !self.params.contains_key(&key);
+            if !only_def {
+                return None;
+            }
+            let uses = self.name_uses.get(fname.as_str())?;
+            if uses.escapes {
+                return None;
+            }
+            uses.calls
+                .iter()
+                .copied()
+                .filter(|(_, call_scope)| self.binding_scope(&fname, *call_scope) == home)
+                .collect()
+        };
+        if calls.is_empty() {
+            return None;
+        }
+
+        let default = self
+            .params
+            .get(&(func, name.to_string()))
+            .and_then(|p| p.default);
+        let mut vals = Vec::new();
+        for (call, call_scope) in calls {
+            let val = match argument_for(call, position, keyword, |n| self.text(n)) {
+                ArgFor::Found(expr) => self.eval(expr, call_scope, 0),
+                ArgFor::Missing => self.eval(default?, parent, 0),
+                ArgFor::Unknown => return None,
+            };
+            vals.push(val);
+        }
+        let real: Vec<Val> = vals
+            .into_iter()
+            .filter(|v| !matches!(v, Val::Untracked(Origin::Cycle)))
+            .collect();
+        let first = real.first()?.clone();
+        let agree = real.iter().all(|v| *v == first);
+        match first {
+            Val::Client { path, .. } if path.is_empty() => match combine(real) {
+                Val::Client { client, path } if path.is_empty() && !client.ambiguous => {
+                    Some(Val::Client { client, path })
+                }
+                _ => None,
+            },
+            Val::Module { .. } | Val::Symbol { .. } | Val::Class(_) | Val::GoogleNs if agree => {
+                Some(first)
+            }
+            _ => None,
+        }
+    }
+
+    fn assign_value(&mut self, assign: Assign<'t>) -> Val {
         if assign.unknowable {
             return Val::untracked(Origin::Other);
         }
-        let value = assign.value.map(|v| self.eval(v, assign.scope, depth + 1));
+        let value = assign.value.map(|v| self.eval(v, assign.scope, 0));
         if let Some(val @ Val::Client { .. }) = &value {
             return val.clone();
         }
         if let Some(annotation) = assign.annotation {
-            if let Some(val) = self.typed(annotation, assign.scope, depth) {
+            if let Some(val) = self.typed(annotation, assign.scope) {
                 return val;
             }
         }
@@ -1307,13 +2328,13 @@ impl<'t> Ctx<'t> {
 
     /// A client typed by an annotation (`client: OpenAI`,
     /// `Optional[AzureOpenAI]`).
-    fn typed(&mut self, annotation: Node<'t>, scope: usize, depth: u32) -> Option<Val> {
-        let mut stack = vec![annotation];
-        while let Some(node) = stack.pop() {
-            let top_chain = matches!(node.kind(), "identifier" | "attribute")
-                && node.parent().is_none_or(|p| p.kind() != "attribute");
+    fn typed(&mut self, annotation: Node<'t>, scope: usize) -> Option<Val> {
+        // Each entry: a node and whether its parent is an attribute.
+        let mut stack = vec![(annotation, false)];
+        while let Some((node, in_attribute)) = stack.pop() {
+            let top_chain = matches!(node.kind(), "identifier" | "attribute") && !in_attribute;
             if top_chain {
-                if let Val::Class(class) = self.eval(node, scope, depth + 1) {
+                if let Val::Class(class) = self.eval(node, scope, 0) {
                     return Some(Val::Client {
                         client: Client {
                             pkg: class.pkg,
@@ -1327,44 +2348,74 @@ impl<'t> Ctx<'t> {
                 }
                 continue;
             }
-            for i in (0..node.named_child_count()).rev() {
-                if let Some(child) = node.named_child(i) {
-                    stack.push(child);
-                }
+            let is_attribute = node.kind() == "attribute";
+            for child in named_children(node).into_iter().rev() {
+                stack.push((child, is_attribute));
             }
         }
         None
     }
 
     /// All assignments to attribute `attr` of `class`: class-body names and
-    /// `self.attr = ...`, falling back to same-file base classes.
-    fn attr_assignments(&self, class: usize, attr: &str, depth: u32) -> Vec<Assign<'t>> {
+    /// `self.attr = ...`, falling back to same-file base classes. Each class
+    /// is visited once per lookup and the answer is memoized, so a file
+    /// whose classes all list each other as bases stays cheap.
+    fn attr_assignments(&mut self, class: usize, attr: &str) -> Vec<Assign<'t>> {
+        let key = (class, attr.to_string());
+        if let Some(found) = self.attr_lookup_memo.get(&key) {
+            return found.clone();
+        }
+        let mut visited = HashSet::new();
+        let found = self.attr_assignments_in(class, attr, 0, &mut visited);
+        self.attr_lookup_memo.insert(key, found.clone());
+        found
+    }
+
+    fn attr_assignments_in(
+        &self,
+        class: usize,
+        attr: &str,
+        depth: u32,
+        visited: &mut HashSet<usize>,
+    ) -> Vec<Assign<'t>> {
+        if !visited.insert(class) {
+            return Vec::new();
+        }
         let key = (class, attr.to_string());
         let mut found: Vec<Assign<'t>> = self.assigns.get(&key).cloned().unwrap_or_default();
         found.extend(self.attr_assigns.get(&key).cloned().unwrap_or_default());
-        if found.is_empty() && depth < 8 {
-            for base in self.scopes[class].bases.clone() {
-                if let Some([base_class]) = self.classes_by_name.get(&base).map(Vec::as_slice) {
-                    let inherited = self.attr_assignments(*base_class, attr, depth + 1);
-                    if !inherited.is_empty() {
-                        return inherited;
-                    }
+        if !found.is_empty() || depth >= MAX_BASE_DEPTH {
+            return found;
+        }
+        for base in self.scopes[class].bases.iter().take(MAX_BASES) {
+            if visited.len() >= MAX_CLASSES_VISITED {
+                break;
+            }
+            if let Some([base_class]) = self.classes_by_name.get(base).map(Vec::as_slice) {
+                let inherited = self.attr_assignments_in(*base_class, attr, depth + 1, visited);
+                if !inherited.is_empty() {
+                    return inherited;
                 }
             }
         }
         found
     }
 
-    fn resolve_attr(&mut self, class: usize, attr: &str, depth: u32) -> Val {
+    fn resolve_attr(&mut self, class: usize, attr: &str) -> Val {
         let key = (class, attr.to_string());
         if let Some(val) = self.attr_memo.get(&key) {
             return val.clone();
         }
-        let guard = (true, class, attr.to_string());
+        let guard = (1u8, class, attr.to_string());
         if !self.visiting.insert(guard.clone()) {
             return Val::untracked(Origin::Cycle);
         }
-        let assigns = self.attr_assignments(class, attr, 0);
+        if !self.enter_name() {
+            self.visiting.remove(&guard);
+            return Val::untracked(Origin::Other);
+        }
+        let cutoffs = self.cutoffs;
+        let assigns = self.attr_assignments(class, attr);
         let val = if assigns.is_empty() {
             Val::untracked(Origin::UnassignedAttribute {
                 name: attr.to_string(),
@@ -1372,12 +2423,15 @@ impl<'t> Ctx<'t> {
         } else {
             let vals = assigns
                 .into_iter()
-                .map(|a| self.assign_value(a, depth))
+                .map(|a| self.assign_value_memo(a))
                 .collect();
             combine(vals)
         };
+        self.leave_name();
         self.visiting.remove(&guard);
-        self.attr_memo.insert(key, val.clone());
+        if self.cutoffs == cutoffs {
+            self.attr_memo.insert(key, val.clone());
+        }
         val
     }
 
@@ -1428,9 +2482,9 @@ impl<'t> Ctx<'t> {
                 let pkg = client.pkg;
                 let joined = path.join(".");
                 match joined.as_str() {
-                    // Copies of the same client.
+                    // Copies of the same client, re-routed by their options.
                     "with_options" | "copy" => Val::Client {
-                        client,
+                        client: self.copied_client(client, call, scope),
                         path: Vec::new(),
                     },
                     // Chat sessions that keep the client's routing.
@@ -1447,7 +2501,7 @@ impl<'t> Ctx<'t> {
             Val::Untracked(_) => {
                 let callee = call
                     .child_by_field_name("function")
-                    .map(|f| self.render(f))
+                    .map(|f| self.render_links(f, 16))
                     .unwrap_or_else(|| "<expr>".to_string());
                 let wraps = self.wrapped_pkg(call, scope, depth);
                 Val::untracked(Origin::Factory { callee, wraps })
@@ -1455,14 +2509,39 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// `client.with_options(...)` / `client.copy(...)`: both SDKs accept
+    /// `base_url` there, so a direct client given one is a custom route, and
+    /// options passed through an unreadable `**kwargs` make it unknown.
+    fn copied_client(&mut self, mut client: Client, call: Node<'t>, scope: usize) -> Client {
+        let args = self.arguments(call);
+        let mut base_url = args.kwargs.iter().any(|k| is_base_url_key(k));
+        let mut opaque = false;
+        for splat in &args.splats {
+            match self.expand_splat(*splat, scope) {
+                Some(expansion) => {
+                    base_url |= expansion.pairs.iter().any(|(k, _)| is_base_url_key(k));
+                    opaque |= expansion.opaque;
+                }
+                None => opaque = true,
+            }
+        }
+        let direct = matches!(
+            client.routing,
+            Routing::OpenaiDirect | Routing::AnthropicDirect
+        );
+        if direct && base_url {
+            client.routing = Routing::CustomBaseUrl;
+        } else if direct && opaque {
+            client.routing = Routing::Unknown;
+        }
+        client
+    }
+
     /// The SDK of a tracked client or constructor passed to a call
     /// (`instructor.from_openai(OpenAI())`).
     fn wrapped_pkg(&mut self, call: Node<'t>, scope: usize, depth: u32) -> Option<Pkg> {
         let args = call.child_by_field_name("arguments")?;
-        for i in 0..args.named_child_count() {
-            let Some(arg) = args.named_child(i) else {
-                continue;
-            };
+        for arg in named_children(args) {
             let expr = if arg.kind() == "keyword_argument" {
                 arg.child_by_field_name("value")
             } else {
@@ -1529,7 +2608,7 @@ impl<'t> Ctx<'t> {
     /// The name a constructed client is assigned to, and how it is held.
     fn binding_target(&self, call: Node<'t>, scope: usize) -> (Option<String>, ClientScope) {
         let mut child = call;
-        let mut parent = call.parent();
+        let mut parent = self.parents.get(&call.id()).copied();
         while let Some(p) = parent {
             if matches!(
                 p.kind(),
@@ -1537,9 +2616,10 @@ impl<'t> Ctx<'t> {
                     | "boolean_operator"
                     | "conditional_expression"
                     | "await"
-            ) {
+            ) && p.is_named()
+            {
                 child = p;
-                parent = p.parent();
+                parent = self.parents.get(&p.id()).copied();
             } else {
                 break;
             }
@@ -1726,34 +2806,47 @@ impl<'t> Ctx<'t> {
         let symbol = self.symbol(scope);
         let args = self.arguments(call);
         let sdk = target.pkg.sdk();
+        let member = strip_wrappers(&target.member);
+        let request = is_request(&member);
+        let model_bearing = is_model_bearing(&member);
 
-        // An unresolved model matters where it reaches a request or a model
-        // object; on an SDK type (`ChatCompletion(model=model)`) the call
-        // still lists `model` in its kwargs, without a gap.
-        let gap_worthy = is_request(&target.member) || is_model_bearing(&target.member);
+        // An unresolved model matters where it reaches a request, a model
+        // object, or any call on a client or SDK module; on an SDK type
+        // (`ChatCompletion(model=model)`) the call still lists `model` in
+        // its kwargs, without a gap.
+        let on_sdk_object = matches!(target.receiver, Receiver::Client | Receiver::Module)
+            && member.split('.').next() != Some("types");
+        let gap_worthy = request || model_bearing || on_sdk_object;
+        let site = Site {
+            sdk,
+            call,
+            chain: &chain,
+            scope,
+            gap_worthy,
+        };
+
         let mut values = Vec::new();
         let mut keyed = false;
         for (key, expr) in &args.value_args {
             keyed = true;
-            match self.resolve_value(*expr, scope, 0) {
-                Ok(resolved) => values.push(captured(key, resolved, false)),
-                Err(unresolved) if gap_worthy => {
-                    self.unresolved_gap(sdk, call, &chain, key, &unresolved, scope)
-                }
-                Err(_) => {}
-            }
+            let result = self.resolve_value(*expr, scope, 0);
+            self.take_value(&site, key, false, result, &mut values);
         }
 
-        // `GenerativeModel("gemini-pro")`: the model name is positional.
-        if target.member == "GenerativeModel" && !keyed {
-            if let Some(first) = args.first_positional {
+        // `GenerativeModel("gemini-pro")`, `genai.embed_content("models/...", text)`:
+        // the model is positional.
+        if !keyed {
+            if let (Some(key), Some(first)) = (
+                positional_model_key(target.pkg, target.receiver, &member),
+                args.first_positional,
+            ) {
                 keyed = true;
-                match self.resolve_value(first, scope, 0) {
-                    Ok(resolved) => values.push(captured("model_name", resolved, true)),
-                    Err(unresolved) => {
-                        self.unresolved_gap(sdk, call, &chain, "model_name", &unresolved, scope)
-                    }
-                }
+                let result = self.resolve_value(first, scope, 0);
+                let site = Site {
+                    gap_worthy: true,
+                    ..site
+                };
+                self.take_value(&site, key, true, result, &mut values);
             }
         }
 
@@ -1765,14 +2858,47 @@ impl<'t> Ctx<'t> {
             self.nested_values(*expr, &prefix, keyword.is_none(), scope, 0, &mut values);
         }
 
-        if !keyed && args.splat && is_model_bearing(&target.member) {
-            let key = if target.member == "GenerativeModel" {
+        // `**PARAMS` where `PARAMS` is a same-file dict literal.
+        let mut opaque_splat = false;
+        for splat in &args.splats {
+            let Some(expansion) = self.expand_splat(*splat, scope) else {
+                opaque_splat = true;
+                continue;
+            };
+            opaque_splat |= expansion.opaque;
+            for (key, value) in &expansion.pairs {
+                if is_value_key(key) {
+                    keyed = true;
+                    let label = expansion.name.as_ref().map(|n| format!("{n}[\"{key}\"]"));
+                    let result = self
+                        .resolve_value(*value, expansion.scope, 0)
+                        .map(|mut r| {
+                            if r.origin == ValueOrigin::Literal {
+                                r.origin = expansion.origin;
+                                r.name = label.clone();
+                            }
+                            r
+                        })
+                        .map_err(|u| match &label {
+                            Some(label) => u.via(label),
+                            None => u,
+                        });
+                    self.take_value(&site, key, false, result, &mut values);
+                } else if is_container(*value) {
+                    let prefix = format!("{key}.");
+                    self.nested_values(*value, &prefix, false, expansion.scope, 0, &mut values);
+                }
+            }
+        }
+
+        if !keyed && opaque_splat && (request || model_bearing) {
+            let key = if member == "GenerativeModel" {
                 "model_name"
             } else {
                 "model"
             };
             let unresolved = Unresolved::new("splat", "**kwargs".to_string());
-            self.unresolved_gap(sdk, call, &chain, key, &unresolved, scope);
+            self.unresolved_gap(&site, key, &unresolved, false);
         }
 
         if target.ambiguous {
@@ -1796,8 +2922,8 @@ impl<'t> Ctx<'t> {
             sdk,
             package: target.pkg.package().to_string(),
             chain,
-            request: is_request(&target.member),
-            member: target.member,
+            request,
+            member,
             receiver: target.receiver,
             routing: target.routing,
             client_line: target.client_line,
@@ -1811,18 +2937,43 @@ impl<'t> Ctx<'t> {
         });
     }
 
+    /// Attaches a resolved value to `key`, or reports why it did not
+    /// resolve. A fallback captured from an environment or config lookup is
+    /// both a value and a gap.
+    fn take_value(
+        &mut self,
+        site: &Site<'_, 't>,
+        key: &str,
+        positional: bool,
+        result: Result<Resolved, Unresolved>,
+        values: &mut Vec<CapturedValue>,
+    ) {
+        match result {
+            Ok(mut resolved) => {
+                let caveat = resolved.caveat.take();
+                values.push(captured(key, resolved, positional));
+                if let Some(caveat) = caveat.filter(|_| site.gap_worthy) {
+                    self.unresolved_gap(site, key, &caveat, true);
+                }
+            }
+            Err(unresolved) if site.gap_worthy => {
+                self.unresolved_gap(site, key, &unresolved, false)
+            }
+            Err(_) => {}
+        }
+    }
+
     fn unresolved_gap(
         &mut self,
-        sdk: Sdk,
-        call: Node<'t>,
-        chain: &str,
+        site: &Site<'_, 't>,
         key: &str,
         unresolved: &Unresolved,
-        scope: usize,
+        fallback_captured: bool,
     ) {
+        let chain = site.chain;
         let phrase = unresolved.phrase();
         let shape = &unresolved.shape;
-        let detail = match unresolved.via.as_deref() {
+        let mut detail = match unresolved.via.as_deref() {
             _ if unresolved.reason == "splat" => {
                 format!("`{key}` for `{chain}` is not passed by name and may come from `**kwargs`")
             }
@@ -1832,12 +2983,15 @@ impl<'t> Ctx<'t> {
             Some(via) => format!("`{key}` for `{chain}` comes from `{via}`, which is {phrase}"),
             None => format!("`{key}` for `{chain}` is `{shape}`, which is {phrase}"),
         };
+        if fallback_captured {
+            detail.push_str("; its literal fallback is captured with origin `env_default`");
+        }
         self.out.gaps.push(UsageGap {
             kind: GapKind::UnresolvedModel,
-            sdk: Some(sdk),
+            sdk: Some(site.sdk),
             file: self.file.clone(),
-            span: Some(self.span(call)),
-            symbol: self.symbol(scope),
+            span: Some(self.span(site.call)),
+            symbol: self.symbol(site.scope),
             chain: Some(chain.to_string()),
             key: Some(key.to_string()),
             reason: unresolved.reason.to_string(),
@@ -1886,6 +3040,9 @@ impl<'t> Ctx<'t> {
         scope: usize,
         origin: Origin,
     ) {
+        if sdk_shape(&self.render_links(function, 8)).is_none() {
+            return;
+        }
         let chain = self.render(function);
         let Some((shape_sdk, strong)) = sdk_shape(&chain) else {
             return;
@@ -1902,7 +3059,7 @@ impl<'t> Ctx<'t> {
             ),
             Origin::Parameter { name } => (
                 "parameter",
-                format!("`{root}` comes from parameter `{name}`, which has no SDK type annotation"),
+                format!("`{root}` comes from parameter `{name}`, which has no SDK type annotation and no in-file caller that passes a known client"),
                 shape_sdk,
             ),
             Origin::Imported { module } => (
@@ -1996,10 +3153,7 @@ impl<'t> Ctx<'t> {
             args.positional = 1;
             return args;
         }
-        for i in 0..list.named_child_count() {
-            let Some(arg) = list.named_child(i) else {
-                continue;
-            };
+        for arg in named_children(list) {
             match arg.kind() {
                 "keyword_argument" => {
                     let Some(name) = arg.child_by_field_name("name") else {
@@ -2015,7 +3169,12 @@ impl<'t> Ctx<'t> {
                     }
                     args.kwargs.push(name);
                 }
-                "dictionary_splat" => args.splat = true,
+                "dictionary_splat" => {
+                    args.splat = true;
+                    if let Some(inner) = arg.named_child(0) {
+                        args.splats.push(inner);
+                    }
+                }
                 "list_splat" | "comment" => {}
                 _ => {
                     if args.positional == 0 {
@@ -2032,10 +3191,10 @@ impl<'t> Ctx<'t> {
     }
 
     /// Allowlisted keys inside dict literals passed to a call
-    /// (`fallbacks=[{"model": "claude-opus-4-8"}]`). Only keys
-    /// [`is_value_key`] accepts are read; an unresolvable nested value is
-    /// skipped, not reported, because the argument may not configure the
-    /// request at all.
+    /// (`fallbacks=[{"model": "claude-opus-4-8"}]`). Only identifier-shaped
+    /// keys are followed and only keys [`is_value_key`] accepts are read; an
+    /// unresolvable nested value is skipped, not reported, because the
+    /// argument may not configure the request at all.
     fn nested_values(
         &mut self,
         node: Node<'t>,
@@ -2050,10 +3209,10 @@ impl<'t> Ctx<'t> {
         }
         match node.kind() {
             "dictionary" => {
-                for i in 0..node.named_child_count() {
-                    let Some(pair) = node.named_child(i).filter(|p| p.kind() == "pair") else {
+                for pair in named_children(node) {
+                    if pair.kind() != "pair" {
                         continue;
-                    };
+                    }
                     let (Some(key), Some(value)) = (
                         pair.child_by_field_name("key"),
                         pair.child_by_field_name("value"),
@@ -2063,9 +3222,9 @@ impl<'t> Ctx<'t> {
                     let Ok(key) = self.literal(key) else {
                         continue;
                     };
-                    // Nothing under a credential-shaped key is read, at any
-                    // depth (`extra_headers={"auth": {...}}`).
-                    if is_secret_key(&key) {
+                    // Nothing under a credential-shaped or non-identifier key
+                    // is read, at any depth (`extra_headers={"auth": {...}}`).
+                    if !is_identifier_key(&key) {
                         continue;
                     }
                     let path = format!("{prefix}{key}");
@@ -2080,10 +3239,8 @@ impl<'t> Ctx<'t> {
                 }
             }
             "list" | "tuple" | "set" | "parenthesized_expression" => {
-                for i in 0..node.named_child_count() {
-                    if let Some(item) = node.named_child(i) {
-                        self.nested_values(item, prefix, positional, scope, depth + 1, out);
-                    }
+                for item in named_children(node) {
+                    self.nested_values(item, prefix, positional, scope, depth + 1, out);
                 }
             }
             _ => {}
@@ -2095,10 +3252,7 @@ impl<'t> Ctx<'t> {
         match node.kind() {
             "string" => {
                 let mut value = String::new();
-                for i in 0..node.child_count() {
-                    let Some(part) = node.child(i) else {
-                        continue;
-                    };
+                for part in children(node) {
                     match part.kind() {
                         "string_start" => {
                             let prefix = self.text(part).to_ascii_lowercase();
@@ -2118,10 +3272,8 @@ impl<'t> Ctx<'t> {
             }
             "concatenated_string" => {
                 let mut value = String::new();
-                for i in 0..node.named_child_count() {
-                    if let Some(part) = node.named_child(i) {
-                        value.push_str(&self.literal(part)?);
-                    }
+                for part in named_children(node) {
+                    value.push_str(&self.literal(part)?);
                 }
                 Ok(value)
             }
@@ -2138,14 +3290,30 @@ impl<'t> Ctx<'t> {
         if depth > 16 {
             return Err(Unresolved::new("non_literal", self.render(expr)));
         }
+        stacker::maybe_grow(64 * 1024, 2 * 1024 * 1024, || {
+            self.resolve_value_inner(expr, scope, depth)
+        })
+    }
+
+    fn resolve_value_inner(
+        &mut self,
+        expr: Node<'t>,
+        scope: usize,
+        depth: u32,
+    ) -> Result<Resolved, Unresolved> {
         match expr.kind() {
             "string" | "concatenated_string" => match self.literal(expr) {
-                Ok(value) => Ok(Resolved {
+                Ok(value) if is_capturable_value(&value) => Ok(Resolved {
                     value,
                     origin: ValueOrigin::Literal,
                     name: None,
                     span: self.span(expr),
+                    caveat: None,
                 }),
+                Ok(value) if is_credential_value(&value) => {
+                    Err(Unresolved::new("credential", self.render(expr)))
+                }
+                Ok(_) => Err(Unresolved::new("non_literal", self.render(expr))),
                 Err(reason) => Err(Unresolved::new(reason, self.render(expr))),
             },
             "parenthesized_expression" => match expr.named_child(0) {
@@ -2154,7 +3322,7 @@ impl<'t> Ctx<'t> {
             },
             "identifier" => {
                 let name = self.text(expr).to_string();
-                self.resolve_constant(&name, scope, depth)
+                self.resolve_constant(&name, scope, expr.start_byte(), depth)
             }
             "attribute" => {
                 let rendered = self.render(expr);
@@ -2162,17 +3330,15 @@ impl<'t> Ctx<'t> {
                     expr.child_by_field_name("object"),
                     expr.child_by_field_name("attribute"),
                 ) {
+                    let attr = self.text(attr).to_string();
+                    if is_secret_key(&attr) {
+                        return Err(Unresolved::new("credential", rendered));
+                    }
                     if let Some(class) = self.class_receiver(object, scope) {
-                        let attr = self.text(attr).to_string();
-                        let assigns = self.attr_assignments(class, &attr, 0);
+                        let assigns = self.attr_assignments(class, &attr);
                         return self
                             .single_constant(&assigns, ValueOrigin::ClassConstant, depth)
-                            .map(|mut r| {
-                                if r.origin != ValueOrigin::ParameterDefault {
-                                    r.name = Some(rendered.clone());
-                                }
-                                r
-                            })
+                            .map(|r| r.through(&rendered, ValueOrigin::ClassConstant))
                             .map_err(|u| u.via(&rendered));
                     }
                 }
@@ -2184,6 +3350,9 @@ impl<'t> Ctx<'t> {
                 Err(Unresolved::new(reason, rendered))
             }
             "call" => {
+                if let Some(result) = self.fallback_value(expr, scope, depth) {
+                    return result;
+                }
                 let reason = if self.contains_env(expr) {
                     "env_var"
                 } else {
@@ -2192,6 +3361,9 @@ impl<'t> Ctx<'t> {
                 Err(Unresolved::new(reason, self.render(expr)))
             }
             "subscript" => {
+                if let Some(result) = self.subscript_value(expr, scope, depth) {
+                    return result;
+                }
                 let reason = if self.contains_env(expr) {
                     "env_var"
                 } else {
@@ -2199,7 +3371,18 @@ impl<'t> Ctx<'t> {
                 };
                 Err(Unresolved::new(reason, self.render(expr)))
             }
-            "conditional_expression" | "boolean_operator" => {
+            "boolean_operator" => {
+                if let Some(result) = self.or_fallback(expr, scope, depth) {
+                    return result;
+                }
+                let reason = if self.contains_env(expr) {
+                    "env_var"
+                } else {
+                    "conditional"
+                };
+                Err(Unresolved::new(reason, self.render(expr)))
+            }
+            "conditional_expression" => {
                 let reason = if self.contains_env(expr) {
                     "env_var"
                 } else {
@@ -2215,49 +3398,67 @@ impl<'t> Ctx<'t> {
         &mut self,
         name: &str,
         scope: usize,
+        pos: usize,
         depth: u32,
     ) -> Result<Resolved, Unresolved> {
-        let home = self.binding_scope(name, scope);
-        let key = (home, name.to_string());
-        let assigns = self.assigns.get(&key).cloned().unwrap_or_default();
-        let result = if let Some(param) = self.params.get(&key).copied() {
-            if !assigns.is_empty() {
-                Err(Unresolved::new("reassigned", name.to_string()))
-            } else {
-                match param.default.map(|d| (d, self.literal(d))) {
-                    Some((default, Ok(value))) => Ok(Resolved {
-                        value,
-                        origin: ValueOrigin::ParameterDefault,
-                        name: Some(name.to_string()),
-                        span: self.span(default),
-                    }),
-                    _ => Err(Unresolved::new("parameter", name.to_string())),
-                }
+        // A value that flows through a secret-named binding is never read.
+        if is_secret_key(name) {
+            return Err(Unresolved::new("credential", name.to_string()));
+        }
+        let (key, defs) = self.defs_at(name, scope, pos);
+        let home = key.0;
+        let assigns: Vec<Assign<'t>> = defs
+            .iter()
+            .filter_map(|def| match def {
+                DefRef::Assign(i) => self.assigns.get(&key).and_then(|v| v.get(*i)).copied(),
+                _ => None,
+            })
+            .collect();
+        let imported = defs
+            .iter()
+            .any(|def| matches!(def, DefRef::Import(_) | DefRef::Other(_)));
+        if defs.contains(&DefRef::Param) {
+            if !assigns.is_empty() || imported {
+                return Err(Unresolved::new("reassigned", name.to_string()));
             }
-        } else if !assigns.is_empty() {
-            let origin = match self.scopes[home].kind {
-                ScopeKind::Module => ValueOrigin::ModuleConstant,
-                ScopeKind::Class => ValueOrigin::ClassConstant,
-                ScopeKind::Function => ValueOrigin::LocalConstant,
+            let default = self.params.get(&key).and_then(|p| p.default);
+            let Some(default) = default else {
+                return Err(Unresolved::new("parameter", name.to_string()));
             };
-            self.single_constant(&assigns, origin, depth)
-                .map(|mut r| {
-                    if r.origin != ValueOrigin::ParameterDefault {
-                        r.name = Some(name.to_string());
+            // Defaults are evaluated where the function is defined.
+            let parent = self.scopes[home].parent.unwrap_or(0);
+            return match self.resolve_value(default, parent, depth + 1) {
+                Ok(mut resolved) => {
+                    if resolved.origin != ValueOrigin::EnvDefault {
+                        resolved.origin = ValueOrigin::ParameterDefault;
+                        resolved.name = Some(name.to_string());
                     }
-                    r
-                })
-                .map_err(|u| u.via(name))
-        } else if self.imports.contains_key(&key) || self.other_imports.contains_key(&key) {
+                    resolved.caveat = resolved.caveat.map(|caveat| caveat.via(name));
+                    Ok(resolved)
+                }
+                Err(unresolved) if unresolved.reason == "credential" => Err(unresolved.via(name)),
+                Err(_) => Err(Unresolved::new("parameter", name.to_string())),
+            };
+        }
+        if !assigns.is_empty() {
+            if imported {
+                return Err(Unresolved::new("reassigned", name.to_string()));
+            }
+            let origin = constant_origin(self.scopes[home].kind);
+            return self
+                .single_constant(&assigns, origin, depth)
+                .map(|r| r.through(name, origin))
+                .map_err(|u| u.via(name));
+        }
+        if imported {
             Err(Unresolved::new("imported_name", name.to_string()))
         } else {
             Err(Unresolved::new("unbound", name.to_string()))
-        };
-        result
+        }
     }
 
     /// A name or attribute assigned exactly once, to something that itself
-    /// resolves to a string literal.
+    /// resolves to a string.
     fn single_constant(
         &mut self,
         assigns: &[Assign<'t>],
@@ -2281,6 +3482,322 @@ impl<'t> Ctx<'t> {
                 format!("{} assignments", many.len()),
             )),
         }
+    }
+
+    /// The literal fallback of an environment or config lookup, or an exact
+    /// lookup in a same-file dict literal (`MODELS.get("fast", "gpt-4o")`).
+    /// `None` when `call` is neither.
+    fn fallback_value(
+        &mut self,
+        call: Node<'t>,
+        scope: usize,
+        depth: u32,
+    ) -> Option<Result<Resolved, Unresolved>> {
+        let function = call.child_by_field_name("function")?;
+        let (positional, keywords) = call_arguments(call, |n| self.text(n));
+        let keyword = |name: &str| {
+            keywords
+                .iter()
+                .find(|(k, _)| k.as_str() == name)
+                .map(|(_, v)| *v)
+        };
+        let rendered = self.render(function);
+        let (lookup_key, default, reason) = match rendered.as_str() {
+            "os.getenv"
+            | "getenv"
+            | "os.environ.get"
+            | "environ.get"
+            | "os.environ.setdefault"
+            | "environ.setdefault" => (
+                positional.first().copied(),
+                positional.get(1).copied().or_else(|| keyword("default")),
+                "env_var",
+            ),
+            _ if CONFIG_LOOKUPS.contains(&rendered.as_str()) => (
+                positional.first().copied(),
+                keyword("default").or_else(|| positional.get(1).copied()),
+                "env_var",
+            ),
+            "getattr" => (
+                positional.get(1).copied(),
+                positional.get(2).copied(),
+                "attribute",
+            ),
+            _ if function.kind() == "attribute"
+                && function
+                    .child_by_field_name("attribute")
+                    .is_some_and(|a| self.text(a) == "get") =>
+            {
+                let key = positional.first().copied();
+                let default = positional.get(1).copied().or_else(|| keyword("default"));
+                if let Some(object) = function.child_by_field_name("object") {
+                    if let Some(dict) = self.dict_node(object, scope, 0) {
+                        if let Some(found) = self.dict_get_value(&dict, key, default, depth) {
+                            return Some(found);
+                        }
+                    }
+                }
+                let reason = if self.contains_env(function) {
+                    "env_var"
+                } else {
+                    "function_call"
+                };
+                (key, default, reason)
+            }
+            _ => return None,
+        };
+        let default = default?;
+        let shape = self.render(call);
+        // The name being looked up must not be a credential's.
+        if let Some(lookup_key) = lookup_key {
+            let looked_up = self
+                .literal(lookup_key)
+                .unwrap_or_else(|_| self.text(lookup_key).to_string());
+            if is_secret_key(&looked_up) {
+                return Some(Err(Unresolved::new("credential", shape)));
+            }
+        }
+        Some(match self.resolve_value(default, scope, depth + 1) {
+            Ok(mut resolved) => {
+                resolved.origin = ValueOrigin::EnvDefault;
+                resolved.caveat = Some(Unresolved::new(reason, shape));
+                Ok(resolved)
+            }
+            Err(unresolved) if unresolved.reason == "credential" => Err(unresolved),
+            Err(_) => Err(Unresolved::new(reason, shape)),
+        })
+    }
+
+    /// `os.getenv("MODEL") or "gpt-4o"`: the right side is the fallback.
+    fn or_fallback(
+        &mut self,
+        expr: Node<'t>,
+        scope: usize,
+        depth: u32,
+    ) -> Option<Result<Resolved, Unresolved>> {
+        let operator = expr.child_by_field_name("operator")?;
+        if self.text(operator) != "or" {
+            return None;
+        }
+        let left = expr.child_by_field_name("left")?;
+        let right = expr.child_by_field_name("right")?;
+        let lookup = self.contains_env(left)
+            || (left.kind() == "call"
+                && left
+                    .child_by_field_name("function")
+                    .is_some_and(|f| CONFIG_LOOKUPS.contains(&self.render(f).as_str())));
+        if !lookup {
+            return None;
+        }
+        match self.resolve_value(right, scope, depth + 1) {
+            Ok(mut resolved) => {
+                resolved.origin = ValueOrigin::EnvDefault;
+                resolved.caveat = Some(Unresolved::new("env_var", self.render(left)));
+                Some(Ok(resolved))
+            }
+            Err(unresolved) if unresolved.reason == "credential" => Some(Err(unresolved)),
+            Err(_) => None,
+        }
+    }
+
+    /// `MODELS["fast"]` where `MODELS` is a same-file dict literal.
+    fn subscript_value(
+        &mut self,
+        expr: Node<'t>,
+        scope: usize,
+        depth: u32,
+    ) -> Option<Result<Resolved, Unresolved>> {
+        let base = expr.child_by_field_name("value")?;
+        let index = single_subscript(expr)?;
+        let key = self.literal(index).ok()?;
+        if is_secret_key(&key) {
+            return Some(Err(Unresolved::new("credential", self.render(expr))));
+        }
+        let dict = self.dict_node(base, scope, 0)?;
+        match self.dict_lookup(dict.node, &key) {
+            Lookup::Found(value) => Some(self.dict_entry(&dict, &key, value, depth)),
+            Lookup::Absent | Lookup::Unknown => None,
+        }
+    }
+
+    /// The value of `dict.get(key, default)` on a same-file dict literal:
+    /// the entry when the key is there, the default when it certainly is not.
+    fn dict_get_value(
+        &mut self,
+        dict: &DictRef<'t>,
+        key: Option<Node<'t>>,
+        default: Option<Node<'t>>,
+        depth: u32,
+    ) -> Option<Result<Resolved, Unresolved>> {
+        let key = self.literal(key?).ok()?;
+        if is_secret_key(&key) {
+            return Some(Err(Unresolved::new("credential", key)));
+        }
+        match self.dict_lookup(dict.node, &key) {
+            Lookup::Found(value) => Some(self.dict_entry(dict, &key, value, depth)),
+            Lookup::Absent => {
+                let default = default?;
+                Some(self.resolve_value(default, dict.scope, depth + 1))
+            }
+            Lookup::Unknown => None,
+        }
+    }
+
+    fn dict_entry(
+        &mut self,
+        dict: &DictRef<'t>,
+        key: &str,
+        value: Node<'t>,
+        depth: u32,
+    ) -> Result<Resolved, Unresolved> {
+        let label = dict.name.as_ref().map(|name| {
+            if is_identifier_key(key) {
+                format!("{name}[\"{key}\"]")
+            } else {
+                format!("{name}[...]")
+            }
+        });
+        self.resolve_value(value, dict.scope, depth + 1)
+            .map(|mut r| {
+                if r.origin == ValueOrigin::Literal {
+                    r.origin = dict.origin;
+                    r.name = label.clone();
+                }
+                r
+            })
+            .map_err(|u| match &label {
+                Some(label) => u.via(label),
+                None => u,
+            })
+    }
+
+    /// The dict literal `expr` evaluates to: a `{...}` or `dict(...)`
+    /// written inline, a name assigned exactly one (and never mutated), or a
+    /// constant key of one of those.
+    fn dict_node(&mut self, expr: Node<'t>, scope: usize, depth: u32) -> Option<DictRef<'t>> {
+        if depth > 8 {
+            return None;
+        }
+        match expr.kind() {
+            "dictionary" => Some(DictRef {
+                node: expr,
+                scope,
+                name: None,
+                origin: ValueOrigin::Literal,
+            }),
+            "call" if is_dict_call(expr, |n| self.text(n)) => Some(DictRef {
+                node: expr,
+                scope,
+                name: None,
+                origin: ValueOrigin::Literal,
+            }),
+            "parenthesized_expression" => {
+                let inner = expr.named_child(0)?;
+                self.dict_node(inner, scope, depth + 1)
+            }
+            "identifier" => {
+                let name = self.text(expr);
+                if is_secret_key(name) || self.mutated.contains(name) {
+                    return None;
+                }
+                let (key, defs) = self.defs_at(name, scope, expr.start_byte());
+                let [DefRef::Assign(i)] = defs.as_slice() else {
+                    return None;
+                };
+                let assign = self.assigns.get(&key)?.get(*i).copied()?;
+                if assign.unknowable {
+                    return None;
+                }
+                let mut dict = self.dict_node(assign.value?, assign.scope, depth + 1)?;
+                if dict.name.is_none() {
+                    dict.name = Some(name.to_string());
+                    dict.origin = constant_origin(self.scopes[key.0].kind);
+                }
+                Some(dict)
+            }
+            "subscript" => {
+                let base = expr.child_by_field_name("value")?;
+                let key = self.literal(single_subscript(expr)?).ok()?;
+                if !is_identifier_key(&key) {
+                    return None;
+                }
+                let outer = self.dict_node(base, scope, depth + 1)?;
+                let Lookup::Found(value) = self.dict_lookup(outer.node, &key) else {
+                    return None;
+                };
+                let mut dict = self.dict_node(value, outer.scope, depth + 1)?;
+                if dict.name.is_none() {
+                    dict.name = outer.name.map(|n| format!("{n}[\"{key}\"]"));
+                    dict.origin = outer.origin;
+                }
+                Some(dict)
+            }
+            _ => None,
+        }
+    }
+
+    /// The entries of a dict expanded with `**` that can matter.
+    fn expand_splat(&mut self, expr: Node<'t>, scope: usize) -> Option<Expansion<'t>> {
+        let dict = self.dict_node(expr, scope, 0)?;
+        let summary = self.dict_summary(dict.node);
+        Some(Expansion {
+            pairs: summary.expansion.clone(),
+            scope: dict.scope,
+            name: dict.name,
+            origin: dict.origin,
+            opaque: summary.opaque,
+        })
+    }
+
+    /// Looks `key` up in a dict literal: the last matching entry wins, as in
+    /// Python, unless an unreadable entry after it could override it.
+    fn dict_lookup(&mut self, dict: Node<'t>, key: &str) -> Lookup<'t> {
+        let summary = self.dict_summary(dict);
+        match summary.last.get(key) {
+            Some((index, value)) if summary.last_unknown.is_none_or(|u| u < *index) => {
+                Lookup::Found(*value)
+            }
+            Some(_) => Lookup::Unknown,
+            None if summary.last_unknown.is_some() => Lookup::Unknown,
+            None => Lookup::Absent,
+        }
+    }
+
+    fn dict_summary(&mut self, dict: Node<'t>) -> Rc<DictSummary<'t>> {
+        if let Some(summary) = self.dict_cache.get(&dict.id()) {
+            return Rc::clone(summary);
+        }
+        let mut summary = DictSummary {
+            last: HashMap::new(),
+            last_unknown: None,
+            expansion: Vec::new(),
+            opaque: false,
+        };
+        let entries = dict_entries(dict, |n| self.literal(n).ok(), |n| self.text(n));
+        for (index, entry) in entries.into_iter().enumerate() {
+            let Some((key, value)) = entry else {
+                summary.last_unknown = Some(index);
+                summary.opaque = true;
+                continue;
+            };
+            // A credential-named or non-identifier key cannot be a model
+            // argument; it is never read through an expansion.
+            let relevant = is_identifier_key(&key)
+                && (is_value_key(&key) || is_base_url_key(&key) || is_container(value));
+            if relevant {
+                if let Some(slot) = summary.expansion.iter_mut().find(|(k, _)| *k == key) {
+                    slot.1 = value;
+                } else if summary.expansion.len() < 256 {
+                    summary.expansion.push((key.clone(), value));
+                } else {
+                    summary.opaque = true;
+                }
+            }
+            summary.last.insert(key, (index, value));
+        }
+        let summary = Rc::new(summary);
+        self.dict_cache.insert(dict.id(), Rc::clone(&summary));
+        summary
     }
 
     /// Whether `node` reads the process environment
@@ -2309,75 +3826,69 @@ impl<'t> Ctx<'t> {
                     return true;
                 }
             }
-            for i in 0..current.named_child_count() {
-                if let Some(child) = current.named_child(i) {
-                    stack.push(child);
-                }
-            }
+            stack.extend(named_children(current));
         }
         false
     }
 
     /// An expression's shape with every argument and literal elided, so a
-    /// rendering can never carry a value.
+    /// rendering can never carry a value. The spine (attribute objects, call
+    /// functions, subscript values) is walked iteratively, at most
+    /// [`MAX_DEPTH`] links deep, so rendering is linear in the chain.
     fn render(&self, node: Node<'t>) -> String {
-        self.render_depth(node, 0)
+        self.render_links(node, MAX_DEPTH)
     }
 
-    fn render_depth(&self, node: Node<'t>, depth: u32) -> String {
-        if depth > MAX_DEPTH {
-            return "<expr>".to_string();
+    /// [`Self::render`] keeping at most `links` links of the spine.
+    fn render_links(&self, node: Node<'t>, links: u32) -> String {
+        let mut suffixes: Vec<String> = Vec::new();
+        let mut current = Some(node);
+        let mut depth = 0;
+        let base = loop {
+            let Some(node) = current else {
+                break String::new();
+            };
+            if depth > links {
+                break "<expr>".to_string();
+            }
+            depth += 1;
+            match node.kind() {
+                "identifier" => break self.text(node).to_string(),
+                "attribute" => {
+                    let attr = node
+                        .child_by_field_name("attribute")
+                        .map(|a| self.text(a))
+                        .unwrap_or_default();
+                    suffixes.push(format!(".{attr}"));
+                    current = node.child_by_field_name("object");
+                }
+                "call" => {
+                    suffixes.push(if self.has_args(node) { "(...)" } else { "()" }.to_string());
+                    current = node.child_by_field_name("function");
+                }
+                "subscript" => {
+                    suffixes.push("[...]".to_string());
+                    current = node.child_by_field_name("value");
+                }
+                "parenthesized_expression" | "await" => match node.named_child(0) {
+                    Some(inner) => current = Some(inner),
+                    None => break "<expr>".to_string(),
+                },
+                "string" => {
+                    let interpolated = children(node).iter().any(|c| c.kind() == "interpolation");
+                    break if interpolated { "f\"...\"" } else { "\"...\"" }.to_string();
+                }
+                "concatenated_string" => break "\"...\"".to_string(),
+                "conditional_expression" => break "<conditional>".to_string(),
+                "boolean_operator" => break "<boolean>".to_string(),
+                _ => break "<expr>".to_string(),
+            }
+        };
+        let mut rendered = base;
+        for suffix in suffixes.iter().rev() {
+            rendered.push_str(suffix);
         }
-        stacker::maybe_grow(64 * 1024, 2 * 1024 * 1024, || match node.kind() {
-            "identifier" => self.text(node).to_string(),
-            "attribute" => {
-                let object = node
-                    .child_by_field_name("object")
-                    .map(|o| self.render_depth(o, depth + 1))
-                    .unwrap_or_default();
-                let attr = node
-                    .child_by_field_name("attribute")
-                    .map(|a| self.text(a))
-                    .unwrap_or_default();
-                format!("{object}.{attr}")
-            }
-            "call" => {
-                let function = node
-                    .child_by_field_name("function")
-                    .map(|f| self.render_depth(f, depth + 1))
-                    .unwrap_or_default();
-                if self.has_args(node) {
-                    format!("{function}(...)")
-                } else {
-                    format!("{function}()")
-                }
-            }
-            "subscript" => {
-                let value = node
-                    .child_by_field_name("value")
-                    .map(|v| self.render_depth(v, depth + 1))
-                    .unwrap_or_default();
-                format!("{value}[...]")
-            }
-            "parenthesized_expression" | "await" => node
-                .named_child(0)
-                .map(|inner| self.render_depth(inner, depth + 1))
-                .unwrap_or_else(|| "<expr>".to_string()),
-            "string" => {
-                let interpolated = (0..node.child_count())
-                    .filter_map(|i| node.child(i))
-                    .any(|c| c.kind() == "interpolation");
-                if interpolated {
-                    "f\"...\"".to_string()
-                } else {
-                    "\"...\"".to_string()
-                }
-            }
-            "concatenated_string" => "\"...\"".to_string(),
-            "conditional_expression" => "<conditional>".to_string(),
-            "boolean_operator" => "<boolean>".to_string(),
-            _ => "<expr>".to_string(),
-        })
+        rendered
     }
 
     fn has_args(&self, call: Node<'t>) -> bool {
@@ -2421,6 +3932,17 @@ struct CallTarget {
     ambiguous: bool,
 }
 
+/// The call a value or gap is reported for.
+#[derive(Clone, Copy)]
+struct Site<'a, 't> {
+    sdk: Sdk,
+    call: Node<'t>,
+    chain: &'a str,
+    scope: usize,
+    /// Whether an unresolved value here is reported as a gap.
+    gap_worthy: bool,
+}
+
 #[derive(Default)]
 struct Args<'t> {
     kwargs: Vec<String>,
@@ -2432,6 +3954,8 @@ struct Args<'t> {
     /// Other arguments that are dict/list/tuple literals, with the keyword
     /// they were passed under (`None` when positional).
     literal_args: Vec<(Option<String>, Node<'t>)>,
+    /// The expressions passed with `**`.
+    splats: Vec<Node<'t>>,
 }
 
 fn captured(key: &str, resolved: Resolved, positional: bool) -> CapturedValue {
@@ -2447,6 +3971,27 @@ fn captured(key: &str, resolved: Resolved, positional: bool) -> CapturedValue {
     }
 }
 
+fn constant_origin(kind: ScopeKind) -> ValueOrigin {
+    match kind {
+        ScopeKind::Module => ValueOrigin::ModuleConstant,
+        ScopeKind::Class => ValueOrigin::ClassConstant,
+        ScopeKind::Function => ValueOrigin::LocalConstant,
+    }
+}
+
+/// The key a call's first positional argument is captured under, when that
+/// argument is the model.
+fn positional_model_key(pkg: Pkg, receiver: Receiver, member: &str) -> Option<&'static str> {
+    if member == "GenerativeModel" {
+        return Some("model_name");
+    }
+    let last = member.rsplit('.').next().unwrap_or(member);
+    (pkg == Pkg::GoogleGenerativeai
+        && receiver != Receiver::Client
+        && LEGACY_POSITIONAL_MODEL.contains(&last))
+    .then_some("model")
+}
+
 /// A dict, list, tuple or set literal.
 fn is_container(node: Node<'_>) -> bool {
     matches!(node.kind(), "dictionary" | "list" | "tuple" | "set")
@@ -2456,6 +4001,145 @@ fn is_model_bearing(member: &str) -> bool {
     MODEL_BEARING
         .iter()
         .any(|m| member == *m || member.ends_with(&format!(".{m}")))
+}
+
+/// `dict(model=..., ...)`.
+fn is_dict_call<'t>(call: Node<'t>, text: impl Fn(Node<'t>) -> &'t str) -> bool {
+    call.child_by_field_name("function")
+        .is_some_and(|f| f.kind() == "identifier" && text(f) == "dict")
+}
+
+/// The one index of `x[i]`, if there is exactly one.
+fn single_subscript(expr: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = expr.walk();
+    let mut indexes = expr.children_by_field_name("subscript", &mut cursor);
+    let first = indexes.next()?;
+    indexes.next().is_none().then_some(first)
+}
+
+/// The entries of a dict literal or `dict(...)` call: `Some((key, value))`
+/// for a string or keyword key, `None` for a part that cannot be read
+/// (`**other`, a computed key, a positional argument to `dict`).
+fn dict_entries<'t>(
+    dict: Node<'t>,
+    literal: impl Fn(Node<'t>) -> Option<String>,
+    text: impl Fn(Node<'t>) -> &'t str,
+) -> Vec<Option<(String, Node<'t>)>> {
+    let mut entries = Vec::new();
+    if dict.kind() == "dictionary" {
+        for item in named_children(dict) {
+            match item.kind() {
+                "pair" => {
+                    let key = item.child_by_field_name("key").and_then(&literal);
+                    match (key, item.child_by_field_name("value")) {
+                        (Some(key), Some(value)) => entries.push(Some((key, value))),
+                        _ => entries.push(None),
+                    }
+                }
+                "comment" => {}
+                _ => entries.push(None),
+            }
+        }
+    } else if let Some(args) = dict.child_by_field_name("arguments") {
+        if args.kind() != "argument_list" {
+            entries.push(None);
+            return entries;
+        }
+        for arg in named_children(args) {
+            match arg.kind() {
+                "keyword_argument" => {
+                    match (
+                        arg.child_by_field_name("name"),
+                        arg.child_by_field_name("value"),
+                    ) {
+                        (Some(name), Some(value)) => {
+                            entries.push(Some((text(name).to_string(), value)))
+                        }
+                        _ => entries.push(None),
+                    }
+                }
+                "comment" => {}
+                _ => entries.push(None),
+            }
+        }
+    }
+    entries
+}
+
+/// Positional and keyword arguments of a call, as written.
+fn call_arguments<'t>(
+    call: Node<'t>,
+    text: impl Fn(Node<'t>) -> &'t str,
+) -> (Vec<Node<'t>>, Vec<(String, Node<'t>)>) {
+    let mut positional = Vec::new();
+    let mut keywords = Vec::new();
+    let Some(args) = call
+        .child_by_field_name("arguments")
+        .filter(|a| a.kind() == "argument_list")
+    else {
+        return (positional, keywords);
+    };
+    for arg in named_children(args) {
+        match arg.kind() {
+            "keyword_argument" => {
+                if let (Some(name), Some(value)) = (
+                    arg.child_by_field_name("name"),
+                    arg.child_by_field_name("value"),
+                ) {
+                    keywords.push((text(name).to_string(), value));
+                }
+            }
+            "list_splat" | "dictionary_splat" | "comment" => {}
+            _ => positional.push(arg),
+        }
+    }
+    (positional, keywords)
+}
+
+/// The argument a call passes for a parameter at `position` (counting from
+/// the first explicit argument) or named `keyword`.
+fn argument_for<'t>(
+    call: Node<'t>,
+    position: Option<usize>,
+    keyword: Option<&str>,
+    text: impl Fn(Node<'t>) -> &'t str,
+) -> ArgFor<'t> {
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return ArgFor::Missing;
+    };
+    if args.kind() != "argument_list" {
+        return ArgFor::Unknown;
+    }
+    let mut index = 0;
+    let mut star = false;
+    let mut double_star = false;
+    let mut found = None;
+    for arg in named_children(args) {
+        match arg.kind() {
+            "keyword_argument" => {
+                let name = arg.child_by_field_name("name").map(&text);
+                if keyword.is_some() && name == keyword {
+                    if let Some(value) = arg.child_by_field_name("value") {
+                        return ArgFor::Found(value);
+                    }
+                }
+            }
+            "list_splat" => star = true,
+            "dictionary_splat" => double_star = true,
+            "comment" => {}
+            _ => {
+                if !star && Some(index) == position {
+                    found = Some(arg);
+                }
+                index += 1;
+            }
+        }
+    }
+    match found {
+        Some(arg) => ArgFor::Found(arg),
+        None if (star && position.is_some()) || double_star => ArgFor::Unknown,
+        None => ArgFor::Missing,
+    }
 }
 
 /// The first segment of a rendered chain (`self.client` for
@@ -2472,23 +4156,47 @@ fn chain_root(chain: &str) -> String {
 }
 
 /// Whether an attribute node is used as a value: not the callee of a call,
-/// not the object of a longer chain, not an assignment target.
-fn is_value_reference(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
+/// not the object of a longer chain, not an assignment target. Decided from
+/// the parent's kind and the field the node fills in it.
+fn is_value_reference(parent: Option<Node<'_>>, field: Option<&str>) -> bool {
+    let Some(parent) = parent else {
         return false;
     };
-    let is_field = |field: &str| {
-        parent
-            .child_by_field_name(field)
-            .is_some_and(|child| child.id() == node.id())
-    };
     match parent.kind() {
-        "attribute" => !is_field("object"),
-        "call" => !is_field("function"),
-        "assignment" | "augmented_assignment" => !is_field("left"),
+        "attribute" => field != Some("object"),
+        "call" => field != Some("function"),
+        "assignment" | "augmented_assignment" => field != Some("left"),
         "as_pattern_target" | "delete_statement" => false,
         _ => true,
     }
+}
+
+/// Every child, in order, in time linear in their number.
+fn children(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).collect()
+}
+
+/// Every named child, in order, in time linear in their number
+/// (`Node::named_child(i)` walks from the first child on every call).
+fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).collect()
+}
+
+/// Every child with the field it fills in `node`.
+fn children_with_fields(node: Node<'_>) -> Vec<(Node<'_>, Option<&'static str>)> {
+    let mut out = Vec::with_capacity(node.child_count());
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            out.push((cursor.node(), cursor.field_name()));
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Combines every value a binding is given. Placeholders (`None`, literals)

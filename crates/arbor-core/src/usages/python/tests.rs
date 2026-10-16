@@ -527,7 +527,8 @@ from settings import settings
 
 ENV_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 TWICE = "gpt-4"
-TWICE = "gpt-4o"
+if os.getenv("FAST"):
+    TWICE = "gpt-4o"
 client = OpenAI()
 
 def run(version, model, params):
@@ -564,11 +565,27 @@ def run(version, model, params):
             "splat",
         ]
     );
-    // Every call is still a usage; only the value is missing.
+    // Every call is still a usage; only the value is missing, except the
+    // environment lookup whose literal fallback is captured as env_default.
     assert_eq!(found.calls.len(), 11);
-    assert!(found.calls.iter().all(|c| c.values.is_empty()));
+    let with_values: Vec<&SdkCall> = found
+        .calls
+        .iter()
+        .filter(|c| !c.values.is_empty())
+        .collect();
+    assert_eq!(with_values.len(), 1);
+    let fallback = &with_values[0].values[0];
+    assert_eq!(
+        (
+            fallback.value.as_str(),
+            fallback.origin,
+            fallback.name.as_deref()
+        ),
+        ("gpt-3.5-turbo", ValueOrigin::EnvDefault, Some("ENV_MODEL"))
+    );
     let via = gaps(&found, GapKind::UnresolvedModel)[3];
     assert!(via.detail.contains("ENV_MODEL"), "{}", via.detail);
+    assert!(via.detail.contains("env_default"), "{}", via.detail);
     assert_eq!(via.key.as_deref(), Some("model"));
     // No literal reaches a gap detail.
     for gap in &found.gaps {
@@ -1288,4 +1305,588 @@ def embed(**kwargs):
     assert_eq!(gap.reason, "splat");
     assert_eq!(gap.sdk, Some(Sdk::Google));
     assert!(call(&found, "genai.embed_content").request);
+}
+
+// ---------------------------------------------------------------------------
+// Review of #276: credentials
+// ---------------------------------------------------------------------------
+
+/// The five cases from the review, each of which printed a secret.
+const REVIEW_SECRETS: &str = r#"
+from openai import OpenAI
+
+client = OpenAI()
+OPENAI_API_KEY = "sk-proj-AAAAREVIEWSECRETONEAAAA"
+
+client.chat.completions.create(model=OPENAI_API_KEY, messages=[])
+client.chat.completions.create(model="sk-ant-api03-BBBBREVIEWSECRETTWOBBBB", messages=[])
+
+def f(token="sk-CCCCREVIEWSECRETTHREECCCC"):
+    return client.chat.completions.create(model=token, messages=[])
+
+class Bot:
+    def __init__(self):
+        self.secret = "sk-DDDDREVIEWSECRETFOURDDDD"
+
+    def go(self):
+        return client.chat.completions.create(model=self.secret, messages=[])
+
+client.chat.completions.create(model="gpt-4", messages=[], extra_body={"sk-proj-EEEEREVIEWSECRETFIVEEEEE": {"model": "gpt-4"}})
+"#;
+
+#[test]
+fn review_credential_cases_never_reach_the_output() {
+    let found = usages(REVIEW_SECRETS);
+    let json = serde_json::to_string(&found).unwrap();
+    for leaked in [
+        "sk-",
+        "REVIEWSECRET",
+        "AAAA",
+        "BBBB",
+        "CCCC",
+        "DDDD",
+        "EEEE",
+    ] {
+        assert!(!json.contains(leaked), "`{leaked}` leaked: {json}");
+    }
+    // The four refused models are typed gaps that name the binding only.
+    let refused: Vec<&UsageGap> = gaps(&found, GapKind::UnresolvedModel)
+        .into_iter()
+        .filter(|g| g.reason == "credential")
+        .collect();
+    assert_eq!(refused.len(), 4, "{:?}", found.gaps);
+    assert!(refused[0].detail.contains("OPENAI_API_KEY"));
+    // The dict under a credential-shaped key is never descended into.
+    let last = found.calls.last().unwrap();
+    let keys: Vec<&str> = last.values.iter().map(|v| v.key.as_str()).collect();
+    assert_eq!(keys, vec!["model"]);
+}
+
+#[test]
+fn credential_shaped_values_are_refused_through_any_name() {
+    let found = usages(
+        r#"
+import os
+from openai import OpenAI
+
+client = OpenAI()
+MODEL = "sk-proj-FFFFSHAPEDSECRETFFFF"
+PARAMS = {"model": "AIzaSyGGGGSHAPEDSECRETGGGG"}
+CONFIG = {"api_key": "gpt-4"}
+SECRET_MODEL = "gpt-4"
+
+client.chat.completions.create(model=MODEL, messages=[])
+client.chat.completions.create(**PARAMS, messages=[])
+client.chat.completions.create(model=CONFIG["api_key"], messages=[])
+client.chat.completions.create(model=SECRET_MODEL, messages=[])
+client.chat.completions.create(model=os.getenv("OPENAI_API_KEY", "gpt-4"), messages=[])
+client.chat.completions.create(model=os.getenv("MODEL", "sk-HHHHSHAPEDSECRETHHHH"), messages=[])
+client.chat.completions.create(model="0123456789abcdef0123456789abcdef", messages=[])
+"#,
+    );
+    let json = serde_json::to_string(&found).unwrap();
+    for leaked in ["SHAPEDSECRET", "sk-", "AIza", "0123456789abcdef"] {
+        assert!(!json.contains(leaked), "`{leaked}` leaked: {json}");
+    }
+    assert!(found.calls.iter().all(|c| c.values.is_empty()), "{json}");
+    let reasons: Vec<&str> = gaps(&found, GapKind::UnresolvedModel)
+        .iter()
+        .map(|g| g.reason.as_str())
+        .collect();
+    assert_eq!(reasons, vec!["credential"; 7], "{json}");
+}
+
+#[test]
+fn control_characters_are_never_captured() {
+    let found = usages(
+        "from openai import OpenAI\nclient = OpenAI()\nclient.chat.completions.create(model=\"gpt-4\u{1b}]8;;http://x\u{7}\", messages=[])\n",
+    );
+    assert!(found.calls[0].values.is_empty());
+    assert_eq!(
+        gaps(&found, GapKind::UnresolvedModel)[0].reason,
+        "non_literal"
+    );
+    assert!(!serde_json::to_string(&found).unwrap().contains("8;;"));
+}
+
+// ---------------------------------------------------------------------------
+// Review of #276: bounded work
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cyclic_multi_base_classes_resolve_in_bounded_time() {
+    // Every class lists every class (itself included) as a base. With no
+    // visited set, attribute lookup was exponential: 7 classes took 13 s
+    // and 10 never finished.
+    let names: Vec<String> = (0..12).map(|i| format!("C{i}")).collect();
+    let bases = names.join(", ");
+    let mut source = String::from("from openai import OpenAI\nclient = OpenAI()\n");
+    for name in &names {
+        source.push_str(&format!(
+            "class {name}({bases}):\n    def go(self):\n        return self.client.chat.completions.create(model=self.model, messages=[])\n"
+        ));
+    }
+    let started = std::time::Instant::now();
+    let found = usages(&source);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "took {elapsed:?}"
+    );
+    assert_eq!(gaps(&found, GapKind::UnknownClientFactory).len(), 12);
+}
+
+#[test]
+fn a_twenty_thousand_link_chain_is_linear() {
+    // `Node::parent()` descends from the root, so asking it for every node
+    // of a deep chain was quadratic: 20,000 links took 50 s.
+    let mut source = String::from("from openai import OpenAI\nclient = OpenAI()\nx = client");
+    for _ in 0..20_000 {
+        source.push_str(".m()");
+    }
+    source.push_str("\nclient.chat.completions.create(model=\"gpt-4\", messages=[])\n");
+    let started = std::time::Instant::now();
+    let found = usages(&source);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "took {elapsed:?}"
+    );
+    assert_eq!(
+        value(call(&found, "client.chat.completions.create"), "model"),
+        Some("gpt-4")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review of #276: gaps instead of silent drops
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_model_bearing_call_reports_a_value_or_a_gap() {
+    let found = usages(
+        r#"
+import os
+from openai import OpenAI
+import google.generativeai as genai
+
+client = OpenAI()
+
+def run(kw, f):
+    client.images.generate(model=os.getenv("IMAGE_MODEL"), prompt="x")
+    client.images.edit(model=os.getenv("IMAGE_MODEL"), image=f, prompt="x")
+    client.beta.realtime.connect(model=os.getenv("REALTIME_MODEL"))
+    client.chat.completions.with_raw_response.create(**kw)
+    client.chat.completions.with_streaming_response.create(model=os.getenv("M"), messages=[])
+    client.audio.transcriptions.create(**kw)
+    client.audio.speech.create(**kw)
+    client.vector_stores.files.poll(model=os.getenv("M"))
+    genai.embed_content("models/embedding-001", "text")
+    genai.embed_content(model=os.getenv("EMBED"), content="text")
+"#,
+    );
+    let calls_without_values: Vec<&SdkCall> =
+        found.calls.iter().filter(|c| c.values.is_empty()).collect();
+    for c in &calls_without_values {
+        let start = c.span.start_byte;
+        assert!(
+            found
+                .gaps
+                .iter()
+                .any(|g| g.span.map(|s| s.start_byte) == Some(start)),
+            "silent drop at `{}`",
+            c.chain
+        );
+    }
+    assert_eq!(calls_without_values.len(), 9);
+    let raw = call(&found, "client.chat.completions.with_raw_response.create");
+    assert_eq!(raw.member, "chat.completions.create");
+    assert!(raw.request);
+    let reasons: Vec<&str> = gaps(&found, GapKind::UnresolvedModel)
+        .iter()
+        .map(|g| g.reason.as_str())
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            "env_var", "env_var", "env_var", "splat", "env_var", "splat", "splat", "env_var",
+            "env_var"
+        ]
+    );
+    let legacy = found
+        .calls
+        .iter()
+        .find(|c| c.chain == "genai.embed_content" && !c.values.is_empty())
+        .unwrap();
+    let model = &legacy.values[0];
+    assert_eq!(
+        (model.key.as_str(), model.value.as_str(), model.positional),
+        ("model", "models/embedding-001", true)
+    );
+    assert_eq!(model.model_family, Some(Sdk::Google));
+}
+
+// ---------------------------------------------------------------------------
+// Review of #276: routing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn with_options_and_copy_reroute_the_client() {
+    let found = usages(
+        r#"
+from openai import OpenAI
+from anthropic import Anthropic
+
+client = OpenAI()
+claude = Anthropic()
+LOCAL = {"base_url": "http://localhost:8000"}
+
+def run(opts):
+    client.with_options(base_url="https://openrouter.ai/api/v1").chat.completions.create(model="gpt-4", messages=[])
+    client.copy(base_url="http://localhost:8000").chat.completions.create(model="gpt-4", messages=[])
+    client.with_options(**opts).chat.completions.create(model="gpt-4", messages=[])
+    client.with_options(timeout=5).chat.completions.create(model="gpt-4", messages=[])
+    client.with_options(**LOCAL).chat.completions.create(model="gpt-4", messages=[])
+    claude.with_options(base_url="http://litellm:4000").messages.create(model="claude-2.1", max_tokens=1, messages=[])
+"#,
+    );
+    let routes: Vec<(String, Routing)> = found
+        .calls
+        .iter()
+        .filter(|c| c.request)
+        .map(|c| (c.member.clone(), c.routing))
+        .collect();
+    let chat = "chat.completions.create".to_string();
+    assert_eq!(
+        routes,
+        vec![
+            (chat.clone(), Routing::CustomBaseUrl),
+            (chat.clone(), Routing::CustomBaseUrl),
+            (chat.clone(), Routing::Unknown),
+            (chat.clone(), Routing::OpenaiDirect),
+            (chat, Routing::CustomBaseUrl),
+            ("messages.create".to_string(), Routing::CustomBaseUrl),
+        ]
+    );
+}
+
+#[test]
+fn a_module_name_rebound_to_a_client_routes_as_that_client() {
+    let found = usages(
+        r#"
+import openai
+
+openai = openai.OpenAI(base_url="http://localhost:8000/v1")
+openai.chat.completions.create(model="gpt-4", messages=[])
+
+def later():
+    return openai.chat.completions.create(model="gpt-4", messages=[])
+"#,
+    );
+    assert_eq!(found.clients[0].routing, Routing::CustomBaseUrl);
+    assert_eq!(found.calls.len(), 2);
+    for c in &found.calls {
+        assert_eq!(c.receiver, Receiver::Client, "{}", c.chain);
+        assert_eq!(c.routing, Routing::CustomBaseUrl, "{}", c.chain);
+        assert_eq!(c.client_line, Some(4));
+    }
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn lambda_parameters_are_bindings() {
+    let found = usages(
+        r#"
+import openai
+from openai import OpenAI
+
+client = OpenAI()
+ask = lambda client, q: client.chat.completions.create(model="gpt-4", messages=[q])
+legacy = lambda openai: openai.ChatCompletion.create(model="gpt-4", messages=[])
+direct = lambda q: client.chat.completions.create(model="gpt-4", messages=[q])
+"#,
+    );
+    // Only the lambda that closes over the module client is a usage.
+    let chains: Vec<&str> = found.calls.iter().map(|c| c.chain.as_str()).collect();
+    assert_eq!(chains, vec!["client.chat.completions.create"]);
+    assert_eq!(found.calls[0].span.line, 8);
+    let reasons: Vec<&str> = gaps(&found, GapKind::UnknownClientFactory)
+        .iter()
+        .map(|g| g.reason.as_str())
+        .collect();
+    assert_eq!(reasons, vec!["parameter", "parameter"]);
+}
+
+#[test]
+fn each_call_site_sees_its_reaching_assignment() {
+    let found = usages(
+        r#"
+from openai import OpenAI, AzureOpenAI
+
+client = OpenAI()
+client.chat.completions.create(model="gpt-4", messages=[])
+client = AzureOpenAI()
+client.chat.completions.create(model="dep", messages=[])
+
+def later():
+    return client.chat.completions.create(model="dep", messages=[])
+
+def looped(items):
+    c = OpenAI()
+    for item in items:
+        c.chat.completions.create(model="gpt-4", messages=[])
+        c = AzureOpenAI()
+    return c
+"#,
+    );
+    let routes: Vec<(u32, Routing)> = found
+        .calls
+        .iter()
+        .map(|c| (c.span.line, c.routing))
+        .collect();
+    assert_eq!(
+        routes,
+        vec![
+            (5, Routing::OpenaiDirect),
+            (7, Routing::AzureOpenai),
+            (10, Routing::AzureOpenai),
+            // A later assignment in the loop reaches the call on the next
+            // iteration.
+            (15, Routing::Unknown),
+        ]
+    );
+    let ambiguous = gaps(&found, GapKind::AmbiguousClient);
+    assert_eq!(ambiguous.len(), 1);
+    assert_eq!(ambiguous[0].span.unwrap().line, 15);
+}
+
+// ---------------------------------------------------------------------------
+// Review of #276 and the Track C misses: values
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_constant_parameter_default_resolves() {
+    let found = usages(
+        r#"
+from openai import OpenAI
+
+GPT_MODEL = "gpt-3.5-turbo"
+client = OpenAI()
+
+def ask(q, model: str = GPT_MODEL):
+    return client.chat.completions.create(model=model, messages=[q])
+"#,
+    );
+    let model = &call(&found, "client.chat.completions.create").values[0];
+    assert_eq!(
+        (
+            model.value.as_str(),
+            model.origin,
+            model.name.as_deref(),
+            model.span.line
+        ),
+        (
+            "gpt-3.5-turbo",
+            ValueOrigin::ParameterDefault,
+            Some("model"),
+            4
+        )
+    );
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn environment_and_config_fallbacks_are_env_defaults_with_a_gap() {
+    let found = usages(
+        r#"
+import os
+from decouple import config
+from openai import OpenAI
+from settings import settings
+
+client = OpenAI()
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+client.chat.completions.create(model=MODEL, messages=[])
+client.chat.completions.create(model=os.environ.get("CHAT_MODEL", "gpt-4o"), messages=[])
+client.chat.completions.create(model=config("CHAT_MODEL", default="gpt-4.1"), messages=[])
+client.chat.completions.create(model=settings.get("model", "gpt-4-turbo"), messages=[])
+client.chat.completions.create(model=os.getenv("CHAT_MODEL") or "gpt-3.5-turbo", messages=[])
+client.chat.completions.create(model=getattr(settings, "MODEL", "o3-mini"), messages=[])
+"#,
+    );
+    let values: Vec<(&str, ValueOrigin)> = found
+        .calls
+        .iter()
+        .map(|c| (c.values[0].value.as_str(), c.values[0].origin))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            ("gpt-4o-mini", ValueOrigin::EnvDefault),
+            ("gpt-4o", ValueOrigin::EnvDefault),
+            ("gpt-4.1", ValueOrigin::EnvDefault),
+            ("gpt-4-turbo", ValueOrigin::EnvDefault),
+            ("gpt-3.5-turbo", ValueOrigin::EnvDefault),
+            ("o3-mini", ValueOrigin::EnvDefault),
+        ]
+    );
+    // Each call keeps its gap: the deployed value may differ.
+    let reasons: Vec<&str> = gaps(&found, GapKind::UnresolvedModel)
+        .iter()
+        .map(|g| g.reason.as_str())
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            "env_var",
+            "env_var",
+            "env_var",
+            "function_call",
+            "env_var",
+            "attribute"
+        ]
+    );
+    let json = serde_json::to_string(&found).unwrap();
+    assert!(!json.contains("OPENAI_MODEL"));
+    assert!(!json.contains("CHAT_MODEL"));
+    assert!(json.contains("\"env_default\""));
+}
+
+#[test]
+fn same_file_dict_literals_expand() {
+    let found = usages(
+        r#"
+from openai import OpenAI
+
+client = OpenAI()
+PARAMS = {"model": "gpt-4o", "temperature": 0}
+MODELS = {"fast": "gpt-4o-mini", "smart": "o3"}
+CONFIG = {"openai": {"model": "gpt-4.1"}}
+MUTATED = {"model": "gpt-4"}
+MUTATED["model"] = pick()
+
+def run(tier):
+    client.chat.completions.create(**PARAMS, messages=[])
+    client.chat.completions.create(model=MODELS["fast"], messages=[])
+    client.chat.completions.create(model=CONFIG["openai"]["model"], messages=[])
+    client.chat.completions.create(**dict(model="gpt-4-turbo"), messages=[])
+    client.chat.completions.create(model=MODELS.get("smart", "gpt-4"), messages=[])
+    client.chat.completions.create(**MUTATED, messages=[])
+    client.chat.completions.create(model=MODELS[tier], messages=[])
+"#,
+    );
+    let values: Vec<(u32, &str, ValueOrigin, Option<&str>)> = found
+        .calls
+        .iter()
+        .flat_map(|c| {
+            c.values
+                .iter()
+                .map(move |v| (c.span.line, v.value.as_str(), v.origin, v.name.as_deref()))
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            (
+                12,
+                "gpt-4o",
+                ValueOrigin::ModuleConstant,
+                Some("PARAMS[\"model\"]")
+            ),
+            (
+                13,
+                "gpt-4o-mini",
+                ValueOrigin::ModuleConstant,
+                Some("MODELS[\"fast\"]")
+            ),
+            (
+                14,
+                "gpt-4.1",
+                ValueOrigin::ModuleConstant,
+                Some("CONFIG[\"openai\"][\"model\"]")
+            ),
+            (15, "gpt-4-turbo", ValueOrigin::Literal, None),
+            (
+                16,
+                "o3",
+                ValueOrigin::ModuleConstant,
+                Some("MODELS[\"smart\"]")
+            ),
+        ]
+    );
+    let reasons: Vec<(u32, &str)> = gaps(&found, GapKind::UnresolvedModel)
+        .iter()
+        .map(|g| (g.span.unwrap().line, g.reason.as_str()))
+        .collect();
+    assert_eq!(reasons, vec![(17, "splat"), (18, "subscript")]);
+}
+
+#[test]
+fn a_client_passed_by_every_in_file_caller_resolves() {
+    let found = usages(
+        r#"
+from openai import OpenAI, AzureOpenAI
+
+client = OpenAI()
+
+def ask(llm, q):
+    return llm.chat.completions.create(model="gpt-4", messages=[q])
+
+ask(client, "a")
+ask(llm=client, q="b")
+
+class Bot:
+    def __init__(self):
+        self.client = AzureOpenAI()
+
+    def run(self):
+        return self._send(self.client, "x")
+
+    def _send(self, c, q):
+        return c.chat.completions.create(model="dep", messages=[q])
+
+def mixed(llm):
+    return llm.chat.completions.create(model="gpt-4", messages=[])
+
+mixed(OpenAI())
+mixed(AzureOpenAI())
+
+def escaped(llm):
+    return llm.chat.completions.create(model="gpt-4", messages=[])
+
+callbacks = [escaped]
+escaped(client)
+"#,
+    );
+    let ask = call(&found, "llm.chat.completions.create");
+    assert_eq!(
+        (ask.routing, ask.client_line),
+        (Routing::OpenaiDirect, Some(4))
+    );
+    assert_eq!(ask.symbol.as_deref(), Some("ask"));
+    let send = call(&found, "c.chat.completions.create");
+    assert_eq!(send.routing, Routing::AzureOpenai);
+    // Callers that disagree, or a function that escapes, stay gaps.
+    let unknown: Vec<(Option<&str>, &str)> = gaps(&found, GapKind::UnknownClientFactory)
+        .iter()
+        .map(|g| (g.symbol.as_deref(), g.reason.as_str()))
+        .collect();
+    assert_eq!(
+        unknown,
+        vec![(Some("mixed"), "parameter"), (Some("escaped"), "parameter")]
+    );
+}
+
+#[test]
+fn syntax_errors_are_flagged() {
+    let found = usages(
+        "from openai import OpenAI\nclient = OpenAI()\ndef broken(:\n    pass\nclient.chat.completions.create(model=\"gpt-4\", messages=[])\n",
+    );
+    assert!(found.syntax_errors);
+    let clean = usages("from openai import OpenAI\nclient = OpenAI()\n");
+    assert!(!clean.syntax_errors);
+    assert!(!serde_json::to_string(&clean)
+        .unwrap()
+        .contains("syntax_errors"));
 }

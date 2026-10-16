@@ -26,7 +26,7 @@
     {"at": "app/chat.py:23", "chain": "client.responses.create", "routing": "openai_direct", "values": {"model": "gpt-4"}},
     {"at": "app/chat.py:27", "chain": "client.completions.create", "routing": "openai_direct", "values": {"model": "gpt-3.5-turbo-instruct"}},
 
-    {"at": "app/dynamic.py:13", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/dynamic.py:13", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-3.5-turbo"}},
     {"at": "app/dynamic.py:17", "chain": "client.chat.completions.create", "routing": "openai_direct"},
     {"at": "app/dynamic.py:21", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
     {"at": "app/dynamic.py:25", "chain": "client.chat.completions.create", "routing": "openai_direct"},
@@ -93,5 +93,5 @@
     "value app/dynamic.py:34 llm.chat.completions.create model=gpt-3.5-turbo"
   ],
   "known_extra": [],
-  "notes": "Synthetic. Truth is what each line actually does at run time. The engine resolves within one file in v0, so the client built by app/factory.py:make_client and the constant in app/settings.py are reported as gaps at their use sites (dynamic.py:34 and :21) and recorded here as known misses. dynamic.py:38 receives an untyped parameter that nothing in the fixture calls, so its provider is not knowable and it is a gap only. app/sms.py (Twilio messages.create) and app/pricing.py (model IDs in a price table) must report nothing. venv/ and libs/_vendor/ hold one SDK call each and must be excluded and counted."
+  "notes": "Synthetic. Truth is what each line actually does at run time. The engine resolves within one file in v0, so the client built by app/factory.py:make_client and the constant in app/settings.py are reported as gaps at their use sites (dynamic.py:34 and :21) and recorded here as known misses. app/dynamic.py:13 reads OPENAI_MODEL with a literal fallback: the fallback is captured as env_default and the call keeps its env_var gap. dynamic.py:38 receives an untyped parameter that nothing in the fixture calls, so its provider is not knowable and it is a gap only. app/sms.py (Twilio messages.create) and app/pricing.py (model IDs in a price table) must report nothing. venv/ and libs/_vendor/ hold one SDK call each and must be excluded and counted."
 }
