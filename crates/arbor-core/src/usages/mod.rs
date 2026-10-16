@@ -21,21 +21,38 @@
 //!   (`client.chat.completions.create`, `openai.ChatCompletion.create`,
 //!   `self.client.messages.create`, `genai.GenerativeModel(...)`). A call
 //!   records keyword-argument *names* only. A *value* is captured only for
-//!   the keys in [`VALUE_KEYS`] (as keyword arguments, or as keys of a dict
-//!   literal passed to the call), only when it is a string literal or a
-//!   same-file constant that resolves to one, and never for a key that
-//!   [`is_secret_key`] matches.
+//!   the keys in [`VALUE_KEYS`] (as keyword arguments, as keys of a dict
+//!   literal passed to the call or expanded with `**`), only when it is a
+//!   string literal or a same-file constant that resolves to one.
 //! - [`UsageGap`]: everything the extractor saw but could not resolve. A gap
 //!   is never a silent drop: a model passed from the environment, a client
 //!   from an unknown factory, `getattr` dispatch, or an ambiguous client each
-//!   get a typed record.
+//!   get a typed record. A model read from the environment or a config
+//!   lookup with a literal fallback (`os.getenv("MODEL", "gpt-4o")`) is both:
+//!   the fallback is captured with origin [`ValueOrigin::EnvDefault`] and the
+//!   call keeps its gap, because the deployed value may differ.
+//!
+//! # Credentials
+//!
+//! No credential value is ever captured. A value is refused when any name it
+//! flows through matches [`is_secret_key`] (the keyword, a constant, a
+//! parameter, a `self.attr`, a dict key or an environment variable name),
+//! when the value itself is credential-shaped ([`is_credential_value`]:
+//! `sk-`, `sk-ant-`, `AIza`, `ghp_`, `xox...`, long random tokens), and dict
+//! key paths are built only from identifier-shaped keys
+//! ([`is_identifier_key`]). A refused value at a request is an
+//! `unresolved_model` gap with reason `credential`; the gap names the
+//! binding, never the value.
 //!
 //! Positions are [`Span`]s: 1-based lines and 1-based columns counted in
-//! Unicode scalar values, plus 0-based UTF-8 byte offsets for rewriting.
+//! Unicode scalar values, plus 0-based UTF-8 byte offsets for rewriting. A
+//! consumer that needs another column unit (UTF-16 for JS editors) should
+//! derive it from the byte offsets.
 //!
 //! # Scope of this version
 //!
-//! Python only ([`python`]). The TypeScript/ESM slice will implement
+//! Python only ([`python`]): `.py` files and extensionless scripts with a
+//! Python shebang. The TypeScript/ESM slice will implement
 //! [`crate::LanguageParser::extract_usages`] for its parsers and reuse these
 //! types. Resolution is per file: a client or model constant imported from
 //! another module is a gap, not a usage.
@@ -249,9 +266,18 @@ pub enum ValueOrigin {
     ClassConstant,
     /// A function-local name assigned exactly one string literal.
     LocalConstant,
-    /// The literal default of the enclosing function's parameter. Callers
-    /// may pass another value.
+    /// The default of the enclosing function's parameter: a literal or a
+    /// same-file constant (`def ask(model=GPT_MODEL)`). Callers may pass
+    /// another value.
     ParameterDefault,
+    /// The literal fallback of an environment or configuration lookup:
+    /// `os.getenv("MODEL", "gpt-4o")`, `os.environ.get(...)`,
+    /// `config("MODEL", default=...)` (python-decouple, django-environ),
+    /// `settings.get("model", "gpt-4o")`, `getattr(cfg, "model", "gpt-4o")`
+    /// or `os.getenv("MODEL") or "gpt-4o"`. The deployed value may differ, so
+    /// the call also carries an `unresolved_model` gap: confirm before
+    /// acting on it.
+    EnvDefault,
 }
 
 /// A value captured for an allowlisted key ([`VALUE_KEYS`]).
@@ -259,14 +285,19 @@ pub enum ValueOrigin {
 pub struct CapturedValue {
     /// `model`, `engine`, `deployment_id` or `model_name`; for a key inside a
     /// dict literal argument, the path to it (`fallbacks.model` for
-    /// `fallbacks=[{"model": ...}]`, `model` when the dict is positional).
+    /// `fallbacks=[{"model": ...}]`, `model` when the dict is positional or
+    /// expanded with `**`). Every segment is an identifier-shaped key.
     pub key: String,
     pub value: String,
     pub origin: ValueOrigin,
-    /// The constant or parameter name when the value is not written inline.
+    /// The constant or parameter name when the value is not written inline
+    /// (`MODEL`, `self.model`, `MODELS["fast"]`, `model` for a parameter
+    /// default).
     pub name: Option<String>,
-    /// Whether the value was the first positional argument
-    /// (`GenerativeModel("gemini-pro")`) rather than a keyword.
+    /// Python: the value was the call's first positional argument
+    /// (`GenerativeModel("gemini-pro")`, legacy `genai.embed_content(...)`) or
+    /// sits in a dict literal passed positionally, rather than under a
+    /// keyword. It describes how the call is written, not the SDK signature.
     pub positional: bool,
     /// The span of the string literal itself, at its definition.
     pub span: Span,
@@ -282,7 +313,9 @@ pub struct SdkCall {
     /// The callee as written, arguments elided
     /// (`self.client.chat.completions.create`).
     pub chain: String,
-    /// The part after the tracked root (`chat.completions.create`).
+    /// The part after the tracked root (`chat.completions.create`), with the
+    /// response wrappers `with_raw_response` / `with_streaming_response` and
+    /// client copies (`with_options(...)`, `copy(...)`) removed.
     pub member: String,
     /// Whether the call sends a request to the provider: its last member is
     /// a request method (`create`, `stream`, `generate_content`,
@@ -384,6 +417,10 @@ pub struct FileUsages {
     pub clients: Vec<ClientConstruction>,
     pub calls: Vec<SdkCall>,
     pub gaps: Vec<UsageGap>,
+    /// The parser recovered from syntax errors: calls inside the broken
+    /// region may be missing. Set only for files that mention an SDK.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub syntax_errors: bool,
 }
 
 impl FileUsages {
@@ -413,8 +450,12 @@ impl FileUsages {
     }
 }
 
+/// Languages that have a usage extractor.
+pub const USAGE_LANGUAGES: &[&str] = &["python"];
+
 /// File extensions that have a usage extractor. `.pyi` stubs are excluded:
-/// they declare types, they do not make requests.
+/// they declare types, they do not make requests. Extensionless scripts are
+/// scanned when [`is_python_shebang`] accepts their first line.
 pub const USAGE_EXTENSIONS: &[&str] = &["py"];
 
 /// Whether files with this extension have a usage extractor.
@@ -422,6 +463,18 @@ pub fn is_usage_extension(extension: &str) -> bool {
     USAGE_EXTENSIONS
         .iter()
         .any(|e| e.eq_ignore_ascii_case(extension))
+}
+
+/// Whether the start of an extensionless file is a Python shebang
+/// (`#!/usr/bin/env python3`, `#!/usr/bin/python3.11`).
+pub fn is_python_shebang(head: &[u8]) -> bool {
+    let Some(rest) = head.strip_prefix(b"#!") else {
+        return false;
+    };
+    let line = rest.split(|b| *b == b'\n').next().unwrap_or_default();
+    String::from_utf8_lossy(line)
+        .split(|c: char| c.is_whitespace() || c == '/')
+        .any(|word| word.starts_with("python"))
 }
 
 /// Keys whose string value may be captured. Every other key is recorded by
@@ -440,6 +493,98 @@ pub fn is_secret_key(key: &str) -> bool {
 /// Whether a value for `key` may be captured.
 pub fn is_value_key(key: &str) -> bool {
     VALUE_KEYS.contains(&key) && !is_secret_key(key)
+}
+
+/// Whether a dict key may appear in a [`CapturedValue::key`] path: an ASCII
+/// identifier of at most 64 characters that is neither secret-named nor
+/// credential-shaped. A dict under any other key is never descended into.
+pub fn is_identifier_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    key.len() <= 64
+        && (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !is_secret_key(key)
+        && !is_credential_value(key)
+}
+
+/// Prefixes of API keys and tokens (OpenAI, Anthropic, Stripe, Google,
+/// GitHub, Slack, AWS, GitLab, Hugging Face, Replicate, Groq, Perplexity,
+/// NVIDIA, Cerebras), PEM blocks and HTTP authorization values.
+const CREDENTIAL_PREFIXES: &[&str] = &[
+    "sk-",
+    "sk_",
+    "rk_",
+    "pk_live_",
+    "pk_test_",
+    "AIza",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "xox",
+    "xapp-",
+    "glpat-",
+    "hf_",
+    "r8_",
+    "gsk_",
+    "pplx-",
+    "nvapi-",
+    "csk-",
+    "-----BEGIN",
+    "Bearer ",
+    "bearer ",
+    "Basic ",
+];
+
+/// Whether a string looks like a credential rather than a model ID: a known
+/// key or token prefix, an AWS key ID, a JWT, or a long random run of alphanumerics (20 or
+/// more mixing upper case, lower case and digits, or 32 or more mixing
+/// letters and digits, which covers hex keys). Model IDs are short words
+/// joined by `-`, `.`, `:`, `/` or `@`, so they do not match.
+pub fn is_credential_value(value: &str) -> bool {
+    let value = value.trim();
+    if CREDENTIAL_PREFIXES.iter().any(|p| value.starts_with(p)) {
+        return true;
+    }
+    // An AWS access key ID.
+    if (value.starts_with("AKIA") || value.starts_with("ASIA"))
+        && value.len() == 20
+        && value
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
+        return true;
+    }
+    // A JWT: base64url segments, the first a JSON header.
+    if value.starts_with("eyJ") && value.matches('.').count() >= 2 {
+        return true;
+    }
+    value
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|run| {
+            let upper = run.chars().any(|c| c.is_ascii_uppercase());
+            let lower = run.chars().any(|c| c.is_ascii_lowercase());
+            let digit = run.chars().any(|c| c.is_ascii_digit());
+            (run.len() >= 20 && upper && lower && digit)
+                || (run.len() >= 32 && (upper || lower) && digit)
+        })
+}
+
+/// Whether a resolved string may be reported as a value: not
+/// credential-shaped, no control or bidirectional-override characters (an
+/// escape sequence must never reach a terminal) and at most 256 bytes.
+pub fn is_capturable_value(value: &str) -> bool {
+    value.len() <= 256 && !value.chars().any(is_unsafe_char) && !is_credential_value(value)
+}
+
+/// Control characters and bidirectional overrides.
+pub fn is_unsafe_char(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 /// Which provider's model-ID naming `value` follows, if any.
@@ -555,6 +700,84 @@ mod tests {
             assert!(!is_value_key(key));
         }
         assert!(!is_value_key("temperature"));
+    }
+
+    #[test]
+    fn credential_shaped_values_are_refused() {
+        for secret in [
+            "sk-proj-AbCdEf0123456789xyz",
+            "sk-ant-api03-AbCdEf0123456789",
+            "sk-live-SECRET",
+            "sk_live_51H8abc",
+            "AIzaSyD-abcdefghijklmnop",
+            "ghp_0123456789abcdefABCDEF",
+            "xoxb-1234-5678-abcdef",
+            "AKIAIOSFODNN7EXAMPLE",
+            "Bearer abc",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig",
+            "Zx8aB2cD4eF6gH8iJ0kL2mN4",
+            "0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(is_credential_value(secret), "{secret} must be refused");
+            assert!(!is_capturable_value(secret));
+        }
+        for model in [
+            "gpt-4o-2024-08-06",
+            "claude-3-5-sonnet-20241022",
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "ft:gpt-4o-mini-2024-07-18:acme::9xKz3mQp",
+            "models/gemini-1.5-flash-001",
+            "GPT4o-Prod-Deployment-2024",
+            "claude-3-5-sonnet-v2@20241022",
+            "projects/123456789012/locations/us-central1/endpoints/1234567890123456789",
+            "text-embedding-3-small",
+            "o3-mini",
+        ] {
+            assert!(!is_credential_value(model), "{model} is a model ID");
+            assert!(is_capturable_value(model));
+        }
+        assert!(!is_capturable_value("gpt-4\u{1b}]8;;x\u{7}"));
+        assert!(!is_capturable_value("gpt-\u{202E}4"));
+        assert!(!is_capturable_value(&"a".repeat(300)));
+    }
+
+    #[test]
+    fn identifier_keys_only() {
+        for ok in ["model", "fallbacks", "extra_body", "_x1"] {
+            assert!(is_identifier_key(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "sk-proj-abc",
+            "x-api-key",
+            "api_key",
+            "1model",
+            "has space",
+            "sk_live_abc",
+            "Zx8aB2cD4eF6gH8iJ0kL2mN4",
+        ] {
+            assert!(!is_identifier_key(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn python_shebangs() {
+        for yes in [
+            "#!/usr/bin/env python3\nimport openai\n",
+            "#!/usr/bin/python\n",
+            "#! /usr/local/bin/python3.11 -u\n",
+            "#!/usr/bin/env -S python3 -X utf8\n",
+        ] {
+            assert!(is_python_shebang(yes.as_bytes()), "{yes}");
+        }
+        for no in [
+            "#!/bin/sh\n",
+            "import openai\n",
+            "",
+            "#!/usr/bin/env node\n# python\n",
+        ] {
+            assert!(!is_python_shebang(no.as_bytes()), "{no}");
+        }
     }
 
     #[test]
