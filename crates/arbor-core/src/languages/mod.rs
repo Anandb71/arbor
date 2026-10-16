@@ -55,6 +55,19 @@ pub trait LanguageParser: Send + Sync {
     ) -> Option<FileUsages> {
         None
     }
+
+    /// The language name usage records carry, for a language that
+    /// implements [`Self::extract_usages`].
+    fn usages_language(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Whether `source` can contain usages at all. A `false` answer lets
+    /// [`crate::parse_source_usages`] skip the parse: most files of a large
+    /// tree never mention an SDK.
+    fn may_have_usages(&self, _source: &str) -> bool {
+        true
+    }
 }
 
 /// Gets a parser for the given file extension.

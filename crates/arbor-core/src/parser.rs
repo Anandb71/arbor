@@ -114,28 +114,47 @@ pub fn parse_source_with_usages(
 }
 
 /// SDK usages for in-memory source. `Ok(None)` when the language has no
-/// usage extractor (today: every language except Python).
+/// usage extractor (today: every language except Python). A file that
+/// mentions no tracked SDK is not parsed at all.
 pub fn parse_source_usages(
     source: &str,
     file_path: &str,
     lang_parser: &dyn LanguageParser,
 ) -> Result<Option<FileUsages>> {
+    let Some(language) = lang_parser.usages_language() else {
+        return Ok(None);
+    };
+    if !lang_parser.may_have_usages(source) {
+        return Ok(Some(FileUsages::new(file_path, language)));
+    }
     let tree = parse_tree(source, lang_parser)?;
     Ok(lang_parser.extract_usages(&tree, source, file_path))
 }
 
 /// SDK usages for a file on disk, with the path as written used in records.
-/// `Ok(None)` when the file's extension has no usage extractor (see
-/// [`crate::usages::is_usage_extension`]); the file is then not read.
+/// `Ok(None)` when the file has no usage extractor: its extension is not in
+/// [`crate::usages::is_usage_extension`] and, for a file without one, its
+/// first line is not a Python shebang. Other files are not read past that.
 pub fn parse_file_usages(path: &Path) -> Result<Option<FileUsages>> {
     let extension = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or_default();
-    if !crate::usages::is_usage_extension(extension) {
-        return Ok(None);
-    }
-    let Some(parser) = detect_language(path) else {
+    let parser = if extension.is_empty() {
+        let mut head = [0u8; 256];
+        let read = fs::File::open(path)
+            .and_then(|mut file| std::io::Read::read(&mut file, &mut head))
+            .map_err(|e| ParseError::io(path, e))?;
+        if !crate::usages::is_python_shebang(&head[..read]) {
+            return Ok(None);
+        }
+        get_parser("py")
+    } else if crate::usages::is_usage_extension(extension) {
+        detect_language(path)
+    } else {
+        None
+    };
+    let Some(parser) = parser else {
         return Ok(None);
     };
     let source = fs::read_to_string(path).map_err(|e| ParseError::io(path, e))?;
@@ -245,6 +264,26 @@ mod tests {
         let empty = dir.path().join("__init__.py");
         std::fs::write(&empty, "").unwrap();
         assert!(parse_file_usages(&empty).unwrap().unwrap().is_empty());
+
+        // An extensionless script counts when its shebang names Python.
+        let script = dir.path().join("summarize");
+        std::fs::write(&script, "#!/usr/bin/env python3\nimport anthropic\nanthropic.Anthropic().messages.create(model=\"claude-2.1\", max_tokens=1, messages=[])\n").unwrap();
+        assert_eq!(parse_file_usages(&script).unwrap().unwrap().calls.len(), 1);
+        let shell = dir.path().join("deploy");
+        std::fs::write(&shell, "#!/bin/sh\necho openai\n").unwrap();
+        assert!(parse_file_usages(&shell).unwrap().is_none());
+    }
+
+    #[test]
+    fn files_that_mention_no_sdk_are_not_parsed() {
+        let parser = get_parser("py").unwrap();
+        // Not even valid Python: the prefilter answers before the parser.
+        let found = parse_source_usages("def (:\n", "x.py", parser.as_ref())
+            .unwrap()
+            .unwrap();
+        assert!(found.is_empty());
+        assert!(!found.syntax_errors);
+        assert_eq!(found.language, "python");
     }
 
     #[test]

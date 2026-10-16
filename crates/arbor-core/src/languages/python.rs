@@ -29,6 +29,14 @@ impl LanguageParser for PythonParser {
     fn extract_usages(&self, tree: &Tree, source: &str, file_path: &str) -> Option<FileUsages> {
         Some(crate::usages::python::extract(tree, source, file_path))
     }
+
+    fn usages_language(&self) -> Option<&'static str> {
+        Some("python")
+    }
+
+    fn may_have_usages(&self, source: &str) -> bool {
+        crate::usages::python::may_use_sdk(source)
+    }
 }
 
 fn extract_from_node(
