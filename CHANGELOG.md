@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`arbor refactor` exited 0 for a missing symbol (#195):** it now exits 1 and prints `error: Symbol '<name>' not found` to stderr after the "Did you mean" suggestions, matching `inspect` and `callers`.
+
 ## [3.1.0] - 2026-10-20
 
 A feature release: two commands for Python code that calls AI model APIs. See [docs/RELEASE_NOTES_v3.1.0.md](docs/RELEASE_NOTES_v3.1.0.md).
@@ -42,7 +45,6 @@ A fix release. See [docs/RELEASE_NOTES_v3.0.4.md](docs/RELEASE_NOTES_v3.0.4.md).
 - **First run after an upgrade (#251):** clearing an outdated graph cache re-opened the store right after dropping its handle, and sled could still hold the directory lock ("could not acquire lock … WouldBlock"). The cache is now checked, cleared and re-stamped through one handle.
 - **MCP protocol (#254, #256):** `initialize` rejects a malformed `protocolVersion` with `-32602` naming the supported versions, and maps any dated version from 2026 on to the current protocol. On HTTP, one connection's negotiation no longer changes what another sees. Over stdio a malformed line gets a `-32700` response instead of leaving the client waiting. Declared extensions are intersected with the implemented ones.
 - **`.arbor/` showing up in git (#233):** Arbor now writes `.arbor/.gitignore` whenever it creates or initialises the folder, including when a receipt creates it, so `git add -A` no longer picks up the graph or saved prompts. An existing `.arbor/.gitignore` is left alone. Files from `.arbor/` that you already committed stay tracked; remove them with `git rm -r --cached .arbor`.
-- **`arbor refactor` exited 0 for a missing symbol (#195):** it now exits 1 and prints `error: Symbol '<name>' not found` to stderr after the "Did you mean" suggestions, matching `inspect` and `callers`.
 
 ### Added
 - **Named symbols in `arbor diff` and `check`:** each modified symbol is listed with its file, line and direct caller count, most-called first (top 12 in the text report, a table in `--markdown`, all in `--json` as `modified`).
