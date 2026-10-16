@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "description": "Versioned evaluation corpus. expected/<name>.json is hand-audited truth for the fixture in corpus/<name>; known_missing/known_extra record the engine's current deltas so regressions fail and fixes must retire entries. Fixtures with before/ and after/ subdirectories are controlled changes \u2014 each state is indexed and compared independently (renames, deletions, removed exports, base-only code).",
+  "description": "Versioned evaluation corpus. expected/<name>.json is hand-audited truth for the fixture in corpus/<name>; known_missing/known_extra record the engine's current deltas so regressions fail and fixes must retire entries. Fixtures with before/ and after/ subdirectories are controlled changes \u2014 each state is indexed and compared independently (renames, deletions, removed exports, base-only code). Fixtures with \"suite\": \"usages\" are SDK-usage fixtures: `arbor usages . --json` is run on them and compared against expected/<name>.json (usages, clients, captured values, typed gaps, skipped vendored files, and strings that must never be output).",
   "fixtures": [
     {
       "name": "py-crossfile",
@@ -63,6 +63,18 @@
       "name": "py-real-slice",
       "language": "python",
       "covers": "real repository code (pallets/itsdangerous exc+encoding+signer, BSD-3-Clause) with real cross-file calls"
+    },
+    {
+      "name": "py-sdk-usages",
+      "language": "python",
+      "suite": "usages",
+      "covers": "OpenAI/Anthropic/Gemini SDK usage extraction: aliasing, routing, self.client, constants, v0 API, gaps, vendored dirs, secrets"
+    },
+    {
+      "name": "py-sdk-real-slice",
+      "language": "python",
+      "suite": "usages",
+      "covers": "real SDK example code from openai-python (Apache-2.0), anthropic-sdk-python (MIT) and deprecated-generative-ai-python (Apache-2.0)"
     }
   ]
 }
