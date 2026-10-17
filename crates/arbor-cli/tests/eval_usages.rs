@@ -62,6 +62,10 @@ struct ExpectedSkipped {
     vendored_files: usize,
     #[serde(default)]
     vendored_calls: usize,
+    #[serde(default)]
+    hidden_files: usize,
+    #[serde(default)]
+    hidden_calls: usize,
 }
 
 #[derive(Deserialize)]
@@ -238,6 +242,8 @@ fn evaluate(name: &str, expected: &Expected, raw: &str, failures: &mut Vec<Strin
     for (field, want) in [
         ("vendored_files", expected.skipped_expected.vendored_files),
         ("vendored_calls", expected.skipped_expected.vendored_calls),
+        ("hidden_files", expected.skipped_expected.hidden_files),
+        ("hidden_calls", expected.skipped_expected.hidden_calls),
     ] {
         let got = skipped[field].as_u64().unwrap_or(u64::MAX) as usize;
         if got != want {
