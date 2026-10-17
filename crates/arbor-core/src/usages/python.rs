@@ -176,10 +176,12 @@ const LEGACY_POSITIONAL_MODEL: &[&str] = &[
 const CONFIG_LOOKUPS: &[&str] = &["config", "decouple.config", "env", "env.str"];
 
 /// Maximum expression depth within one evaluation; deeper chains are
-/// treated as unresolved. Every name resolution starts a fresh budget, so a
-/// name's value never depends on how deep its first use was.
+/// treated as unresolved. Every name resolution starts a fresh budget.
 const MAX_DEPTH: u32 = 64;
-/// Maximum nesting of name, attribute and caller resolutions.
+/// Maximum nesting of name, attribute and caller resolutions. A value cut
+/// off here is memoized with the budget it had (see [`Memo`]), so a long
+/// chain of names that each use the previous one more than once stays
+/// linear instead of doubling per link.
 const MAX_NAME_DEPTH: u32 = 64;
 /// Inheritance search bounds: base-class hops, classes visited per lookup and
 /// bases read per class. Real hierarchies are far smaller; a pathological
@@ -190,6 +192,16 @@ const MAX_BASES: usize = 32;
 /// Definitions a reaching-definition search may look at before it gives up
 /// and counts every definition of the name.
 const MAX_REACH_SCAN: usize = 64;
+/// Longest string literal read, in source bytes. A captured value is at
+/// most 256 bytes, so a longer literal is refused without being copied.
+const MAX_LITERAL_BYTES: usize = 4096;
+/// Most arguments an environment, config or dict lookup takes. A call with
+/// more is not a lookup and its arguments are not scanned.
+const MAX_LOOKUP_ARGS: usize = 8;
+/// Container entries a search for nested model keys reads per argument
+/// (`fallbacks=[{"model": ...}, ...]`); the rest of a huge literal is not
+/// read.
+const MAX_NESTED_ENTRIES: usize = 256;
 
 /// Extracts SDK usages from a parsed Python file.
 pub fn extract(tree: &Tree, source: &str, file_path: &str) -> FileUsages {
@@ -588,6 +600,34 @@ impl Resolved {
     }
 }
 
+/// A memoized evaluation. `budget` is `None` when no resolution inside it
+/// was cut off at [`MAX_NAME_DEPTH`]: the value is final. Otherwise it is
+/// the name budget the evaluation ran with. A lookup with no more budget
+/// reuses the value (and counts as cut off itself); one with more budget
+/// recomputes it. Each entry is therefore computed at most
+/// `MAX_NAME_DEPTH + 1` times, which keeps the work linear in the file
+/// however its names branch.
+#[derive(Clone)]
+struct Memo<V> {
+    val: V,
+    budget: Option<u32>,
+}
+
+/// The memoized value for `key`, if one may be reused with `budget` left,
+/// and whether it was cut off.
+fn recall<K: std::hash::Hash + Eq, V: Clone>(
+    memo: &HashMap<K, Memo<V>>,
+    key: &K,
+    budget: u32,
+) -> Option<(V, bool)> {
+    let entry = memo.get(key)?;
+    match entry.budget {
+        None => Some((entry.val.clone(), false)),
+        Some(had) if budget <= had => Some((entry.val.clone(), true)),
+        Some(_) => None,
+    }
+}
+
 // ============================================================================
 // Collection state
 // ============================================================================
@@ -741,6 +781,18 @@ enum Reach {
     Subset(Vec<DefRef>),
 }
 
+/// What kinds of definition reach a use, without listing every one: a
+/// name assigned thousands of times costs the same as one assigned twice.
+#[derive(Default)]
+struct DefKinds {
+    param: bool,
+    /// A tracked or other import.
+    imported: bool,
+    assigns: usize,
+    /// The assignment, when there is exactly one.
+    only_assign: Option<usize>,
+}
+
 /// A `x.attr = value` whose object is not `self`/`cls`/a class, checked later
 /// for module-level OpenAI configuration.
 #[derive(Clone, Copy)]
@@ -854,18 +906,25 @@ struct Ctx<'t> {
     /// Names whose dict may change after its literal (`D[k] = v`, `D.update`).
     mutated: HashSet<&'t str>,
     def_index: HashMap<Key, DefIndex>,
+    /// Start bytes of the expressions that read the process environment
+    /// (`os.environ`, `os.getenv`, `getenv(...)`, `environ[...]`), in
+    /// order, so "does this expression read the environment?" is a binary
+    /// search instead of a walk.
+    env_reads: Vec<usize>,
     constructions: HashMap<usize, usize>,
-    name_memo: HashMap<Key, Val>,
-    attr_memo: HashMap<Key, Val>,
-    def_memo: HashMap<usize, Val>,
-    call_memo: HashMap<(usize, usize), Val>,
+    name_memo: HashMap<Key, Memo<Val>>,
+    attr_memo: HashMap<Key, Memo<Val>>,
+    def_memo: HashMap<usize, Memo<Val>>,
+    param_memo: HashMap<Key, Memo<Val>>,
+    call_memo: HashMap<(usize, usize), Memo<Val>>,
     dict_cache: HashMap<usize, Rc<DictSummary<'t>>>,
-    attr_lookup_memo: HashMap<Key, Vec<Assign<'t>>>,
-    caller_memo: HashMap<Key, Option<Val>>,
+    attr_lookup_memo: HashMap<Key, Rc<[Assign<'t>]>>,
+    caller_memo: HashMap<Key, Memo<Option<Val>>>,
     /// Resolutions in progress: (kind, scope or id, name).
     visiting: HashSet<(u8, usize, String)>,
     /// Current nesting of name resolutions, and how many were cut off at
-    /// [`MAX_NAME_DEPTH`]; a value computed across a cut-off is not memoized.
+    /// [`MAX_NAME_DEPTH`]; a value computed across a cut-off is memoized
+    /// with its budget (see [`Memo`]).
     name_depth: u32,
     cutoffs: u64,
     next_id: usize,
@@ -908,10 +967,12 @@ impl<'t> Ctx<'t> {
             attr_uses: HashMap::new(),
             mutated: HashSet::new(),
             def_index: HashMap::new(),
+            env_reads: Vec::new(),
             constructions: HashMap::new(),
             name_memo: HashMap::new(),
             attr_memo: HashMap::new(),
             def_memo: HashMap::new(),
+            param_memo: HashMap::new(),
             call_memo: HashMap::new(),
             dict_cache: HashMap::new(),
             attr_lookup_memo: HashMap::new(),
@@ -1093,7 +1154,9 @@ impl<'t> Ctx<'t> {
                             self.parents.insert(node.id(), parent);
                         }
                         self.note_dict_mutation(node);
+                        self.note_env_read(node);
                     }
+                    "subscript" => self.note_env_read(node),
                     "parenthesized_expression"
                     | "boolean_operator"
                     | "conditional_expression"
@@ -1107,6 +1170,7 @@ impl<'t> Ctx<'t> {
                             self.refs.push((node, scope));
                         }
                         self.note_attr_use(node, &frame, scope);
+                        self.note_env_read(node);
                     }
                     "identifier" => self.note_name_use(node, &frame, scope),
                     _ => {}
@@ -1133,6 +1197,8 @@ impl<'t> Ctx<'t> {
                 });
             }
         }
+        // The walk is pre-order, so this is already sorted; keep it so.
+        self.env_reads.sort_unstable();
     }
 
     /// Records a call or value use of a bare name, for resolving parameters
@@ -1189,6 +1255,33 @@ impl<'t> Ctx<'t> {
                 uses.calls.push((parent, scope));
             }
             _ => uses.escapes = true,
+        }
+    }
+
+    /// Records `node` when it reads the process environment: `os.environ`,
+    /// `os.getenv`, `environ.get`, `getenv(...)` or `environ[...]`.
+    fn note_env_read(&mut self, node: Node<'t>) {
+        let (object, member) = match node.kind() {
+            "attribute" => (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("attribute"),
+            ),
+            "call" => (node.child_by_field_name("function"), None),
+            "subscript" => (node.child_by_field_name("value"), None),
+            _ => return,
+        };
+        let Some(object) = object.filter(|o| o.kind() == "identifier") else {
+            return;
+        };
+        let reads = match (node.kind(), self.text(object), member.map(|m| self.text(m))) {
+            ("attribute", "os", Some(member)) => matches!(member, "environ" | "getenv"),
+            ("attribute", "environ", Some(member)) => matches!(member, "get" | "setdefault"),
+            ("call", name, _) => name == "getenv",
+            ("subscript", name, _) => name == "environ",
+            _ => false,
+        };
+        if reads {
+            self.env_reads.push(node.start_byte());
         }
     }
 
@@ -1854,12 +1947,11 @@ impl<'t> Ctx<'t> {
                 chosen.push(d.def);
             }
         }
-        chosen.extend(index.foreign.iter().copied());
-        if chosen.is_empty() || chosen.len() >= index.total {
-            Reach::All
-        } else {
-            Reach::Subset(chosen)
+        if chosen.is_empty() || chosen.len() + index.foreign.len() >= index.total {
+            return Reach::All;
         }
+        chosen.extend(index.foreign.iter().copied());
+        Reach::Subset(chosen)
     }
 
     /// Every definition of `key`, in a fixed order.
@@ -1874,17 +1966,40 @@ impl<'t> Ctx<'t> {
         defs
     }
 
-    /// The definitions of `name` a use at `pos` in `scope` sees, and the key
-    /// they belong to.
-    fn defs_at(&self, name: &str, scope: usize, pos: usize) -> (Key, Vec<DefRef>) {
+    /// The kinds of definition of `name` a use at `pos` in `scope` sees,
+    /// and the key they belong to. Constant time when every definition
+    /// reaches the use, however many there are.
+    fn defs_at(&self, name: &str, scope: usize, pos: usize) -> (Key, DefKinds) {
         let home = self.binding_scope(name, scope);
         let key = (home, name.to_string());
         let pos = (scope == home).then_some(pos);
-        let defs = match self.reaching(&key, pos) {
-            Reach::All => self.all_defs(&key),
-            Reach::Subset(defs) => defs,
+        let kinds = match self.reaching(&key, pos) {
+            Reach::All => {
+                let assigns = self.assigns.get(&key).map_or(0, Vec::len);
+                DefKinds {
+                    param: self.params.contains_key(&key),
+                    imported: self.imports.contains_key(&key)
+                        || self.other_imports.contains_key(&key),
+                    assigns,
+                    only_assign: (assigns == 1).then_some(0),
+                }
+            }
+            Reach::Subset(defs) => {
+                let mut kinds = DefKinds::default();
+                for def in defs {
+                    match def {
+                        DefRef::Import(_) | DefRef::Other(_) => kinds.imported = true,
+                        DefRef::Param => kinds.param = true,
+                        DefRef::Assign(i) => {
+                            kinds.assigns += 1;
+                            kinds.only_assign = (kinds.assigns == 1).then_some(i);
+                        }
+                    }
+                }
+                kinds
+            }
         };
-        (key, defs)
+        (key, kinds)
     }
 
     // ------------------------------------------------------------------
@@ -1924,15 +2039,18 @@ impl<'t> Ctx<'t> {
                 // Each call is evaluated once per scope: a chain of calls
                 // (`x.a().b().c()...`) is then linear, not quadratic.
                 let key = (node.id(), scope);
-                if let Some(val) = self.call_memo.get(&key) {
-                    return val.clone();
+                let budget = self.budget();
+                if let Some(val) = self.reuse(recall(&self.call_memo, &key, budget)) {
+                    return val;
                 }
                 let Some(function) = node.child_by_field_name("function") else {
                     return Val::untracked(Origin::Other);
                 };
+                let cutoffs = self.cutoffs;
                 let callee = self.eval(function, scope, depth + 1);
                 let val = self.apply_call(callee, node, scope, depth + 1);
-                self.call_memo.insert(key, val.clone());
+                let memo = self.memo(val.clone(), cutoffs, budget);
+                self.call_memo.insert(key, memo);
                 val
             }
             "parenthesized_expression" | "await" => match node.named_child(0) {
@@ -2061,6 +2179,30 @@ impl<'t> Ctx<'t> {
         self.name_depth -= 1;
     }
 
+    /// Name resolutions that may still nest below this point.
+    fn budget(&self) -> u32 {
+        MAX_NAME_DEPTH.saturating_sub(self.name_depth)
+    }
+
+    /// A value [`recall`] found; reusing a cut-off value makes the current
+    /// evaluation cut off too.
+    fn reuse<V>(&mut self, found: Option<(V, bool)>) -> Option<V> {
+        let (val, cut) = found?;
+        if cut {
+            self.cutoffs += 1;
+        }
+        Some(val)
+    }
+
+    /// `val` as computed with `budget`, final unless a resolution was cut
+    /// off since `cutoffs` was read.
+    fn memo<V>(&self, val: V, cutoffs: u64, budget: u32) -> Memo<V> {
+        Memo {
+            val,
+            budget: (self.cutoffs != cutoffs).then_some(budget),
+        }
+    }
+
     /// The value of `name` used at byte `pos` of `scope`.
     fn resolve_name(&mut self, name: &str, scope: usize, pos: usize) -> Val {
         if !self.enter_name() {
@@ -2086,8 +2228,9 @@ impl<'t> Ctx<'t> {
 
     /// Every definition of `key` combined, memoized.
     fn resolve_all(&mut self, key: Key) -> Val {
-        if let Some(val) = self.name_memo.get(&key) {
-            return val.clone();
+        let budget = self.budget();
+        if let Some(val) = self.reuse(recall(&self.name_memo, &key, budget)) {
+            return val;
         }
         let guard = (0u8, key.0, key.1.clone());
         if !self.visiting.insert(guard.clone()) {
@@ -2102,9 +2245,8 @@ impl<'t> Ctx<'t> {
             combine(vals)
         };
         self.visiting.remove(&guard);
-        if self.cutoffs == cutoffs {
-            self.name_memo.insert(key, val.clone());
-        }
+        let memo = self.memo(val.clone(), cutoffs, budget);
+        self.name_memo.insert(key, memo);
         val
     }
 
@@ -2121,8 +2263,8 @@ impl<'t> Ctx<'t> {
                 }
                 DefRef::Other(_) => {}
                 DefRef::Param => {
-                    if let Some(param) = self.params.get(key).copied() {
-                        vals.push(self.param_value(&key.1, param, key.0));
+                    if self.params.contains_key(key) {
+                        vals.push(self.param_value_memo(key));
                     }
                 }
                 DefRef::Assign(i) => {
@@ -2151,8 +2293,9 @@ impl<'t> Ctx<'t> {
     }
 
     fn assign_value_memo(&mut self, assign: Assign<'t>) -> Val {
-        if let Some(val) = self.def_memo.get(&assign.id) {
-            return val.clone();
+        let budget = self.budget();
+        if let Some(val) = self.reuse(recall(&self.def_memo, &assign.id, budget)) {
+            return val;
         }
         let guard = (2u8, assign.id, String::new());
         if !self.visiting.insert(guard.clone()) {
@@ -2161,9 +2304,29 @@ impl<'t> Ctx<'t> {
         let cutoffs = self.cutoffs;
         let val = self.assign_value(assign);
         self.visiting.remove(&guard);
-        if self.cutoffs == cutoffs {
-            self.def_memo.insert(assign.id, val.clone());
+        let memo = self.memo(val.clone(), cutoffs, budget);
+        self.def_memo.insert(assign.id, memo);
+        val
+    }
+
+    /// The value of parameter `key.1` of function `key.0`, memoized.
+    fn param_value_memo(&mut self, key: &Key) -> Val {
+        let budget = self.budget();
+        if let Some(val) = self.reuse(recall(&self.param_memo, key, budget)) {
+            return val;
         }
+        let Some(param) = self.params.get(key).copied() else {
+            return Val::untracked(Origin::Unbound);
+        };
+        let guard = (4u8, key.0, key.1.clone());
+        if !self.visiting.insert(guard.clone()) {
+            return Val::untracked(Origin::Cycle);
+        }
+        let cutoffs = self.cutoffs;
+        let val = self.param_value(&key.1, param, key.0);
+        self.visiting.remove(&guard);
+        let memo = self.memo(val.clone(), cutoffs, budget);
+        self.param_memo.insert(key.clone(), memo);
         val
     }
 
@@ -2194,24 +2357,24 @@ impl<'t> Ctx<'t> {
     /// on another object) or when the callers disagree.
     fn param_from_callers(&mut self, func: usize, name: &str) -> Option<Val> {
         let key = (func, name.to_string());
-        if let Some(found) = self.caller_memo.get(&key) {
-            return found.clone();
+        let budget = self.budget();
+        if let Some(found) = self.reuse(recall(&self.caller_memo, &key, budget)) {
+            return found;
         }
         let guard = (3u8, func, name.to_string());
         if !self.visiting.insert(guard.clone()) {
             return Some(Val::untracked(Origin::Cycle));
         }
+        let cutoffs = self.cutoffs;
         if !self.enter_name() {
             self.visiting.remove(&guard);
             return None;
         }
-        let cutoffs = self.cutoffs;
         let found = self.callers_agree(func, name);
         self.leave_name();
         self.visiting.remove(&guard);
-        if self.cutoffs == cutoffs {
-            self.caller_memo.insert(key, found.clone());
-        }
+        let memo = self.memo(found.clone(), cutoffs, budget);
+        self.caller_memo.insert(key, memo);
         found
     }
 
@@ -2360,14 +2523,16 @@ impl<'t> Ctx<'t> {
     /// `self.attr = ...`, falling back to same-file base classes. Each class
     /// is visited once per lookup and the answer is memoized, so a file
     /// whose classes all list each other as bases stays cheap.
-    fn attr_assignments(&mut self, class: usize, attr: &str) -> Vec<Assign<'t>> {
+    fn attr_assignments(&mut self, class: usize, attr: &str) -> Rc<[Assign<'t>]> {
         let key = (class, attr.to_string());
         if let Some(found) = self.attr_lookup_memo.get(&key) {
-            return found.clone();
+            return Rc::clone(found);
         }
         let mut visited = HashSet::new();
-        let found = self.attr_assignments_in(class, attr, 0, &mut visited);
-        self.attr_lookup_memo.insert(key, found.clone());
+        let found: Rc<[Assign<'t>]> = self
+            .attr_assignments_in(class, attr, 0, &mut visited)
+            .into();
+        self.attr_lookup_memo.insert(key, Rc::clone(&found));
         found
     }
 
@@ -2403,35 +2568,32 @@ impl<'t> Ctx<'t> {
 
     fn resolve_attr(&mut self, class: usize, attr: &str) -> Val {
         let key = (class, attr.to_string());
-        if let Some(val) = self.attr_memo.get(&key) {
-            return val.clone();
+        let budget = self.budget();
+        if let Some(val) = self.reuse(recall(&self.attr_memo, &key, budget)) {
+            return val;
         }
         let guard = (1u8, class, attr.to_string());
         if !self.visiting.insert(guard.clone()) {
             return Val::untracked(Origin::Cycle);
         }
+        let cutoffs = self.cutoffs;
         if !self.enter_name() {
             self.visiting.remove(&guard);
             return Val::untracked(Origin::Other);
         }
-        let cutoffs = self.cutoffs;
         let assigns = self.attr_assignments(class, attr);
         let val = if assigns.is_empty() {
             Val::untracked(Origin::UnassignedAttribute {
                 name: attr.to_string(),
             })
         } else {
-            let vals = assigns
-                .into_iter()
-                .map(|a| self.assign_value_memo(a))
-                .collect();
+            let vals = assigns.iter().map(|a| self.assign_value_memo(*a)).collect();
             combine(vals)
         };
         self.leave_name();
         self.visiting.remove(&guard);
-        if self.cutoffs == cutoffs {
-            self.attr_memo.insert(key, val.clone());
-        }
+        let memo = self.memo(val.clone(), cutoffs, budget);
+        self.attr_memo.insert(key, memo);
         val
     }
 
@@ -2855,7 +3017,7 @@ impl<'t> Ctx<'t> {
                 .as_ref()
                 .map(|k| format!("{k}."))
                 .unwrap_or_default();
-            self.nested_values(*expr, &prefix, keyword.is_none(), scope, 0, &mut values);
+            self.nested_values(*expr, &prefix, keyword.is_none(), scope, &mut values);
         }
 
         // `**PARAMS` where `PARAMS` is a same-file dict literal.
@@ -2886,7 +3048,7 @@ impl<'t> Ctx<'t> {
                     self.take_value(&site, key, false, result, &mut values);
                 } else if is_container(*value) {
                     let prefix = format!("{key}.");
-                    self.nested_values(*value, &prefix, false, expansion.scope, 0, &mut values);
+                    self.nested_values(*value, &prefix, false, expansion.scope, &mut values);
                 }
             }
         }
@@ -3194,22 +3356,43 @@ impl<'t> Ctx<'t> {
     /// (`fallbacks=[{"model": "claude-opus-4-8"}]`). Only identifier-shaped
     /// keys are followed and only keys [`is_value_key`] accepts are read; an
     /// unresolvable nested value is skipped, not reported, because the
-    /// argument may not configure the request at all.
+    /// argument may not configure the request at all. At most
+    /// [`MAX_NESTED_ENTRIES`] entries are read per argument, so a huge
+    /// literal expanded at many calls costs little at each.
     fn nested_values(
         &mut self,
         node: Node<'t>,
         prefix: &str,
         positional: bool,
         scope: usize,
+        out: &mut Vec<CapturedValue>,
+    ) {
+        let mut left = MAX_NESTED_ENTRIES;
+        self.nested_values_in(node, prefix, positional, scope, 0, &mut left, out);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn nested_values_in(
+        &mut self,
+        node: Node<'t>,
+        prefix: &str,
+        positional: bool,
+        scope: usize,
         depth: u32,
+        left: &mut usize,
         out: &mut Vec<CapturedValue>,
     ) {
         if depth > 4 {
             return;
         }
+        let mut cursor = node.walk();
         match node.kind() {
             "dictionary" => {
-                for pair in named_children(node) {
+                for pair in node.named_children(&mut cursor) {
+                    if *left == 0 {
+                        return;
+                    }
+                    *left -= 1;
                     if pair.kind() != "pair" {
                         continue;
                     }
@@ -3234,13 +3417,25 @@ impl<'t> Ctx<'t> {
                         }
                     } else if is_container(value) {
                         let nested = format!("{path}.");
-                        self.nested_values(value, &nested, positional, scope, depth + 1, out);
+                        self.nested_values_in(
+                            value,
+                            &nested,
+                            positional,
+                            scope,
+                            depth + 1,
+                            left,
+                            out,
+                        );
                     }
                 }
             }
             "list" | "tuple" | "set" | "parenthesized_expression" => {
-                for item in named_children(node) {
-                    self.nested_values(item, prefix, positional, scope, depth + 1, out);
+                for item in node.named_children(&mut cursor) {
+                    if *left == 0 {
+                        return;
+                    }
+                    *left -= 1;
+                    self.nested_values_in(item, prefix, positional, scope, depth + 1, left, out);
                 }
             }
             _ => {}
@@ -3248,7 +3443,11 @@ impl<'t> Ctx<'t> {
     }
 
     /// A plain string literal's value. `Err` carries the reason it is not.
+    /// A literal longer than [`MAX_LITERAL_BYTES`] is never read.
     fn literal(&self, node: Node<'t>) -> Result<String, &'static str> {
+        if node.end_byte() - node.start_byte() > MAX_LITERAL_BYTES {
+            return Err("non_literal");
+        }
         match node.kind() {
             "string" => {
                 let mut value = String::new();
@@ -3336,8 +3535,12 @@ impl<'t> Ctx<'t> {
                     }
                     if let Some(class) = self.class_receiver(object, scope) {
                         let assigns = self.attr_assignments(class, &attr);
+                        let only = match assigns.as_ref() {
+                            [assign] => Some(*assign),
+                            _ => None,
+                        };
                         return self
-                            .single_constant(&assigns, ValueOrigin::ClassConstant, depth)
+                            .single_constant(only, assigns.len(), ValueOrigin::ClassConstant, depth)
                             .map(|r| r.through(&rendered, ValueOrigin::ClassConstant))
                             .map_err(|u| u.via(&rendered));
                     }
@@ -3407,18 +3610,9 @@ impl<'t> Ctx<'t> {
         }
         let (key, defs) = self.defs_at(name, scope, pos);
         let home = key.0;
-        let assigns: Vec<Assign<'t>> = defs
-            .iter()
-            .filter_map(|def| match def {
-                DefRef::Assign(i) => self.assigns.get(&key).and_then(|v| v.get(*i)).copied(),
-                _ => None,
-            })
-            .collect();
-        let imported = defs
-            .iter()
-            .any(|def| matches!(def, DefRef::Import(_) | DefRef::Other(_)));
-        if defs.contains(&DefRef::Param) {
-            if !assigns.is_empty() || imported {
+        let imported = defs.imported;
+        if defs.param {
+            if defs.assigns > 0 || imported {
                 return Err(Unresolved::new("reassigned", name.to_string()));
             }
             let default = self.params.get(&key).and_then(|p| p.default);
@@ -3440,13 +3634,16 @@ impl<'t> Ctx<'t> {
                 Err(_) => Err(Unresolved::new("parameter", name.to_string())),
             };
         }
-        if !assigns.is_empty() {
+        if defs.assigns > 0 {
             if imported {
                 return Err(Unresolved::new("reassigned", name.to_string()));
             }
             let origin = constant_origin(self.scopes[home].kind);
+            let only = defs
+                .only_assign
+                .and_then(|i| self.assigns.get(&key).and_then(|v| v.get(i)).copied());
             return self
-                .single_constant(&assigns, origin, depth)
+                .single_constant(only, defs.assigns, origin, depth)
                 .map(|r| r.through(name, origin))
                 .map_err(|u| u.via(name));
         }
@@ -3457,17 +3654,18 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    /// A name or attribute assigned exactly once, to something that itself
-    /// resolves to a string.
+    /// A name or attribute assigned exactly once (`only`, out of `count`
+    /// assignments), to something that itself resolves to a string.
     fn single_constant(
         &mut self,
-        assigns: &[Assign<'t>],
+        only: Option<Assign<'t>>,
+        count: usize,
         origin: ValueOrigin,
         depth: u32,
     ) -> Result<Resolved, Unresolved> {
-        match assigns {
-            [] => Err(Unresolved::new("unbound", String::new())),
-            [assign] => {
+        match (only, count) {
+            (_, 0) => Err(Unresolved::new("unbound", String::new())),
+            (Some(assign), 1) => {
                 let Some(value) = assign.value.filter(|_| !assign.unknowable) else {
                     return Err(Unresolved::new("non_literal", String::new()));
                 };
@@ -3477,10 +3675,7 @@ impl<'t> Ctx<'t> {
                 }
                 Ok(resolved)
             }
-            many => Err(Unresolved::new(
-                "reassigned",
-                format!("{} assignments", many.len()),
-            )),
+            (_, many) => Err(Unresolved::new("reassigned", format!("{many} assignments"))),
         }
     }
 
@@ -3494,6 +3689,31 @@ impl<'t> Ctx<'t> {
         depth: u32,
     ) -> Option<Result<Resolved, Unresolved>> {
         let function = call.child_by_field_name("function")?;
+        let rendered = self.render_links(function, 4);
+        let dict_get = function.kind() == "attribute"
+            && function
+                .child_by_field_name("attribute")
+                .is_some_and(|a| self.text(a) == "get");
+        let lookup = dict_get
+            || CONFIG_LOOKUPS.contains(&rendered.as_str())
+            || matches!(
+                rendered.as_str(),
+                "os.getenv"
+                    | "getenv"
+                    | "os.environ.get"
+                    | "environ.get"
+                    | "os.environ.setdefault"
+                    | "environ.setdefault"
+                    | "getattr"
+            );
+        // Lookups take a key and a default: a call with many arguments is
+        // something else, and its arguments are not scanned.
+        let few_args = call
+            .child_by_field_name("arguments")
+            .is_some_and(|a| a.named_child_count() <= MAX_LOOKUP_ARGS);
+        if !lookup || !few_args {
+            return None;
+        }
         let (positional, keywords) = call_arguments(call, |n| self.text(n));
         let keyword = |name: &str| {
             keywords
@@ -3501,7 +3721,6 @@ impl<'t> Ctx<'t> {
                 .find(|(k, _)| k.as_str() == name)
                 .map(|(_, v)| *v)
         };
-        let rendered = self.render(function);
         let (lookup_key, default, reason) = match rendered.as_str() {
             "os.getenv"
             | "getenv"
@@ -3701,10 +3920,10 @@ impl<'t> Ctx<'t> {
                     return None;
                 }
                 let (key, defs) = self.defs_at(name, scope, expr.start_byte());
-                let [DefRef::Assign(i)] = defs.as_slice() else {
+                if defs.param || defs.imported || defs.assigns != 1 {
                     return None;
-                };
-                let assign = self.assigns.get(&key)?.get(*i).copied()?;
+                }
+                let assign = self.assigns.get(&key)?.get(defs.only_assign?).copied()?;
                 if assign.unknowable {
                     return None;
                 }
@@ -3801,34 +4020,16 @@ impl<'t> Ctx<'t> {
     }
 
     /// Whether `node` reads the process environment
-    /// (`os.getenv(...)`, `os.environ[...]`, `os.environ.get(...)`).
+    /// (`os.getenv(...)`, `os.environ[...]`, `os.environ.get(...)`): a
+    /// binary search over the reads recorded during collection, so asking
+    /// it of every nested call in a deep expression stays linear.
     fn contains_env(&self, node: Node<'t>) -> bool {
-        let mut stack = vec![node];
-        while let Some(current) = stack.pop() {
-            let rendered = match current.kind() {
-                "call" => current
-                    .child_by_field_name("function")
-                    .map(|f| self.render(f)),
-                "subscript" => current.child_by_field_name("value").map(|v| self.render(v)),
-                "attribute" => Some(self.render(current)),
-                _ => None,
-            };
-            if let Some(rendered) = rendered {
-                if matches!(
-                    rendered.as_str(),
-                    "os.getenv"
-                        | "getenv"
-                        | "os.environ"
-                        | "environ"
-                        | "os.environ.get"
-                        | "environ.get"
-                ) {
-                    return true;
-                }
-            }
-            stack.extend(named_children(current));
-        }
-        false
+        let first = self
+            .env_reads
+            .partition_point(|&start| start < node.start_byte());
+        self.env_reads
+            .get(first)
+            .is_some_and(|&start| start < node.end_byte())
     }
 
     /// An expression's shape with every argument and literal elided, so a

@@ -3,6 +3,7 @@ use crate::usages::{
     BindingKind, ClientScope, FileUsages, GapKind, Receiver, Routing, Sdk, SdkCall, UsageGap,
     ValueOrigin,
 };
+use std::collections::HashMap;
 
 fn usages(source: &str) -> FileUsages {
     let mut parser = tree_sitter::Parser::new();
@@ -1456,6 +1457,134 @@ fn a_twenty_thousand_link_chain_is_linear() {
         value(call(&found, "client.chat.completions.create"), "model"),
         Some("gpt-4")
     );
+}
+
+/// Extracts `source` and fails if that takes longer than `limit` seconds.
+fn usages_within(source: &str, limit: u64) -> FileUsages {
+    let started = std::time::Instant::now();
+    let found = usages(source);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(limit),
+        "took {elapsed:?}"
+    );
+    found
+}
+
+#[test]
+fn branching_chains_past_the_name_depth_stay_linear() {
+    // Each link uses the previous one twice. A value cut off at the name
+    // depth used to be recomputed on every use, so 70 links never
+    // finished; it is now memoized with the budget it had.
+    let head = "from openai import OpenAI\nclient = OpenAI()\n";
+    let shapes = [
+        (
+            "x{i} = x{p} or x{p}\n",
+            "x0 = client\n",
+            "x{n}.chat.completions.create(model=\"gpt-4\", messages=[])\n",
+        ),
+        (
+            "x{i} = x{p} if flag else x{p}\n",
+            "x0 = client\n",
+            "x{n}.chat.completions.create(model=\"gpt-4\", messages=[])\n",
+        ),
+        (
+            "class C{i}:\n    a = C{p}.a or C{p}.a\n",
+            "class C0:\n    a = client\n",
+            "C{n}.a.chat.completions.create(model=\"gpt-4\", messages=[])\n",
+        ),
+    ];
+    for (link, first, last) in shapes {
+        for (n, resolves) in [(40, true), (300, false)] {
+            let mut source = format!("{head}{first}");
+            for i in 1..=n {
+                let p = i - 1;
+                source.push_str(
+                    &link
+                        .replace("{i}", &i.to_string())
+                        .replace("{p}", &p.to_string()),
+                );
+            }
+            source.push_str(&last.replace("{n}", &n.to_string()));
+            let found = usages_within(&source, 5);
+            if resolves {
+                assert_eq!(found.calls.len(), 1, "{link} x {n}");
+                assert_eq!(found.calls[0].routing, Routing::OpenaiDirect);
+            } else {
+                // Past the depth the receiver is a typed gap, never a silent
+                // drop.
+                assert!(found.calls.is_empty(), "{link} x {n}");
+                let gap = &gaps(&found, GapKind::UnknownClientFactory)[0];
+                assert_eq!(gap.reason, "unresolved_receiver");
+            }
+        }
+    }
+
+    // `self.a{i}` assigned from `self.a{i-1}` twice, and a client parameter
+    // whose only callers pass it on twice, deepest function first.
+    let mut methods = String::from(
+        "from openai import OpenAI\nclass B:\n    def __init__(self):\n        self.a0 = OpenAI()\n",
+    );
+    let mut params = String::from(
+        "from openai import OpenAI\ndef g0(c):\n    return c.chat.completions.create(model=\"gpt-4\", messages=[])\n",
+    );
+    for i in 1..300 {
+        let p = i - 1;
+        methods.push_str(&format!(
+            "    def m{i}(self):\n        self.a{i} = self.a{p} or self.a{p}\n"
+        ));
+        params.push_str(&format!("def g{i}(c):\n    g{p}(c)\n    g{p}(c)\n"));
+    }
+    methods.push_str(
+        "    def go(self):\n        return self.a299.chat.completions.create(model=\"gpt-4\", messages=[])\n",
+    );
+    params.push_str("g299(OpenAI())\n");
+    for source in [methods, params] {
+        let found = usages_within(&source, 5);
+        assert_eq!(gaps(&found, GapKind::UnknownClientFactory).len(), 1);
+    }
+}
+
+#[test]
+fn large_definitions_used_many_times_stay_linear() {
+    let mut source = String::from("import os\nfrom openai import OpenAI\nclient = OpenAI()\n");
+    // A constant whose value is a call with 20,000 arguments, read at
+    // 2,000 sites: it is not a lookup, so its arguments are never scanned.
+    source.push_str("MODEL = pick(");
+    for i in 0..20_000 {
+        source.push_str(&format!("a{i}, "));
+    }
+    source.push_str(")\n");
+    // A name assigned 2,000 times in branches, read at 2,000 sites.
+    for i in 0..2_000 {
+        source.push_str(&format!("if c{i}:\n    TIER = \"gpt-4\"\n"));
+    }
+    for _ in 0..2_000 {
+        source.push_str("client.chat.completions.create(model=MODEL, messages=[])\n");
+        source.push_str("client.chat.completions.create(model=TIER, messages=[])\n");
+    }
+    // Requests nested 1,500 deep as each other's model argument: each asks
+    // whether its argument reads the environment.
+    let mut nested = String::from("os.getenv(\"M\")");
+    for _ in 0..1_500 {
+        nested = format!("client.chat.completions.create(model={nested}, messages=[])");
+    }
+    source.push_str(&nested);
+    source.push('\n');
+
+    let found = usages_within(&source, 10);
+    assert_eq!(found.calls.len(), 4_000 + 1_500);
+    let reasons: HashMap<&str, usize> =
+        gaps(&found, GapKind::UnresolvedModel)
+            .iter()
+            .fold(HashMap::new(), |mut counts, g| {
+                *counts.entry(g.reason.as_str()).or_default() += 1;
+                counts
+            });
+    assert_eq!(reasons.get("function_call"), Some(&2_000));
+    assert_eq!(reasons.get("reassigned"), Some(&2_000));
+    // Every nested request reads the environment somewhere below it.
+    assert_eq!(reasons.get("env_var"), Some(&1_500));
 }
 
 // ---------------------------------------------------------------------------
