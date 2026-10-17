@@ -52,7 +52,9 @@ accepted. (`extensions_are_narrowed_to_what_the_client_declared`,
 ## Tool surface
 
 `tools/list` exposes the seventeen documented tools; `search_symbols`,
-`get_map` and `find_api_usages` paginate (`offset`, `limit`, `hasMore`). Client-supplied `limit`,
+`get_map` and `find_api_usages` paginate (`offset`, `limit`, `hasMore`;
+`find_api_usages` also pages clients and gaps with `clients_offset` and
+`gaps_offset`). Client-supplied `limit`,
 `max_depth`, `top_n` and `tokens` are capped (500 / 32 / 500 / 64k).
 
 ## Client flows verified

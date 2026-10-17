@@ -290,7 +290,7 @@ Every tool returns `{ ok, tool, data, meta: { suggested_next_tool, suggested_nex
 | `arbor inspect <sym>` | Full symbol detail |
 | `arbor path <a> <b>` | Shortest call-graph path |
 | `arbor refactor <sym>` | Blast radius before refactoring |
-| `arbor usages` | OpenAI, Anthropic and Gemini SDK calls in Python: client routing (direct, Azure, custom `base_url`, Bedrock, Vertex), model IDs and typed gaps. `--sdk openai\|anthropic\|google`, `--json` |
+| `arbor usages` | OpenAI, Anthropic and Gemini SDK calls in Python: client routing (direct, Azure, custom `base_url`, Bedrock, Vertex), model IDs and typed gaps; never prints credentials. `--sdk openai\|anthropic\|google`, `--json` |
 | `arbor diff` | Git-change impact report, per symbol: new symbols carry no blast radius. `--base <ref>` compares against the merge base (what a PR shows), `--staged` only staged changes |
 | `arbor check` | CI safety gate (`--max-blast-radius N`, `--base <ref>`) |
 | `arbor summary` | Auto-generate PR description (`--base <ref>`) |

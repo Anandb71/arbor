@@ -233,7 +233,7 @@ Errors return `{ "ok": false, "error": "..." }`.
 | `get_node_detail` | Returns full detail for a node by ID or name |
 | `explain_symbol` | Token-bounded explanation of a symbol: role, callers, callees, centrality |
 | `batch_query` | Several symbols in one call, optionally with callers and callees |
-| `find_api_usages` | OpenAI, Anthropic and Gemini SDK call sites (Python): file, line, enclosing symbol, client routing, model IDs from literals or same-file constants, and typed gaps. Paginated; filter with `sdk` and `path` |
+| `find_api_usages` | OpenAI, Anthropic and Gemini SDK call sites (Python): file, line, enclosing symbol, client routing, model IDs from literals, same-file constants, dict literals and parameter defaults (env/config fallbacks as `env_default`, with a gap), and typed gaps. Never returns credential values. Usages paginate with `offset`/`limit`, clients and gaps with `clients_offset`/`gaps_offset`; filter with `sdk` and `path` |
 
 ### Broad tools
 

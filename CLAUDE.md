@@ -90,7 +90,7 @@ Key features:
 - `summary .`: auto-generates structured Pull Request descriptions based on graph diff analysis.
 - `agent review`/`agent onboard`/`agent guard`: built-in autonomous workflows (PR risk review, contributor onboarding guide, architecture violation check with `--max-blast-radius`).
 - `audit "sink"`: traces call paths to sensitive sinks (e.g. `db_query`, `exec`).
-- `usages [--sdk openai|anthropic|google] [path] [--json]`: OpenAI, Anthropic and Gemini SDK call sites in Python with client routing (direct, Azure, custom `base_url`, Bedrock, Vertex...), model IDs from literals or same-file constants, and typed gaps for everything unresolved (`src/usages.rs`; never prints credential values).
+- `usages [--sdk openai|anthropic|google] [path] [--json]`: OpenAI, Anthropic and Gemini SDK call sites in Python with client routing (direct, Azure, custom `base_url`, Bedrock, Vertex...), model IDs from literals, same-file constants, dict literals and parameter defaults (env/config fallbacks flagged `env_default`), and typed gaps for everything unresolved (`src/usages.rs`; never prints credential values, refusing secret-named bindings and credential-shaped values).
 - `explain "question"`: graph-backed context slicing for a question (`--tokens`, `--why`).
 - `hook claude [--global]`: installs Arbor directives + hooks into Claude Code settings.
 
