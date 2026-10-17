@@ -294,10 +294,13 @@ pub struct CapturedValue {
     /// (`MODEL`, `self.model`, `MODELS["fast"]`, `model` for a parameter
     /// default).
     pub name: Option<String>,
-    /// Python: the value was the call's first positional argument
-    /// (`GenerativeModel("gemini-pro")`, legacy `genai.embed_content(...)`) or
-    /// sits in a dict literal passed positionally, rather than under a
-    /// keyword. It describes how the call is written, not the SDK signature.
+    /// The value was passed by position rather than by name: the call's
+    /// first positional argument (`GenerativeModel("gemini-pro")`, legacy
+    /// `genai.embed_content(...)`) or a key of a dict literal passed
+    /// positionally. It describes how the call is written, not the SDK
+    /// signature. In a language whose SDK methods take one options object
+    /// (TypeScript `create({ model })`), that object's properties are by
+    /// name: `false`.
     pub positional: bool,
     /// The span of the string literal itself, at its definition.
     pub span: Span,
@@ -330,11 +333,14 @@ pub struct SdkCall {
     pub file: String,
     pub span: Span,
     pub symbol: Option<String>,
-    /// Keyword argument names in source order.
+    /// Argument names in source order: Python keyword arguments, or the
+    /// properties of the options object in a language whose SDK methods
+    /// take one (TypeScript `create({ model, messages })`).
     pub kwargs: Vec<String>,
-    /// Number of positional arguments.
+    /// Number of positional arguments, the options object excluded.
     pub positional: u32,
-    /// Whether `**kwargs` was passed.
+    /// Whether arguments were spread into the call (`**kwargs`; TypeScript
+    /// `...opts` in the options object).
     pub splat: bool,
     /// Values for allowlisted keys that resolved to string literals.
     pub values: Vec<CapturedValue>,
