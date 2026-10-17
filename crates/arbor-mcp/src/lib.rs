@@ -599,6 +599,8 @@ impl McpServer {
         }
         let offset = bounded_usize(args, "offset", 0, usize::MAX);
         let limit = bounded_usize(args, "limit", 100, MAX_LIST_LIMIT).max(1);
+        let clients_offset = bounded_usize(args, "clients_offset", 0, usize::MAX);
+        let gaps_offset = bounded_usize(args, "gaps_offset", 0, usize::MAX);
 
         let target = self.project_root.join(relative_path);
         let options = arbor_watcher::UsageScanOptions {
@@ -630,10 +632,23 @@ impl McpServer {
             .cloned()
             .collect();
         let has_more = offset.saturating_add(page.len()) < total;
+        // Clients and gaps page separately, at most MAX_LIST_LIMIT at a time.
         let clients_total = report.clients.len();
         let gaps_total = report.gaps.len();
-        report.clients.truncate(MAX_LIST_LIMIT);
-        report.gaps.truncate(MAX_LIST_LIMIT);
+        let clients: Vec<_> = report
+            .clients
+            .drain(..)
+            .skip(clients_offset)
+            .take(MAX_LIST_LIMIT)
+            .collect();
+        let gaps: Vec<_> = report
+            .gaps
+            .drain(..)
+            .skip(gaps_offset)
+            .take(MAX_LIST_LIMIT)
+            .collect();
+        let clients_has_more = clients_offset.saturating_add(clients.len()) < clients_total;
+        let gaps_has_more = gaps_offset.saturating_add(gaps.len()) < gaps_total;
 
         let next_symbol = page.iter().find_map(|call| call.symbol.clone());
         let data = json!({
@@ -645,10 +660,14 @@ impl McpServer {
             "limit": limit,
             "total": total,
             "hasMore": has_more,
-            "clients": report.clients,
+            "clients": clients,
+            "clients_offset": clients_offset,
             "clients_total": clients_total,
-            "gaps": report.gaps,
+            "clients_hasMore": clients_has_more,
+            "gaps": gaps,
+            "gaps_offset": gaps_offset,
             "gaps_total": gaps_total,
+            "gaps_hasMore": gaps_has_more,
             "skipped": report.skipped,
         });
         let node_count = self.graph.read().await.node_count();
@@ -855,14 +874,16 @@ impl McpServer {
                 },
                 {
                     "name": "find_api_usages",
-                    "description": "Finds calls to the OpenAI, Anthropic and Gemini SDKs in Python files: each call with file, line, enclosing symbol, client routing (openai_direct, azure_openai, custom_base_url, anthropic_bedrock, anthropic_vertex, google_genai...) and the model IDs passed as string literals or same-file constants. Also returns client constructions, typed gaps for what could not be resolved (models from env/config, unknown client factories, getattr) and vendored directories that were skipped. Use INSTEAD of grep to find where a deprecated model or SDK is used. Reads files directly; does not need the graph. Never returns credential values.",
+                    "description": "Finds calls to the OpenAI, Anthropic and Gemini SDKs (Python files and Python shebang scripts today): each call with file, line, enclosing symbol, client routing (openai_direct, azure_openai, custom_base_url, anthropic_bedrock, anthropic_vertex, google_genai...) and the model IDs passed as string literals, same-file constants, dict literals or parameter defaults. A literal fallback of an env/config lookup is returned with origin env_default and the call keeps a gap: confirm it before acting. Also returns client constructions, typed gaps for what could not be resolved (models from env/config, unknown client factories, getattr) and the vendored and hidden directories that were skipped. Use INSTEAD of grep to find where a deprecated model or SDK is used. Reads files directly; does not need the graph. Never returns credential values: a value is refused when any name it flows through looks like a secret (key, token, secret, password, auth) or the value itself is credential-shaped (sk-, AIza, ghp_, xox..., long random tokens).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "sdk": { "type": "string", "enum": ["openai", "anthropic", "google"], "description": "Only this provider's SDK" },
                             "path": { "type": "string", "description": "Project-relative directory or file to scan (default: the whole project)" },
                             "offset": { "type": "integer", "description": "Pagination offset for usages (default: 0)", "default": 0 },
-                            "limit": { "type": "integer", "description": "Max usages per page (default: 100)", "default": 100 }
+                            "limit": { "type": "integer", "description": "Max usages per page (default: 100)", "default": 100 },
+                            "clients_offset": { "type": "integer", "description": "Pagination offset for clients, 500 per page (default: 0)", "default": 0 },
+                            "gaps_offset": { "type": "integer", "description": "Pagination offset for gaps, 500 per page (default: 0)", "default": 0 }
                         }
                     },
                     "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
@@ -2394,6 +2415,8 @@ mod tool_tests {
         );
         assert_eq!(scoped["data"]["root"], "svc");
         assert_eq!(scoped["data"]["total"], 0);
+        assert_eq!(scoped["data"]["clients_hasMore"], false);
+        assert_eq!(scoped["data"]["gaps_hasMore"], false);
 
         for (args, error) in [
             (json!({ "path": "../elsewhere" }), "stay inside"),
@@ -2412,6 +2435,74 @@ mod tool_tests {
                 "{failed}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn find_api_usages_never_returns_credentials_and_pages_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        // The five leaks from the review of #276.
+        let mut source = String::from(
+            r#"import os
+from openai import OpenAI
+
+client = OpenAI()
+OPENAI_API_KEY = "sk-proj-LEAKONE0000000000000000"
+client.chat.completions.create(model=OPENAI_API_KEY, messages=[])
+client.chat.completions.create(model="sk-ant-api03-LEAKTWO00000000000", messages=[])
+
+def f(token="sk-LEAKTHREE000000000000000"):
+    return client.chat.completions.create(model=token, messages=[])
+
+class Bot:
+    def __init__(self):
+        self.secret = "sk-LEAKFOUR0000000000000000"
+
+    def go(self):
+        return client.chat.completions.create(model=self.secret, messages=[])
+
+client.chat.completions.create(model="gpt-4", messages=[], extra_body={"sk-proj-LEAKFIVE000000000": {"model": "gpt-4"}})
+"#,
+        );
+        // Enough unresolved models to need a second page of gaps.
+        for _ in 0..501 {
+            source
+                .push_str("client.chat.completions.create(model=os.getenv(\"M\"), messages=[])\n");
+        }
+        std::fs::write(dir.path().join("leaks.py"), source).unwrap();
+        let shared: SharedGraph = Arc::new(RwLock::new(ArborGraph::new()));
+        let server = McpServer::with_project(shared, dir.path().to_path_buf());
+
+        let result = server
+            .call_tool(json!({ "name": "find_api_usages", "arguments": {} }))
+            .await
+            .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("LEAK"), "a secret was returned");
+        assert!(!text.contains("sk-"), "a key prefix was returned");
+        let data = &tool_envelope(result)["data"];
+        assert_eq!(data["gaps_total"], 505);
+        assert_eq!(data["gaps"].as_array().unwrap().len(), 500);
+        assert_eq!(data["gaps_hasMore"], true);
+        let credential = data["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|g| g["reason"] == "credential")
+            .count();
+        assert_eq!(credential, 4);
+
+        let next = tool_envelope(
+            server
+                .call_tool(json!({
+                    "name": "find_api_usages",
+                    "arguments": { "gaps_offset": 500 }
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(next["data"]["gaps"].as_array().unwrap().len(), 5);
+        assert_eq!(next["data"]["gaps_offset"], 500);
+        assert_eq!(next["data"]["gaps_hasMore"], false);
     }
 
     #[tokio::test]
