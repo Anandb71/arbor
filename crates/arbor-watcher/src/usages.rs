@@ -11,16 +11,25 @@
 //! `.venv`, `node_modules`, any directory holding a `pyvenv.cfg`...) are not
 //! project code. They are walked only to count what is skipped: their usages
 //! are excluded from the report and summarised as `vendored_path` gaps.
+//! Other hidden directories (`.github`, `.circleci`...) are counted the same
+//! way, without a gap; version-control, Arbor and tool-cache directories are
+//! not walked at all.
+//!
+//! Extensionless files are scanned when their first line is a Python
+//! shebang (`#!/usr/bin/env python3`).
 
 use crate::indexer::IgnoreMatcher;
+use arbor_core::languages::get_parser;
 use arbor_core::usages::{
-    is_usage_extension, ClientConstruction, FileUsages, GapKind, Sdk, SdkCall, SdkImport, UsageGap,
+    is_python_shebang, is_usage_extension, ClientConstruction, FileUsages, GapKind, Sdk, SdkCall,
+    SdkImport, UsageGap, USAGE_LANGUAGES,
 };
 use arbor_core::{detect_language, parse_source_usages};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 /// Version of the [`UsageReport`] JSON shape.
@@ -40,6 +49,19 @@ pub const VENDORED_DIRS: &[&str] = &[
     "vendor",
     "_vendor",
     "vendored",
+];
+
+/// Hidden directories that are never walked: version control, Arbor's own
+/// cache and tool caches. Any directory ending in `_cache` is skipped too.
+const UNWALKED_HIDDEN_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".jj",
+    ".arbor",
+    ".idea",
+    ".cache",
+    ".ipynb_checkpoints",
 ];
 
 /// Files larger than this are skipped and listed (generated or data files).
@@ -92,9 +114,9 @@ pub struct UsageSummary {
     pub gaps_by_kind: BTreeMap<String, usize>,
 }
 
-/// One vendored or virtual-environment directory that was skipped.
+/// One skipped directory: vendored, a virtual environment, or hidden.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VendoredRoot {
+pub struct SkippedRoot {
     /// Path relative to the scan root, forward slashes, trailing `/`.
     pub path: String,
     /// Files with a usage extractor under it.
@@ -111,11 +133,25 @@ pub struct Skipped {
     pub vendored_files: usize,
     pub vendored_files_with_usages: usize,
     pub vendored_calls: usize,
-    pub vendored_roots: Vec<VendoredRoot>,
+    pub vendored_roots: Vec<SkippedRoot>,
+    /// Files under hidden directories (`.github/scripts/llm.py`), counted
+    /// like vendored ones and excluded from the report.
+    #[serde(default)]
+    pub hidden_files: usize,
+    #[serde(default)]
+    pub hidden_files_with_usages: usize,
+    #[serde(default)]
+    pub hidden_calls: usize,
+    #[serde(default)]
+    pub hidden_roots: Vec<SkippedRoot>,
     /// Files over the size limit, relative paths.
     pub too_large: Vec<String>,
     /// Files that could not be read as UTF-8 or parsed, with the reason.
     pub unreadable: Vec<String>,
+    /// Project files whose syntax errors the parser recovered from. Their
+    /// usages are reported, but calls inside a broken region may be missing.
+    #[serde(default)]
+    pub syntax_errors: Vec<String>,
 }
 
 /// The result of [`scan_usages`].
@@ -137,17 +173,22 @@ pub struct UsageReport {
     pub skipped: Skipped,
 }
 
-/// One candidate file and, when vendored, the vendored directory it is in.
+/// One candidate file and, when skipped, the directory it is counted under.
 struct Candidate {
     path: PathBuf,
     relative: String,
     vendored_root: Option<String>,
+    hidden_root: Option<String>,
+    /// No extension: scanned only if its first line is a Python shebang.
+    shebang: bool,
 }
 
 enum Outcome {
     Parsed(FileUsages),
     TooLarge,
     Unreadable(String),
+    /// An extensionless file that is not a Python script.
+    NotSource,
 }
 
 /// Scans `root` (a directory or a single file) for tracked SDK usages.
@@ -172,7 +213,7 @@ pub fn scan_usages(root: &Path, options: &UsageScanOptions) -> std::io::Result<U
         version: USAGE_REPORT_VERSION,
         root: prefix.unwrap_or_else(|| root.display().to_string()),
         sdk: options.sdk,
-        languages: vec!["python".to_string()],
+        languages: USAGE_LANGUAGES.iter().map(|l| l.to_string()).collect(),
         summary: UsageSummary::default(),
         usages: Vec::new(),
         clients: Vec::new(),
@@ -180,11 +221,13 @@ pub fn scan_usages(root: &Path, options: &UsageScanOptions) -> std::io::Result<U
         gaps: Vec::new(),
         skipped: Skipped::default(),
     };
-    let mut vendored: BTreeMap<String, VendoredRoot> = BTreeMap::new();
+    let mut vendored: BTreeMap<String, SkippedRoot> = BTreeMap::new();
+    let mut hidden: BTreeMap<String, SkippedRoot> = BTreeMap::new();
 
     for (candidate, outcome) in outcomes {
         let mut found = match outcome {
             Outcome::Parsed(found) => found,
+            Outcome::NotSource => continue,
             Outcome::TooLarge => {
                 report.skipped.too_large.push(candidate.relative);
                 continue;
@@ -201,10 +244,15 @@ pub fn scan_usages(root: &Path, options: &UsageScanOptions) -> std::io::Result<U
             found.retain_sdk(sdk);
         }
 
-        if let Some(root_path) = candidate.vendored_root {
-            let entry = vendored
+        let skipped_under = match (candidate.vendored_root, candidate.hidden_root) {
+            (Some(root_path), _) => Some((&mut vendored, root_path)),
+            (None, Some(root_path)) => Some((&mut hidden, root_path)),
+            (None, None) => None,
+        };
+        if let Some((roots, root_path)) = skipped_under {
+            let entry = roots
                 .entry(root_path.clone())
-                .or_insert_with(|| VendoredRoot {
+                .or_insert_with(|| SkippedRoot {
                     path: root_path,
                     files: 0,
                     files_with_usages: 0,
@@ -218,6 +266,9 @@ pub fn scan_usages(root: &Path, options: &UsageScanOptions) -> std::io::Result<U
             continue;
         }
 
+        if found.syntax_errors {
+            report.skipped.syntax_errors.push(candidate.relative);
+        }
         report.summary.files_scanned += 1;
         if !found.calls.is_empty() {
             report.summary.files_with_calls += 1;
@@ -251,6 +302,12 @@ pub fn scan_usages(root: &Path, options: &UsageScanOptions) -> std::io::Result<U
         }
         report.skipped.vendored_roots.push(root_entry);
     }
+    for root_entry in hidden.into_values() {
+        report.skipped.hidden_files += root_entry.files;
+        report.skipped.hidden_files_with_usages += root_entry.files_with_usages;
+        report.skipped.hidden_calls += root_entry.calls;
+        report.skipped.hidden_roots.push(root_entry);
+    }
 
     summarize(&mut report);
     Ok(report)
@@ -278,7 +335,8 @@ fn under(prefix: Option<&str>, relative: &str) -> String {
 
 fn single_file(path: &Path, prefix: Option<&str>) -> Vec<Candidate> {
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if !is_usage_extension(extension) {
+    let shebang = extension.is_empty();
+    if !shebang && !is_usage_extension(extension) {
         return Vec::new();
     }
     let relative = match prefix {
@@ -292,6 +350,8 @@ fn single_file(path: &Path, prefix: Option<&str>) -> Vec<Candidate> {
         path: path.to_path_buf(),
         relative,
         vendored_root: None,
+        hidden_root: None,
+        shebang,
     }]
 }
 
@@ -309,11 +369,11 @@ fn walk(root: &Path, follow_symlinks: bool, prefix: Option<&str>) -> Vec<Candida
         .add_custom_ignore_filename(".arborignore")
         .follow_links(follow_symlinks)
         .filter_entry(|entry| {
-            if entry.depth() == 0 {
+            if entry.depth() == 0 || !entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 return true;
             }
             let name = entry.file_name().to_string_lossy();
-            !name.starts_with('.') || VENDORED_DIRS.contains(&name.as_ref())
+            !UNWALKED_HIDDEN_DIRS.contains(&name.as_ref()) && !name.ends_with("_cache")
         })
         .build();
 
@@ -325,7 +385,8 @@ fn walk(root: &Path, follow_symlinks: bool, prefix: Option<&str>) -> Vec<Candida
         }
         let path = entry.path();
         let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !is_usage_extension(extension) {
+        let shebang = extension.is_empty();
+        if !shebang && !is_usage_extension(extension) {
             continue;
         }
         let relative_path = path.strip_prefix(root).unwrap_or(path);
@@ -337,10 +398,17 @@ fn walk(root: &Path, follow_symlinks: bool, prefix: Option<&str>) -> Vec<Candida
         if vendored_root.is_none() && matcher.is_ignored(path, false) {
             continue;
         }
+        let hidden_root = if vendored_root.is_none() {
+            hidden_root(relative_path).map(|dir| under(prefix, &dir))
+        } else {
+            None
+        };
         candidates.push(Candidate {
             path: path.to_path_buf(),
             relative: under(prefix, &slash_path(relative_path)),
             vendored_root,
+            hidden_root,
+            shebang,
         });
     }
     candidates.sort_by(|a, b| a.relative.cmp(&b.relative));
@@ -375,11 +443,34 @@ fn vendored_root(
     None
 }
 
+/// The outermost hidden directory containing `relative` (or the file itself
+/// when it is hidden), as a relative path with a trailing `/` for a
+/// directory.
+fn hidden_root(relative: &Path) -> Option<String> {
+    let mut prefix = PathBuf::new();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        prefix.push(name);
+        if name.to_string_lossy().starts_with('.') {
+            let is_dir = components.peek().is_some();
+            let path = slash_path(&prefix);
+            return Some(if is_dir { format!("{path}/") } else { path });
+        }
+    }
+    None
+}
+
 fn slash_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
 fn analyze(candidate: &Candidate, options: &UsageScanOptions) -> Outcome {
+    if candidate.shebang && !has_python_shebang(&candidate.path) {
+        return Outcome::NotSource;
+    }
     let size = std::fs::metadata(&candidate.path)
         .map(|m| m.len())
         .unwrap_or(0);
@@ -394,7 +485,12 @@ fn analyze(candidate: &Candidate, options: &UsageScanOptions) -> Outcome {
         Ok(source) => source,
         Err(_) => return Outcome::Unreadable("not valid UTF-8".to_string()),
     };
-    let Some(parser) = detect_language(&candidate.path) else {
+    let parser = if candidate.shebang {
+        get_parser("py")
+    } else {
+        detect_language(&candidate.path)
+    };
+    let Some(parser) = parser else {
         return Outcome::Parsed(FileUsages::new(&candidate.relative, "unknown"));
     };
     match parse_source_usages(&source, &candidate.relative, parser.as_ref()) {
@@ -402,6 +498,16 @@ fn analyze(candidate: &Candidate, options: &UsageScanOptions) -> Outcome {
         Ok(None) => Outcome::Parsed(FileUsages::new(&candidate.relative, "unknown")),
         Err(error) => Outcome::Unreadable(error.to_string()),
     }
+}
+
+/// Whether an extensionless file starts with a Python shebang. Reads at most
+/// 256 bytes, so binaries and data files cost almost nothing.
+fn has_python_shebang(path: &Path) -> bool {
+    let mut head = [0u8; 256];
+    let read = std::fs::File::open(path)
+        .and_then(|mut file| file.read(&mut head))
+        .unwrap_or(0);
+    is_python_shebang(&head[..read])
 }
 
 fn summarize(report: &mut UsageReport) {
@@ -524,12 +630,72 @@ mod tests {
         write(dir.path(), "venv/lib/site-packages/openai/x.py", CHAT);
         write(dir.path(), "ignored/llm.py", CHAT);
         write(dir.path(), ".github/scripts/llm.py", CHAT);
+        write(dir.path(), ".github/scripts/util.py", "x = 1\n");
+        write(dir.path(), ".git/hooks/pre-commit.py", CHAT);
+        write(dir.path(), ".mypy_cache/x.py", CHAT);
         write(dir.path(), "build/lib/app.py", CHAT);
         write(dir.path(), "app.py", CHAT);
 
         let report = scan_usages(dir.path(), &UsageScanOptions::default()).unwrap();
         assert_eq!(report.usages.len(), 1);
         assert_eq!(report.skipped.vendored_files, 0);
+        // Hidden directories are counted, not dropped silently; version
+        // control and tool caches are not walked.
+        let skipped = &report.skipped;
+        assert_eq!(skipped.hidden_files, 2);
+        assert_eq!(skipped.hidden_files_with_usages, 1);
+        assert_eq!(skipped.hidden_calls, 1);
+        let roots: Vec<&str> = skipped
+            .hidden_roots
+            .iter()
+            .map(|r| r.path.as_str())
+            .collect();
+        assert_eq!(roots, vec![".github/"]);
+    }
+
+    #[test]
+    fn python_shebang_scripts_are_scanned() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "bin/summarize",
+            &format!("#!/usr/bin/env python3\n{CHAT}"),
+        );
+        write(dir.path(), "bin/deploy", "#!/bin/sh\necho openai\n");
+        write(dir.path(), "Makefile", "all:\n\techo openai\n");
+        fs::write(dir.path().join("blob"), [0u8, 159, 146, 150, 255]).unwrap();
+
+        let report = scan_usages(dir.path(), &UsageScanOptions::default()).unwrap();
+        assert_eq!(report.summary.files_scanned, 1);
+        assert_eq!(report.usages.len(), 1);
+        assert_eq!(report.usages[0].file, "bin/summarize");
+        assert!(report.skipped.unreadable.is_empty());
+
+        let single = scan_usages(
+            &dir.path().join("bin/summarize"),
+            &UsageScanOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(single.usages.len(), 1);
+        let not_python =
+            scan_usages(&dir.path().join("bin/deploy"), &UsageScanOptions::default()).unwrap();
+        assert_eq!(not_python.summary.files_scanned, 0);
+    }
+
+    #[test]
+    fn files_with_syntax_errors_are_listed() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "broken.py",
+            "from openai import OpenAI\nclient = OpenAI()\ndef broken(:\n    pass\n",
+        );
+        write(dir.path(), "fine.py", CHAT);
+        // A file that mentions no SDK is not even parsed.
+        write(dir.path(), "other.py", "def broken(:\n");
+        let report = scan_usages(dir.path(), &UsageScanOptions::default()).unwrap();
+        assert_eq!(report.skipped.syntax_errors, vec!["broken.py"]);
+        assert_eq!(report.summary.files_scanned, 3);
     }
 
     #[test]
