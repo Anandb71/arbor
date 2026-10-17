@@ -3,36 +3,36 @@
 //!
 //! The scan itself lives in [`arbor_watcher::usages`]; this module only
 //! prints it. `--json` prints the full [`UsageReport`] and nothing else on
-//! stdout, including when the scan fails.
+//! stdout; when the scan cannot run (a missing or empty path, an unknown
+//! `--sdk`), it prints `{"version", "error"}` instead. Human output escapes
+//! control characters, so a scanned file cannot drive the terminal.
 
-use arbor_core::usages::{CapturedValue, GapKind, Sdk, SdkCall, ValueOrigin};
+use arbor_core::usages::{is_unsafe_char, CapturedValue, GapKind, Sdk, SdkCall, ValueOrigin};
 use arbor_watcher::usages::{scan_usages, UsageReport, UsageScanOptions};
 use colored::Colorize;
 use std::path::Path;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// The `--sdk` filter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum SdkFilter {
-    Openai,
-    Anthropic,
-    Google,
-}
-
-impl From<SdkFilter> for Sdk {
-    fn from(filter: SdkFilter) -> Self {
-        match filter {
-            SdkFilter::Openai => Sdk::Openai,
-            SdkFilter::Anthropic => Sdk::Anthropic,
-            SdkFilter::Google => Sdk::Google,
-        }
+pub fn run(path: &str, sdk: Option<&str>, json: bool) -> Result<()> {
+    let sdk = match sdk {
+        None => None,
+        Some(name) => match Sdk::parse(name) {
+            Some(sdk) => Some(sdk),
+            None => {
+                return fail(
+                    json,
+                    format!("unknown sdk '{name}': use openai, anthropic or google (or gemini)"),
+                )
+            }
+        },
+    };
+    if path.trim().is_empty() {
+        return fail(json, "the path to scan is empty".to_string());
     }
-}
-
-pub fn run(path: &Path, sdk: Option<SdkFilter>, json: bool) -> Result<()> {
+    let path = Path::new(path);
     let options = UsageScanOptions {
-        sdk: sdk.map(Sdk::from),
+        sdk,
         // Paths print relative to where the command was run.
         display_root: Some(path.display().to_string()),
         ..UsageScanOptions::default()
@@ -46,20 +46,39 @@ pub fn run(path: &Path, sdk: Option<SdkFilter>, json: bool) -> Result<()> {
             }
             Ok(())
         }
-        Err(error) => {
-            let message = format!("cannot scan {}: {}", path.display(), error);
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "version": arbor_watcher::usages::USAGE_REPORT_VERSION,
-                        "error": message,
-                    }))?
-                );
-            }
-            Err(message.into())
-        }
+        Err(error) => fail(json, format!("cannot scan {}: {}", path.display(), error)),
     }
+}
+
+/// Reports `message` as the command's error; with `--json`, also as a JSON
+/// object on stdout so a caller parsing stdout always gets JSON.
+fn fail(json: bool, message: String) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": arbor_watcher::usages::USAGE_REPORT_VERSION,
+                "error": message,
+            }))?
+        );
+    }
+    Err(clean(&message).into())
+}
+
+/// `text` with control and bidirectional-override characters escaped.
+fn clean(text: &str) -> String {
+    if !text.chars().any(is_unsafe_char) {
+        return text.to_string();
+    }
+    text.chars()
+        .map(|c| {
+            if is_unsafe_char(c) {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 fn print_report(report: &UsageReport) {
@@ -70,14 +89,15 @@ fn print_report(report: &UsageReport) {
     println!(
         "{} {}{}",
         "SDK usages in".bold(),
-        report.root.bold(),
+        clean(&report.root).bold(),
         filter
     );
     println!(
         "{}",
         format!(
-            "{} Python file(s) scanned; values are shown only for model keys",
-            report.summary.files_scanned
+            "{} file(s) scanned ({}); values are shown only for model keys and never for credentials",
+            report.summary.files_scanned,
+            report.languages.join(", ")
         )
         .dimmed()
     );
@@ -121,16 +141,16 @@ fn print_report(report: &UsageReport) {
             let binding = client
                 .binding
                 .as_deref()
-                .map(|b| format!("{b} = "))
+                .map(|b| format!("{} = ", clean(b)))
                 .unwrap_or_default();
             let kwargs = if client.kwargs.is_empty() {
                 String::new()
             } else {
-                format!("  [{}]", client.kwargs.join(", "))
+                format!("  [{}]", clean(&client.kwargs.join(", ")))
             };
             println!(
                 "  {}  {}{}  {}{}",
-                format!("{}:{}", client.file, client.span.line).dimmed(),
+                format!("{}:{}", clean(&client.file), client.span.line).dimmed(),
                 binding,
                 client.constructor.cyan(),
                 client.routing.as_str().yellow(),
@@ -143,28 +163,60 @@ fn print_report(report: &UsageReport) {
         println!("\n{} ({})", "Gaps".bold(), report.gaps.len());
         for gap in &report.gaps {
             let location = match gap.span {
-                Some(span) => format!("{}:{}", gap.file, span.line),
-                None => gap.file.clone(),
+                Some(span) => format!("{}:{}", clean(&gap.file), span.line),
+                None => clean(&gap.file),
             };
             let kind = match gap.kind {
                 GapKind::VendoredPath => gap.kind.as_str().dimmed(),
                 _ => gap.kind.as_str().red(),
             };
-            println!("  {:<24} {}  {}", kind, location.dimmed(), gap.detail);
+            println!(
+                "  {:<24} {}  {}",
+                kind,
+                location.dimmed(),
+                clean(&gap.detail)
+            );
         }
     }
 
     let skipped = &report.skipped;
-    if skipped.vendored_files > 0 || !skipped.too_large.is_empty() || !skipped.unreadable.is_empty()
+    if skipped.vendored_files > 0
+        || skipped.hidden_files > 0
+        || !skipped.too_large.is_empty()
+        || !skipped.unreadable.is_empty()
     {
         println!(
-            "\n{} {} vendored file(s) ({} with SDK usage, {} call(s)), {} too large, {} unreadable",
+            "\n{} {} vendored file(s) ({} with SDK usage, {} call(s)), {} in hidden directories ({} with SDK usage, {} call(s)), {} too large, {} unreadable",
             "Skipped:".bold(),
             skipped.vendored_files,
             skipped.vendored_files_with_usages,
             skipped.vendored_calls,
+            skipped.hidden_files,
+            skipped.hidden_files_with_usages,
+            skipped.hidden_calls,
             skipped.too_large.len(),
             skipped.unreadable.len()
+        );
+        for root in skipped.hidden_roots.iter().filter(|r| r.calls > 0) {
+            println!(
+                "  {}",
+                format!(
+                    "{}: {} SDK call(s) in {} file(s), not scanned as project code",
+                    clean(&root.path),
+                    root.calls,
+                    root.files_with_usages
+                )
+                .dimmed()
+            );
+        }
+    }
+    if !skipped.syntax_errors.is_empty() {
+        let files: Vec<String> = skipped.syntax_errors.iter().map(|f| clean(f)).collect();
+        println!(
+            "{} {} file(s) have syntax errors; calls in the broken part may be missing: {}",
+            "Partial:".bold(),
+            files.len(),
+            files.join(", ")
         );
     }
 
@@ -202,12 +254,18 @@ fn print_call(call: &SdkCall) {
     let symbol = call
         .symbol
         .as_deref()
-        .map(|s| format!("  in {s}"))
+        .map(|s| format!("  in {}", clean(s)))
         .unwrap_or_default();
     println!(
         "  {}  {}  {}{}{}",
-        format!("{}:{}:{}", call.file, call.span.line, call.span.column).dimmed(),
-        call.chain.cyan(),
+        format!(
+            "{}:{}:{}",
+            clean(&call.file),
+            call.span.line,
+            call.span.column
+        )
+        .dimmed(),
+        clean(&call.chain).cyan(),
         call.routing.as_str().yellow(),
         values.green(),
         symbol.dimmed()
@@ -215,14 +273,19 @@ fn print_call(call: &SdkCall) {
 }
 
 fn describe_value(value: &CapturedValue) -> String {
+    let line = value.span.line;
     let source = match (value.origin, value.name.as_deref()) {
+        (ValueOrigin::EnvDefault, Some(name)) => {
+            format!(" (env/config fallback via {name}, line {line})")
+        }
+        (ValueOrigin::EnvDefault, None) => format!(" (env/config fallback, line {line})"),
         (ValueOrigin::Literal, _) | (_, None) => String::new(),
         (ValueOrigin::ParameterDefault, Some(name)) => {
-            format!(" (default of {name}, line {})", value.span.line)
+            format!(" (default of {name}, line {line})")
         }
-        (_, Some(name)) => format!(" (via {name}, line {})", value.span.line),
+        (_, Some(name)) => format!(" (via {name}, line {line})"),
     };
-    format!("{}=\"{}\"{}", value.key, value.value, source)
+    clean(&format!("{}=\"{}\"{}", value.key, value.value, source))
 }
 
 fn plural(count: usize) -> &'static str {
