@@ -14,6 +14,12 @@
 //!    call; an SDK-shaped chain on an unknown receiver, `getattr` on a
 //!    tracked binding and an unresolved model value become typed gaps.
 //!
+//! `self.x` and `cls.x` read a class attribute that the class, a base, any
+//! same-file subclass (the instance may be one) or an outside write
+//! (`bot.model = ...`, `setattr(bot, "model", ...)`) may set; a write with
+//! a run-time attribute name (`setattr(obj, name, ...)`, `vars(obj)[k]`)
+//! may set any of them.
+//!
 //! Names resolve the way Python scopes them, approximately: function and
 //! lambda locals, parameters and imports shadow enclosing functions, class
 //! bodies are skipped from inside methods, comprehensions have their own
@@ -958,12 +964,13 @@ struct DefKinds {
     only_assign: Option<usize>,
 }
 
-/// A `x.attr = value` whose object is not `self`/`cls`/a class, checked later
-/// for module-level OpenAI configuration.
+/// A `x.attr = value` or `setattr(x, "attr", value)` whose object is not
+/// `self`/`cls`/a class, checked later for module-level OpenAI
+/// configuration and clients re-routed after they are built.
 #[derive(Clone, Copy)]
 struct ConfigAssign<'t> {
     object: Node<'t>,
-    attr: Node<'t>,
+    attr: &'t str,
     value: Option<Node<'t>>,
     scope: usize,
 }
@@ -1169,7 +1176,20 @@ struct Ctx<'t> {
     /// Function definitions, keyed by the scope their name binds in.
     functions: HashMap<Key, Vec<usize>>,
     classes_by_name: HashMap<String, Vec<usize>>,
+    /// The same-file classes that list each class as a base.
+    subclasses: HashMap<usize, Vec<usize>>,
     config_assigns: Vec<ConfigAssign<'t>>,
+    /// Attribute writes on objects other than `self`/`cls`/a class, by
+    /// attribute name: any instance's attribute may be one of them.
+    outside_attr_writes: HashMap<&'t str, Vec<Assign<'t>>>,
+    /// Writes whose attribute name is known only at run time
+    /// (`setattr(obj, name, v)`, `obj.__dict__.update(...)`,
+    /// `vars(obj)[k] = v`): on `self`/`cls` of a class, or (`None`) on
+    /// another object. Any attribute may be one of them.
+    wild_attr_writes: HashSet<Option<usize>>,
+    /// The objects written that way, for clients re-routed after they are
+    /// built.
+    wild_attr_objects: Vec<(Node<'t>, usize)>,
     calls: Vec<(Node<'t>, usize)>,
     refs: Vec<(Node<'t>, usize)>,
     call_scope: HashMap<usize, usize>,
@@ -1195,6 +1215,9 @@ struct Ctx<'t> {
     constructions: HashMap<usize, usize>,
     name_memo: HashMap<Key, Memo<Val>>,
     attr_memo: HashMap<Key, Memo<Val>>,
+    /// The same for `self.x` / `cls.x`, read with subclasses and outside
+    /// writes.
+    dyn_attr_memo: HashMap<Key, Memo<Val>>,
     def_memo: HashMap<usize, Memo<Val>>,
     param_memo: HashMap<Key, Memo<Val>>,
     call_memo: HashMap<(usize, usize), Memo<Val>>,
@@ -1207,6 +1230,7 @@ struct Ctx<'t> {
     /// Candidate values that may still be listed with gaps in this file.
     candidates_left: usize,
     attr_lookup_memo: HashMap<Key, Rc<[Assign<'t>]>>,
+    dyn_attr_lookup_memo: HashMap<Key, Rc<[Assign<'t>]>>,
     caller_memo: HashMap<Key, Memo<Option<Val>>>,
     /// Model values in-file callers pass for a parameter, by (function,
     /// parameter).
@@ -1275,7 +1299,11 @@ impl<'t> Ctx<'t> {
             params: HashMap::new(),
             functions: HashMap::new(),
             classes_by_name: HashMap::new(),
+            subclasses: HashMap::new(),
             config_assigns: Vec::new(),
+            outside_attr_writes: HashMap::new(),
+            wild_attr_writes: HashSet::new(),
+            wild_attr_objects: Vec::new(),
             calls: Vec::new(),
             refs: Vec::new(),
             call_scope: HashMap::new(),
@@ -1290,6 +1318,7 @@ impl<'t> Ctx<'t> {
             constructions: HashMap::new(),
             name_memo: HashMap::new(),
             attr_memo: HashMap::new(),
+            dyn_attr_memo: HashMap::new(),
             def_memo: HashMap::new(),
             param_memo: HashMap::new(),
             call_memo: HashMap::new(),
@@ -1299,6 +1328,7 @@ impl<'t> Ctx<'t> {
             nested_left: MAX_FILE_NESTED_VALUES,
             candidates_left: MAX_FILE_CANDIDATES,
             attr_lookup_memo: HashMap::new(),
+            dyn_attr_lookup_memo: HashMap::new(),
             caller_memo: HashMap::new(),
             caller_models: HashMap::new(),
             dict_candidates_memo: HashMap::new(),
@@ -1502,6 +1532,7 @@ impl<'t> Ctx<'t> {
                         }
                     }
                     "call" => {
+                        self.note_attr_write_call(node, scope, place);
                         self.calls.push((node, scope));
                         self.call_scope.insert(node.id(), scope);
                         if let Some(parent) = frame.parent {
@@ -2276,40 +2307,23 @@ impl<'t> Ctx<'t> {
                 ) else {
                     return;
                 };
-                let attr_name = self.text(attr).to_string();
-                if object.kind() == "identifier" {
-                    let object_name = self.text(object);
-                    if matches!(object_name, "self" | "cls") {
-                        if let Some(class) = self.scopes[scope].class {
-                            self.attr_assigns
-                                .entry((class, attr_name))
-                                .or_default()
-                                .push(assign);
-                            return;
-                        }
-                    }
-                    if let Some(classes) = self.classes_by_name.get(object_name) {
-                        if let [class] = classes.as_slice() {
-                            let class = *class;
-                            self.attr_assigns
-                                .entry((class, attr_name))
-                                .or_default()
-                                .push(assign);
-                            return;
-                        }
-                    }
-                }
+                let attr = self.text(attr);
                 self.note_mutated_root(object);
-                self.config_assigns.push(ConfigAssign {
-                    object,
-                    attr,
-                    value,
-                    scope,
-                });
+                self.record_attr_write(object, attr, assign, scope);
             }
             "subscript" => {
                 self.note_env_write(target);
-                self.note_mutated_root(target)
+                self.note_mutated_root(target);
+                // `obj.__dict__["model"] = v`, `vars(obj)[name] = v`.
+                if let Some(owner) = target
+                    .child_by_field_name("value")
+                    .and_then(|v| self.attribute_dict_owner(v))
+                {
+                    match single_subscript(target).and_then(|k| self.plain_literal(k)) {
+                        Some(attr) => self.record_attr_write(owner, attr, assign, scope),
+                        None => self.note_wild_attr_write(owner, scope),
+                    }
+                }
             }
             "pattern_list"
             | "tuple_pattern"
@@ -2324,6 +2338,140 @@ impl<'t> Ctx<'t> {
             }
             _ => {}
         }
+    }
+
+    /// Records `object.attr = value` (or the same through `setattr` or
+    /// `__dict__`): on `self`/`cls` or a class by name it is an assignment
+    /// of that class's attribute; on anything else it is an outside write
+    /// that may set any instance's attribute of that name.
+    fn record_attr_write(
+        &mut self,
+        object: Node<'t>,
+        attr: &'t str,
+        assign: Assign<'t>,
+        scope: usize,
+    ) {
+        if object.kind() == "identifier" {
+            let object_name = self.text(object);
+            if matches!(object_name, "self" | "cls") {
+                if let Some(class) = self.scopes[scope].class {
+                    self.attr_assigns
+                        .entry((class, attr.to_string()))
+                        .or_default()
+                        .push(assign);
+                    return;
+                }
+            }
+            if let Some([class]) = self.classes_by_name.get(object_name).map(Vec::as_slice) {
+                let class = *class;
+                self.attr_assigns
+                    .entry((class, attr.to_string()))
+                    .or_default()
+                    .push(assign);
+                return;
+            }
+        }
+        self.outside_attr_writes
+            .entry(attr)
+            .or_default()
+            .push(assign);
+        self.config_assigns.push(ConfigAssign {
+            object,
+            attr,
+            value: assign.value,
+            scope,
+        });
+    }
+
+    /// A write to an attribute named only at run time.
+    fn note_wild_attr_write(&mut self, object: Node<'t>, scope: usize) {
+        let own = object.kind() == "identifier" && matches!(self.text(object), "self" | "cls");
+        let class = if own { self.scopes[scope].class } else { None };
+        self.wild_attr_writes.insert(class);
+        self.wild_attr_objects.push((object, scope));
+    }
+
+    /// `setattr(obj, "attr", value)`, `setattr(obj, name, value)`,
+    /// `obj.__dict__.update(...)` and `vars(obj).update(...)`.
+    fn note_attr_write_call(&mut self, call: Node<'t>, scope: usize, place: Place) {
+        let Some(function) = call.child_by_field_name("function") else {
+            return;
+        };
+        if function.kind() == "identifier" && self.text(function) == "setattr" {
+            let (positional, _) = call_arguments(call, |n| self.text(n));
+            let (Some(&object), Some(&name)) = (positional.first(), positional.get(1)) else {
+                return;
+            };
+            let value = positional.get(2).copied();
+            match self.plain_literal(name) {
+                Some(attr) => {
+                    let assign = Assign {
+                        id: self.fresh_id(),
+                        scope,
+                        value,
+                        annotation: None,
+                        unknowable: value.is_none(),
+                        place,
+                    };
+                    self.record_attr_write(object, attr, assign, scope);
+                }
+                None => self.note_wild_attr_write(object, scope),
+            }
+            return;
+        }
+        if function.kind() != "attribute" {
+            return;
+        }
+        let method = function
+            .child_by_field_name("attribute")
+            .map(|a| self.text(a))
+            .unwrap_or_default();
+        if matches!(method, "update" | "setdefault" | "__setitem__" | "__init__") {
+            if let Some(owner) = function
+                .child_by_field_name("object")
+                .and_then(|o| self.attribute_dict_owner(o))
+            {
+                self.note_wild_attr_write(owner, scope);
+            }
+        }
+    }
+
+    /// `obj` for `obj.__dict__` or `vars(obj)`.
+    fn attribute_dict_owner(&self, node: Node<'t>) -> Option<Node<'t>> {
+        match node.kind() {
+            "attribute"
+                if node
+                    .child_by_field_name("attribute")
+                    .is_some_and(|a| self.text(a) == "__dict__") =>
+            {
+                node.child_by_field_name("object")
+            }
+            "call"
+                if node
+                    .child_by_field_name("function")
+                    .is_some_and(|f| f.kind() == "identifier" && self.text(f) == "vars") =>
+            {
+                call_arguments(node, |n| self.text(n)).0.first().copied()
+            }
+            _ => None,
+        }
+    }
+
+    /// The text of a plain string literal (no prefix, interpolation or
+    /// escape), borrowed from the source.
+    fn plain_literal(&self, node: Node<'t>) -> Option<&'t str> {
+        if node.kind() != "string" {
+            return None;
+        }
+        let parts = children(node);
+        let [start, content, _end] = parts.as_slice() else {
+            return None;
+        };
+        let text = self.text(*content);
+        (content.kind() == "string_content"
+            && matches!(self.text(*start), "\"" | "'")
+            && !text.contains('\\'))
+        .then_some(text)
     }
 
     /// The scope an import or definition of `name` in `scope` binds in:
@@ -2617,6 +2765,19 @@ impl<'t> Ctx<'t> {
     /// Orders every name's definitions by position, for reaching-definition
     /// queries.
     fn index_definitions(&mut self) {
+        for class in 0..self.scopes.len() {
+            if self.scopes[class].kind != ScopeKind::Class {
+                continue;
+            }
+            for base in self.scopes[class].bases.iter().take(MAX_BASES) {
+                // Any class of that name may be the base.
+                for &parent in self.classes_by_name.get(base).into_iter().flatten() {
+                    if parent != class {
+                        self.subclasses.entry(parent).or_default().push(class);
+                    }
+                }
+            }
+        }
         let mut keys: HashSet<Key> = HashSet::new();
         keys.extend(self.imports.keys().cloned());
         keys.extend(self.other_imports.keys().cloned());
@@ -2884,8 +3045,8 @@ impl<'t> Ctx<'t> {
                     return Val::untracked(Origin::Other);
                 };
                 let attr = self.text(attr).to_string();
-                if let Some(class) = self.class_receiver(object, scope) {
-                    return self.resolve_attr(class, &attr);
+                if let Some((class, dynamic)) = self.class_receiver(object, scope) {
+                    return self.resolve_attr(class, &attr, dynamic);
                 }
                 let base = self.eval(object, scope, depth + 1);
                 self.member(base, &attr)
@@ -2950,17 +3111,19 @@ impl<'t> Ctx<'t> {
     }
 
     /// The class `self.x` / `cls.x` / `ClassName.x` refers to, when the
-    /// object is one of those.
-    fn class_receiver(&self, object: Node<'t>, scope: usize) -> Option<usize> {
+    /// object is one of those, and whether it is `self`/`cls`: an instance
+    /// that may be a subclass's, or have its attributes written from
+    /// outside.
+    fn class_receiver(&self, object: Node<'t>, scope: usize) -> Option<(usize, bool)> {
         if object.kind() != "identifier" {
             return None;
         }
         let name = self.text(object);
         if matches!(name, "self" | "cls") {
-            return self.scopes[scope].class;
+            return self.scopes[scope].class.map(|class| (class, true));
         }
         match self.classes_by_name.get(name).map(Vec::as_slice) {
-            Some([class]) if !self.is_bound_locally(name, scope) => Some(*class),
+            Some([class]) if !self.is_bound_locally(name, scope) => Some((*class, false)),
             _ => None,
         }
     }
@@ -3606,13 +3769,20 @@ impl<'t> Ctx<'t> {
         found
     }
 
-    fn resolve_attr(&mut self, class: usize, attr: &str) -> Val {
+    /// The value of attribute `attr` of `class`, read through `self`/`cls`
+    /// when `dynamic` (see [`Self::dynamic_attr_assignments`]).
+    fn resolve_attr(&mut self, class: usize, attr: &str, dynamic: bool) -> Val {
         let key = (class, attr.to_string());
         let budget = self.budget();
-        if let Some(val) = self.reuse(recall(&self.attr_memo, &key, budget)) {
+        let memo = if dynamic {
+            &self.dyn_attr_memo
+        } else {
+            &self.attr_memo
+        };
+        if let Some(val) = self.reuse(recall(memo, &key, budget)) {
             return val;
         }
-        let guard = (1u8, class, attr.to_string());
+        let guard = (if dynamic { 5u8 } else { 1u8 }, class, attr.to_string());
         if !self.visiting.insert(guard.clone()) {
             return Val::untracked(Origin::Cycle);
         }
@@ -3621,7 +3791,11 @@ impl<'t> Ctx<'t> {
             self.visiting.remove(&guard);
             return Val::untracked(Origin::Other);
         }
-        let assigns = self.attr_assignments(class, attr);
+        let assigns = if dynamic {
+            self.dynamic_attr_assignments(class, attr)
+        } else {
+            self.attr_assignments(class, attr)
+        };
         let val = if assigns.is_empty() {
             Val::untracked(Origin::UnassignedAttribute {
                 name: attr.to_string(),
@@ -3633,8 +3807,103 @@ impl<'t> Ctx<'t> {
         self.leave_name();
         self.visiting.remove(&guard);
         let memo = self.memo(val.clone(), cutoffs, budget);
-        self.attr_memo.insert(key, memo);
+        if dynamic {
+            self.dyn_attr_memo.insert(key, memo);
+        } else {
+            self.attr_memo.insert(key, memo);
+        }
         val
+    }
+
+    /// The assignments `self.attr` / `cls.attr` may read in a method of
+    /// `class`: the class's own or inherited ones, those of every same-file
+    /// subclass (the instance may be one), outside writes of that
+    /// attribute name on other objects, and an unknown value when a write
+    /// names its attribute at run time anywhere in the hierarchy (or on
+    /// another object), or when only something other than the class itself
+    /// assigns it. Memoized; at most [`MAX_CLASSES_VISITED`] classes.
+    fn dynamic_attr_assignments(&mut self, class: usize, attr: &str) -> Rc<[Assign<'t>]> {
+        let key = (class, attr.to_string());
+        if let Some(found) = self.dyn_attr_lookup_memo.get(&key) {
+            return Rc::clone(found);
+        }
+        let own = self.attr_assignments(class, attr);
+        let mut found: Vec<Assign<'t>> = own.to_vec();
+        let mut hierarchy = vec![class];
+        let mut seen: HashSet<usize> = HashSet::from([class]);
+        let mut next = 0;
+        while next < hierarchy.len() && seen.len() < MAX_CLASSES_VISITED {
+            let current = hierarchy[next];
+            next += 1;
+            for &sub in self.subclasses.get(&current).into_iter().flatten() {
+                if seen.len() >= MAX_CLASSES_VISITED || !seen.insert(sub) {
+                    continue;
+                }
+                let sub_key = (sub, attr.to_string());
+                found.extend(self.assigns.get(&sub_key).into_iter().flatten().copied());
+                found.extend(
+                    self.attr_assigns
+                        .get(&sub_key)
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                );
+                hierarchy.push(sub);
+            }
+        }
+        hierarchy.extend(self.base_classes(class));
+        found.extend(
+            self.outside_attr_writes
+                .get(attr)
+                .into_iter()
+                .flatten()
+                .copied(),
+        );
+        let wild = self.wild_attr_writes.contains(&None)
+            || hierarchy
+                .iter()
+                .any(|c| self.wild_attr_writes.contains(&Some(*c)));
+        if wild || (own.is_empty() && !found.is_empty()) {
+            let unknown = Assign {
+                id: self.fresh_id(),
+                scope: class,
+                value: None,
+                annotation: None,
+                unknowable: true,
+                place: Place {
+                    at: 0,
+                    region: None,
+                },
+            };
+            found.push(unknown);
+        }
+        let found: Rc<[Assign<'t>]> = Rc::from(found);
+        self.dyn_attr_lookup_memo.insert(key, Rc::clone(&found));
+        found
+    }
+
+    /// The same-file base classes of `class`, transitively, at most
+    /// [`MAX_CLASSES_VISITED`].
+    fn base_classes(&self, class: usize) -> Vec<usize> {
+        let mut found: Vec<usize> = Vec::new();
+        let mut queue = vec![(class, 0u32)];
+        while let Some((current, depth)) = queue.pop() {
+            if depth >= MAX_BASE_DEPTH {
+                continue;
+            }
+            for base in self.scopes[current].bases.iter().take(MAX_BASES) {
+                for &parent in self.classes_by_name.get(base).into_iter().flatten() {
+                    if found.len() >= MAX_CLASSES_VISITED {
+                        return found;
+                    }
+                    if parent != class && !found.contains(&parent) {
+                        found.push(parent);
+                        queue.push((parent, depth + 1));
+                    }
+                }
+            }
+        }
+        found
     }
 
     fn member(&mut self, base: Val, attr: &str) -> Val {
@@ -3994,7 +4263,7 @@ impl<'t> Ctx<'t> {
             if !matches!(&target, Val::Module { pkg: Pkg::Openai, path } if path.is_empty()) {
                 continue;
             }
-            let attr = self.text(assign.attr);
+            let attr = assign.attr;
             match attr {
                 "api_type" => match assign.value.and_then(|v| self.literal(v).ok()) {
                     Some(kind) => match kind.to_ascii_lowercase().as_str() {
@@ -4025,11 +4294,16 @@ impl<'t> Ctx<'t> {
     /// Clients given a new `base_url` after they are built
     /// (`client.base_url = "https://openrouter.ai/api/v1"`).
     fn note_rerouted_clients(&mut self) {
-        for assign in self.config_assigns.clone() {
-            if !BASE_URL_ATTRS.contains(&self.text(assign.attr)) {
-                continue;
-            }
-            if let Val::Client { client, path } = self.eval(assign.object, assign.scope, 0) {
+        let written: Vec<(Node<'t>, usize)> = self
+            .config_assigns
+            .iter()
+            .filter(|assign| BASE_URL_ATTRS.contains(&assign.attr))
+            .map(|assign| (assign.object, assign.scope))
+            // An attribute named at run time may be the base URL too.
+            .chain(self.wild_attr_objects.iter().copied())
+            .collect();
+        for (object, scope) in written {
+            if let Val::Client { client, path } = self.eval(object, scope, 0) {
                 if !path.is_empty() {
                     continue;
                 }
@@ -4930,8 +5204,12 @@ impl<'t> Ctx<'t> {
                     if is_secret_key(&attr) || self.chain_has_secret_name(object) {
                         return Err(Unresolved::new("credential", rendered));
                     }
-                    if let Some(class) = self.class_receiver(object, scope) {
-                        let assigns = self.attr_assignments(class, &attr);
+                    if let Some((class, dynamic)) = self.class_receiver(object, scope) {
+                        let assigns = if dynamic {
+                            self.dynamic_attr_assignments(class, &attr)
+                        } else {
+                            self.attr_assignments(class, &attr)
+                        };
                         let only = match assigns.as_ref() {
                             [assign] => Some(*assign),
                             _ => None,

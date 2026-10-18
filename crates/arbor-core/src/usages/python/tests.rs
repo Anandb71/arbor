@@ -3381,3 +3381,143 @@ q: Quiet = Quiet()
     );
     assert_eq!(found.calls[1].routing, Routing::Unknown);
 }
+
+/// `(line, model value or "-", gap reasons)` for each call of `source`.
+fn rows_of(source: &str) -> Vec<(u32, String, Vec<String>)> {
+    values_and_gaps(&usages(source))
+}
+
+#[test]
+fn self_attributes_see_subclasses_and_outside_writes() {
+    // `self.MODEL` read only the class and its bases, so a subclass that
+    // overrides it, `bot.model = ...` and `setattr(bot, "model", ...)`
+    // were invisible and the base's `gpt-4o` was reported with no gap.
+    let header = "from openai import OpenAI\nclient = OpenAI()\n";
+    let reassigned = || vec!["reassigned".to_string()];
+    for (body, line) in [
+        (
+            r#"class Base:
+    MODEL = "gpt-4o"
+    def go(self):
+        return client.chat.completions.create(model=self.MODEL, messages=[])
+class Fast(Base):
+    MODEL = "o1-mini"
+Fast().go()
+"#,
+            6,
+        ),
+        (
+            r#"class Bot:
+    model = "gpt-4o"
+    def go(self):
+        return client.chat.completions.create(model=self.model, messages=[])
+bot = Bot()
+bot.model = "o1-mini"
+bot.go()
+"#,
+            6,
+        ),
+        (
+            r#"class Bot2:
+    model = "gpt-4o"
+    def go(self):
+        return client.chat.completions.create(model=self.model, messages=[])
+b2 = Bot2()
+setattr(b2, "model", "o1-mini")
+b2.go()
+"#,
+            6,
+        ),
+        (
+            r#"class Lazy:
+    def go(self):
+        return client.chat.completions.create(model=self.model, messages=[])
+class Real(Lazy):
+    model = "gpt-4o"
+"#,
+            5,
+        ),
+    ] {
+        let found = usages(&format!("{header}{body}"));
+        let rows = values_and_gaps(&found);
+        assert_eq!(rows, vec![(line, "-".to_string(), reassigned())], "{body}");
+    }
+    // An attribute named at run time may be any of them.
+    for body in [
+        r#"class Cfg:
+    model = "gpt-4o"
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+    def go(self):
+        return client.chat.completions.create(model=self.model, messages=[])
+"#,
+        r#"class Cfg:
+    model = "gpt-4o"
+    def go(self):
+        return client.chat.completions.create(model=self.model, messages=[])
+c = Cfg()
+c.__dict__.update(opts)
+"#,
+        r#"class Cfg:
+    model = "gpt-4o"
+    def go(self):
+        return client.chat.completions.create(model=self.model, messages=[])
+c = Cfg()
+vars(c)[key] = value
+"#,
+    ] {
+        let rows = rows_of(&format!("{header}{body}"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "-", "{body}");
+        assert_eq!(rows[0].2, reassigned(), "{body}");
+    }
+    // A class read by name is not an instance: outside writes do not reach.
+    let rows = rows_of(&format!(
+        "{header}class K:\n    MODEL = \"gpt-4o\"\nk = K()\nk.MODEL = \"o1-mini\"\nclient.chat.completions.create(model=K.MODEL, messages=[])\n"
+    ));
+    assert_eq!(rows, vec![(7, "gpt-4o".to_string(), vec![])]);
+}
+
+#[test]
+fn self_clients_see_subclasses_and_setattr() {
+    // A subclass that swaps the client, and `setattr(client, "base_url",
+    // ...)`, left the client `openai_direct` with no gap.
+    let found = usages(
+        r#"from openai import OpenAI
+class Svc:
+    client = OpenAI()
+    def go(self):
+        return self.client.chat.completions.create(model="gpt-4", messages=[])
+class GwSvc(Svc):
+    client = OpenAI(base_url="https://gw.example/v1")
+GwSvc().go()
+c8 = OpenAI()
+setattr(c8, "base_url", "https://gw.example/v1")
+c8.chat.completions.create(model="gpt-4", messages=[])
+c9 = OpenAI()
+setattr(c9, attr_name, value)
+c9.chat.completions.create(model="gpt-4", messages=[])
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (
+                5,
+                Routing::Unknown,
+                vec!["ambiguous_client/multiple_assignments".to_string()]
+            ),
+            (
+                11,
+                Routing::Unknown,
+                vec!["ambiguous_client/base_url_assigned".to_string()]
+            ),
+            (
+                14,
+                Routing::Unknown,
+                vec!["ambiguous_client/base_url_assigned".to_string()]
+            ),
+        ]
+    );
+}
