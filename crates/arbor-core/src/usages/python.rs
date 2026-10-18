@@ -221,6 +221,7 @@ pub fn extract(tree: &Tree, source: &str, file_path: &str) -> FileUsages {
     let mut cx = Ctx::new(source, file_path);
     cx.collect(tree.root_node());
     cx.index_definitions();
+    cx.settle_dict_escapes();
     cx.analyze();
     let mut found = cx.finish();
     found.syntax_errors = tree.root_node().has_error();
@@ -882,6 +883,8 @@ struct Frame<'t> {
     /// Innermost loop around the node in its scope (an index into that
     /// scope's [`Ctx::loops`]).
     inner_loop: Option<usize>,
+    /// The parent's parent.
+    grand: Option<Node<'t>>,
 }
 
 /// A `for` or `while` statement, for loop-carried definitions.
@@ -909,6 +912,34 @@ enum UseAt {
     /// Later, from a function, lambda or generator defined at this byte of
     /// the binding scope: it may run after any later definition.
     Deferred(usize),
+}
+
+/// How a dict, or a part of one, is used where it appears.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DictUse<'t> {
+    /// Read without letting it change: a subscript, `.get`, `.keys()`,
+    /// `**d` in a call, a test or a read-only builtin.
+    Safe,
+    /// Assigned to this plain name: the two refer to one dict.
+    Alias(&'t str),
+    /// Its entries are handed out (`.items()`, `.values()`, `.copy()`,
+    /// `dict(d)`, `{**d}`, iterated): a change to a nested container
+    /// changes it.
+    Shallow,
+    /// Passed, stored, returned or mutated: it may change.
+    Escape,
+}
+
+/// A part of a dict literal (`D["a"]`, `D.get("a")`, or the whole of `D`
+/// for a shallow use) that leaves the dict, decided after collection.
+#[derive(Clone, Copy)]
+struct Exposed<'t> {
+    root: &'t str,
+    /// The identifier, subscript or `.get` call.
+    node: Node<'t>,
+    scope: usize,
+    /// Assigned to this plain name.
+    alias: Option<&'t str>,
 }
 
 /// A dict literal reached through names and subscripts.
@@ -995,8 +1026,13 @@ struct Ctx<'t> {
     parents: HashMap<usize, Node<'t>>,
     name_uses: HashMap<&'t str, Uses<'t>>,
     attr_uses: HashMap<&'t str, Uses<'t>>,
-    /// Names whose dict may change after its literal (`D[k] = v`, `D.update`).
-    mutated: HashSet<&'t str>,
+    /// Names whose dict literal may change after it is written: mutated
+    /// (`D[k] = v`, `D["a"]["b"] = v`, `D["a"].update()`), passed to a
+    /// function, stored, returned, or aliased by a name that is. Their
+    /// literal is never read.
+    escaped: HashSet<&'t str>,
+    /// Dict parts that leave their dict, and plain-name aliases.
+    exposed: Vec<Exposed<'t>>,
     def_index: HashMap<Key, DefIndex>,
     /// `for`/`while` statements per scope, in source order.
     loops: HashMap<usize, Vec<LoopRange>>,
@@ -1012,6 +1048,7 @@ struct Ctx<'t> {
     param_memo: HashMap<Key, Memo<Val>>,
     call_memo: HashMap<(usize, usize), Memo<Val>>,
     dict_cache: HashMap<usize, Rc<DictSummary<'t>>>,
+    dict_contents_memo: HashMap<usize, (bool, Rc<[&'t str]>)>,
     /// What each expanded dict literal nests, by node id.
     dict_nested: HashMap<usize, Rc<NestedList>>,
     /// Nested values that may still be listed in this file.
@@ -1063,7 +1100,8 @@ impl<'t> Ctx<'t> {
             parents: HashMap::new(),
             name_uses: HashMap::new(),
             attr_uses: HashMap::new(),
-            mutated: HashSet::new(),
+            escaped: HashSet::new(),
+            exposed: Vec::new(),
             def_index: HashMap::new(),
             loops: HashMap::new(),
             env_reads: Vec::new(),
@@ -1074,6 +1112,7 @@ impl<'t> Ctx<'t> {
             param_memo: HashMap::new(),
             call_memo: HashMap::new(),
             dict_cache: HashMap::new(),
+            dict_contents_memo: HashMap::new(),
             dict_nested: HashMap::new(),
             nested_left: MAX_FILE_NESTED_VALUES,
             attr_lookup_memo: HashMap::new(),
@@ -1150,6 +1189,7 @@ impl<'t> Ctx<'t> {
             block_end: root.end_byte(),
             stmt: None,
             inner_loop: None,
+            grand: None,
         }];
         while let Some(frame) = stack.pop() {
             let node = frame.node;
@@ -1257,7 +1297,7 @@ impl<'t> Ctx<'t> {
                     }
                     "delete_statement" => {
                         for target in named_children(node) {
-                            self.note_subscript_target(target);
+                            self.note_mutated_root(target);
                         }
                     }
                     "call" => {
@@ -1268,8 +1308,14 @@ impl<'t> Ctx<'t> {
                         }
                         self.note_dict_mutation(node);
                         self.note_env_read(node);
+                        if is_get_call(node, |n| self.text(n)) {
+                            self.note_dict_part(node, &frame, scope);
+                        }
                     }
-                    "subscript" => self.note_env_read(node),
+                    "subscript" => {
+                        self.note_env_read(node);
+                        self.note_dict_part(node, &frame, scope);
+                    }
                     "parenthesized_expression"
                     | "boolean_operator"
                     | "conditional_expression"
@@ -1285,7 +1331,10 @@ impl<'t> Ctx<'t> {
                         self.note_attr_use(node, &frame, scope);
                         self.note_env_read(node);
                     }
-                    "identifier" => self.note_name_use(node, &frame, scope),
+                    "identifier" => {
+                        self.note_name_use(node, &frame, scope);
+                        self.note_dict_name(node, &frame, scope);
+                    }
                     _ => {}
                 }
             }
@@ -1307,6 +1356,7 @@ impl<'t> Ctx<'t> {
                     block_end,
                     stmt: child_stmt,
                     inner_loop: child_loop,
+                    grand: frame.parent,
                 });
             }
         }
@@ -1330,24 +1380,7 @@ impl<'t> Ctx<'t> {
                     .push((parent, scope));
                 return;
             }
-            ("function_definition" | "class_definition", Some("name"))
-            | ("keyword_argument", Some("name"))
-            | ("attribute", Some("attribute"))
-            | ("default_parameter" | "typed_default_parameter", Some("name")) => true,
-            (
-                "parameters"
-                | "lambda_parameters"
-                | "typed_parameter"
-                | "list_splat_pattern"
-                | "dictionary_splat_pattern"
-                | "dotted_name"
-                | "aliased_import"
-                | "import_from_statement"
-                | "global_statement"
-                | "nonlocal_statement",
-                _,
-            ) => true,
-            _ => false,
+            _ => is_declaration(parent.kind(), frame.field),
         };
         if !declaration {
             let name = self.text(node);
@@ -1398,48 +1431,296 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    /// `D[k] = v`, `del D[k]`: the dict literal bound to `D` is not final.
-    fn note_subscript_target(&mut self, target: Node<'t>) {
-        if target.kind() != "subscript" {
-            return;
-        }
-        if let Some(object) = target.child_by_field_name("value") {
-            if object.kind() == "identifier" {
-                let name = self.text(object);
-                self.mutated.insert(name);
+    /// `D[k] = v`, `del D[k]`, `D["a"]["b"] = v`, `H.d["k"] = v`: the
+    /// name at the root of the target may hold a dict that changes.
+    fn note_mutated_root(&mut self, target: Node<'t>) {
+        if matches!(target.kind(), "subscript" | "attribute") {
+            if let Some(root) = chain_root_name(target, |n| self.text(n)) {
+                self.escaped.insert(root);
             }
         }
     }
 
-    /// `D.update(...)`, `D.setdefault(...)`, `D.pop(...)`...
+    /// `D.update(...)`, `D["a"].setdefault(...)`, `D["fallbacks"].append(...)`.
     fn note_dict_mutation(&mut self, call: Node<'t>) {
-        let Some(function) = call.child_by_field_name("function") else {
+        let Some(function) = call
+            .child_by_field_name("function")
+            .filter(|f| f.kind() == "attribute")
+        else {
             return;
         };
-        if function.kind() != "attribute" {
-            return;
-        }
         let (Some(object), Some(attr)) = (
             function.child_by_field_name("object"),
             function.child_by_field_name("attribute"),
         ) else {
             return;
         };
-        if object.kind() == "identifier"
-            && matches!(
-                self.text(attr),
-                "update"
-                    | "setdefault"
-                    | "pop"
-                    | "popitem"
-                    | "clear"
-                    | "__setitem__"
-                    | "__delitem__"
-            )
-        {
-            let name = self.text(object);
-            self.mutated.insert(name);
+        if MUTATING_METHODS.contains(&self.text(attr)) {
+            if let Some(root) = chain_root_name(object, |n| self.text(n)) {
+                self.escaped.insert(root);
+            }
         }
+    }
+
+    /// A bare name: whether a dict bound to it may change or escape here.
+    fn note_dict_name(&mut self, node: Node<'t>, frame: &Frame<'t>, scope: usize) {
+        let name = self.text(node);
+        match self.dict_use(frame, false) {
+            DictUse::Safe => {}
+            DictUse::Escape => {
+                self.escaped.insert(name);
+            }
+            use_ @ (DictUse::Shallow | DictUse::Alias(_)) => self.exposed.push(Exposed {
+                root: name,
+                node,
+                scope,
+                alias: match use_ {
+                    DictUse::Alias(target) => Some(target),
+                    _ => None,
+                },
+            }),
+        }
+    }
+
+    /// `D["a"]` or `D.get("a")` on a name: whether that part leaves the
+    /// dict here. What it holds is checked after collection: handing out a
+    /// string cannot change the dict, handing out a nested container can.
+    fn note_dict_part(&mut self, node: Node<'t>, frame: &Frame<'t>, scope: usize) {
+        let Some(root) = chain_root_name(node, |n| self.text(n)) else {
+            return;
+        };
+        let alias = match self.dict_use(frame, true) {
+            DictUse::Safe => return,
+            DictUse::Alias(target) => Some(target),
+            DictUse::Shallow | DictUse::Escape => None,
+        };
+        self.exposed.push(Exposed {
+            root,
+            node,
+            scope,
+            alias,
+        });
+    }
+
+    /// How the dict or dict part at `frame` is used, from its parent, the
+    /// field it fills there and its grandparent. `part` is set for a
+    /// subscript or `.get` call: iterating one hands out its elements.
+    fn dict_use(&self, frame: &Frame<'t>, part: bool) -> DictUse<'t> {
+        let Some(parent) = frame.parent else {
+            return DictUse::Safe;
+        };
+        match (parent.kind(), frame.field) {
+            // A longer chain decides at its outer end; a target is a
+            // definition or a mutation, recorded where it is assigned.
+            ("subscript", Some("value"))
+            | ("assignment" | "augmented_assignment", Some("left"))
+            | ("delete_statement", _) => DictUse::Safe,
+            ("attribute", Some("object")) => {
+                let attr = parent
+                    .child_by_field_name("attribute")
+                    .map(|a| self.text(a))
+                    .unwrap_or_default();
+                if READ_ONLY_METHODS.contains(&attr) {
+                    DictUse::Safe
+                } else if SHALLOW_METHODS.contains(&attr) {
+                    DictUse::Shallow
+                } else {
+                    DictUse::Escape
+                }
+            }
+            ("dictionary_splat", _) => match frame.grand.map(|g| g.kind()) {
+                Some("argument_list") => DictUse::Safe,
+                _ => DictUse::Shallow,
+            },
+            ("list_splat", _) | ("for_statement" | "for_in_clause", Some("right")) => {
+                // A dict iterates its keys; a nested list hands out its
+                // elements.
+                if part {
+                    DictUse::Shallow
+                } else {
+                    DictUse::Safe
+                }
+            }
+            ("if_statement" | "elif_clause" | "while_statement", Some("condition"))
+            | ("comparison_operator" | "not_operator" | "expression_statement", _)
+            | ("interpolation", _) => DictUse::Safe,
+            ("argument_list", _) => {
+                let callee = frame
+                    .grand
+                    .and_then(|call| call.child_by_field_name("function"))
+                    .map(|f| self.render_links(f, 4))
+                    .unwrap_or_default();
+                if READ_ONLY_CALLS.contains(&callee.as_str()) {
+                    DictUse::Safe
+                } else if SHALLOW_CALLS.contains(&callee.as_str()) {
+                    DictUse::Shallow
+                } else {
+                    DictUse::Escape
+                }
+            }
+            ("assignment", Some("right")) => match parent.child_by_field_name("left") {
+                Some(target) if target.kind() == "identifier" => DictUse::Alias(self.text(target)),
+                _ => DictUse::Escape,
+            },
+            (kind, field) if !part && is_declaration(kind, field) => DictUse::Safe,
+            _ => DictUse::Escape,
+        }
+    }
+
+    /// Decides the exposed dict parts and aliases once every definition is
+    /// known: a part that hands out a nested container, or an unknown entry,
+    /// lets its dict change; a name held in the dict is exposed itself; and
+    /// every name aliased with an escaped one escapes too.
+    fn settle_dict_escapes(&mut self) {
+        let mut links: Vec<(&'t str, &'t str)> = Vec::new();
+        for exposed in std::mem::take(&mut self.exposed) {
+            let (alters, names) = self.exposed_contents(&exposed);
+            match exposed.alias {
+                Some(target) => {
+                    if alters {
+                        links.push((target, exposed.root));
+                    }
+                    for name in names.iter() {
+                        links.push((target, name));
+                    }
+                }
+                None => {
+                    if alters {
+                        self.escaped.insert(exposed.root);
+                    }
+                    self.escaped.extend(names.iter().copied());
+                }
+            }
+        }
+        // Union the aliases; a class with one escaped name escapes whole.
+        let mut parent: HashMap<&'t str, &'t str> = HashMap::new();
+        fn find<'a>(parent: &mut HashMap<&'a str, &'a str>, name: &'a str) -> &'a str {
+            let mut root = name;
+            while let Some(&next) = parent.get(root) {
+                if next == root {
+                    break;
+                }
+                root = next;
+            }
+            let mut current = name;
+            while current != root {
+                let next = parent.get(current).copied().unwrap_or(root);
+                parent.insert(current, root);
+                current = next;
+            }
+            root
+        }
+        for (a, b) in &links {
+            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+            if ra != rb {
+                parent.insert(ra, rb);
+            }
+        }
+        let names: Vec<&'t str> = links.iter().flat_map(|(a, b)| [*a, *b]).collect();
+        let escaped_roots: HashSet<&'t str> = names
+            .iter()
+            .filter(|n| self.escaped.contains(*n))
+            .map(|n| find(&mut parent, n))
+            .collect();
+        for name in names {
+            if escaped_roots.contains(find(&mut parent, name)) {
+                self.escaped.insert(name);
+            }
+        }
+    }
+
+    /// What an exposed part hands out: whether a change through it could
+    /// alter its dict (a nested container, or an entry that cannot be
+    /// read), and the names stored in it (which may be dicts themselves).
+    fn exposed_contents(&mut self, exposed: &Exposed<'t>) -> (bool, Rc<[&'t str]>) {
+        let none: Rc<[&'t str]> = Rc::from(Vec::new());
+        // The literal keys from the root to the part.
+        let mut keys: Vec<Option<String>> = Vec::new();
+        let mut node = exposed.node;
+        for _ in 0..MAX_DEPTH {
+            match node.kind() {
+                "identifier" => break,
+                "subscript" => {
+                    keys.push(single_subscript(node).and_then(|k| self.literal(k).ok()));
+                    match node.child_by_field_name("value") {
+                        Some(value) => node = value,
+                        None => return (true, none),
+                    }
+                }
+                "call" => {
+                    let key = call_arguments(node, |n| self.text(n)).0.first().copied();
+                    keys.push(key.and_then(|k| self.literal(k).ok()));
+                    match node
+                        .child_by_field_name("function")
+                        .and_then(|f| f.child_by_field_name("object"))
+                    {
+                        Some(object) => node = object,
+                        None => return (true, none),
+                    }
+                }
+                "parenthesized_expression" => match node.named_child(0) {
+                    Some(inner) => node = inner,
+                    None => return (true, none),
+                },
+                _ => return (true, none),
+            }
+        }
+        if node.kind() != "identifier" {
+            return (true, none);
+        }
+        // Not a same-file dict literal here: nothing to protect.
+        let Some(mut dict) = self.dict_node(node, exposed.scope, 0) else {
+            return (false, none);
+        };
+        keys.reverse();
+        let last = keys.len();
+        for (i, key) in keys.into_iter().enumerate() {
+            let Some(key) = key else {
+                // A key known only at run time: any entry may leave.
+                return self.dict_contents(dict.node);
+            };
+            let value = match self.dict_lookup(dict.node, &key) {
+                Lookup::Found(value) => value,
+                Lookup::Absent => return (false, none),
+                Lookup::Unknown => return (true, none),
+            };
+            if i + 1 == last {
+                return match value.kind() {
+                    "identifier" => (false, Rc::from(vec![self.text(value)])),
+                    _ => (is_mutable_literal(value, |n| self.text(n)), none),
+                };
+            }
+            match self.dict_node(value, dict.scope, 0) {
+                Some(inner) => dict = inner,
+                // An entry that is not a dict literal: not readable as one.
+                None => return (false, none),
+            }
+        }
+        // The whole dict is handed out (`.items()`, `dict(D)`, an alias).
+        if exposed.alias.is_some() && exposed.node.kind() == "identifier" {
+            return (true, none);
+        }
+        self.dict_contents(dict.node)
+    }
+
+    /// Whether a dict literal holds a container or an unreadable entry, and
+    /// the names it holds. Computed once per literal.
+    fn dict_contents(&mut self, dict: Node<'t>) -> (bool, Rc<[&'t str]>) {
+        if let Some(found) = self.dict_contents_memo.get(&dict.id()) {
+            return found.clone();
+        }
+        let mut alters = false;
+        let mut names = Vec::new();
+        for entry in dict_entries(dict, |n| self.literal(n).ok(), |n| self.text(n)) {
+            match entry {
+                None => alters = true,
+                Some((_, value)) if value.kind() == "identifier" => names.push(self.text(value)),
+                Some((_, value)) => alters |= is_mutable_literal(value, |n| self.text(n)),
+            }
+        }
+        let found = (alters, Rc::from(names));
+        self.dict_contents_memo.insert(dict.id(), found.clone());
+        found
     }
 
     fn enter_function(
@@ -1739,6 +2020,7 @@ impl<'t> Ctx<'t> {
                         }
                     }
                 }
+                self.note_mutated_root(object);
                 self.config_assigns.push(ConfigAssign {
                     object,
                     attr,
@@ -1746,7 +2028,7 @@ impl<'t> Ctx<'t> {
                     scope,
                 });
             }
-            "subscript" => self.note_subscript_target(target),
+            "subscript" => self.note_mutated_root(target),
             "pattern_list"
             | "tuple_pattern"
             | "list_pattern"
@@ -4204,7 +4486,8 @@ impl<'t> Ctx<'t> {
     }
 
     /// The dict literal `expr` evaluates to: a `{...}` or `dict(...)`
-    /// written inline, a name assigned exactly one (and never mutated), or a
+    /// written inline, a name assigned exactly one (and never mutated or
+    /// passed on, see [`Ctx::escaped`]), or a
     /// constant key of one of those.
     fn dict_node(&mut self, expr: Node<'t>, scope: usize, depth: u32) -> Option<DictRef<'t>> {
         if depth > 8 {
@@ -4229,7 +4512,7 @@ impl<'t> Ctx<'t> {
             }
             "identifier" => {
                 let name = self.text(expr);
-                if is_secret_key(name) || self.mutated.contains(name) {
+                if is_secret_key(name) || self.escaped.contains(name) {
                     return None;
                 }
                 let (key, defs) = self.defs_at(name, scope, expr.start_byte());
@@ -4515,6 +4798,144 @@ fn is_model_bearing(member: &str) -> bool {
     MODEL_BEARING
         .iter()
         .any(|m| member == *m || member.ends_with(&format!(".{m}")))
+}
+
+/// Methods that read a dict or list without changing it or handing out
+/// its entries.
+const READ_ONLY_METHODS: &[&str] = &[
+    "get",
+    "keys",
+    "__contains__",
+    "__len__",
+    "__getitem__",
+    "count",
+    "index",
+];
+
+/// Methods that hand out a dict's entries (or a shallow copy of them).
+const SHALLOW_METHODS: &[&str] = &["items", "values", "copy", "__iter__"];
+
+/// Methods that change a dict, list or set in place.
+const MUTATING_METHODS: &[&str] = &[
+    "update",
+    "setdefault",
+    "pop",
+    "popitem",
+    "clear",
+    "__setitem__",
+    "__delitem__",
+    "__ior__",
+    "append",
+    "extend",
+    "insert",
+    "remove",
+    "sort",
+    "reverse",
+    "add",
+    "discard",
+];
+
+/// Calls that only read their argument.
+const READ_ONLY_CALLS: &[&str] = &[
+    "len",
+    "print",
+    "repr",
+    "str",
+    "sorted",
+    "list",
+    "tuple",
+    "set",
+    "frozenset",
+    "iter",
+    "bool",
+    "isinstance",
+    "type",
+    "id",
+    "hash",
+    "enumerate",
+    "any",
+    "all",
+    "json.dumps",
+    "copy.deepcopy",
+    "deepcopy",
+];
+
+/// Calls that return a shallow copy, sharing nested containers.
+const SHALLOW_CALLS: &[&str] = &["dict", "copy.copy", "copy"];
+
+/// Whether a field of a node of kind `parent` names a binding rather than
+/// using one: a definition's name, a parameter, an import, a keyword
+/// argument's name, an attribute name or an assignment target.
+fn is_declaration(parent: &str, field: Option<&str>) -> bool {
+    matches!(
+        (parent, field),
+        ("function_definition" | "class_definition", Some("name"))
+            | ("keyword_argument", Some("name"))
+            | ("attribute", Some("attribute"))
+            | (
+                "default_parameter" | "typed_default_parameter",
+                Some("name")
+            )
+            | ("assignment" | "augmented_assignment", Some("left"))
+            | (
+                "parameters"
+                    | "lambda_parameters"
+                    | "typed_parameter"
+                    | "list_splat_pattern"
+                    | "dictionary_splat_pattern"
+                    | "dotted_name"
+                    | "aliased_import"
+                    | "import_from_statement"
+                    | "global_statement"
+                    | "nonlocal_statement",
+                _,
+            )
+    )
+}
+
+/// The name at the root of a subscript, attribute or `.get` chain
+/// (`CFG` in `CFG["a"]["b"]`, `H` in `H.d["k"]`, `D` in `D.get("a")["b"]`).
+fn chain_root_name<'t>(mut node: Node<'t>, text: impl Fn(Node<'t>) -> &'t str) -> Option<&'t str> {
+    for _ in 0..MAX_DEPTH {
+        node = match node.kind() {
+            "identifier" => return Some(text(node)),
+            "subscript" => node.child_by_field_name("value")?,
+            "attribute" => node.child_by_field_name("object")?,
+            "call" => node.child_by_field_name("function")?,
+            "parenthesized_expression" => node.named_child(0)?,
+            _ => return None,
+        };
+    }
+    None
+}
+
+/// `x.get(...)`.
+fn is_get_call<'t>(call: Node<'t>, text: impl Fn(Node<'t>) -> &'t str) -> bool {
+    call.child_by_field_name("function")
+        .filter(|f| f.kind() == "attribute")
+        .and_then(|f| f.child_by_field_name("attribute"))
+        .is_some_and(|a| text(a) == "get")
+}
+
+/// A dict, list or set literal, or a `dict(...)`/`list(...)` call: a
+/// container that can be changed in place. Strings, numbers and tuples of
+/// them cannot.
+fn is_mutable_literal<'t>(node: Node<'t>, text: impl Fn(Node<'t>) -> &'t str + Copy) -> bool {
+    match node.kind() {
+        "dictionary"
+        | "list"
+        | "set"
+        | "dictionary_comprehension"
+        | "list_comprehension"
+        | "set_comprehension" => true,
+        "tuple" | "parenthesized_expression" => named_children(node)
+            .into_iter()
+            .any(|n| is_mutable_literal(n, text)),
+        "call" => node
+            .child_by_field_name("function")
+            .is_some_and(|f| matches!(text(f), "dict" | "list" | "set")),
+        _ => false,
+    }
 }
 
 /// `dict(model=..., ...)`.

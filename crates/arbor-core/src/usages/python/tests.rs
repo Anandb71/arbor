@@ -2349,3 +2349,97 @@ def run(batches):
     assert_eq!(found.calls[0].routing, Routing::Unknown);
     assert_eq!(gaps(&found, GapKind::AmbiguousClient).len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Re-review of #276: a dict that may change is never read
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dicts_changed_through_chains_aliases_helpers_or_attributes_are_not_read() {
+    // Each of these used to report the literal's `gpt-4o` with no gap while
+    // the request sent another model.
+    let found = usages(
+        r#"
+from openai import OpenAI
+client = OpenAI()
+CFG = {"openai": {"model": "gpt-4o"}}
+CFG["openai"]["model"] = "o1-mini"
+client.chat.completions.create(**CFG["openai"], messages=[])
+CFG2 = {"openai": {"model": "gpt-4o"}}
+CFG2["openai"].update(model="o3-mini")
+client.chat.completions.create(model=CFG2["openai"]["model"], messages=[])
+P3 = {"model": "gpt-4o"}
+alias = P3
+alias["model"] = "gpt-3.5-turbo"
+client.chat.completions.create(**P3, messages=[])
+P4 = {"model": "gpt-4o"}
+def tweak(d):
+    d["model"] = "o4-mini"
+tweak(P4)
+client.chat.completions.create(**P4, messages=[])
+P5 = {"model": "gpt-4o"}
+class H: pass
+H.d = P5
+H.d["model"] = "gpt-4-0613"
+client.chat.completions.create(model=P5["model"], messages=[])
+P6 = {"extra_body": {"model": "gpt-4o"}}
+for key, part in P6.items():
+    part["model"] = "o1-mini"
+client.chat.completions.create(model="gpt-4", messages=[], **P6)
+P7 = {"openai": {"model": "gpt-4o"}}
+sub = P7["openai"]
+sub["model"] = "o1-mini"
+client.chat.completions.create(**P7["openai"], messages=[])
+P8 = {"fallbacks": [{"model": "gpt-4o"}]}
+P8["fallbacks"].append({"model": "o1-mini"})
+client.chat.completions.create(model="gpt-4", messages=[], **P8)
+"#,
+    );
+    let json = serde_json::to_string(&found).unwrap();
+    assert!(
+        !json.contains("\"gpt-4o\""),
+        "a stale value was reported: {json}"
+    );
+    for c in &found.calls {
+        if c.values.iter().any(|v| v.key == "model") {
+            continue;
+        }
+        let start = c.span.start_byte;
+        assert!(
+            found
+                .gaps
+                .iter()
+                .any(|g| g.span.map(|s| s.start_byte) == Some(start)),
+            "silent call at line {}",
+            c.span.line
+        );
+    }
+}
+
+#[test]
+fn dicts_that_are_only_read_still_resolve() {
+    let found = usages(
+        r#"
+import json
+from openai import OpenAI
+client = OpenAI()
+CONFIG = {"model": "gpt-4o", "openai": {"model": "o3"}, "temperature": 0}
+MODEL = CONFIG["model"]
+OPENAI = CONFIG["openai"]
+print(json.dumps(CONFIG), len(CONFIG), "model" in CONFIG)
+for key in CONFIG:
+    print(key, CONFIG.get(key))
+for key, value in {"a": "b"}.items():
+    pass
+client.chat.completions.create(model=MODEL, messages=[])
+client.chat.completions.create(**OPENAI, messages=[])
+client.chat.completions.create(model=CONFIG.get("model"), messages=[])
+"#,
+    );
+    let models: Vec<&str> = found
+        .calls
+        .iter()
+        .map(|c| value(c, "model").unwrap_or("-"))
+        .collect();
+    assert_eq!(models, vec!["gpt-4o", "o3", "gpt-4o"]);
+}
