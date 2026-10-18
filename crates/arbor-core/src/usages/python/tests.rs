@@ -3567,3 +3567,33 @@ c5.chat.completions.create(model="gpt-4", messages=[])
         ]
     );
 }
+
+#[test]
+fn dicts_aliased_by_a_chain_a_class_attribute_or_the_namespace_are_not_read() {
+    // `x = y = CFG2` aliased only `y`, a mutation through `K.cfg[...]` or
+    // `self.cfg[...]` marked only `K` / `self`, and `globals()["CFG7"]`
+    // marked `globals`, so each call read the literal's `gpt-4o`.
+    let header = "from openai import OpenAI\nclient = OpenAI()\n";
+    for body in [
+        "CFG = {\"model\": \"gpt-4o\"}\nclass K:\n    cfg = CFG\nK.cfg[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**CFG, messages=[])\n",
+        "CFG2 = {\"model\": \"gpt-4o\"}\nx = y = CFG2\nx[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**CFG2, messages=[])\n",
+        "CFG2 = {\"model\": \"gpt-4o\"}\na = b = c = CFG2\na[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**CFG2, messages=[])\n",
+        "CFG3 = {\"model\": \"gpt-4o\"}\nclass K3:\n    cfg = CFG3\n    def tune(self):\n        self.cfg[\"model\"] = \"o3-mini\"\nclient.chat.completions.create(**CFG3, messages=[])\n",
+        "CFG4 = {\"model\": \"gpt-4o\"}\nclass K4:\n    cfg = CFG4\nx = K4.cfg\nx[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**CFG4, messages=[])\n",
+        "CFG5 = {\"model\": \"gpt-4o\"}\nclass K5:\n    cfg = CFG5\n    def tune(self):\n        self.cfg.update(model=\"o1-mini\")\nclient.chat.completions.create(**CFG5, messages=[])\n",
+        "CFG7 = {\"model\": \"gpt-4o\"}\nglobals()[\"CFG7\"][\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**CFG7, messages=[])\n",
+    ] {
+        let rows = rows_of(&format!("{header}{body}"));
+        assert_eq!(rows.len(), 1, "{body}");
+        assert_eq!(rows[0].1, "-", "{body}");
+        assert_eq!(rows[0].2, vec!["splat".to_string()], "{body}");
+    }
+    // Read-only uses of the same shapes still resolve.
+    for body in [
+        "CFG = {\"model\": \"gpt-4o\"}\nclass K:\n    cfg = CFG\nprint(K.cfg[\"model\"])\nclient.chat.completions.create(**CFG, messages=[])\n",
+        "CFG2 = {\"model\": \"gpt-4o\"}\nx = y = CFG2\nprint(x[\"model\"])\nclient.chat.completions.create(**CFG2, messages=[])\n",
+    ] {
+        let rows = rows_of(&format!("{header}{body}"));
+        assert_eq!(rows[0].1, "gpt-4o", "{body}");
+    }
+}

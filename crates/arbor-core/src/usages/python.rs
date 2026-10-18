@@ -1484,6 +1484,7 @@ impl<'t> Ctx<'t> {
                             let annotation = node.child_by_field_name("type");
                             self.record_target(left, value, annotation, scope, false, place);
                         }
+                        self.note_chained_alias(node, scope);
                     }
                     "augmented_assignment" => {
                         if let Some(left) = node.child_by_field_name("left") {
@@ -1565,6 +1566,7 @@ impl<'t> Ctx<'t> {
                         }
                         self.note_attr_use(node, &frame, scope);
                         self.note_env_read(node);
+                        self.note_dict_attribute(node, &frame);
                     }
                     "identifier" => {
                         self.note_name_use(node, &frame, scope);
@@ -1729,14 +1731,65 @@ impl<'t> Ctx<'t> {
         self.env_writes.extend(names);
     }
 
-    /// `D[k] = v`, `del D[k]`, `D["a"]["b"] = v`, `H.d["k"] = v`: the
-    /// name at the root of the target may hold a dict that changes.
+    /// `D[k] = v`, `del D[k]`, `D["a"]["b"] = v`, `H.d["k"] = v`,
+    /// `self.cfg["k"] = v`: the name at the root of the target, and every
+    /// attribute name along it (`d`, `cfg`: a class or instance attribute
+    /// may alias a dict), may hold a dict that changes.
     fn note_mutated_root(&mut self, target: Node<'t>) {
         if matches!(target.kind(), "subscript" | "attribute") {
-            if let Some(root) = chain_root_name(target, |n| self.text(n)) {
-                self.escaped.insert(root);
-            }
+            let names = self.chain_names(target);
+            self.escaped.extend(names);
         }
+    }
+
+    /// The root name of a subscript, attribute or call chain and every
+    /// attribute name along it, plus the literal key of
+    /// `globals()["NAME"]` / `vars()["NAME"]`, which names a module-level
+    /// binding.
+    fn chain_names(&self, node: Node<'t>) -> Vec<&'t str> {
+        let mut names = Vec::new();
+        let mut node = node;
+        for _ in 0..MAX_DEPTH {
+            node = match node.kind() {
+                "identifier" => {
+                    names.push(self.text(node));
+                    break;
+                }
+                "subscript" => {
+                    let Some(value) = node.child_by_field_name("value") else {
+                        break;
+                    };
+                    if is_namespace_call(value, |n| self.text(n)) {
+                        if let Some(key) =
+                            single_subscript(node).and_then(|k| self.plain_literal(k))
+                        {
+                            names.push(key);
+                        }
+                        break;
+                    }
+                    value
+                }
+                "attribute" => {
+                    if let Some(attr) = node.child_by_field_name("attribute") {
+                        names.push(self.text(attr));
+                    }
+                    match node.child_by_field_name("object") {
+                        Some(object) => object,
+                        None => break,
+                    }
+                }
+                "call" => match node.child_by_field_name("function") {
+                    Some(function) => function,
+                    None => break,
+                },
+                "parenthesized_expression" => match node.named_child(0) {
+                    Some(inner) => inner,
+                    None => break,
+                },
+                _ => break,
+            };
+        }
+        names
     }
 
     /// `D.update(...)`, `D["a"].setdefault(...)`, `D["fallbacks"].append(...)`.
@@ -1754,9 +1807,54 @@ impl<'t> Ctx<'t> {
             return;
         };
         if MUTATING_METHODS.contains(&self.text(attr)) {
-            if let Some(root) = chain_root_name(object, |n| self.text(n)) {
+            let names = self.chain_names(object);
+            self.escaped.extend(names);
+        }
+    }
+
+    /// `x = y = D` (each target aliases `D`; the inner one is seen by
+    /// [`Self::dict_use`]) and `self.d = x = D` (the dict is stored).
+    fn note_chained_alias(&mut self, assignment: Node<'t>, scope: usize) {
+        let mut value = assignment.child_by_field_name("right");
+        let mut chained = false;
+        for _ in 0..MAX_DEPTH {
+            match value {
+                Some(inner) if inner.kind() == "assignment" => {
+                    chained = true;
+                    value = inner.child_by_field_name("right");
+                }
+                _ => break,
+            }
+        }
+        let (Some(value), true) = (value, chained) else {
+            return;
+        };
+        if value.kind() != "identifier" {
+            return;
+        }
+        let root = self.text(value);
+        match assignment.child_by_field_name("left") {
+            Some(target) if target.kind() == "identifier" => self.exposed.push(Exposed {
+                root,
+                node: value,
+                scope,
+                alias: Some(self.text(target)),
+            }),
+            _ => {
                 self.escaped.insert(root);
             }
+        }
+    }
+
+    /// `K.cfg` or `self.cfg` used where a dict held there may be changed
+    /// (assigned to a name, passed, iterated): the attribute name
+    /// escapes, so a dict aliased by an attribute of that name is not read.
+    fn note_dict_attribute(&mut self, node: Node<'t>, frame: &Frame<'t>) {
+        if matches!(self.dict_use(frame, true), DictUse::Safe) {
+            return;
+        }
+        if let Some(attr) = node.child_by_field_name("attribute") {
+            self.escaped.insert(self.text(attr));
         }
     }
 
@@ -6284,6 +6382,18 @@ fn chain_root_name<'t>(mut node: Node<'t>, text: impl Fn(Node<'t>) -> &'t str) -
         };
     }
     None
+}
+
+/// `globals()`, `locals()` or `vars()` with no argument: the namespace
+/// itself, whose keys are binding names.
+fn is_namespace_call<'t>(node: Node<'t>, text: impl Fn(Node<'t>) -> &'t str) -> bool {
+    node.kind() == "call"
+        && node.child_by_field_name("function").is_some_and(|f| {
+            f.kind() == "identifier" && matches!(text(f), "globals" | "locals" | "vars")
+        })
+        && node
+            .child_by_field_name("arguments")
+            .is_some_and(|a| a.named_child_count() == 0)
 }
 
 /// `x.get(...)`.
