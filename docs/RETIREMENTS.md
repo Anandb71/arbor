@@ -2,9 +2,11 @@
 
 AI providers retire models on fixed dates, and a request to a retired model fails.
 OpenAI shuts down `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` on
-**14 January 2027**. `arbor retirements` finds every call in your code that uses a
-model its provider has retired or is retiring. For each call it shows the replacement
-the provider lists and the other arguments that have to change with it.
+**14 January 2027**. `arbor retirements` finds the direct `openai`, `anthropic` and
+Google SDK calls in your code that use a model its provider has retired or is
+retiring. For each call it shows the replacement the provider lists, the other
+arguments that have to change with it, and the choices your repository has to make
+first.
 
 ```bash
 npx @anandb71/arbor-cli retirements .
@@ -27,22 +29,29 @@ Model retirements in . (1 Python file checked)
 
 3 calls use models OpenAI shuts down on 14 Jan 2027 (88 days)
   app/chat.py:12  gpt-4o (MODEL, line 8) → gpt-6-luna
-                  also change: max_tokens → max_completion_tokens, add reasoning_effort="none" (for temperature, max_tokens)
+                  also change: max_tokens → max_completion_tokens
+                  decide: keep reasoning off (add reasoning_effort="none"; keep temperature) or let the model reason (remove temperature)
   app/chat.py:21  gpt-4o-mini (line 22) → gpt-6-luna  fallback of an environment or config lookup: confirm the deployed value
+                  decide: keep reasoning off (add reasoning_effort="none") or let the model reason (no change)
                   check: stop and logit_bias are not supported on gpt-6-luna (400).
   app/chat.py:29  gpt-4.1 → gpt-6-luna
-                  also change: add reasoning_effort="none" (for tools)
-  note: gpt-6-luna is OpenAI's most efficient tier; GPT-4o and GPT-4.1 were flagship models, so answer quality may change.
+                  decide: keep reasoning off (add reasoning_effort="none"; keep tools) or let the model reason (remove tools)
+  decide once for this repo (Arbor does not choose): gpt-6-luna reasons at medium effort by default, and this model answered without a reasoning step.
+    keep reasoning off: Closest to the old non-reasoning model: the call keeps answering without a reasoning step. (not verified)
+                        ...
+    let the model reason: The model reasons at medium: slower, reasoning tokens are billed as output tokens, max_completion_tokens also has to cover reasoning, and answers may change.
+                          The model reasons, but the request no longer offers its tools, so the app's tool calls stop. ...
+  note: If gpt-6-luna reasons, max_completion_tokens also bounds its reasoning tokens, so a small limit can be used up before any visible text.
   ...
 
 Not checked: 1 call takes the model from somewhere Arbor cannot read (an environment variable, a function argument, another module); arbor usages lists it.
-Not listed: 1 call reaches these models through Azure, a custom base_url or another cloud, where the provider's dates may not apply. Add --include-routed to list it.
+Not listed: 1 call reaches these models through Azure, another host in base_url or another cloud, where the provider's dates may not apply. Add --include-routed to list it.
 Summary: 4 calls in 1 file use retired or retiring models: 1 already retired, 3 retiring (next: 14 Jan 2027, 88 days).
-3 can move to the listed replacement with the changes shown; 1 needs a manual check.
+1 can move to the listed replacement with the changes shown; 2 can move once this repo makes the choice shown under decide; 1 needs a manual check.
 Failing (exit 1): 1 call uses a model that is already retired.
 ```
 
-(Run on 18 October 2026. Days are counted from the day you run it.)
+(Run on 18 October 2026. Days are counted from the day you run it, in UTC.)
 
 For each affected call it reports:
 
@@ -50,11 +59,27 @@ For each affected call it reports:
 |---|---|
 | **Where** | `file:line`, and the line of the string to edit when the model comes from a constant or a default |
 | **When** | Already retired, or the shutdown date and the days left. Google lists its Gemini dates as the earliest possible, so those read "on or after". |
-| **Replacement** | The model the provider's deprecation page lists. Arbor does not pick a "better" one. When the provider lists several models, or none, the report says so. |
-| **Also change** | Arguments that must change with the replacement, worked out from the arguments the call passes. For example, `max_tokens` becomes `max_completion_tokens` and `reasoning_effort="none"` is added when the call sets `temperature` or `tools`. |
-| **Check** | What needs a person: parameters the replacement rejects (`stop`, `logit_bias`), fine-tuned models, embedding models (new vectors), several listed replacements. |
+| **Replacement** | The model the provider's deprecation page lists. Arbor does not pick a "better" one. When the listed model is itself retired or retiring, Arbor follows what the provider lists for it in turn and shows the first one that still works: `gpt-4-vision-preview → gpt-6-luna (via gpt-4o)`. Such a call always needs a manual check, and `--json` has the whole chain. When the provider lists several models, or none, the report says so. |
+| **Also change** | Arguments that must change with the replacement, worked out from the arguments the call passes: for example `max_tokens` becomes `max_completion_tokens` on gpt-6-luna. Only changes the provider documents as required are listed here. |
+| **Decide** | Choices your repository makes once, which Arbor never makes for you. Today that is the reasoning effort on OpenAI's new models: gpt-6-luna and GPT-5.6 reason by default, while gpt-4o and gpt-4.1 did not. You can keep reasoning off (`reasoning_effort="none"`; parameters such as `temperature` and `tools` keep working) or let the model reason (slower, reasoning tokens are billed, and those parameters have to go). The report shows both options with their effect and how well each effect is established. |
+| **Check** | What needs a person: parameters the replacement rejects (`stop`, `logit_bias`), fine-tuned models, embedding models (new vectors), several listed replacements, a model set in a request parameter object such as a tool config. |
 | **Confidence** | *Confirmed*: a literal or a constant in the same file. *Confirm first*: the fallback of `os.getenv(...)`, a parameter default, or one of the values a dict lookup, a branch or an in-file caller may give; the value at run time may differ. *Gap*: an SDK-shaped call whose client Arbor could not resolve (built by a factory, passed in). |
-| **Routing** | A provider's dates apply to its own API. Calls through Azure OpenAI, a custom `base_url` (OpenRouter, LiteLLM, a proxy), Bedrock or Vertex are counted separately; `--include-routed` lists them. |
+| **Routing** | A provider's dates apply to its own API. A client whose `base_url` is the provider's own host (`https://api.openai.com/v1`), `None`, or an environment lookup that falls back to that host is a direct call. A `base_url` read only from the environment, or from code Arbor cannot read, is listed with *routing unknown*. Calls through Azure OpenAI, another host in `base_url` (OpenRouter, LiteLLM, a proxy), Bedrock or Vertex are counted separately; `--include-routed` lists them. |
+
+Calls through LangChain, LiteLLM's own API, LlamaIndex or other wrappers are not
+checked yet, so a clean result says "No direct openai/anthropic/google SDK calls"
+and nothing more.
+
+Fine-tuned models (`ft:<base>:...`) follow their base model's schedule. Arbor names a
+base model to retrain on only when the provider lists one that supports fine-tuning;
+today none does (gpt-6-luna and the GPT-5.6 models do not support fine-tuning), so the
+report says that no fine-tunable replacement is listed.
+
+Objects built from SDK types in code that sends nothing, such as
+`ChatCompletion(model=...)` in a test fixture, Anthropic's `Message(...)`, or
+`.model_validate(...)`, are skipped and counted on one "Skipped" line. Tool configs
+and other request parameter objects (`ImageGeneration(model=...)`) are checked, since
+their model is sent with a request.
 
 ## Options and exit codes
 
@@ -62,16 +87,30 @@ For each affected call it reports:
 |---|---|
 | `--json` | One JSON object on stdout, errors included (`{"version", "error"}`) |
 | `--markdown` | A Markdown report, for a CI job summary |
-| `--annotations` | GitHub Actions annotations, one warning per affected call |
+| `--annotations` | GitHub Actions annotations: one warning per affected call, most urgent first, up to `--max-annotations` (default 10, GitHub's limit per step), then one notice saying how many more there are |
+| `--markdown-out <file>` | Also write the Markdown report to a file, from the same scan |
 | `--fail-within <days>` | Also fail when a model retires within this many days |
-| `--include-routed` | List calls through Azure, a custom `base_url` or another cloud, and let them fail the check |
+| `--count-unconfirmed` | Also let unconfirmed calls fail the check (see below) |
+| `--include-routed` | List calls through Azure, another host in `base_url` or another cloud, and let them fail the check |
 | `--quiet` | Only the calls and the summary |
 
 | Exit code | Meaning |
 |---|---|
-| `0` | Nothing failing. Calls to models that retire later are still listed. |
-| `1` | A call uses a model that is already retired, or, with `--fail-within N`, one that retires within N days |
+| `0` | Nothing failing. Calls to models that retire later, and unconfirmed calls, are still listed. |
+| `1` | A confirmed call uses a model that is already retired, or, with `--fail-within N`, one that retires within N days |
 | `2` | The check could not run (a missing path, a bad flag) |
+
+By default only **confirmed** values at **direct** calls count toward exit 1. The
+others are listed, and a "Not counted" line says how many there are:
+environment or config fallbacks, parameter defaults, values a lookup, branch or caller
+may give, calls whose client was not resolved, and calls whose routing is unknown.
+`--count-unconfirmed` counts them too; `--include-routed` adds the routed calls.
+
+A shutdown date counts in UTC, and **on the shutdown date itself the call counts as
+retired**: the provider may switch the model off at any time that day. So a `gpt-4o`
+call fails the check from 14 January 2027 (UTC) on, and reads "OpenAI shuts down
+today" that day. Google's "earliest" dates are a possibility, not a
+shutdown: from that day on the call is listed as "may stop working" and does not fail.
 
 ## In CI: GitHub Action
 
@@ -90,11 +129,16 @@ jobs:
           # retirements-fail-on: retired   # or a number of days, e.g. 90
 ```
 
-The job summary gets the Markdown report and each affected line gets a warning
-annotation. The Action never fails the build unless you set `retirements-fail-on`
-to `retired` or to a number of days. `retirements-path` picks a subdirectory, and
-`retirements-include-routed: "true"` adds the routed calls. The check runs on the
-runner and sends nothing anywhere.
+The Action scans once. The job summary gets the Markdown report, which lists every
+call. Affected lines get warning annotations: GitHub shows at most 10 warnings per
+step, so Arbor writes the 10 most urgent and one notice saying how many more the
+summary lists. The Action fails the build only if you set `retirements-fail-on` to
+`retired` or to a number of days, with one exception: when the check cannot run
+(exit 2: a missing path, a bad `retirements-fail-on` value), the step fails even with
+`retirements-fail-on: never`, so a missing report never passes quietly.
+`retirements-path` picks a subdirectory, `retirements-include-routed: "true"` adds the
+routed calls, and `retirements-count-unconfirmed: "true"` lets unconfirmed calls fail
+it too. The check runs on the runner and sends nothing anywhere.
 
 ## Scope today
 
@@ -102,12 +146,13 @@ runner and sends nothing anywhere.
 - **Providers:** OpenAI, Anthropic, the Gemini API and Gemini on Google Cloud (Vertex AI):
   283 model IDs from their deprecation pages, plus aliases and changelog entries those
   pages leave out, such as the four OpenAI aliases above.
-- **SDK calls only.** It reads the `openai`, `anthropic`, `google-genai` and
+- **Direct SDK calls only.** It reads the `openai`, `anthropic`, `google-genai` and
   `google-generativeai` SDKs. Framework wrappers (LangChain, LlamaIndex, LiteLLM's own
-  API) are not tracked yet. Model IDs in `.env`, YAML, JSON or notebooks are not read.
+  API) are not checked yet. Model IDs in `.env`, YAML, JSON or notebooks are not read.
 - **Values it can see.** A model passed in from an environment variable, a function
   argument or another module is counted under "Not checked"; `arbor usages` lists those
-  calls. So is a call that passes no model, where the SDK's or the server's default applies. Argument checks look at the argument *names* a call passes, not their values,
+  calls. So is a call that passes no model, where the SDK's or the server's default
+  applies. Argument checks look at the argument *names* a call passes, not their values,
   and not at parameters nested in config objects such as Gemini's
   `GenerateContentConfig`.
 - **Exact matches.** A value matches only when the whole string equals a listed ID.
@@ -118,25 +163,33 @@ runner and sends nothing anywhere.
 ## Where the data comes from
 
 The model IDs, dates and replacements come from the providers' own deprecation pages,
-and every one was checked against a saved copy of the page. The data was last read on
-**18 October 2026**, and each report prints that date. The argument rules come from
-the providers' migration guides and API references. Rules marked `live` in the JSON were
-confirmed with real API calls on 18 October 2026. Those calls used Chat Completions; the
-Responses API was not tested. Rules marked `unverified` are reported as checks, not
-changes.
+and every one was checked against a saved copy of the page. Each report prints the day
+each provider's pages were read (in the bundled data: OpenAI on 18 October 2026,
+Anthropic and Google on 16 October 2026), and the data date in `--json` is the oldest
+of them. The argument rules come from the providers' migration guides and API
+references. A rule marked `live` in the JSON was confirmed with real API calls on
+18 October 2026; the label is shown only for the models those calls used and only on
+Chat Completions, the one API they called. Elsewhere the same rule reads `docs` (a
+provider page states it) or `unverified`. Rules marked `unverified` are reported as
+checks, not changes, and a decision option whose effect is not verified says so.
 
 The data is bundled into Arbor at build time, so it changes only when you update Arbor.
 When the data is more than 90 days old, the report reminds you to update. It is built by
 [`scripts/retirements/generate_model_retirements.py`](../scripts/retirements/generate_model_retirements.py)
-from Arbor's retirement recipes. The generator keeps provenance with the data: the
-pages, the recipe versions and the date. A test fails `cargo test` if the file is edited
-by hand.
+from Arbor's retirement recipes, which live in a private research repository. The
+generator keeps provenance with the data: the provider pages, each recipe's version,
+the date its pages were read and the SHA-256 of the recipe file. Every fact names the
+provider page it came from, so you can check it there. A test fails `cargo test` if
+any part of the file except its write date is edited by hand, and releases regenerate
+it (see [RELEASING.md](RELEASING.md)).
 
 ## Privacy
 
 `arbor retirements` reads source files on your machine and prints a report. It makes no
 network requests and has no telemetry. Model values are captured only for model
-arguments, and credential-shaped strings are never captured or printed.
+arguments, and credential-shaped strings are never captured or printed. For a client
+given a `base_url`, Arbor reads that argument to tell the provider's own host from a
+proxy; it reports only that class, never the URL.
 
 The human report ends with one line offering automated fix pull requests. That line is
 never printed with `--json`, `--markdown`, `--annotations`, `--quiet`, or when `CI` is set.

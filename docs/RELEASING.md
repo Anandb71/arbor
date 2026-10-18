@@ -65,6 +65,23 @@ Also enable **Settings → Actions → General → Allow GitHub Actions to creat
 ## Recommended release sequence
 
 1. Ensure `CHANGELOG.md` and `docs/RELEASE_NOTES_vX.Y.Z.md` are updated.
+1. Regenerate the model retirement data, so the release ships the providers' latest
+   deprecation pages. It needs a checkout of the retirement recipes
+   (`getArbor-dev/arbor-cloud`, branch `docs/self-maintaining-apis-research` until they
+   merge, folder `recipes/`) and PyYAML:
+
+   ```bash
+   # Fails (exit 1) and names each recipe that changed when the data is stale.
+   python3 scripts/retirements/generate_model_retirements.py --recipes ../arbor-cloud/recipes --check
+   # If it does: regenerate, review the diff, and commit it with the release.
+   python3 scripts/retirements/generate_model_retirements.py --recipes ../arbor-cloud/recipes \
+       --source "getArbor-dev/arbor-cloud@$(git -C ../arbor-cloud rev-parse HEAD):recipes/"
+   cargo test -p arbor-core retirements
+   ```
+
+   Exit 2 means a recipe uses a rule, option or condition the generator cannot
+   translate yet: extend the generator rather than editing the JSON by hand (the
+   digest test fails on any hand edit).
 2. Bump the workspace version, the internal crate dependency versions, `Cargo.lock`, `agent-card.json`, `packaging/npm/package.json` and `extensions/arbor-vscode/package.json` (and its lockfile). Leave `packaging/homebrew` and `packaging/scoop` alone: the release workflow writes them once the assets and their checksums exist.
 3. Create and push a release tag:
    - `vX.Y.Z`

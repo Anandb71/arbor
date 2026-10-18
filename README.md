@@ -235,7 +235,7 @@ claude mcp add --transport stdio --scope project arbor -- arbor bridge
 
 ## Find code that calls retiring AI models
 
-OpenAI shuts down `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` on 14 January 2027, and Anthropic and Google retire models on their own dates. `arbor retirements` lists every call that uses a retired or retiring model. For each one it shows the replacement the provider lists and the arguments that have to change with it.
+OpenAI shuts down `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` on 14 January 2027, and Anthropic and Google retire models on their own dates. `arbor retirements` lists the direct `openai`, `anthropic` and Google SDK calls that use a retired or retiring model. For each one it shows the replacement the provider lists, the arguments that have to change with it, and the choices your repo makes first (such as whether gpt-6-luna should reason). Calls through LangChain, LiteLLM or other wrappers are not checked yet.
 
 ```bash
 npx @anandb71/arbor-cli retirements .
@@ -244,14 +244,17 @@ npx @anandb71/arbor-cli retirements .
 ```text
 3 calls use models OpenAI shuts down on 14 Jan 2027 (88 days)
   app/chat.py:12  gpt-4o (MODEL, line 8) → gpt-6-luna
-                  also change: max_tokens → max_completion_tokens, add reasoning_effort="none" (for temperature, max_tokens)
+                  also change: max_tokens → max_completion_tokens
+                  decide: keep reasoning off (add reasoning_effort="none"; keep temperature) or let the model reason (remove temperature)
   app/chat.py:21  gpt-4o-mini (line 22) → gpt-6-luna  fallback of an environment or config lookup: confirm the deployed value
+                  decide: keep reasoning off (add reasoning_effort="none") or let the model reason (no change)
                   check: stop and logit_bias are not supported on gpt-6-luna (400).
 ```
 
 - **Runs locally.** No account, no API key, no telemetry; no code leaves your machine.
-- **Honest about confidence.** Literals are confirmed. `os.getenv("MODEL", "gpt-4o")` fallbacks are marked *confirm first*. Calls through Azure, OpenRouter or a proxy are listed apart (`--include-routed`), because the provider's dates may not apply there. Models Arbor cannot read are counted, not hidden.
-- **CI ready.** `--json`, `--markdown`, `--annotations`, and `--fail-within <days>`. Exit code 1 means a retired model is in use, or one retiring inside your window.
+- **Honest about confidence.** Literals are confirmed. `os.getenv("MODEL", "gpt-4o")` fallbacks are marked *confirm first* and fail the check only with `--count-unconfirmed`. Calls through Azure, OpenRouter or a proxy are listed apart (`--include-routed`), because the provider's dates may not apply there; a `base_url` on the provider's own host is a direct call. Models Arbor cannot read are counted, not hidden.
+- **Arbor does not decide for you.** When the replacement behaves differently by design (gpt-6-luna reasons by default; gpt-4o did not), the report shows both options and what each costs, and changes nothing until you choose.
+- **CI ready.** `--json`, `--markdown`, `--annotations`, `--markdown-out <file>` and `--fail-within <days>`. Exit code 1 means a confirmed call uses a retired model, or one retiring inside your window; the shutdown day itself counts as retired (UTC).
 - **Scope today:** Python with the `openai`, `anthropic` and Google GenAI SDKs. TypeScript and JavaScript are coming.
 
 GitHub Action (warns by default; it fails the build only if you ask it to):
@@ -325,7 +328,7 @@ Every tool returns `{ ok, tool, data, meta: { suggested_next_tool, suggested_nex
 | `arbor path <a> <b>` | Shortest call-graph path |
 | `arbor refactor <sym>` | Blast radius before refactoring |
 | `arbor usages` | OpenAI, Anthropic and Gemini SDK calls in Python: client routing (direct, Azure, custom `base_url`, Bedrock, Vertex), model IDs and typed gaps; never prints credentials. `--sdk openai\|anthropic\|google`, `--json`. What a value with no gap confirms: [docs/SDK_USAGES.md](docs/SDK_USAGES.md) |
-| `arbor retirements` | Calls to AI models their provider has retired or is retiring (Python): date and days left, listed replacement, the argument changes it needs. `--fail-within <days>`, `--include-routed`, `--json`, `--markdown`, `--annotations` ([guide](docs/RETIREMENTS.md)) |
+| `arbor retirements` | Direct SDK calls to AI models their provider has retired or is retiring (Python): date and days left, listed replacement, the argument changes and per-repo choices it needs. `--fail-within <days>`, `--count-unconfirmed`, `--include-routed`, `--json`, `--markdown`, `--annotations` ([guide](docs/RETIREMENTS.md)) |
 | `arbor diff` | Git-change impact report, per symbol: new symbols carry no blast radius. `--base <ref>` compares against the merge base (what a PR shows), `--staged` only staged changes |
 | `arbor check` | CI safety gate (`--max-blast-radius N`, `--base <ref>`) |
 | `arbor summary` | Auto-generate PR description (`--base <ref>`) |
@@ -415,7 +418,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-`mode: retirements` runs `arbor retirements` instead. It writes a job summary and annotates each call to a retiring model ([guide](docs/RETIREMENTS.md#in-ci-github-action)).
+`mode: retirements` runs `arbor retirements` instead. It writes a job summary that lists every call to a retiring model and annotates the 10 most urgent lines, GitHub's limit per step ([guide](docs/RETIREMENTS.md#in-ci-github-action)).
 
 ---
 
