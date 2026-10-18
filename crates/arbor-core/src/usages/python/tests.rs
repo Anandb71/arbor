@@ -2443,3 +2443,36 @@ client.chat.completions.create(model=CONFIG.get("model"), messages=[])
         .collect();
     assert_eq!(models, vec!["gpt-4o", "o3", "gpt-4o"]);
 }
+
+#[test]
+fn same_named_nested_functions_resolve_their_callers_in_linear_time() {
+    // Each nested `f` scanned every call of `f` in the file: 16,500 of them
+    // in a 2 MB file took 62 s.
+    let mut source = String::from("from openai import OpenAI\nclient = OpenAI()\n");
+    for i in 0..6_000 {
+        source.push_str(&format!(
+            "def o{i}():\n    def f(c):\n        return c.chat.completions.create(model=\"gpt-4\", messages=[])\n    return f(client)\n"
+        ));
+    }
+    // Calls of `f` that bind elsewhere (the module) do not count.
+    for _ in 0..20_000 {
+        source.push_str("f()\n");
+    }
+    // Same-named methods called on `self` in many classes.
+    for i in 0..3_000 {
+        source.push_str(&format!(
+            "class K{i}:\n    def _send(self, c):\n        return c.chat.completions.create(model=\"gpt-4\", messages=[])\n    def run(self):\n        return self._send(client)\n"
+        ));
+    }
+    let found = usages_within(&source, 10);
+    // Nested functions resolve from their only caller.
+    let resolved = found
+        .calls
+        .iter()
+        .filter(|c| c.chain == "c.chat.completions.create" && c.routing == Routing::OpenaiDirect)
+        .count();
+    assert_eq!(resolved, 6_000);
+    // Methods of the same name in other classes may be inherited, so those
+    // stay gaps.
+    assert_eq!(gaps(&found, GapKind::UnknownClientFactory).len(), 3_000);
+}

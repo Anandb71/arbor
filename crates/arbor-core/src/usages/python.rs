@@ -860,6 +860,13 @@ struct ConfigAssign<'t> {
     scope: usize,
 }
 
+/// Calls of a method name on `self`/`cls`, by calling class.
+struct MethodCalls<'t> {
+    /// Some call is on another object.
+    foreign: bool,
+    by_class: HashMap<usize, Rc<[(Node<'t>, usize)]>>,
+}
+
 /// Calls of a function or method name, and whether the name is also used as
 /// a value (passed, stored, decorated, rebound).
 #[derive(Default)]
@@ -1055,6 +1062,8 @@ struct Ctx<'t> {
     nested_left: usize,
     attr_lookup_memo: HashMap<Key, Rc<[Assign<'t>]>>,
     caller_memo: HashMap<Key, Memo<Option<Val>>>,
+    name_call_index: HashMap<String, Rc<HashMap<usize, Rc<[(Node<'t>, usize)]>>>>,
+    method_call_index: HashMap<String, Rc<MethodCalls<'t>>>,
     /// Resolutions in progress: (kind, scope or id, name).
     visiting: HashSet<(u8, usize, String)>,
     /// Current nesting of name resolutions, and how many were cut off at
@@ -1117,6 +1126,8 @@ impl<'t> Ctx<'t> {
             nested_left: MAX_FILE_NESTED_VALUES,
             attr_lookup_memo: HashMap::new(),
             caller_memo: HashMap::new(),
+            name_call_index: HashMap::new(),
+            method_call_index: HashMap::new(),
             visiting: HashSet::new(),
             name_depth: 0,
             cutoffs: 0,
@@ -2881,7 +2892,6 @@ impl<'t> Ctx<'t> {
             return None;
         }
         let parent = scope.parent?;
-        let fname = scope.name.clone();
         let method = self.scopes[parent].kind == ScopeKind::Class;
         let shift = usize::from(method && !scope.staticmethod);
         let index = scope.slots.iter().position(|s| s.name == name)?;
@@ -2893,46 +2903,7 @@ impl<'t> Ctx<'t> {
             matches!(slot, SlotKind::Positional | SlotKind::PositionalOnly).then(|| index - shift);
         let keyword = (slot != SlotKind::PositionalOnly).then_some(name);
 
-        let calls: Vec<(Node<'t>, usize)> = if method {
-            let uses = self.attr_uses.get(fname.as_str())?;
-            if uses.escapes {
-                return None;
-            }
-            let mut calls = Vec::new();
-            for &(call, call_scope) in &uses.calls {
-                let object = call
-                    .child_by_field_name("function")
-                    .and_then(|f| f.child_by_field_name("object"))?;
-                let on_self = object.kind() == "identifier"
-                    && matches!(self.text(object), "self" | "cls")
-                    && self.scopes[call_scope].class == Some(parent);
-                if !on_self {
-                    return None;
-                }
-                calls.push((call, call_scope));
-            }
-            calls
-        } else {
-            let home = self.import_home(parent, &fname);
-            let key = (home, fname.clone());
-            let only_def = self.functions.get(&key).map_or(0, Vec::len) == 1
-                && !self.assigns.contains_key(&key)
-                && !self.imports.contains_key(&key)
-                && !self.other_imports.contains_key(&key)
-                && !self.params.contains_key(&key);
-            if !only_def {
-                return None;
-            }
-            let uses = self.name_uses.get(fname.as_str())?;
-            if uses.escapes {
-                return None;
-            }
-            uses.calls
-                .iter()
-                .copied()
-                .filter(|(_, call_scope)| self.binding_scope(&fname, *call_scope) == home)
-                .collect()
-        };
+        let calls = self.calls_of(func)?;
         if calls.is_empty() {
             return None;
         }
@@ -2942,7 +2913,7 @@ impl<'t> Ctx<'t> {
             .get(&(func, name.to_string()))
             .and_then(|p| p.default);
         let mut vals = Vec::new();
-        for (call, call_scope) in calls {
+        for &(call, call_scope) in calls.iter() {
             let val = match argument_for(call, position, keyword, |n| self.text(n)) {
                 ArgFor::Found(expr) => self.eval(expr, call_scope, 0),
                 ArgFor::Missing => self.eval(default?, parent, 0),
@@ -2968,6 +2939,114 @@ impl<'t> Ctx<'t> {
             }
             _ => None,
         }
+    }
+
+    /// Every in-file call of function or method `func`, or `None` when some
+    /// may not be seen: it is a lambda or decorated, its name is used as a
+    /// value or bound more than once, or (for a method) it is called on
+    /// something other than `self`/`cls` of its class. Calls are indexed by
+    /// binding scope (by class for methods) once per name, so a file with
+    /// thousands of same-named functions stays linear.
+    fn calls_of(&mut self, func: usize) -> Option<Rc<[(Node<'t>, usize)]>> {
+        let scope = &self.scopes[func];
+        if scope.lambda || scope.decorated {
+            return None;
+        }
+        let parent = scope.parent?;
+        let fname = scope.name.clone();
+        let empty = || Rc::from(Vec::new());
+        if self.scopes[parent].kind == ScopeKind::Class {
+            if self.attr_uses.get(fname.as_str())?.escapes {
+                return None;
+            }
+            let index = self.method_calls(&fname);
+            if index.foreign {
+                return None;
+            }
+            return match index.by_class.len() {
+                0 => Some(empty()),
+                1 => match index.by_class.get(&parent) {
+                    Some(calls) => Some(Rc::clone(calls)),
+                    // Only another class calls a method of this name on
+                    // `self`: it may inherit this one.
+                    None => None,
+                },
+                _ => None,
+            };
+        }
+        let home = self.import_home(parent, &fname);
+        let key = (home, fname.clone());
+        let only_def = self.functions.get(&key).map_or(0, Vec::len) == 1
+            && !self.assigns.contains_key(&key)
+            && !self.imports.contains_key(&key)
+            && !self.other_imports.contains_key(&key)
+            && !self.params.contains_key(&key);
+        if !only_def || self.name_uses.get(fname.as_str())?.escapes {
+            return None;
+        }
+        let index = self.name_calls(&fname);
+        Some(index.get(&home).map_or_else(empty, Rc::clone))
+    }
+
+    /// The calls of bare name `name`, grouped by the scope that binds the
+    /// name at each call. Built once per name.
+    fn name_calls(&mut self, name: &str) -> Rc<HashMap<usize, Rc<[(Node<'t>, usize)]>>> {
+        if let Some(index) = self.name_call_index.get(name) {
+            return Rc::clone(index);
+        }
+        let mut grouped: HashMap<usize, Vec<(Node<'t>, usize)>> = HashMap::new();
+        if let Some(uses) = self.name_uses.get(name) {
+            for &(call, call_scope) in &uses.calls {
+                let home = self.binding_scope(name, call_scope);
+                grouped.entry(home).or_default().push((call, call_scope));
+            }
+        }
+        let index: Rc<HashMap<usize, Rc<[(Node<'t>, usize)]>>> = Rc::new(
+            grouped
+                .into_iter()
+                .map(|(home, calls)| (home, Rc::from(calls)))
+                .collect(),
+        );
+        self.name_call_index
+            .insert(name.to_string(), Rc::clone(&index));
+        index
+    }
+
+    /// The calls of method name `name` on `self`/`cls`, grouped by the
+    /// calling class. Built once per name.
+    fn method_calls(&mut self, name: &str) -> Rc<MethodCalls<'t>> {
+        if let Some(index) = self.method_call_index.get(name) {
+            return Rc::clone(index);
+        }
+        let mut foreign = false;
+        let mut grouped: HashMap<usize, Vec<(Node<'t>, usize)>> = HashMap::new();
+        if let Some(uses) = self.attr_uses.get(name) {
+            for &(call, call_scope) in &uses.calls {
+                let object = call
+                    .child_by_field_name("function")
+                    .and_then(|f| f.child_by_field_name("object"));
+                let class = self.scopes[call_scope].class;
+                match (object, class) {
+                    (Some(object), Some(class))
+                        if object.kind() == "identifier"
+                            && matches!(self.text(object), "self" | "cls") =>
+                    {
+                        grouped.entry(class).or_default().push((call, call_scope));
+                    }
+                    _ => foreign = true,
+                }
+            }
+        }
+        let index = Rc::new(MethodCalls {
+            foreign,
+            by_class: grouped
+                .into_iter()
+                .map(|(class, calls)| (class, Rc::from(calls)))
+                .collect(),
+        });
+        self.method_call_index
+            .insert(name.to_string(), Rc::clone(&index));
+        index
     }
 
     fn assign_value(&mut self, assign: Assign<'t>) -> Val {
