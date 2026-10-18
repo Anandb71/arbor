@@ -1,0 +1,127 @@
+{
+  "corpus_version": 1,
+  "suite": "usages",
+  "language": "python",
+  "covers": [
+    "the findings of the second review of #276 and the Track C re-measurement, one shape each",
+    "a **DICT of 40 fallbacks expanded at three calls: at most 32 nested values per call and a truncated gap",
+    "credentials through ApiKeys.openai, PASSWD, CREDENTIALS, db_pwd, a URL with a password, a credential-shaped lookup key and an extra_body.credentials key",
+    "dicts changed through a chain, an alias, a helper and an attribute are never read; a dict that is only read still resolves",
+    "OPENAI_BASE_URL set in the file, base_url assigned after construction, a constructor imported two ways",
+    "a dict lookup with a run-time key and a name assigned in two branches list the values they may take; a request with no model is a gap; a nested env fallback keeps its gap",
+    "parameter defaults overridden by in-file callers, client defaults weighed against callers, a dict.get default resolved where the call runs, a client known only from the callers of a public function",
+    "comprehension targets, a function called between rebindings, a class body run before a rebinding, and a client rebound in another branch of the same loop (Track C h042)"
+  ],
+  "usages_expected": [
+    {"at": "app/amplify.py:23", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o", "extra_body.fallbacks.model": "gpt-4-0613"}},
+    {"at": "app/amplify.py:24", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o", "extra_body.fallbacks.model": "gpt-4-0613"}},
+    {"at": "app/amplify.py:25", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o", "extra_body.fallbacks.model": "gpt-4-0613"}},
+
+    {"at": "app/credentials.py:21", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/credentials.py:25", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/credentials.py:29", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/credentials.py:33", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/credentials.py:37", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/credentials.py:41", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/credentials.py:45", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+
+    {"at": "app/dicts.py:9", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/dicts.py:14", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/dicts.py:24", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/dicts.py:34", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/dicts.py:38", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4.1"}},
+
+    {"at": "app/env_endpoint.py:8", "chain": "local.chat.completions.create", "routing": "unknown", "values": {"model": "gpt-4"}},
+    {"at": "app/env_endpoint.py:11", "chain": "own.chat.completions.create", "routing": "custom_base_url", "values": {"model": "gpt-4"}},
+
+    {"at": "app/lookups.py:11", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/lookups.py:20", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/lookups.py:23", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/lookups.py:24", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o", "extra_body.fallbacks.model": "gpt-4-0314"}},
+
+    {"at": "app/params.py:13", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "app/params.py:21", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o-mini"}},
+    {"at": "app/params.py:29", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "app/params.py:33", "chain": "c.chat.completions.create", "routing": "unknown", "values": {"model": "gpt-4"}},
+    {"at": "app/params.py:40", "chain": "c.chat.completions.create", "routing": "custom_base_url", "values": {"model": "gpt-4"}},
+    {"at": "app/params.py:45", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "app/params.py:50", "chain": "llm.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4.1"}},
+    {"at": "app/params.py:54", "chain": "llm.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4.1"}},
+
+    {"at": "app/rerouted.py:11", "chain": "router.chat.completions.create", "routing": "unknown", "values": {"model": "gpt-4"}},
+    {"at": "app/rerouted.py:14", "chain": "plain.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4"}},
+    {"at": "app/rerouted.py:17", "chain": "either.chat.completions.create", "routing": "unknown", "values": {"model": "gpt-4"}},
+
+    {"at": "app/scopes.py:10", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/scopes.py:16", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/scopes.py:29", "chain": "self.c.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4"}},
+    {"at": "app/scopes.py:39", "chain": "llm.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "app/scopes.py:42", "chain": "llm.messages.create", "routing": "anthropic_direct", "values": {"model": "claude-3-opus-20240229"}}
+  ],
+  "clients_expected": [
+    {"at": "app/amplify.py:6", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "app/credentials.py:6", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "app/dicts.py:5", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "app/env_endpoint.py:7", "constructor": "openai.OpenAI", "binding": "local", "routing": "unknown"},
+    {"at": "app/env_endpoint.py:10", "constructor": "openai.OpenAI", "binding": "own", "routing": "custom_base_url"},
+    {"at": "app/lookups.py:8", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "app/params.py:6", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "app/params.py:7", "constructor": "openai.OpenAI", "binding": "gw", "routing": "custom_base_url"},
+    {"at": "app/rerouted.py:9", "constructor": "openai.OpenAI", "binding": "router", "routing": "openai_direct"},
+    {"at": "app/rerouted.py:13", "constructor": "openai.OpenAI", "binding": "plain", "routing": "openai_direct"},
+    {"at": "app/scopes.py:7", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "app/scopes.py:22", "constructor": "openai.OpenAI", "binding": "CL7", "routing": "openai_direct"},
+    {"at": "app/scopes.py:32", "constructor": "openai.OpenAI", "binding": "CL7", "routing": "custom_base_url"},
+    {"at": "app/scopes.py:38", "constructor": "openai.OpenAI", "binding": "llm", "routing": "openai_direct"},
+    {"at": "app/scopes.py:41", "constructor": "anthropic.Anthropic", "binding": "llm", "routing": "anthropic_direct"}
+  ],
+  "gaps_expected": [
+    {"at": "app/amplify.py:23", "kind": "unresolved_model", "reason": "truncated"},
+    {"at": "app/amplify.py:24", "kind": "unresolved_model", "reason": "truncated"},
+    {"at": "app/amplify.py:25", "kind": "unresolved_model", "reason": "truncated"},
+
+    {"at": "app/credentials.py:21", "kind": "unresolved_model", "reason": "credential"},
+    {"at": "app/credentials.py:25", "kind": "unresolved_model", "reason": "credential"},
+    {"at": "app/credentials.py:29", "kind": "unresolved_model", "reason": "credential"},
+    {"at": "app/credentials.py:33", "kind": "unresolved_model", "reason": "credential"},
+    {"at": "app/credentials.py:37", "kind": "unresolved_model", "reason": "credential"},
+    {"at": "app/credentials.py:41", "kind": "unresolved_model", "reason": "credential"},
+
+    {"at": "app/dicts.py:9", "kind": "unresolved_model", "reason": "splat"},
+    {"at": "app/dicts.py:14", "kind": "unresolved_model", "reason": "splat"},
+    {"at": "app/dicts.py:24", "kind": "unresolved_model", "reason": "splat"},
+    {"at": "app/dicts.py:34", "kind": "unresolved_model", "reason": "subscript"},
+
+    {"at": "app/env_endpoint.py:8", "kind": "ambiguous_client", "reason": "endpoint_env"},
+
+    {"at": "app/lookups.py:11", "kind": "unresolved_model", "reason": "env_var"},
+    {"at": "app/lookups.py:20", "kind": "unresolved_model", "reason": "parameter"},
+    {"at": "app/lookups.py:23", "kind": "unresolved_model", "reason": "missing_model"},
+    {"at": "app/lookups.py:24", "kind": "unresolved_model", "reason": "env_var"},
+
+    {"at": "app/params.py:13", "kind": "unresolved_model", "reason": "parameter_overridden"},
+    {"at": "app/params.py:33", "kind": "ambiguous_client", "reason": "multiple_assignments"},
+    {"at": "app/params.py:45", "kind": "unresolved_model", "reason": "parameter_overridden"},
+    {"at": "app/params.py:50", "kind": "ambiguous_client", "reason": "in_file_callers"},
+
+    {"at": "app/rerouted.py:11", "kind": "ambiguous_client", "reason": "base_url_assigned"},
+    {"at": "app/rerouted.py:17", "kind": "ambiguous_client", "reason": "multiple_assignments"},
+
+    {"at": "app/scopes.py:10", "kind": "unresolved_model", "reason": "non_literal"},
+    {"at": "app/scopes.py:16", "kind": "unresolved_model", "reason": "reassigned"}
+  ],
+  "skipped_expected": {"vendored_files": 0, "vendored_calls": 0, "hidden_files": 0, "hidden_calls": 0},
+  "forbidden_in_output": [
+    "EVALRR2",
+    "sk-proj-",
+    "postgres://",
+    "localhost:11434",
+    "gateway.example",
+    "openrouter.ai",
+    "\"gpt-3.5-turbo-instruct\"",
+    "\"o4-mini\""
+  ],
+  "known_missing": [],
+  "known_extra": [],
+  "notes": "Synthetic. Truth is what each line does at run time, except where a policy turns a value into a gap: a value refused as a credential (credentials.py:41 sends the dict.get default `gpt-4`, but its lookup key is credential-shaped, so the call is a credential gap), a model chosen by a for clause (scopes.py:10) and a name assigned again after a deferred use (scopes.py:16) are gaps, not values. Gap `values` (the models a run-time lookup, a branch or the in-file callers may give) are triage hints and are not compared here; the unit tests check them. dicts.py:9, :14 and :24 expand dicts that are changed after they are written, so they are read as unknown `**kwargs`; dicts.py:38 is only read and resolves. env_endpoint.py sets OPENAI_BASE_URL, so the client built without a base_url is unknown with an endpoint_env gap and the one given a base_url stays custom_base_url. rerouted.py:11 is given a base_url after construction; rerouted.py:16 builds an AzureOpenAI or an OpenAI depending on the import, so its call is ambiguous and the construction is not listed as a client. params.py:33 is public, so its client default and its caller's gateway are both possible; params.py:40 is private and its only caller passes the gateway. params.py:50 resolves from its only caller but keeps an in_file_callers gap because send() is public; _send() at :54 does not. scopes.py:29 reads CL7 when the class body runs, before CL7 is rebound. scopes.py:39 and :42 are Track C h042: the client in each branch dominates its own call. amplify.py expands 40 nested fallbacks at each call: 32 are listed (one distinct value) and a truncated gap says more were cut. `gpt-3.5-turbo-instruct` is the module M that params.py:29 must not report, and `o4-mini` is what tweak() writes into a dict that must not be read."
+}

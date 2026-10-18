@@ -75,6 +75,12 @@
       "language": "python",
       "suite": "usages",
       "covers": "real SDK example code from openai-python (Apache-2.0), anthropic-sdk-python (MIT) and deprecated-generative-ai-python (Apache-2.0)"
+    },
+    {
+      "name": "py-sdk-rereview",
+      "language": "python",
+      "suite": "usages",
+      "covers": "the second review of #276 and the Track C re-measurement: bounded **DICT expansion, wider credential refusal, dict mutations, endpoints set after construction or in the environment, parameter defaults against their callers, run-time lookups, missing models, per-use scoping and the h042 loop"
     }
   ]
 }
