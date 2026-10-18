@@ -3597,3 +3597,98 @@ fn dicts_aliased_by_a_chain_a_class_attribute_or_the_namespace_are_not_read() {
         assert_eq!(rows[0].1, "gpt-4o", "{body}");
     }
 }
+
+#[test]
+fn match_captures_except_targets_star_imports_and_globals_rebind() {
+    // `case str() as model5`, `except ... as model11`, `from mod import *`
+    // and `globals()["M"] = ...` bound nothing, so each call reported the
+    // earlier `gpt-4o` with no gap.
+    let header = "import os\nfrom openai import OpenAI\nclient = OpenAI()\n";
+    for (body, reason) in [
+        (
+            "model5 = \"gpt-4o\"\nmatch os.getenv(\"M\"):\n    case str() as model5:\n        pass\nclient.chat.completions.create(model=model5, messages=[])\n",
+            "reassigned",
+        ),
+        (
+            "m = \"gpt-4o\"\nmatch os.getenv(\"M\"):\n    case m:\n        pass\nclient.chat.completions.create(model=m, messages=[])\n",
+            "reassigned",
+        ),
+        (
+            "m = \"gpt-4o\"\nmatch cfg:\n    case {\"model\": m, **rest}:\n        pass\nclient.chat.completions.create(model=m, messages=[])\n",
+            "reassigned",
+        ),
+        (
+            "m = \"gpt-4o\"\nmatch cfg:\n    case Cfg(model=m) | Other(m):\n        pass\nclient.chat.completions.create(model=m, messages=[])\n",
+            "reassigned",
+        ),
+        (
+            "m = \"gpt-4o\"\nmatch cfg:\n    case [first, *m]:\n        pass\nclient.chat.completions.create(model=m, messages=[])\n",
+            "reassigned",
+        ),
+        (
+            "model11 = \"gpt-4o\"\ntry:\n    pass\nexcept Exception as model11:\n    pass\nclient.chat.completions.create(model=model11, messages=[])\n",
+            "reassigned",
+        ),
+        (
+            "MODEL4 = \"gpt-4o\"\nfrom local_overrides import *\nclient.chat.completions.create(model=MODEL4, messages=[])\n",
+            "reassigned",
+        ),
+        (
+            "from .settings import *\nclient.chat.completions.create(model=MODEL, messages=[])\n",
+            "imported_name",
+        ),
+        (
+            "M = \"gpt-4o\"\ndef tune():\n    globals()[\"M\"] = \"o1-mini\"\nclient.chat.completions.create(model=M, messages=[])\n",
+            "reassigned",
+        ),
+        (
+            "M = \"gpt-4o\"\nglobals().update(overrides)\nclient.chat.completions.create(model=M, messages=[])\n",
+            "reassigned",
+        ),
+    ] {
+        let rows = rows_of(&format!("{header}{body}"));
+        assert_eq!(rows.len(), 1, "{body}");
+        assert_eq!(rows[0].1, "-", "{body}");
+        // A wildcard import may rebind `client` too.
+        assert!(
+            rows[0].2.contains(&reason.to_string()),
+            "{body}: {:?}",
+            rows[0].2
+        );
+    }
+    // What a pattern does not bind stays resolved: a value pattern, a class
+    // name, a keyword name, `_`; and a definition after a wildcard import
+    // dominates it.
+    for source in [
+        format!("{header}m = \"gpt-4o\"\nmatch cfg:\n    case Color.m:\n        pass\n    case m():\n        pass\n    case P(m=1):\n        pass\n    case _:\n        pass\nclient.chat.completions.create(model=m, messages=[])\n"),
+        "from local_overrides import *\nfrom openai import OpenAI\nclient = OpenAI()\nm = \"gpt-4o\"\nclient.chat.completions.create(model=m, messages=[])\n".to_string(),
+    ] {
+        let rows = rows_of(&source);
+        assert_eq!(rows[0].1, "gpt-4o", "{source}");
+        assert!(rows[0].2.is_empty(), "{source}: {:?}", rows[0].2);
+    }
+    // At module level, `globals()["M"] = v` is `M = v`.
+    let rows = rows_of(&format!(
+        "{header}M = \"gpt-4o\"\nglobals()[\"M\"] = \"o1-mini\"\nclient.chat.completions.create(model=M, messages=[])\n"
+    ));
+    assert_eq!(rows, vec![(6, "o1-mini".to_string(), vec![])]);
+    // A client, or a constructor, the wildcard import may rebind is
+    // ambiguous; one imported after it still resolves.
+    let found = usages(
+        "from openai import OpenAI\nclient = OpenAI()\nfrom helpers import *\nclient.chat.completions.create(model=\"gpt-4\", messages=[])\ndef ask():\n    return client.chat.completions.create(model=\"gpt-4\", messages=[])\nlater = OpenAI()\nlater.chat.completions.create(model=\"gpt-4\", messages=[])\nfrom openai import OpenAI as Direct\nDirect().chat.completions.create(model=\"gpt-4\", messages=[])\n",
+    );
+    let routes: Vec<(u32, Routing)> = found
+        .calls
+        .iter()
+        .map(|c| (c.span.line, c.routing))
+        .collect();
+    assert_eq!(
+        routes,
+        vec![
+            (4, Routing::Unknown),
+            (6, Routing::Unknown),
+            (8, Routing::Unknown),
+            (10, Routing::OpenaiDirect)
+        ]
+    );
+}

@@ -4,7 +4,10 @@
 //!
 //! 1. **Collect.** One iterative walk records scopes (module, class,
 //!    function, lambda), imports, every assignment target (names, `self.x`,
-//!    class attributes, `with ... as`, walrus, `global`), parameters, every
+//!    class attributes, `with ... as`, `except ... as`, `match` captures,
+//!    walrus, `global`, `nonlocal`, `globals()["NAME"]`, and a wildcard
+//!    import from another module, which may bind any module-level name),
+//!    parameters, every
 //!    call, every attribute chain used as a value, and where each binding
 //!    takes effect. Parent kinds and field names travel down the walk, so no
 //!    node is asked for its parent: tree-sitter answers that by descending
@@ -213,6 +216,10 @@ const MAX_BASES: usize = 32;
 /// Definitions a reaching-definition search may look at before it gives up
 /// and counts every definition of the name.
 const MAX_REACH_SCAN: usize = 64;
+/// Wildcard imports from other modules placed as definitions of every
+/// module-level name. Past it, every module-level name may come from one
+/// at any point.
+const MAX_STARS: usize = 16;
 /// Longest string literal read, in source bytes. A captured value is at
 /// most 256 bytes, so a longer literal is refused without being copied.
 const MAX_LITERAL_BYTES: usize = 4096;
@@ -931,6 +938,14 @@ enum DefRef {
     Other(usize),
     Param,
     Assign(usize),
+    /// `from other import *` at module level (an index into
+    /// [`Ctx::module_stars`]): it may bind any module-level name.
+    Star(usize),
+    /// A write to the module namespace whose name is known only at run
+    /// time (`globals().update(...)`, `globals()[name] = v`), or more
+    /// wildcard imports than [`MAX_STARS`]: any module-level name, at any
+    /// time.
+    Dynamic,
 }
 
 #[derive(Clone, Copy)]
@@ -1267,6 +1282,11 @@ struct Ctx<'t> {
     rerouted_pkgs: HashSet<Pkg>,
     /// Why the module-level OpenAI API's routing may not hold.
     openai_caveat: Option<ClientCaveat>,
+    /// Wildcard imports from other modules, in order, and whether there
+    /// were more than [`MAX_STARS`] or the module namespace is written with
+    /// a run-time name (see [`DefRef::Dynamic`]).
+    module_stars: Vec<(Place, Rc<str>)>,
+    dynamic_globals: bool,
     /// Names bound by imports so far, and the import statement at which
     /// [`MAX_FILE_IMPORTS`] was reached.
     import_bindings: usize,
@@ -1347,6 +1367,8 @@ impl<'t> Ctx<'t> {
             rerouted: HashSet::new(),
             rerouted_pkgs: HashSet::new(),
             openai_caveat: None,
+            module_stars: Vec::new(),
+            dynamic_globals: false,
             import_bindings: 0,
             import_cut: None,
             out: FileUsages::new(file, "python"),
@@ -1513,6 +1535,30 @@ impl<'t> Ctx<'t> {
                                 region: None,
                             };
                             self.record_target(name, value, None, home, false, place);
+                        }
+                    }
+                    "case_clause" => {
+                        for pattern in named_children(node) {
+                            if pattern.kind() == "case_pattern" {
+                                self.record_pattern_captures(pattern, scope);
+                            }
+                        }
+                    }
+                    "except_clause" => {
+                        // `except E as name:` binds `name` in the handler
+                        // only (it is deleted after it).
+                        for child in named_children(node) {
+                            let target = (child.kind() == "as_pattern")
+                                .then(|| child.child_by_field_name("alias"))
+                                .flatten()
+                                .and_then(|alias| alias.named_child(0));
+                            if let Some(target) = target {
+                                let place = Place {
+                                    at: target.end_byte(),
+                                    region: None,
+                                };
+                                self.record_target(target, None, None, scope, true, place);
+                            }
                         }
                     }
                     "global_statement" | "nonlocal_statement" => {
@@ -2414,6 +2460,22 @@ impl<'t> Ctx<'t> {
             "subscript" => {
                 self.note_env_write(target);
                 self.note_mutated_root(target);
+                // `globals()["MODEL"] = v` rebinds a module-level name.
+                if target
+                    .child_by_field_name("value")
+                    .is_some_and(|v| self.is_module_namespace(v, scope))
+                {
+                    match single_subscript(target).and_then(|k| self.plain_literal(k)) {
+                        Some(name) => {
+                            self.assigns
+                                .entry((0, name.to_string()))
+                                .or_default()
+                                .push(assign);
+                        }
+                        None => self.dynamic_globals = true,
+                    }
+                    return;
+                }
                 // `obj.__dict__["model"] = v`, `vars(obj)[name] = v`.
                 if let Some(owner) = target
                     .child_by_field_name("value")
@@ -2483,6 +2545,55 @@ impl<'t> Ctx<'t> {
         });
     }
 
+    /// The names a `match` case pattern binds: captures (`case model:`,
+    /// `case [a, *rest]`, `case {"k": v, **kw}`, `case P(x=m)`) and
+    /// `as` targets (`case str() as model`). A class name, a value pattern
+    /// (`Color.RED`) and a keyword name bind nothing. Each holds only where
+    /// its case matched, so none dominates what follows.
+    fn record_pattern_captures(&mut self, pattern: Node<'t>, scope: usize) {
+        // Each pattern is walked once: linear in its size.
+        let mut stack = vec![(pattern, "")];
+        while let Some((node, parent)) = stack.pop() {
+            let bound = match node.kind() {
+                "dotted_name"
+                    if matches!(parent, "case_pattern" | "keyword_pattern" | "union_pattern") =>
+                {
+                    match named_children(node).as_slice() {
+                        [only] => Some(*only),
+                        _ => None,
+                    }
+                }
+                "splat_pattern" => node.named_child(0),
+                "identifier" if parent == "as_pattern" => Some(node),
+                _ => None,
+            };
+            if let Some(target) = bound.filter(|t| t.kind() == "identifier" && self.text(*t) != "_")
+            {
+                let place = Place {
+                    at: target.end_byte(),
+                    region: None,
+                };
+                self.record_target(target, None, None, scope, true, place);
+                continue;
+            }
+            if matches!(node.kind(), "dotted_name" | "identifier") {
+                continue;
+            }
+            let mut cursor = node.walk();
+            for (index, child) in node.named_children(&mut cursor).enumerate() {
+                // A class pattern's first child is the class; a dict
+                // pattern's keys are values.
+                let skip = (node.kind() == "class_pattern" && index == 0)
+                    || (node.kind() == "dict_pattern"
+                        && child.kind() != "case_pattern"
+                        && child.kind() != "splat_pattern");
+                if !skip {
+                    stack.push((child, node.kind()));
+                }
+            }
+        }
+    }
+
     /// A write to an attribute named only at run time.
     fn note_wild_attr_write(&mut self, object: Node<'t>, scope: usize) {
         let own = object.kind() == "identifier" && matches!(self.text(object), "self" | "cls");
@@ -2527,13 +2638,23 @@ impl<'t> Ctx<'t> {
             .map(|a| self.text(a))
             .unwrap_or_default();
         if matches!(method, "update" | "setdefault" | "__setitem__" | "__init__") {
-            if let Some(owner) = function
-                .child_by_field_name("object")
-                .and_then(|o| self.attribute_dict_owner(o))
-            {
+            let object = function.child_by_field_name("object");
+            if object.is_some_and(|o| self.is_module_namespace(o, scope)) {
+                self.dynamic_globals = true;
+            } else if let Some(owner) = object.and_then(|o| self.attribute_dict_owner(o)) {
                 self.note_wild_attr_write(owner, scope);
             }
         }
+    }
+
+    /// `globals()`, or `vars()` / `locals()` at module level: the module
+    /// namespace, which a write rebinds names in.
+    fn is_module_namespace(&self, node: Node<'t>, scope: usize) -> bool {
+        is_namespace_call(node, |n| self.text(n))
+            && (scope == 0
+                || node
+                    .child_by_field_name("function")
+                    .is_some_and(|f| self.text(f) == "globals"))
     }
 
     /// `obj` for `obj.__dict__` or `vars(obj)`.
@@ -2707,6 +2828,18 @@ impl<'t> Ctx<'t> {
         };
 
         if wildcard {
+            if target.is_none() {
+                // `from settings import *` may rebind any module-level name
+                // (`MODEL` among them) from here on.
+                if self.import_budget(node) {
+                    if self.module_stars.len() < MAX_STARS {
+                        self.module_stars.push((place, Rc::clone(&shared)));
+                    } else {
+                        self.dynamic_globals = true;
+                    }
+                }
+                return;
+            }
             if let Some((pkg, _)) = target {
                 for class in CLASSES.iter().filter(|c| c.pkg == pkg) {
                     if !self.import_budget(node) {
@@ -2879,6 +3012,7 @@ impl<'t> Ctx<'t> {
             }
         }
         let mut keys: HashSet<Key> = HashSet::new();
+        let module_wide = !self.module_stars.is_empty() || self.dynamic_globals;
         keys.extend(self.imports.keys().cloned());
         keys.extend(self.other_imports.keys().cloned());
         keys.extend(self.params.keys().cloned());
@@ -2923,6 +3057,21 @@ impl<'t> Ctx<'t> {
                     });
                 } else {
                     foreign.push(DefRef::Assign(i));
+                }
+            }
+            if home == 0 && module_wide {
+                // It may not bind this name: it never dominates.
+                for (i, (place, _)) in self.module_stars.iter().enumerate() {
+                    local.push(DefPos {
+                        place: Place {
+                            at: place.at,
+                            region: None,
+                        },
+                        def: DefRef::Star(i),
+                    });
+                }
+                if self.dynamic_globals {
+                    foreign.push(DefRef::Dynamic);
                 }
             }
             local.sort_by_key(|d| d.place.at);
@@ -3081,6 +3230,12 @@ impl<'t> Ctx<'t> {
             defs.push(DefRef::Param);
         }
         defs.extend((0..self.assigns.get(key).map_or(0, Vec::len)).map(DefRef::Assign));
+        if key.0 == 0 {
+            defs.extend((0..self.module_stars.len()).map(DefRef::Star));
+            if self.dynamic_globals {
+                defs.push(DefRef::Dynamic);
+            }
+        }
         defs
     }
 
@@ -3095,7 +3250,8 @@ impl<'t> Ctx<'t> {
                 DefKinds {
                     param: self.params.contains_key(&key),
                     imported: self.imports.contains_key(&key)
-                        || self.other_imports.contains_key(&key),
+                        || self.other_imports.contains_key(&key)
+                        || (key.0 == 0 && (!self.module_stars.is_empty() || self.dynamic_globals)),
                     assigns,
                     only_assign: (assigns == 1).then_some(0),
                 }
@@ -3104,7 +3260,10 @@ impl<'t> Ctx<'t> {
                 let mut kinds = DefKinds::default();
                 for def in defs {
                     match def {
-                        DefRef::Import(_) | DefRef::Other(_) => kinds.imported = true,
+                        DefRef::Import(_)
+                        | DefRef::Other(_)
+                        | DefRef::Star(_)
+                        | DefRef::Dynamic => kinds.imported = true,
                         DefRef::Param => kinds.param = true,
                         DefRef::Assign(i) => {
                             kinds.assigns += 1;
@@ -3385,6 +3544,14 @@ impl<'t> Ctx<'t> {
                         }));
                     }
                 }
+                DefRef::Star(i) => {
+                    if let Some((_, module)) = self.module_stars.get(i) {
+                        vals.push(Val::untracked(Origin::Imported {
+                            module: module.to_string(),
+                        }));
+                    }
+                }
+                DefRef::Dynamic => vals.push(Val::untracked(Origin::Other)),
                 DefRef::Param => {
                     if self.params.contains_key(key) {
                         vals.push(self.param_value_memo(key));
@@ -3407,6 +3574,7 @@ impl<'t> Ctx<'t> {
                 .get(key)
                 .and_then(|v| v.get(*i))
                 .map(|o| o.module.to_string()),
+            DefRef::Star(i) => self.module_stars.get(*i).map(|(_, m)| m.to_string()),
             _ => None,
         });
         match module {
