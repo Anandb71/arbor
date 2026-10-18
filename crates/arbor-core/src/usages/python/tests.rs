@@ -2095,7 +2095,12 @@ fn a_dict_expanded_at_many_calls_stays_bounded() {
                 .collect::<Vec<_>>()
         );
     }
-    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+    // Nothing was cut; each call passes no top-level model.
+    assert!(
+        found.gaps.iter().all(|g| g.reason == "missing_model"),
+        "{:?}",
+        found.gaps
+    );
 }
 
 #[test]
@@ -2844,5 +2849,44 @@ Anthropic().messages.create(model=\"claude-3-opus-20240229\", max_tokens=1, mess
     assert_eq!(
         routes_and_gaps(&found),
         vec![(4, Routing::AnthropicDirect, vec![])]
+    );
+}
+
+#[test]
+fn a_request_with_no_model_is_a_gap() {
+    // Track C: a request that passes no model at all (the SDK or server
+    // default applies) was silent.
+    let found = usages(
+        r#"import google.generativeai as legacy
+from openai import OpenAI
+from anthropic import Anthropic
+client = OpenAI()
+ac = Anthropic()
+client.chat.completions.create(messages=[])
+client.images.generate(prompt="a cat")
+ac.messages.create(max_tokens=1, messages=[])
+legacy.GenerativeModel()
+P = {"temperature": 0}
+client.chat.completions.create(**P, messages=[])
+client.chat.completions.create(*args)
+client.chat.completions.create(**kwargs)
+client.chat.completions.create(model="gpt-4o", messages=[])
+client.files.list()
+"#,
+    );
+    let rows: Vec<(u32, Option<&str>, &str)> = gaps(&found, GapKind::UnresolvedModel)
+        .iter()
+        .map(|g| (g.span.unwrap().line, g.key.as_deref(), g.reason.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (6, Some("model"), "missing_model"),
+            (7, Some("model"), "missing_model"),
+            (8, Some("model"), "missing_model"),
+            (9, Some("model_name"), "missing_model"),
+            (11, Some("model"), "missing_model"),
+            (13, Some("model"), "splat"),
+        ]
     );
 }

@@ -4016,14 +4016,19 @@ impl<'t> Ctx<'t> {
         }
         self.take_nested(&site, nested, nested_cut, &mut values);
 
+        let model_key = if member == "GenerativeModel" {
+            "model_name"
+        } else {
+            "model"
+        };
         if !keyed && opaque_splat && (request || model_bearing) {
-            let key = if member == "GenerativeModel" {
-                "model_name"
-            } else {
-                "model"
-            };
             let unresolved = Unresolved::new("splat", "**kwargs".to_string());
-            self.unresolved_gap(&site, key, &unresolved, None);
+            self.unresolved_gap(&site, model_key, &unresolved, None);
+        } else if !keyed && model_bearing && !args.list_splat {
+            // No model at all: the SDK's or the server's default applies,
+            // and it may be one that retires.
+            let unresolved = Unresolved::new("missing_model", String::new());
+            self.unresolved_gap(&site, model_key, &unresolved, None);
         }
 
         if target.ambiguous {
@@ -4204,6 +4209,9 @@ impl<'t> Ctx<'t> {
         let mut detail = match unresolved.via.as_deref() {
             _ if unresolved.reason == "splat" => {
                 format!("`{key}` for `{chain}` is not passed by name and may come from `**kwargs`")
+            }
+            _ if unresolved.reason == "missing_model" => {
+                format!("`{key}` for `{chain}` is not passed, so the SDK or server default applies")
             }
             Some(via) if !shape.is_empty() && via != shape => {
                 format!("`{key}` for `{chain}` comes from `{via}`, which is {phrase} (`{shape}`)")
@@ -4436,7 +4444,8 @@ impl<'t> Ctx<'t> {
                         args.splats.push(inner);
                     }
                 }
-                "list_splat" | "comment" => {}
+                "list_splat" => args.list_splat = true,
+                "comment" => {}
                 _ => {
                     if args.positional == 0 {
                         args.first_positional = Some(arg);
@@ -5377,6 +5386,8 @@ struct Args<'t> {
     literal_args: Vec<(Option<String>, Node<'t>)>,
     /// The expressions passed with `**`.
     splats: Vec<Node<'t>>,
+    /// Arguments were spread with `*`.
+    list_splat: bool,
 }
 
 /// Adds `resolved` to `values` unless its value is already there, keeping at

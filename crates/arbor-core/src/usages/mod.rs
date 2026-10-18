@@ -374,7 +374,9 @@ pub enum GapKind {
     /// At a request or a model constructor (`GenerativeModel`), an
     /// allowlisted key's value is not a resolvable string literal
     /// (environment, config attribute, function call, f-string, parameter,
-    /// `**kwargs`, a name imported from another module...).
+    /// `**kwargs`, a name imported from another module...), or a call that
+    /// takes a model passes none (`missing_model`: the SDK or server
+    /// default applies).
     UnresolvedModel,
     /// A call shaped like an SDK endpoint whose receiver is not a tracked
     /// client: built by an unknown factory, passed in as a parameter, or
