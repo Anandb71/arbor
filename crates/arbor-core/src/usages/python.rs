@@ -400,15 +400,26 @@ impl ClientClass {
         self.name.starts_with("Async")
     }
 
-    /// Routing from the constructor and its keyword names.
-    fn routing(self, kwargs: &[String], splat: bool) -> Routing {
-        let custom = kwargs.iter().any(|k| is_base_url_key(k));
+    /// Routing from the constructor, its keyword names and what its
+    /// `base_url` is.
+    fn routing(self, kwargs: &[String], splat: bool, base_url: BaseUrl) -> Routing {
         // `OpenAI(provider=bedrock(...))` hands requests to a platform adapter.
         let adapter = kwargs.iter().any(|k| k == "provider");
         match self.family {
             Family::OpenaiDirect | Family::AnthropicDirect if adapter => Routing::Unknown,
-            Family::OpenaiDirect | Family::AnthropicDirect if custom => Routing::CustomBaseUrl,
-            Family::OpenaiDirect | Family::AnthropicDirect if splat => Routing::Unknown,
+            Family::OpenaiDirect | Family::AnthropicDirect if base_url == BaseUrl::Custom => {
+                Routing::CustomBaseUrl
+            }
+            Family::OpenaiDirect | Family::AnthropicDirect
+                if matches!(base_url, BaseUrl::Unknown { .. }) =>
+            {
+                Routing::Unknown
+            }
+            Family::OpenaiDirect | Family::AnthropicDirect
+                if splat && base_url == BaseUrl::Absent =>
+            {
+                Routing::Unknown
+            }
             Family::OpenaiDirect => Routing::OpenaiDirect,
             Family::AnthropicDirect => Routing::AnthropicDirect,
             Family::Azure => Routing::AzureOpenai,
@@ -425,7 +436,7 @@ impl ClientClass {
     fn typed_routing(self) -> Routing {
         match self.family {
             Family::OpenaiDirect | Family::AnthropicDirect => Routing::Unknown,
-            _ => self.routing(&[], false),
+            _ => self.routing(&[], false, BaseUrl::Absent),
         }
     }
 }
@@ -531,6 +542,58 @@ enum ClientCaveat {
     /// The file sets an environment variable the SDK reads its endpoint
     /// from (`os.environ["OPENAI_BASE_URL"] = ...`).
     EndpointEnv { var: &'static str },
+    /// The `base_url` given to the constructor is read from the environment
+    /// with no fallback (`env`), falls back to the provider's own host
+    /// (`fallback`), or does not resolve to a string.
+    BaseUrl { env: bool, fallback: bool },
+}
+
+/// How the `base_url` given to a direct client routes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseUrl {
+    /// None given, or `None`: the SDK's default host or its endpoint
+    /// variable.
+    Absent,
+    /// The provider's own host (`https://api.openai.com/v1`).
+    Provider,
+    /// Another host: a gateway, a proxy or a local server.
+    Custom,
+    /// The provider's own host as the fallback of an environment lookup.
+    ProviderFallback,
+    /// Read from the environment with no fallback (`env`), or not a string
+    /// this file resolves.
+    Unknown { env: bool },
+}
+
+/// The provider's own API host, for [`BaseUrl::Provider`].
+fn provider_host(pkg: Pkg) -> &'static str {
+    match pkg {
+        Pkg::Openai => "api.openai.com",
+        Pkg::Anthropic => "api.anthropic.com",
+        Pkg::GoogleGenai | Pkg::GoogleGenerativeai => "generativelanguage.googleapis.com",
+    }
+}
+
+/// The host of a URL, lowercase, without user information or port.
+fn url_host(url: &str) -> String {
+    let rest = url.trim().split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host.split(':').next().unwrap_or_default(),
+    };
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// [`BaseUrl::Provider`] when `url` is the provider's own host, else
+/// [`BaseUrl::Custom`].
+fn host_kind(pkg: Pkg, url: &str) -> BaseUrl {
+    if url_host(url) == provider_host(pkg) {
+        BaseUrl::Provider
+    } else {
+        BaseUrl::Custom
+    }
 }
 
 /// Environment variables an SDK reads its endpoint from when the
@@ -1278,7 +1341,9 @@ struct Ctx<'t> {
     /// order, so "does this expression read the environment?" is a binary
     /// search instead of a walk.
     env_reads: Vec<usize>,
-    constructions: HashMap<usize, usize>,
+    /// Constructions recorded so far: the index of the record and why its
+    /// routing may not hold.
+    constructions: HashMap<usize, (usize, Option<ClientCaveat>)>,
     name_memo: HashMap<Key, Memo<Val>>,
     attr_memo: HashMap<Key, Memo<Val>>,
     /// The same for `self.x` / `cls.x`, read with subclasses and outside
@@ -4504,20 +4569,28 @@ impl<'t> Ctx<'t> {
     }
 
     /// `client.with_options(...)` / `client.copy(...)`: both SDKs accept
-    /// `base_url` there, so a direct client given one is a custom route, and
-    /// options passed through an unreadable `**kwargs` make it unknown.
+    /// `base_url` there, so a direct client given one routes by what it is
+    /// (see [`Self::base_url_kind`]), and options passed through an
+    /// unreadable `**kwargs` make it unknown.
     fn copied_client(&mut self, mut client: Client, call: Node<'t>, scope: usize) -> Client {
         let args = self.arguments(call);
-        let mut base_url = args.kwargs.iter().any(|k| is_base_url_key(k));
+        let mut base_url = BaseUrl::Absent;
         let mut opaque = false;
+        if let Some(expr) = keyword_value(call, |n| self.text(n), is_base_url_key) {
+            base_url = self.base_url_kind(client.pkg, expr, scope);
+        }
         for splat in &args.splats {
             match self.expand_splat(*splat, scope) {
                 Some(expansion) => {
-                    base_url |= expansion
+                    let given = expansion
                         .summary
                         .expansion
                         .iter()
-                        .any(|(k, _)| is_base_url_key(k));
+                        .find(|(k, _)| is_base_url_key(k))
+                        .map(|(_, v)| *v);
+                    if let Some(expr) = given {
+                        base_url = self.base_url_kind(client.pkg, expr, expansion.scope);
+                    }
                     opaque |= expansion.opaque();
                 }
                 None => opaque = true,
@@ -4527,12 +4600,56 @@ impl<'t> Ctx<'t> {
             client.routing,
             Routing::OpenaiDirect | Routing::AnthropicDirect
         );
-        if direct && base_url {
-            client.routing = Routing::CustomBaseUrl;
-        } else if direct && opaque {
-            client.routing = Routing::Unknown;
+        if !direct {
+            return client;
+        }
+        match base_url {
+            BaseUrl::Custom => client.routing = Routing::CustomBaseUrl,
+            BaseUrl::Unknown { env } => {
+                client.routing = Routing::Unknown;
+                client.caveat.get_or_insert(ClientCaveat::BaseUrl {
+                    env,
+                    fallback: false,
+                });
+            }
+            BaseUrl::ProviderFallback => {
+                client.caveat.get_or_insert(ClientCaveat::BaseUrl {
+                    env: false,
+                    fallback: true,
+                });
+            }
+            BaseUrl::Absent if opaque => client.routing = Routing::Unknown,
+            BaseUrl::Absent | BaseUrl::Provider => {}
         }
         client
+    }
+
+    /// What a `base_url` argument of a `pkg` client routes it to (P6): the
+    /// provider's own host is direct, any other host a custom route, the
+    /// provider's host as an environment fallback direct with a gap, and an
+    /// environment lookup with no fallback, or anything that does not
+    /// resolve to a string, unknown with a gap. The URL is never reported.
+    fn base_url_kind(&mut self, pkg: Pkg, expr: Node<'t>, scope: usize) -> BaseUrl {
+        if expr.kind() == "none" {
+            return BaseUrl::Absent;
+        }
+        // A literal at the call: its host decides, credentials or not.
+        if let Ok(url) = self.literal(expr) {
+            return host_kind(pkg, &url);
+        }
+        match self.resolve_value(expr, scope, 0) {
+            Ok(resolved) if resolved.origin == ValueOrigin::EnvDefault => {
+                match host_kind(pkg, &resolved.value) {
+                    BaseUrl::Provider => BaseUrl::ProviderFallback,
+                    _ => BaseUrl::Custom,
+                }
+            }
+            Ok(resolved) if resolved.caveats.is_empty() => host_kind(pkg, &resolved.value),
+            Ok(_) => BaseUrl::Unknown { env: false },
+            Err(unresolved) => BaseUrl::Unknown {
+                env: unresolved.reason == "env_var",
+            },
+        }
     }
 
     /// The SDK of a tracked client or constructor passed to a call
@@ -4559,9 +4676,8 @@ impl<'t> Ctx<'t> {
     /// The client built by `call`, recorded once.
     fn construction(&mut self, call: Node<'t>, class: ClientClass) -> Client {
         let site = Some(call.id());
-        if let Some(&index) = self.constructions.get(&call.id()) {
+        if let Some((index, caveat)) = self.constructions.get(&call.id()).cloned() {
             let built = &self.out.clients[index];
-            let kwargs = built.kwargs.clone();
             return Client {
                 pkg: class.pkg,
                 routing: built.routing,
@@ -4569,15 +4685,38 @@ impl<'t> Ctx<'t> {
                 site,
                 ambiguous: false,
                 typed: false,
-                caveat: self.endpoint_env(class, &kwargs),
+                caveat,
             };
         }
         let scope = self.call_scope.get(&call.id()).copied().unwrap_or(0);
         let args = self.arguments(call);
-        let mut routing = class.routing(&args.kwargs, args.splat);
-        let caveat = self.endpoint_env(class, &args.kwargs);
+        let direct = matches!(class.family, Family::OpenaiDirect | Family::AnthropicDirect);
+        let base_url = match keyword_value(call, |n| self.text(n), is_base_url_key) {
+            Some(expr) if direct => self.base_url_kind(class.pkg, expr, scope),
+            Some(_) => BaseUrl::Custom,
+            None => BaseUrl::Absent,
+        };
+        let mut routing = class.routing(&args.kwargs, args.splat, base_url);
+        let mut caveat = self.endpoint_env(class, base_url);
         if caveat.is_some() {
             routing = Routing::Unknown;
+        }
+        if direct {
+            match base_url {
+                BaseUrl::Unknown { env } => {
+                    caveat.get_or_insert(ClientCaveat::BaseUrl {
+                        env,
+                        fallback: false,
+                    });
+                }
+                BaseUrl::ProviderFallback => {
+                    caveat.get_or_insert(ClientCaveat::BaseUrl {
+                        env: false,
+                        fallback: true,
+                    });
+                }
+                _ => {}
+            }
         }
         let (binding, binding_scope) = self.binding_target(call, scope);
         let chain = call
@@ -4600,7 +4739,8 @@ impl<'t> Ctx<'t> {
             span,
             symbol: self.symbol(scope),
         };
-        self.constructions.insert(call.id(), self.out.clients.len());
+        self.constructions
+            .insert(call.id(), (self.out.clients.len(), caveat.clone()));
         self.out.clients.push(record);
         Client {
             pkg: class.pkg,
@@ -4613,17 +4753,14 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    /// The endpoint variable this file sets for a client built by `class`
-    /// with keyword arguments `kwargs`, when the constructor does not name
-    /// its own endpoint: the SDK reads the variable instead.
-    fn endpoint_env(&self, class: ClientClass, kwargs: &[String]) -> Option<ClientCaveat> {
-        let own = match class.family {
-            Family::OpenaiDirect | Family::AnthropicDirect => {
-                kwargs.iter().any(|k| is_base_url_key(k))
-            }
-            _ => return None,
-        };
-        if own {
+    /// Why a client built by `class` may not reach the endpoint its
+    /// constructor names: when it names none (`base_url` absent or `None`),
+    /// the SDK reads its endpoint variable, which this file may set
+    /// ([`ClientCaveat::EndpointEnv`]).
+    fn endpoint_env(&self, class: ClientClass, base_url: BaseUrl) -> Option<ClientCaveat> {
+        if !matches!(class.family, Family::OpenaiDirect | Family::AnthropicDirect)
+            || base_url != BaseUrl::Absent
+        {
             return None;
         }
         ENDPOINT_ENV
@@ -4783,7 +4920,29 @@ impl<'t> Ctx<'t> {
                     None => unknown = true,
                 },
                 "azure_endpoint" | "azure_ad_token" | "azure_ad_token_provider" => azure = true,
-                "api_base" | "base_url" => custom = true,
+                "api_base" | "base_url" => {
+                    let kind = match assign.value {
+                        Some(value) => self.base_url_kind(Pkg::Openai, value, assign.scope),
+                        None => BaseUrl::Unknown { env: false },
+                    };
+                    match kind {
+                        BaseUrl::Absent | BaseUrl::Provider => {}
+                        BaseUrl::Custom => custom = true,
+                        BaseUrl::ProviderFallback => {
+                            self.openai_caveat.get_or_insert(ClientCaveat::BaseUrl {
+                                env: false,
+                                fallback: true,
+                            });
+                        }
+                        BaseUrl::Unknown { env } => {
+                            unknown = true;
+                            self.openai_caveat.get_or_insert(ClientCaveat::BaseUrl {
+                                env,
+                                fallback: false,
+                            });
+                        }
+                    }
+                }
                 _ if attr.starts_with("bedrock_") => unknown = true,
                 _ => {}
             }
@@ -5123,6 +5282,24 @@ impl<'t> Ctx<'t> {
                     "endpoint_env",
                     format!(
                         "this file sets `{var}`, which the SDK reads its endpoint from, so `{chain}` may send its requests elsewhere"
+                    ),
+                ),
+                ClientCaveat::BaseUrl { env: true, .. } => (
+                    "base_url_env",
+                    format!(
+                        "the `base_url` of the client behind `{chain}` is read from the environment with no fallback, so its endpoint is not known"
+                    ),
+                ),
+                ClientCaveat::BaseUrl { fallback: true, .. } => (
+                    "base_url_env",
+                    format!(
+                        "the `base_url` of the client behind `{chain}` falls back to the provider's own host, but the environment may set another"
+                    ),
+                ),
+                ClientCaveat::BaseUrl { .. } => (
+                    "base_url_unresolved",
+                    format!(
+                        "the `base_url` of the client behind `{chain}` does not resolve to a string in this file, so its endpoint is not known"
                     ),
                 ),
             };
@@ -7179,6 +7356,24 @@ fn dict_entries<'t>(
         }
     }
     entries
+}
+
+/// The value of the first keyword argument of `call` whose name `wanted`
+/// accepts.
+fn keyword_value<'t>(
+    call: Node<'t>,
+    text: impl Fn(Node<'t>) -> &'t str,
+    wanted: impl Fn(&str) -> bool,
+) -> Option<Node<'t>> {
+    let args = call
+        .child_by_field_name("arguments")
+        .filter(|a| a.kind() == "argument_list")?;
+    named_children(args).into_iter().find_map(|arg| {
+        let name = arg.child_by_field_name("name")?;
+        (arg.kind() == "keyword_argument" && wanted(text(name)))
+            .then(|| arg.child_by_field_name("value"))
+            .flatten()
+    })
 }
 
 /// Positional and keyword arguments of a call, as written.

@@ -1017,7 +1017,7 @@ fn wildcard_import_binds_client_classes() {
 #[test]
 fn annotated_module_assignment() {
     let found = usages(
-        "from openai import OpenAI\nclient: OpenAI = OpenAI(base_url=URL)\nclient.chat.completions.create(model=\"gpt-4\", messages=[])\n",
+        "from openai import OpenAI\nURL = \"https://gw.example/v1\"\nclient: OpenAI = OpenAI(base_url=URL)\nclient.chat.completions.create(model=\"gpt-4\", messages=[])\n",
     );
     assert_eq!(
         call(&found, "client.chat.completions.create").routing,
@@ -4006,4 +4006,64 @@ fn candidate_lists_stay_linear_however_many_definitions_and_uses() {
             .iter()
             .all(|g| !g.values_complete));
     }
+}
+
+#[test]
+fn a_base_url_routes_by_its_host() {
+    // P6: the provider's own host is direct; an environment lookup with
+    // no fallback, or a value that does not resolve, is `unknown` with a
+    // gap; the provider's host as a fallback is direct with a gap; another
+    // host is a custom route. The URL itself is never reported.
+    let found = usages(
+        r#"import os
+import openai
+from openai import OpenAI
+from anthropic import Anthropic
+a = OpenAI(base_url="https://api.openai.com/v1")
+a.chat.completions.create(model="gpt-4o", messages=[])
+b = OpenAI(base_url=os.environ["OPENAI_BASE_URL"])
+b.chat.completions.create(model="gpt-4o", messages=[])
+c = OpenAI(base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+c.chat.completions.create(model="gpt-4o", messages=[])
+d = OpenAI(base_url=os.getenv("GATEWAY", "https://gw.example/v1"))
+d.chat.completions.create(model="gpt-4o", messages=[])
+e = OpenAI(base_url=None)
+e.chat.completions.create(model="gpt-4o", messages=[])
+f = OpenAI(base_url=settings.base_url)
+f.chat.completions.create(model="gpt-4o", messages=[])
+g = Anthropic(base_url="https://API.anthropic.com:443/")
+g.messages.create(model="claude-3-haiku-20240307", max_tokens=1, messages=[])
+h = OpenAI(base_url="https://user:pw@gw.example/v1")
+h.chat.completions.create(model="gpt-4o", messages=[])
+i = OpenAI().with_options(base_url=os.getenv("BASE"))
+i.chat.completions.create(model="gpt-4o", messages=[])
+"#,
+    );
+    let gap = |reason: &str| vec![format!("ambiguous_client/{reason}")];
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (6, Routing::OpenaiDirect, vec![]),
+            (8, Routing::Unknown, gap("base_url_env")),
+            (10, Routing::OpenaiDirect, gap("base_url_env")),
+            (12, Routing::CustomBaseUrl, vec![]),
+            (14, Routing::OpenaiDirect, vec![]),
+            (16, Routing::Unknown, gap("base_url_unresolved")),
+            (18, Routing::AnthropicDirect, vec![]),
+            (20, Routing::CustomBaseUrl, vec![]),
+            // `with_options` itself is a call on the fresh direct client.
+            (21, Routing::OpenaiDirect, vec![]),
+            (22, Routing::Unknown, gap("base_url_env")),
+        ]
+    );
+    let json = serde_json::to_string(&found).unwrap();
+    assert!(!json.contains("pw@") && !json.contains("gw.example"));
+    // Module configuration: the provider's own host stays direct.
+    let found = usages(
+        "import openai\nopenai.base_url = \"https://api.openai.com/v1/\"\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+    );
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![(3, Routing::OpenaiDirect, vec![])]
+    );
 }
