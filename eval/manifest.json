@@ -81,6 +81,12 @@
       "language": "python",
       "suite": "usages",
       "covers": "the second review of #276 and the Track C re-measurement: bounded **DICT expansion, wider credential refusal, dict mutations, endpoints set after construction or in the environment, parameter defaults against their callers, run-time lookups, missing models, per-use scoping and the h042 loop"
+    },
+    {
+      "name": "py-sdk-rereview3",
+      "language": "python",
+      "suite": "usages",
+      "covers": "the third review of #276: nonlocal, match, except and wildcard-import bindings, globals() writes, constructor calls against __init__ defaults, subclasses and outside writes against self attributes, functions used as values, constructors chosen at run time, dict aliases through chains and attributes, candidate values with no credential, a clipped import path"
     }
   ]
 }
