@@ -3955,3 +3955,55 @@ fn annotated_fields_of_data_classes_are_constructor_defaults() {
     ));
     assert_eq!(rows, vec![(9, "gpt-4o".to_string(), vec![])]);
 }
+
+// ---------------------------------------------------------------------------
+// Policy round (re-review of d6132ac): a supported grammar, and dynamic
+// features as gaps
+// ---------------------------------------------------------------------------
+
+#[test]
+fn candidate_lists_stay_linear_however_many_definitions_and_uses() {
+    // Finding 2: a use whose every definition reaches it cloned all of
+    // them, and loop items were re-read for each use and each reaching
+    // loop: a 73 KB file took 30 s, a 1.48 MB one never finished.
+    let head = "import os\nfrom openai import OpenAI\nclient = OpenAI()\n";
+    let names: Vec<String> = (0..5_000).map(|i| format!("\"gpt-{i}\"")).collect();
+    let mut long_list = format!("{head}L = [{}]\n", names.join(", "));
+    for _ in 0..200 {
+        long_list
+            .push_str("for m in L:\n    client.chat.completions.create(model=m, messages=[])\n");
+    }
+    let mut branches = String::from(head);
+    for i in 0..20_000 {
+        branches.push_str(&format!("if os.getenv(\"C{i}\"):\n    M = \"gpt-{i}\"\n"));
+    }
+    for _ in 0..3_000 {
+        branches.push_str("client.chat.completions.create(model=M, messages=[])\n");
+    }
+    let mut cases = format!("{head}M = 'gpt-4o'\nmatch os.getenv('X'):\n");
+    for i in 0..8_000 {
+        cases.push_str(&format!(
+            "    case 'k{i}' as M:\n        client.chat.completions.create(model=M, messages=[])\n"
+        ));
+    }
+    let mut excepts = format!("{head}M = 'gpt-4o'\n");
+    for i in 0..7_000 {
+        excepts.push_str(&format!(
+            "try:\n    pass\nexcept E{i} as M:\n    pass\nclient.chat.completions.create(model=M, messages=[])\n"
+        ));
+    }
+    for (source, calls) in [
+        (long_list, 200),
+        (branches, 3_000),
+        (cases, 8_000),
+        (excepts, 7_000),
+    ] {
+        let found = usages_within(&source, 10);
+        assert_eq!(found.calls.len(), calls);
+        // Each use is a gap; a list cut at the read limit is not complete.
+        assert!(found.calls.iter().all(|c| c.values.is_empty()));
+        assert!(gaps(&found, GapKind::UnresolvedModel)
+            .iter()
+            .all(|g| !g.values_complete));
+    }
+}

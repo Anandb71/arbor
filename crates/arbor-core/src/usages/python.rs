@@ -1212,6 +1212,9 @@ enum ArgFor<'t> {
 
 type Key = (usize, String);
 
+/// Candidate values read once, and whether they are every value.
+type CandidateList = Rc<(Vec<Resolved>, bool)>;
+
 struct Ctx<'t> {
     src: &'t str,
     file: String,
@@ -1294,6 +1297,11 @@ struct Ctx<'t> {
     candidates_left: usize,
     attr_lookup_memo: HashMap<Key, Rc<[Assign<'t>]>>,
     dyn_attr_lookup_memo: HashMap<Key, Rc<[Assign<'t>]>>,
+    /// The items a loop runs over, read once per iterable and origin.
+    loop_items_memo: HashMap<(usize, ValueOrigin), CandidateList>,
+    /// Candidates of a name every definition of which reaches the use,
+    /// read once per name and origin.
+    reach_all_memo: HashMap<(Key, ValueOrigin), CandidateList>,
     caller_memo: HashMap<Key, Memo<Option<Val>>>,
     /// Model values in-file callers pass for a parameter, by (function,
     /// parameter).
@@ -1401,6 +1409,8 @@ impl<'t> Ctx<'t> {
             candidates_left: MAX_FILE_CANDIDATES,
             attr_lookup_memo: HashMap::new(),
             dyn_attr_lookup_memo: HashMap::new(),
+            loop_items_memo: HashMap::new(),
+            reach_all_memo: HashMap::new(),
             caller_memo: HashMap::new(),
             caller_models: HashMap::new(),
             dict_candidates_memo: HashMap::new(),
@@ -3344,7 +3354,12 @@ impl<'t> Ctx<'t> {
                 chosen.push(d.def);
             }
         }
-        if chosen.is_empty() || chosen.len() + index.foreign.len() >= index.total {
+        // Every foreign definition reaches every use: past the scan limit,
+        // listing them per use would make many uses quadratic.
+        if chosen.is_empty()
+            || index.foreign.len() > MAX_REACH_SCAN
+            || chosen.len() + index.foreign.len() >= index.total
+        {
             return Reach::All;
         }
         chosen.extend(index.foreign.iter().copied());
@@ -5870,9 +5885,8 @@ impl<'t> Ctx<'t> {
         if defs.param {
             if defs.assigns > 0 || imported {
                 // The parameter's own values are not listed: partial.
-                let (reaching, _) = self.reaching_assigns(name, scope, pos);
                 let origin = constant_origin(self.scopes[home].kind);
-                let (candidates, _) = self.assign_candidates(&reaching, origin, name, depth);
+                let (candidates, _) = self.name_candidates(name, scope, pos, origin, depth);
                 return Err(Unresolved::new("reassigned", name.to_string())
                     .with_candidates(candidates, false));
             }
@@ -5916,9 +5930,8 @@ impl<'t> Ctx<'t> {
         if defs.assigns > 0 {
             if imported {
                 // What the assignments give; the import's value is unknown.
-                let (reaching, _) = self.reaching_assigns(name, scope, pos);
                 let origin = constant_origin(self.scopes[home].kind);
-                let (candidates, _) = self.assign_candidates(&reaching, origin, name, depth);
+                let (candidates, _) = self.name_candidates(name, scope, pos, origin, depth);
                 return Err(Unresolved::new("reassigned", name.to_string())
                     .with_candidates(candidates, false));
             }
@@ -5930,12 +5943,9 @@ impl<'t> Ctx<'t> {
                 Ok(resolved) => Ok(resolved.through(name, origin)),
                 // Assigned in more than one branch: what each assigns.
                 Err(unresolved) if unresolved.reason == "reassigned" => {
-                    let (reaching, all) = self.reaching_assigns(name, scope, pos);
                     let (candidates, complete) =
-                        self.assign_candidates(&reaching, origin, name, depth);
-                    Err(unresolved
-                        .via(name)
-                        .with_candidates(candidates, complete && all))
+                        self.name_candidates(name, scope, pos, origin, depth);
+                    Err(unresolved.via(name).with_candidates(candidates, complete))
                 }
                 Err(unresolved) => Err(unresolved.via(name)),
             };
@@ -6018,35 +6028,74 @@ impl<'t> Ctx<'t> {
         Some(Unresolved::new(reason, name.to_string()).with_candidates(others, passed.complete))
     }
 
-    /// The assignments of `name` that reach a use at byte `pos` of `scope`,
-    /// at most [`MAX_CANDIDATE_READS`], and whether that is all of them.
-    fn reaching_assigns(&self, name: &str, scope: usize, pos: usize) -> (Vec<Assign<'t>>, bool) {
-        let (key, at) = self.locate(name, scope, pos);
-        let Some(assigns) = self.assigns.get(&key) else {
+    /// The assignments of `key` among `reach`, at most
+    /// [`MAX_CANDIDATE_READS`] (only those are copied, however many the
+    /// name has), and whether that is all of them.
+    fn reaching_assigns(&self, key: &Key, reach: &Reach) -> (Vec<Assign<'t>>, bool) {
+        let Some(assigns) = self.assigns.get(key) else {
             return (Vec::new(), true);
         };
-        let reaching: Vec<Assign<'t>> = match self.reaching(&key, at) {
-            Reach::All => assigns.clone(),
+        let mut reaching: Vec<Assign<'t>> = match reach {
+            Reach::All => assigns
+                .iter()
+                .take(MAX_CANDIDATE_READS + 1)
+                .copied()
+                .collect(),
             Reach::Subset(defs) => defs
                 .iter()
                 .filter_map(|def| match def {
                     DefRef::Assign(i) => assigns.get(*i).copied(),
                     _ => None,
                 })
+                .take(MAX_CANDIDATE_READS + 1)
                 .collect(),
         };
         let all = reaching.len() <= MAX_CANDIDATE_READS;
-        (
-            reaching.into_iter().take(MAX_CANDIDATE_READS).collect(),
-            all,
-        )
+        reaching.truncate(MAX_CANDIDATE_READS);
+        (reaching, all)
+    }
+
+    /// The values the assignments of `name` that reach a use at byte `pos`
+    /// of `scope` give it (see [`Self::assign_candidates`]), and whether
+    /// they are every value: only when each resolved and there were few
+    /// enough to read. When every definition reaches the use, the list is
+    /// the same for every use and is read once.
+    fn name_candidates(
+        &mut self,
+        name: &str,
+        scope: usize,
+        pos: usize,
+        origin: ValueOrigin,
+        depth: u32,
+    ) -> (Vec<Resolved>, bool) {
+        let (key, at) = self.locate(name, scope, pos);
+        let reach = self.reaching(&key, at);
+        let every_use = matches!(reach, Reach::All);
+        let memo_key = (key, origin);
+        if every_use {
+            if let Some(found) = self.reach_all_memo.get(&memo_key) {
+                return (found.0.clone(), found.1);
+            }
+        }
+        let (reaching, all) = self.reaching_assigns(&memo_key.0, &reach);
+        // A nested lookup collects nothing; its empty answer is not kept.
+        let reading = self.collecting == 0;
+        let (candidates, complete) = self.assign_candidates(&reaching, origin, name, depth);
+        let found = (candidates, complete && all);
+        if every_use && reading {
+            self.reach_all_memo
+                .insert(memo_key, Rc::new((found.0.clone(), found.1)));
+        }
+        found
     }
 
     /// The values `assigns` give a name, for a `reassigned` gap: each
     /// assignment resolved on its own (without collecting candidates of
     /// its own), a loop target's items, distinct, at most
     /// [`MAX_CANDIDATES`]; and whether every assignment resolved, with no
-    /// caveat, into the list.
+    /// caveat, into the list. At most [`MAX_CANDIDATE_READS`] values are
+    /// read in all, assignments and loop items together, so a use reached
+    /// by many loops over a long list costs no more than one.
     fn assign_candidates(
         &mut self,
         assigns: &[Assign<'t>],
@@ -6060,26 +6109,34 @@ impl<'t> Ctx<'t> {
         self.collecting += 1;
         let mut found = Vec::new();
         let mut complete = assigns.len() <= MAX_CANDIDATE_READS;
+        let mut reads_left = MAX_CANDIDATE_READS;
         for assign in assigns.iter().take(MAX_CANDIDATE_READS) {
+            if reads_left == 0 {
+                complete = false;
+                break;
+            }
             let value = match (assign.value, assign.unknowable) {
                 (Some(value), false) => value,
                 _ => {
                     // A loop target takes each item of a literal list.
-                    let items = assign
-                        .iter
-                        .map(|iter| self.loop_items(iter, assign.scope, origin, depth));
-                    match items {
-                        Some((items, all)) => {
-                            complete &= all;
-                            for item in items {
-                                complete &= push_candidate(&mut found, item.through(name, origin));
-                            }
+                    let Some(iter) = assign.iter else {
+                        complete = false;
+                        continue;
+                    };
+                    let items = self.loop_items(iter, assign.scope, origin, depth);
+                    complete &= items.1;
+                    for item in items.0.iter() {
+                        if reads_left == 0 {
+                            complete = false;
+                            break;
                         }
-                        None => complete = false,
+                        reads_left -= 1;
+                        complete &= push_candidate(&mut found, item.clone().through(name, origin));
                     }
                     continue;
                 }
             };
+            reads_left -= 1;
             match self.resolve_value(value, assign.scope, depth + 1) {
                 Ok(mut resolved) => {
                     complete &= resolved.is_certain();
@@ -6096,9 +6153,27 @@ impl<'t> Ctx<'t> {
     }
 
     /// The items of the literal list, tuple or set a loop runs over (or of
-    /// one bound once to a name that never changes), resolved, and whether
-    /// every item resolved. Called while candidates are being collected.
+    /// one bound once to a name that never changes),
+    /// resolved, and whether every item resolved. Called while candidates
+    /// are being collected; read once per iterable, and at most
+    /// [`MAX_CANDIDATE_READS`] items of it.
     fn loop_items(
+        &mut self,
+        iter: Node<'t>,
+        scope: usize,
+        origin: ValueOrigin,
+        depth: u32,
+    ) -> CandidateList {
+        let key = (iter.id(), origin);
+        if let Some(found) = self.loop_items_memo.get(&key) {
+            return Rc::clone(found);
+        }
+        let found = Rc::new(self.read_loop_items(iter, scope, origin, depth));
+        self.loop_items_memo.insert(key, Rc::clone(&found));
+        found
+    }
+
+    fn read_loop_items(
         &mut self,
         iter: Node<'t>,
         scope: usize,
@@ -6132,14 +6207,21 @@ impl<'t> Ctx<'t> {
         };
         let mut found = Vec::new();
         let mut complete = true;
-        for (i, item) in named_children(list).into_iter().enumerate() {
-            if i >= MAX_CANDIDATE_READS {
+        let mut read = 0;
+        // A cursor stops at the limit: a huge literal is not listed whole.
+        let mut cursor = list.walk();
+        let mut more = cursor.goto_first_child();
+        while more {
+            let item = cursor.node();
+            more = cursor.goto_next_sibling();
+            if !item.is_named() || item.kind() == "comment" {
+                continue;
+            }
+            if read >= MAX_CANDIDATE_READS {
                 complete = false;
                 break;
             }
-            if item.kind() == "comment" {
-                continue;
-            }
+            read += 1;
             match self.resolve_value(item, list_scope, depth + 1) {
                 Ok(mut resolved) => {
                     complete &= resolved.is_certain();
@@ -6254,9 +6336,9 @@ impl<'t> Ctx<'t> {
                         return Err(unresolved);
                     };
                     self.collecting += 1;
-                    let (items, complete) = self.loop_items(iter, assign.scope, origin, depth);
+                    let items = self.loop_items(iter, assign.scope, origin, depth);
                     self.collecting -= 1;
-                    return Err(unresolved.with_candidates(items, complete));
+                    return Err(unresolved.with_candidates(items.0.clone(), items.1));
                 };
                 let mut resolved = self.resolve_value(value, assign.scope, depth + 1)?;
                 if resolved.origin == ValueOrigin::Literal {
