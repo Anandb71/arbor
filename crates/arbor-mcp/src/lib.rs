@@ -59,6 +59,39 @@ pub(crate) enum HttpReply {
 /// Caps on client-supplied sizes so one request cannot inflate a response
 /// unboundedly.
 const MAX_LIST_LIMIT: usize = 500;
+
+/// Entries of each `skipped` list (`too_large`, `unreadable`,
+/// `syntax_errors`, vendored and hidden roots) `find_api_usages` returns.
+const MAX_SKIPPED_LISTED: usize = 20;
+
+/// `find_api_usages`'s `skipped` for one page: every count, a `*_total` for
+/// each list, and the first [`MAX_SKIPPED_LISTED`] entries of each list on
+/// the first page only, so a large project's lists neither grow the
+/// response without bound nor repeat on every page.
+fn skipped_summary(skipped: &arbor_watcher::usages::Skipped, first_page: bool) -> Value {
+    fn head<T: serde::Serialize>(items: &[T], listed: usize) -> Value {
+        json!(items.iter().take(listed).collect::<Vec<_>>())
+    }
+    let listed = if first_page { MAX_SKIPPED_LISTED } else { 0 };
+    json!({
+        "vendored_files": skipped.vendored_files,
+        "vendored_files_with_usages": skipped.vendored_files_with_usages,
+        "vendored_calls": skipped.vendored_calls,
+        "vendored_roots": head(&skipped.vendored_roots, listed),
+        "vendored_roots_total": skipped.vendored_roots.len(),
+        "hidden_files": skipped.hidden_files,
+        "hidden_files_with_usages": skipped.hidden_files_with_usages,
+        "hidden_calls": skipped.hidden_calls,
+        "hidden_roots": head(&skipped.hidden_roots, listed),
+        "hidden_roots_total": skipped.hidden_roots.len(),
+        "too_large": head(&skipped.too_large, listed),
+        "too_large_total": skipped.too_large.len(),
+        "unreadable": head(&skipped.unreadable, listed),
+        "unreadable_total": skipped.unreadable.len(),
+        "syntax_errors": head(&skipped.syntax_errors, listed),
+        "syntax_errors_total": skipped.syntax_errors.len(),
+    })
+}
 const MAX_DEPTH: usize = 32;
 const MAX_TOKEN_BUDGET: usize = 64_000;
 
@@ -668,7 +701,10 @@ impl McpServer {
             "gaps_offset": gaps_offset,
             "gaps_total": gaps_total,
             "gaps_hasMore": gaps_has_more,
-            "skipped": report.skipped,
+            "skipped": skipped_summary(
+                &report.skipped,
+                offset == 0 && clients_offset == 0 && gaps_offset == 0,
+            ),
         });
         let node_count = self.graph.read().await.node_count();
         match next_symbol {
@@ -874,7 +910,7 @@ impl McpServer {
                 },
                 {
                     "name": "find_api_usages",
-                    "description": "Finds calls to the OpenAI, Anthropic and Gemini SDKs (Python files and Python shebang scripts today): each call with file, line, enclosing symbol, client routing (openai_direct, azure_openai, custom_base_url, anthropic_bedrock, anthropic_vertex, google_genai...) and the model IDs passed as string literals, same-file constants, dict literals or parameter defaults. A literal fallback of an env/config lookup is returned with origin env_default and the call keeps a gap: confirm it before acting. Also returns client constructions, typed gaps for what could not be resolved (models from env/config, unknown client factories, getattr) and the vendored and hidden directories that were skipped. Use INSTEAD of grep to find where a deprecated model or SDK is used. Reads files directly; does not need the graph. Never returns credential values: a value is refused when any name it flows through looks like a secret (key, token, secret, password, pwd, auth, credential, private) or the value itself is credential-shaped (sk-, AIza, ghp_, xox..., URLs with a user or password, long random tokens).",
+                    "description": "Finds calls to the OpenAI, Anthropic and Gemini SDKs (Python files and Python shebang scripts today): each call with file, line, enclosing symbol, client routing (openai_direct, azure_openai, custom_base_url, anthropic_bedrock, anthropic_vertex, google_genai...) and the model IDs passed as string literals, same-file constants, dict literals or parameter defaults. A literal fallback of an env/config lookup is returned with origin env_default and the call keeps a gap: confirm it before acting. Also returns client constructions, typed gaps for what could not be resolved (models from env/config, unknown client factories, getattr) and what was skipped: counts on every page, and the first 20 vendored and hidden directories, oversized, unreadable and syntax-error files on the first page. Use INSTEAD of grep to find where a deprecated model or SDK is used. Reads files directly; does not need the graph. Never returns credential values: a value is refused when any name it flows through looks like a secret (key, token, secret, password, pwd, auth, credential, private) or the value itself is credential-shaped (sk-, AIza, ghp_, xox..., URLs with a user or password, long random tokens).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -2503,6 +2539,42 @@ client.chat.completions.create(model="gpt-4", messages=[], extra_body={"sk-proj-
         assert_eq!(next["data"]["gaps"].as_array().unwrap().len(), 5);
         assert_eq!(next["data"]["gaps_offset"], 500);
         assert_eq!(next["data"]["gaps_hasMore"], false);
+    }
+
+    #[tokio::test]
+    async fn find_api_usages_caps_skipped_lists_and_sends_them_once() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..30 {
+            std::fs::write(
+                dir.path().join(format!("broken_{i}.py")),
+                "from openai import OpenAI
+def broken(:
+    pass
+",
+            )
+            .unwrap();
+        }
+        let shared: SharedGraph = Arc::new(RwLock::new(ArborGraph::new()));
+        let server = McpServer::with_project(shared, dir.path().to_path_buf());
+        let first = tool_envelope(
+            server
+                .call_tool(json!({ "name": "find_api_usages", "arguments": {} }))
+                .await
+                .unwrap(),
+        );
+        let skipped = &first["data"]["skipped"];
+        assert_eq!(skipped["syntax_errors"].as_array().unwrap().len(), 20);
+        assert_eq!(skipped["syntax_errors_total"], 30);
+        let later = tool_envelope(
+            server
+                .call_tool(json!({ "name": "find_api_usages", "arguments": { "gaps_offset": 1 } }))
+                .await
+                .unwrap(),
+        );
+        let skipped = &later["data"]["skipped"];
+        assert!(skipped["syntax_errors"].as_array().unwrap().is_empty());
+        assert_eq!(skipped["syntax_errors_total"], 30);
+        assert_eq!(skipped["vendored_files"], 0);
     }
 
     #[tokio::test]
