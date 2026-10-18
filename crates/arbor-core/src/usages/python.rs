@@ -734,6 +734,12 @@ struct Resolved {
 }
 
 impl Resolved {
+    /// Whether the value is the only one its source gives: no caveat, and
+    /// not a parameter default (another module may pass the parameter).
+    fn is_certain(&self) -> bool {
+        self.caveats.is_empty() && self.origin != ValueOrigin::ParameterDefault
+    }
+
     /// Names `name` as the binding the value came through: the value's own
     /// name when it was written inline there, and the gaps of its caveats.
     fn through(mut self, name: &str, origin: ValueOrigin) -> Self {
@@ -3704,7 +3710,10 @@ impl<'t> Ctx<'t> {
             // No in-file call passes the argument, or the calls cannot all
             // be seen: the default holds only where nobody else calls.
             Some(Val::Client { mut client, path }) => {
-                let unseen = self.calls_of(scope).is_none();
+                // Calls past the read limit are not seen either.
+                let unseen = self
+                    .calls_of(scope)
+                    .is_none_or(|calls| calls.len() > MAX_CALLERS_READ);
                 if (unseen || !self.is_private(scope)) && client.caveat.is_none() {
                     client.caveat = Some(ClientCaveat::ParameterDefault {
                         param: name.to_string(),
@@ -5819,7 +5828,7 @@ impl<'t> Ctx<'t> {
                 }
                 match argument_for(call, slot.position, keyword, |n| self.text(n)) {
                     ArgFor::Found(expr) => match self.resolve_value(expr, call_scope, 0) {
-                        Ok(resolved) if resolved.caveats.is_empty() => {
+                        Ok(resolved) if resolved.is_certain() => {
                             if !push_candidate(&mut models.values, resolved) {
                                 models.unknown = true;
                             }
@@ -5928,7 +5937,7 @@ impl<'t> Ctx<'t> {
             };
             match self.resolve_value(value, assign.scope, depth + 1) {
                 Ok(mut resolved) => {
-                    complete &= resolved.caveats.is_empty();
+                    complete &= resolved.is_certain();
                     if resolved.origin == ValueOrigin::Literal {
                         resolved.origin = origin;
                     }
@@ -5988,7 +5997,7 @@ impl<'t> Ctx<'t> {
             }
             match self.resolve_value(item, list_scope, depth + 1) {
                 Ok(mut resolved) => {
-                    complete &= resolved.caveats.is_empty();
+                    complete &= resolved.is_certain();
                     if resolved.origin == ValueOrigin::Literal {
                         resolved.origin = origin;
                     }
@@ -6018,7 +6027,7 @@ impl<'t> Ctx<'t> {
         for side in [children.first(), children.last()].into_iter().flatten() {
             match self.resolve_value(*side, scope, depth + 1) {
                 Ok(resolved) => {
-                    complete &= resolved.caveats.is_empty();
+                    complete &= resolved.is_certain();
                     complete &= push_candidate(&mut found, resolved);
                 }
                 Err(unresolved) => {
@@ -6066,7 +6075,7 @@ impl<'t> Ctx<'t> {
             }
             match self.dict_entry(dict, &entry_key, value, 0) {
                 Ok(resolved) => {
-                    complete &= resolved.caveats.is_empty();
+                    complete &= resolved.is_certain();
                     complete &= push_candidate(&mut found, resolved);
                 }
                 Err(_) => complete = false,

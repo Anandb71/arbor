@@ -3852,3 +3852,51 @@ fn a_repeated_keyword_is_read_once() {
     assert_eq!(found.calls[0].values.len(), 1);
     assert_eq!(found.gaps.len(), 1);
 }
+
+#[test]
+fn callers_past_the_read_limit_are_unseen() {
+    // A private function's client default with more calls than are read:
+    // the one passing the gateway could be past the limit, so the default
+    // must keep a gap.
+    let mut source = String::from(
+        "from openai import OpenAI\nclient = OpenAI()\ngw = OpenAI(base_url=\"https://gw.example/v1\")\ndef _ask(q, c=client):\n    return c.chat.completions.create(model=\"gpt-4\", messages=[q])\n",
+    );
+    source.push_str(&"_ask(\"x\")\n".repeat(300));
+    source.push_str("_ask(\"y\", c=gw)\n");
+    let found = usages_within(&source, 10);
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![(
+            5,
+            Routing::OpenaiDirect,
+            vec!["ambiguous_client/unseen_callers".to_string()]
+        )]
+    );
+}
+
+#[test]
+fn a_parameter_default_never_completes_a_list() {
+    // Another module may pass the parameter, so a candidate that is a
+    // parameter default leaves the list partial.
+    let found = usages(
+        r#"from openai import OpenAI
+client = OpenAI()
+class Bot:
+    def __init__(self, model="gpt-4o"):
+        self.model = model
+    def fast(self):
+        self.model = "o1-mini"
+    def go(self):
+        return client.chat.completions.create(model=self.model, messages=[])
+"#,
+    );
+    assert_eq!(
+        listed_with_completeness(&found),
+        vec![(
+            9,
+            "reassigned".to_string(),
+            vec!["gpt-4o".to_string(), "o1-mini".to_string()],
+            false
+        )]
+    );
+}
