@@ -570,10 +570,12 @@ enum Origin {
     SdkResult {
         pkg: Option<Pkg>,
     },
-    /// One of several client constructors that route differently
-    /// (`try: from openai import AzureOpenAI as Maker` /
-    /// `except ImportError: from openai import OpenAI as Maker`); calling
-    /// it builds an ambiguous client of the first one's package.
+    /// A client constructor next to another that routes differently, or
+    /// next to something that is not a tracked constructor
+    /// (`AzureOpenAI if azure else build`, `try: from openai import
+    /// AzureOpenAI as Maker` / `except ImportError: from mylib import
+    /// FakeClient as Maker`); calling it builds an ambiguous client of the
+    /// first constructor's package.
     MixedClasses(Pkg),
     Other,
 }
@@ -3266,8 +3268,9 @@ impl<'t> Ctx<'t> {
         val
     }
 
-    /// Values of the tracked imports, parameter and assignments among `defs`.
-    /// Other imports matter only when nothing else binds the name.
+    /// Values of the imports, parameter and assignments among `defs`. A
+    /// name imported from another module is an untracked value next to
+    /// the others (`except ImportError: from mylib import Client`).
     fn def_values(&mut self, key: &Key, defs: &[DefRef]) -> Vec<Val> {
         let mut vals = Vec::new();
         for def in defs {
@@ -3277,7 +3280,13 @@ impl<'t> Ctx<'t> {
                         vals.push(import.val.clone());
                     }
                 }
-                DefRef::Other(_) => {}
+                DefRef::Other(i) => {
+                    if let Some(import) = self.other_imports.get(key).and_then(|v| v.get(i)) {
+                        vals.push(Val::untracked(Origin::Imported {
+                            module: import.module.to_string(),
+                        }));
+                    }
+                }
                 DefRef::Param => {
                     if self.params.contains_key(key) {
                         vals.push(self.param_value_memo(key));
@@ -6574,7 +6583,9 @@ fn combine(vals: Vec<Val>) -> Val {
         };
     }
 
-    // Constructors that route differently: what they build is ambiguous.
+    // Constructors that route differently, or a constructor next to
+    // something else (a factory, a name from another module, an unknown
+    // value): what they build is ambiguous.
     let classes: Vec<ClientClass> = real
         .iter()
         .filter_map(|v| match v {
@@ -6583,16 +6594,17 @@ fn combine(vals: Vec<Val>) -> Val {
         })
         .collect();
     if let Some(first) = classes.first() {
-        if classes
-            .iter()
-            .any(|c| c.pkg != first.pkg || c.family != first.family)
+        if classes.len() < real.len()
+            || classes
+                .iter()
+                .any(|c| c.pkg != first.pkg || c.family != first.family)
         {
             return Val::untracked(Origin::MixedClasses(first.pkg));
         }
     }
 
-    // No client: a tracked import beats a fallback; otherwise keep the most
-    // informative origin.
+    // No client or constructor: a tracked module beats a fallback;
+    // otherwise keep the most informative origin.
     if let Some(tracked) = real.iter().find(|v| v.is_tracked()) {
         return tracked.clone();
     }

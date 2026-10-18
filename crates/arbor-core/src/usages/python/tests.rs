@@ -3521,3 +3521,49 @@ c9.chat.completions.create(model="gpt-4", messages=[])
         ]
     );
 }
+
+#[test]
+fn a_constructor_chosen_against_another_value_builds_an_ambiguous_client() {
+    // "A tracked import beats a fallback" picked the SDK branch, so these
+    // reported `azure_openai` or `openai_direct` with no gap.
+    let found = usages(
+        r#"import os, functools
+from openai import OpenAI, AzureOpenAI
+def build():
+    return OpenAI(base_url="https://gw.example/v1")
+make = AzureOpenAI if os.getenv("AZ") else build
+c1 = make()
+c1.chat.completions.create(model="gpt-4", messages=[])
+make2 = OpenAI if os.getenv("D") else make_client
+c2 = make2()
+c2.chat.completions.create(model="gpt-4", messages=[])
+make3 = AzureOpenAI if os.getenv("AZ") else functools.partial(OpenAI, base_url="https://gw.example/v1")
+c3 = make3()
+c3.chat.completions.create(model="gpt-4", messages=[])
+try:
+    from openai import AzureOpenAI as Maker
+except ImportError:
+    from mylib import FakeClient as Maker
+c4 = Maker()
+c4.chat.completions.create(model="gpt-4", messages=[])
+try:
+    from openai import OpenAI as Plain
+except ImportError:
+    Plain = None
+c5 = Plain()
+c5.chat.completions.create(model="gpt-4", messages=[])
+"#,
+    );
+    let ambiguous = || vec!["ambiguous_client/multiple_assignments".to_string()];
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (7, Routing::Unknown, ambiguous()),
+            (10, Routing::Unknown, ambiguous()),
+            (13, Routing::Unknown, ambiguous()),
+            (19, Routing::Unknown, ambiguous()),
+            // `None` is a placeholder: the import is the only constructor.
+            (25, Routing::OpenaiDirect, vec![]),
+        ]
+    );
+}
