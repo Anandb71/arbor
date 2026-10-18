@@ -3033,3 +3033,35 @@ fn a_file_reports_at_most_twenty_thousand_records() {
         ("truncated", 20_002)
     );
 }
+
+#[test]
+fn a_constructor_imported_two_ways_builds_an_ambiguous_client() {
+    // `Maker` is `AzureOpenAI` or `OpenAI` depending on the import: the
+    // first one won, so the client was reported as `azure_openai`.
+    let found = usages(
+        r#"try:
+    from openai import AzureOpenAI as Maker
+except ImportError:
+    from openai import OpenAI as Maker
+CL16 = Maker()
+CL16.chat.completions.create(model="gpt-4", messages=[])
+try:
+    from openai import AsyncOpenAI as Same
+except ImportError:
+    from openai import OpenAI as Same
+CL17 = Same()
+CL17.chat.completions.create(model="gpt-4", messages=[])
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (
+                6,
+                Routing::Unknown,
+                vec!["ambiguous_client/multiple_assignments".to_string()]
+            ),
+            (12, Routing::OpenaiDirect, vec![]),
+        ]
+    );
+}

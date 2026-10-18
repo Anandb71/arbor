@@ -543,6 +543,11 @@ enum Origin {
     SdkResult {
         pkg: Option<Pkg>,
     },
+    /// One of several client constructors that route differently
+    /// (`try: from openai import AzureOpenAI as Maker` /
+    /// `except ImportError: from openai import OpenAI as Maker`); calling
+    /// it builds an ambiguous client of the first one's package.
+    MixedClasses(Pkg),
     Other,
 }
 
@@ -3533,6 +3538,18 @@ impl<'t> Ctx<'t> {
             Val::Module { pkg, .. } | Val::Symbol { pkg, .. } => Val::Result(Some(pkg)),
             Val::Result(pkg) => Val::Result(pkg),
             Val::GoogleNs => Val::untracked(Origin::Other),
+            Val::Untracked(Origin::MixedClasses(pkg)) => Val::Client {
+                client: Client {
+                    pkg,
+                    routing: Routing::Unknown,
+                    line: None,
+                    site: None,
+                    ambiguous: true,
+                    typed: false,
+                    caveat: None,
+                },
+                path: Vec::new(),
+            },
             Val::Untracked(_) => {
                 let callee = call
                     .child_by_field_name("function")
@@ -6062,6 +6079,23 @@ fn combine(vals: Vec<Val>) -> Val {
             },
             path: Vec::new(),
         };
+    }
+
+    // Constructors that route differently: what they build is ambiguous.
+    let classes: Vec<ClientClass> = real
+        .iter()
+        .filter_map(|v| match v {
+            Val::Class(class) => Some(*class),
+            _ => None,
+        })
+        .collect();
+    if let Some(first) = classes.first() {
+        if classes
+            .iter()
+            .any(|c| c.pkg != first.pkg || c.family != first.family)
+        {
+            return Val::untracked(Origin::MixedClasses(first.pkg));
+        }
     }
 
     // No client: a tracked import beats a fallback; otherwise keep the most
