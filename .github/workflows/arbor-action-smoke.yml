@@ -65,3 +65,62 @@ jobs:
           ls "$HOME/.arbor-bin"
           test -f "$HOME/.arbor-bin/arbor" || test -f "$HOME/.arbor-bin/arbor.exe"
           arbor --version | grep -F "3.0.0"
+
+  # Retirements mode builds Arbor from this checkout (no release has the
+  # command yet), warns by default, and fails only when asked to.
+  retirements:
+    runs-on: ubuntu-latest
+    env:
+      # Both action runs below install from source; share one build.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write a project that calls a retired model
+        shell: bash
+        run: |
+          mkdir -p smoke-retirements
+          cat > smoke-retirements/app.py <<'PY'
+          from anthropic import Anthropic
+          from openai import OpenAI
+
+          claude = Anthropic()
+          client = OpenAI()
+
+
+          def legacy():
+              return claude.messages.create(model="claude-3-5-sonnet-20241022", max_tokens=64, messages=[])
+
+
+          def current():
+              return client.chat.completions.create(model="gpt-4o", messages=[], max_tokens=64)
+          PY
+
+      - name: Retirements mode warns by default
+        uses: ./
+        with:
+          install-from-source: "true"
+          mode: retirements
+          retirements-path: smoke-retirements
+
+      - name: Retirements mode fails when asked to
+        id: strict
+        continue-on-error: true
+        uses: ./
+        with:
+          install-from-source: "true"
+          mode: retirements
+          retirements-path: smoke-retirements
+          retirements-fail-on: retired
+
+      - name: The strict run failed on the retired call
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.strict.outcome }}" = "failure"
+          CODE=0
+          arbor retirements smoke-retirements --json > report.json || CODE=$?
+          test "$CODE" -eq 1
+          grep -F '"model": "claude-3-5-sonnet-20241022"' report.json
+          grep -F '"status": "retired"' report.json

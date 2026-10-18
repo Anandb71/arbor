@@ -29,6 +29,22 @@ inputs:
     description: "The GITHUB_TOKEN secret, needed to post PR comments."
     required: false
     default: "${{ github.token }}"
+  mode:
+    description: "'command' (default) runs the command input. 'retirements' finds calls to AI models their provider has retired or is retiring, writes a job summary and annotates the affected lines. It runs on the runner; no code is sent anywhere."
+    required: false
+    default: command
+  retirements-path:
+    description: "Retirements mode: the directory or file to check, relative to working-directory."
+    required: false
+    default: .
+  retirements-fail-on:
+    description: "Retirements mode: 'never' (default; warnings only), 'retired' (fail when a call uses a model that is already retired), or a number of days (also fail when a model retires within that many days)."
+    required: false
+    default: never
+  retirements-include-routed:
+    description: "Retirements mode: also list calls through Azure, a custom base_url or another cloud, where the provider's dates may not apply, and let them fail the check."
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -130,7 +146,60 @@ runs:
           fi
         fi
 
+    - name: Check model retirements
+      if: inputs.mode == 'retirements'
+      shell: bash
+      env:
+        RET_WORKDIR: ${{ inputs.working-directory }}
+        RET_PATH: ${{ inputs.retirements-path }}
+        RET_FAIL_ON: ${{ inputs.retirements-fail-on }}
+        RET_ROUTED: ${{ inputs.retirements-include-routed }}
+      run: |
+        set -uo pipefail
+        # Run from the repository root so annotation paths match the repository.
+        TARGET="$RET_PATH"
+        if [[ -n "$RET_WORKDIR" && "$RET_WORKDIR" != "." ]]; then
+          if [[ "$RET_PATH" == "." ]]; then TARGET="$RET_WORKDIR"; else TARGET="${RET_WORKDIR%/}/$RET_PATH"; fi
+        fi
+
+        ARGS=()
+        if [[ "$RET_ROUTED" == "true" ]]; then ARGS+=(--include-routed); fi
+        case "$RET_FAIL_ON" in
+          never|retired) ;;
+          ''|*[!0-9]*)
+            echo "::error title=Arbor retirements::retirements-fail-on must be 'never', 'retired' or a number of days, not '$RET_FAIL_ON'"
+            exit 2
+            ;;
+          *) ARGS+=(--fail-within "$RET_FAIL_ON") ;;
+        esac
+
+        # One warning annotation per affected call; never fails by itself.
+        arbor retirements "$TARGET" --annotations ${ARGS[@]+"${ARGS[@]}"} || true
+
+        # The job summary. Its exit code says whether anything is failing:
+        # 0 nothing, 1 retired (or retiring within the window), 2 error.
+        REPORT="$(mktemp)"
+        arbor retirements "$TARGET" --markdown ${ARGS[@]+"${ARGS[@]}"} > "$REPORT"
+        CODE=$?
+        if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+          cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+        else
+          cat "$REPORT"
+        fi
+        rm -f "$REPORT"
+
+        if [[ $CODE -ge 2 ]]; then
+          echo "::error title=Arbor retirements::the check could not run (exit $CODE)"
+          exit 2
+        fi
+        if [[ $CODE -eq 1 && "$RET_FAIL_ON" != "never" ]]; then
+          echo "::error title=Arbor retirements::calls use models that are retired or retire within the configured window; see the job summary"
+          exit 1
+        fi
+        exit 0
+
     - name: Run Arbor and Comment on PR
+      if: inputs.mode != 'retirements'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
