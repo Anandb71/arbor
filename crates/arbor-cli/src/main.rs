@@ -713,6 +713,11 @@ async fn run() {
                 usages::print_json_error(&error.render().to_string());
                 std::process::exit(error.exit_code());
             }
+            if !informational && retirements::wants_json(std::env::args_os().skip(1)) {
+                let _ = error.print();
+                retirements::print_json_error(&error.render().to_string());
+                std::process::exit(2);
+            }
             error.exit()
         }
     };

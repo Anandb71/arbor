@@ -53,7 +53,7 @@ For each affected call it reports:
 | **Replacement** | The model the provider's deprecation page lists. Arbor does not pick a "better" one. When the provider lists several models, or none, the report says so. |
 | **Also change** | Arguments that must change with the replacement, worked out from the arguments the call passes. For example, `max_tokens` becomes `max_completion_tokens` and `reasoning_effort="none"` is added when the call sets `temperature` or `tools`. |
 | **Check** | What needs a person: parameters the replacement rejects (`stop`, `logit_bias`), fine-tuned models, embedding models (new vectors), several listed replacements. |
-| **Confidence** | *Confirmed*: a literal or a constant in the same file. *Confirm first*: the fallback of `os.getenv(...)` or a parameter default, which the deployed value may override. *Gap*: an SDK-shaped call whose client Arbor could not resolve (built by a factory, passed in). |
+| **Confidence** | *Confirmed*: a literal or a constant in the same file. *Confirm first*: the fallback of `os.getenv(...)`, a parameter default, or one of the values a dict lookup, a branch or an in-file caller may give; the value at run time may differ. *Gap*: an SDK-shaped call whose client Arbor could not resolve (built by a factory, passed in). |
 | **Routing** | A provider's dates apply to its own API. Calls through Azure OpenAI, a custom `base_url` (OpenRouter, LiteLLM, a proxy), Bedrock or Vertex are counted separately; `--include-routed` lists them. |
 
 ## Options and exit codes
@@ -107,7 +107,7 @@ runner and sends nothing anywhere.
   API) are not tracked yet. Model IDs in `.env`, YAML, JSON or notebooks are not read.
 - **Values it can see.** A model passed in from an environment variable, a function
   argument or another module is counted under "Not checked"; `arbor usages` lists those
-  calls. Argument checks look at the argument *names* a call passes, not their values,
+  calls. So is a call that passes no model, where the SDK's or the server's default applies. Argument checks look at the argument *names* a call passes, not their values,
   and not at parameters nested in config objects such as Gemini's
   `GenerateContentConfig`.
 - **Exact matches.** A value matches only when the whole string equals a listed ID.

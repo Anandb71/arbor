@@ -71,14 +71,38 @@ pub fn run(args: &Args) -> i32 {
 
 fn fail(args: &Args, message: &str) -> i32 {
     if args.json {
-        let error = serde_json::json!({ "version": REPORT_VERSION, "error": message });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&error).unwrap_or_else(|_| "{}".to_string())
-        );
+        print_json_error(message);
     }
     eprintln!("{} {}", "error:".red().bold(), clean(message));
     2
+}
+
+/// Prints `{"version", "error"}` on stdout. A multi-line message (an
+/// argument error with its usage line) keeps its first line.
+pub fn print_json_error(message: &str) {
+    let first = message
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(message);
+    let error = serde_json::json!({
+        "version": REPORT_VERSION,
+        "error": first.strip_prefix("error: ").unwrap_or(first),
+    });
+    if let Ok(text) = serde_json::to_string_pretty(&error) {
+        println!("{text}");
+    }
+}
+
+/// Whether the command line (without the program name) runs `retirements`
+/// with `--json`: global flags may come first, and `--` ends the options.
+pub fn wants_json(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    let mut args = args.into_iter();
+    let command = args.find(|arg| arg == "--" || !arg.to_string_lossy().starts_with('-'));
+    command.is_some_and(|c| c == "retirements")
+        && args
+            .take_while(|arg| arg != "--")
+            .any(|arg| arg == "--json")
 }
 
 fn build_report(args: &Args) -> Result<RetirementReport, String> {
@@ -279,6 +303,9 @@ fn describe_changes(changes: &[Change], code: bool) -> String {
 fn caveat(finding: &Finding) -> Option<String> {
     let provider = finding.provider.provider();
     let text = match (finding.confidence, finding.origin) {
+        _ if finding.candidate => {
+            "one of the values this call may get at run time: confirm which one it uses".to_string()
+        }
         (Confidence::ConfirmFirst, Some(ValueOrigin::EnvDefault)) => {
             "fallback of an environment or config lookup: confirm the deployed value".to_string()
         }
@@ -410,6 +437,17 @@ fn not_checked_lines(report: &RetirementReport, markdown: bool) -> Vec<String> {
             calls(s.unreadable_calls),
             if s.unreadable_calls == 1 { "takes" } else { "take" },
             if s.unreadable_calls == 1 { "it" } else { "them" }
+        ));
+    }
+    if s.no_model_calls > 0 {
+        lines.push(format!(
+            "Not checked: {} {} no model, so the SDK's or the server's default applies.",
+            calls(s.no_model_calls),
+            if s.no_model_calls == 1 {
+                "passes"
+            } else {
+                "pass"
+            }
         ));
     }
     if s.routed_calls > 0 && !report.options.include_routed {

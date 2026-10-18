@@ -395,3 +395,78 @@ fn markdown_and_annotations_for_github() {
         .all(|l| l.starts_with("::warning file=app.py,line=")));
     assert!(text.contains("title=gpt-4o%3A OpenAI shuts down on 14 Jan 2027 (88 days)::"));
 }
+
+const LOOKUPS: &str = r#"from openai import OpenAI
+
+client = OpenAI()
+MODELS = {"fast": "gpt-4o-mini", "smart": "gpt-6-luna"}
+
+
+def ask(prompt, tier):
+    return client.chat.completions.create(model=MODELS[tier], messages=[])
+
+
+def pick(prompt, model="gpt-6-luna"):
+    return client.chat.completions.create(model=model, messages=[], temperature=0)
+
+
+def caller():
+    return pick("x", model="o3-mini")
+
+
+def nothing():
+    return client.chat.completions.create(messages=[])
+"#;
+
+#[test]
+fn values_a_call_may_take_are_listed_to_confirm() {
+    let dir = project(LOOKUPS);
+    let output = arbor(
+        dir.path(),
+        &["retirements", ".", "--json", "--today", TODAY],
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report = json(&output);
+
+    let mini = finding(&report, "gpt-4o-mini");
+    assert_eq!(mini["candidate"], true);
+    assert_eq!(mini["confidence"], "confirm_first");
+    assert_eq!(mini["line"], 8);
+    assert_eq!(mini["value_line"], 4);
+
+    // What an in-file caller passes for the parameter.
+    let o3 = finding(&report, "o3-mini");
+    assert_eq!(o3["candidate"], true);
+    assert_eq!(o3["date"], "2026-10-23");
+    assert_eq!(o3["days_left"], 5);
+    assert_eq!(o3["value_line"], 16);
+
+    assert_eq!(report["summary"]["affected_calls"], 2);
+    assert_eq!(report["summary"]["no_model_calls"], 1);
+    assert_eq!(report["summary"]["unreadable_calls"], 0);
+
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    assert!(
+        text.contains("one of the values this call may get at run time"),
+        "{text}"
+    );
+    assert!(text.contains("1 call passes no model"), "{text}");
+}
+
+#[test]
+fn argument_errors_are_json_with_json() {
+    let dir = project(CURRENT);
+    let output = arbor(
+        dir.path(),
+        &["retirements", ".", "--json", "--fail-within", "soon"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let error = json(&output);
+    assert_eq!(error["version"], 1);
+    assert!(error["error"].as_str().unwrap().contains("--fail-within"));
+
+    // Without --json the parser's usual message is enough.
+    let output = arbor(dir.path(), &["retirements", ".", "--fail-within", "soon"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stdout(&output).is_empty());
+}

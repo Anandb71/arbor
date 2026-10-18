@@ -212,8 +212,12 @@ pub struct Finding {
     pub value_from: Option<String>,
     /// Line of the string literal itself.
     pub value_line: u32,
-    /// For a gap: why the client was not resolved (`factory_call`...).
+    /// For a gap: why the client or the model was not resolved
+    /// (`factory_call`, `parameter_overridden`...).
     pub gap_reason: Option<String>,
+    /// The value is one of several the call may get at run time (a lookup's
+    /// entries, a branch, what an in-file caller passes), not the call's own.
+    pub candidate: bool,
     /// Arguments were spread into the call with `**`.
     pub splat: bool,
     /// Counts toward the exit code under the current options.
@@ -289,6 +293,8 @@ pub struct Summary {
     pub routed_calls: usize,
     /// Requests whose model could not be read.
     pub unreadable_calls: usize,
+    /// Requests that pass no model, so the SDK's or server's default applies.
+    pub no_model_calls: usize,
 }
 
 /// The result of [`check`].
@@ -337,24 +343,47 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
             }
         }
     }
-    for gap in input.gaps {
-        let class = CallRouting {
-            class: RoutingClass::Unknown,
-            routing: "unresolved_client".to_string(),
-            sdk: gap.sdk,
-            table: None,
+    for gap in input.gaps.iter().filter(|g| !g.values.is_empty()) {
+        // An unresolved model with listed values: the call is known, its
+        // model is one of these (a lookup's entries, a branch, what in-file
+        // callers pass). Any other gap with values is an SDK-shaped call
+        // whose client was not resolved.
+        let call = (gap.kind == GapKind::UnresolvedModel)
+            .then(|| {
+                input.calls.iter().find(|c| {
+                    c.file == gap.file
+                        && gap.span.is_some_and(|s| s.start_byte == c.span.start_byte)
+                })
+            })
+            .flatten();
+        let (site, class, confidence) = match call {
+            Some(call) => (
+                Site::Call(call),
+                call_routing(call, input.clients),
+                Confidence::ConfirmFirst,
+            ),
+            None => (
+                Site::Gap(gap),
+                CallRouting {
+                    class: RoutingClass::Unknown,
+                    routing: "unresolved_client".to_string(),
+                    sdk: gap.sdk,
+                    table: None,
+                },
+                if gap.kind == GapKind::UnresolvedModel {
+                    Confidence::ConfirmFirst
+                } else {
+                    Confidence::Gap
+                },
+            ),
         };
         for value in &gap.values {
-            let Some(finding) = finding_for(
-                data,
-                options,
-                Site::Gap(gap),
-                &class,
-                value,
-                Confidence::Gap,
-            ) else {
+            let Some(mut finding) = finding_for(data, options, site, &class, value, confidence)
+            else {
                 continue;
             };
+            finding.gap_reason = Some(gap.reason.clone());
+            finding.candidate = gap.kind == GapKind::UnresolvedModel;
             if finding.routing_class == RoutingClass::Routed {
                 routed.push(finding);
             } else {
@@ -363,15 +392,20 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
         }
     }
 
+    // A value can reach the report twice (a parameter default that a caller
+    // also passes): keep the first, which is the call's own.
+    dedupe_findings(&mut direct);
+    dedupe_findings(&mut routed);
     sort_findings(&mut direct);
     sort_findings(&mut routed);
     let routed_calls = routed.len();
     if !options.include_routed {
         routed.clear();
     }
-    let unreadable = unreadable(input);
+    let (unreadable, no_model_calls) = unreadable(input);
 
-    let summary = summarize(&direct, &routed, routed_calls, unreadable.len());
+    let mut summary = summarize(&direct, &routed, routed_calls, unreadable.len());
+    summary.no_model_calls = no_model_calls;
     let exit_code = i32::from(direct.iter().chain(&routed).any(|f| f.in_window));
 
     RetirementReport {
@@ -763,6 +797,7 @@ fn finding_for(
         value_from: value.name.clone(),
         value_line: value.span.line,
         gap_reason,
+        candidate: false,
         splat,
         in_window,
         recipe: hit.recipe.id.clone(),
@@ -1181,8 +1216,9 @@ fn dedupe(items: Vec<String>) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// Requests whose model is not a value Arbor can read (environment, a
-/// parameter, another module), except where a fallback was captured.
-fn unreadable(input: ScanInput<'_>) -> Vec<Unreadable> {
+/// parameter, another module), except where a fallback or the possible
+/// values were captured; and the number of requests that pass no model.
+fn unreadable(input: ScanInput<'_>) -> (Vec<Unreadable>, usize) {
     let captured: HashSet<(&str, u32, &str)> = input
         .calls
         .iter()
@@ -1194,8 +1230,16 @@ fn unreadable(input: ScanInput<'_>) -> Vec<Unreadable> {
         .collect();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
+    let mut no_model = 0;
     for gap in input.gaps {
         if gap.kind != GapKind::UnresolvedModel || gap.reason == "truncated" {
+            continue;
+        }
+        if gap.reason == "missing_model" {
+            no_model += 1;
+            continue;
+        }
+        if !gap.values.is_empty() {
             continue;
         }
         let Some(span) = gap.span else { continue };
@@ -1215,7 +1259,20 @@ fn unreadable(input: ScanInput<'_>) -> Vec<Unreadable> {
             reason: gap.reason.clone(),
         });
     }
-    out
+    (out, no_model)
+}
+
+fn dedupe_findings(findings: &mut Vec<Finding>) {
+    let mut seen = HashSet::new();
+    findings.retain(|f| {
+        seen.insert((
+            f.file.clone(),
+            f.line,
+            f.column,
+            f.key.clone(),
+            f.model.clone(),
+        ))
+    });
 }
 
 fn state_rank(state: State) -> u8 {
@@ -1788,6 +1845,55 @@ mod tests {
         assert_eq!(json["version"], 1);
         assert_eq!(json["findings"][1]["status"], "retiring");
         assert_eq!(json["findings"][1]["date"], "2027-01-14");
+    }
+
+    #[test]
+    fn candidate_values_of_a_known_call_are_confirm_first() {
+        // `model=MODELS[tier]`: the call is known, its model is one of the
+        // dict's entries, listed on the unresolved_model gap.
+        let mut lookup = openai("gpt-4o", &["temperature"]);
+        lookup.values.clear();
+        let gap = UsageGap {
+            kind: GapKind::UnresolvedModel,
+            sdk: Some(Sdk::Openai),
+            file: "app.py".into(),
+            span: Some(span(10)),
+            symbol: Some("ask".into()),
+            chain: Some("client.chat.completions.create".into()),
+            key: Some("model".into()),
+            reason: "dict_lookup".into(),
+            detail: String::new(),
+            values: vec![
+                value("gpt-4o-mini", ValueOrigin::Literal, 3),
+                value("gpt-6-luna", ValueOrigin::Literal, 3),
+            ],
+        };
+        let missing = UsageGap {
+            kind: GapKind::UnresolvedModel,
+            span: Some(span(20)),
+            key: Some("model".into()),
+            reason: "missing_model".into(),
+            values: Vec::new(),
+            ..gap.clone()
+        };
+        let report = run(&[lookup], &[gap, missing], &options("2026-10-18"));
+        assert_eq!(report.findings.len(), 1, "only the retiring entry matches");
+        let finding = &report.findings[0];
+        assert_eq!(finding.model, "gpt-4o-mini");
+        assert!(finding.candidate);
+        assert_eq!(finding.confidence, Confidence::ConfirmFirst);
+        assert_eq!(
+            finding.routing_class,
+            RoutingClass::Direct,
+            "the call's own routing"
+        );
+        assert_eq!(finding.gap_reason.as_deref(), Some("dict_lookup"));
+        // The call's arguments still drive the co-changes.
+        assert!(change(finding, "reasoning_effort").is_some());
+        // Neither gap is an unreadable model: one lists its values, the
+        // other passes no model at all.
+        assert_eq!(report.summary.unreadable_calls, 0);
+        assert_eq!(report.summary.no_model_calls, 1);
     }
 
     #[test]
