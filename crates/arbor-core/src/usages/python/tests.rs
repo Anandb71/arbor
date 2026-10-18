@@ -2457,14 +2457,13 @@ from openai import OpenAI
 client = OpenAI()
 CONFIG = {"model": "gpt-4o", "openai": {"model": "o3"}, "temperature": 0}
 MODEL = CONFIG["model"]
-OPENAI = CONFIG["openai"]
 print(json.dumps(CONFIG), len(CONFIG), "model" in CONFIG)
 for key in CONFIG:
     print(key, CONFIG.get(key))
 for key, value in {"a": "b"}.items():
     pass
 client.chat.completions.create(model=MODEL, messages=[])
-client.chat.completions.create(**OPENAI, messages=[])
+client.chat.completions.create(**CONFIG["openai"], messages=[])
 client.chat.completions.create(model=CONFIG.get("model"), messages=[])
 "#,
     );
@@ -2474,6 +2473,25 @@ client.chat.completions.create(model=CONFIG.get("model"), messages=[])
         .map(|c| value(c, "model").unwrap_or("-"))
         .collect();
     assert_eq!(models, vec!["gpt-4o", "o3", "gpt-4o"]);
+    // Policy round (P2): a nested dict handed to another name may change
+    // through it, mutated or not, so the dict is no longer read.
+    let found = usages(
+        r#"
+from openai import OpenAI
+client = OpenAI()
+CONFIG = {"model": "gpt-4o", "openai": {"model": "o3"}}
+OPENAI = CONFIG["openai"]
+client.chat.completions.create(**CONFIG, messages=[])
+client.chat.completions.create(**OPENAI, messages=[])
+"#,
+    );
+    assert_eq!(
+        values_and_gaps(&found),
+        vec![
+            (6, "-".to_string(), vec!["splat".to_string()]),
+            (7, "-".to_string(), vec!["splat".to_string()]),
+        ]
+    );
 }
 
 #[test]
@@ -3639,20 +3657,21 @@ fn dicts_aliased_by_a_chain_a_class_attribute_or_the_namespace_are_not_read() {
         "CFG4 = {\"model\": \"gpt-4o\"}\nclass K4:\n    cfg = CFG4\nx = K4.cfg\nx[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**CFG4, messages=[])\n",
         "CFG5 = {\"model\": \"gpt-4o\"}\nclass K5:\n    cfg = CFG5\n    def tune(self):\n        self.cfg.update(model=\"o1-mini\")\nclient.chat.completions.create(**CFG5, messages=[])\n",
         "CFG7 = {\"model\": \"gpt-4o\"}\nglobals()[\"CFG7\"][\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**CFG7, messages=[])\n",
+        // Policy round (P2): read only, but aliased: the supported grammar
+        // reads a dict only through its one name.
+        "CFG = {\"model\": \"gpt-4o\"}\nclass K:\n    cfg = CFG\nprint(K.cfg[\"model\"])\nclient.chat.completions.create(**CFG, messages=[])\n",
+        "CFG2 = {\"model\": \"gpt-4o\"}\nx = y = CFG2\nprint(x[\"model\"])\nclient.chat.completions.create(**CFG2, messages=[])\n",
     ] {
         let rows = rows_of(&format!("{header}{body}"));
         assert_eq!(rows.len(), 1, "{body}");
         assert_eq!(rows[0].1, "-", "{body}");
         assert_eq!(rows[0].2, vec!["splat".to_string()], "{body}");
     }
-    // Read-only uses of the same shapes still resolve.
-    for body in [
-        "CFG = {\"model\": \"gpt-4o\"}\nclass K:\n    cfg = CFG\nprint(K.cfg[\"model\"])\nclient.chat.completions.create(**CFG, messages=[])\n",
-        "CFG2 = {\"model\": \"gpt-4o\"}\nx = y = CFG2\nprint(x[\"model\"])\nclient.chat.completions.create(**CFG2, messages=[])\n",
-    ] {
-        let rows = rows_of(&format!("{header}{body}"));
-        assert_eq!(rows[0].1, "gpt-4o", "{body}");
-    }
+    // Read without an alias, the dict resolves.
+    let rows = rows_of(&format!(
+        "{header}CFG = {{\"model\": \"gpt-4o\"}}\nprint(CFG[\"model\"], len(CFG))\nclient.chat.completions.create(**CFG, messages=[])\n"
+    ));
+    assert_eq!(rows, vec![(5, "gpt-4o".to_string(), vec![])]);
 }
 
 #[test]
@@ -4015,6 +4034,89 @@ fn annotated_fields_of_data_classes_are_constructor_defaults() {
 // Policy round (re-review of d6132ac): a supported grammar, and dynamic
 // features as gaps
 // ---------------------------------------------------------------------------
+
+/// Every call of `source` with its model value (or `-`) and gap reasons;
+/// fails when a call reports a value with no gap at all, unless its line
+/// is in `confirmed`.
+fn rows_gapped(source: &str, confirmed: &[u32]) -> Vec<(u32, String, Vec<String>)> {
+    let found = usages(source);
+    let rows = values_and_gaps(&found);
+    for (line, value, reasons) in &rows {
+        if !confirmed.contains(line) {
+            assert!(
+                !reasons.is_empty(),
+                "line {line} reports `{value}` with no gap:\n{source}"
+            );
+        }
+    }
+    rows
+}
+
+#[test]
+fn dicts_and_lists_aliased_or_mutated_through_any_name_are_not_read() {
+    // Finding 6: `params = DEFAULTS; params |= {...}`, a nested list
+    // extended with `+=` through a name, an alias assigned in one branch
+    // and a chain of more than 8 aliases left the literal's value with no
+    // gap. Now any alias of a whole container, and any name given a
+    // nested container, makes the dict a gap.
+    let header = "import os\nfrom openai import OpenAI\nclient = OpenAI()\n";
+    let mut chain = String::from("D = {\"model\": \"gpt-4o\"}\na0 = D\n");
+    for i in 1..70 {
+        chain.push_str(&format!("a{i} = a{}\n", i - 1));
+    }
+    chain.push_str(
+        "a69[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**D, messages=[])\n",
+    );
+    for body in [
+        "DEFAULTS = {\"model\": \"gpt-4o\", \"temperature\": 0}\nparams = DEFAULTS\nparams |= {\"model\": \"o1-mini\"}\nclient.chat.completions.create(**DEFAULTS, messages=[])\n".to_string(),
+        "P = {\"model\": \"gpt-4o\", \"extra_body\": {\"fallbacks\": [{\"model\": \"gpt-4o-mini\"}]}}\nfb = P[\"extra_body\"][\"fallbacks\"]\nfb += [{\"model\": \"o1-mini\"}]\nclient.chat.completions.create(**P, messages=[])\n".to_string(),
+        "D = {\"model\": \"gpt-4o\"}\nif os.getenv(\"X\"):\n    cfg = D\nelse:\n    cfg = {\"model\": \"gpt-4o-mini\"}\nparams = cfg\nparams[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**D, messages=[])\n".to_string(),
+        "D = {\"model\": \"gpt-4o\"}\nQ = D if os.getenv(\"X\") else {}\nQ[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**D, messages=[])\n".to_string(),
+        "D = {\"model\": \"gpt-4o\"}\nfor d in (D,):\n    d[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**D, messages=[])\n".to_string(),
+        chain,
+    ] {
+        let rows = rows_gapped(&format!("{header}{body}"), &[]);
+        assert!(rows.iter().all(|r| r.1 == "-"), "{body}: {rows:?}");
+    }
+    // A copy is not an alias.
+    let rows = rows_gapped(
+        &format!("{header}P18 = {{\"model\": \"gpt-4o\"}}\nns = dict(**P18)\nclient.chat.completions.create(**P18, messages=[])\n"),
+        &[6],
+    );
+    assert_eq!(rows, vec![(6, "gpt-4o".to_string(), vec![])]);
+}
+
+#[test]
+fn values_complete_only_for_one_scope_with_no_alias_or_mutation() {
+    // Finding 11: a list mutated through an alias, and a class-body
+    // comprehension's first iterable, were listed as complete.
+    let header = "import os\nfrom openai import OpenAI\nclient = OpenAI()\n";
+    for body in [
+        "L = [\"gpt-4o\"]\nB = L\nB.append(\"o1-mini\")\nfor m in L:\n    client.chat.completions.create(model=m, messages=[])\n",
+        "L = [\"gpt-4o\"]\nB = L\nB[0] = \"o1-mini\"\nfor m in L:\n    client.chat.completions.create(model=m, messages=[])\n",
+        "L = [\"gpt-4o\"]\nB = L\nB += [\"o1-mini\"]\nfor m in L:\n    client.chat.completions.create(model=m, messages=[])\n",
+        "L = [\"gpt-4o\"]\nB = L\nB.extend([\"o1-mini\"])\nr = [client.chat.completions.create(model=m, messages=[]) for m in L]\n",
+        "L = [\"gpt-4o\"]\nL.append(\"o1-mini\")\ndef run():\n    for m in L:\n        client.chat.completions.create(model=m, messages=[])\n",
+        "M4 = [\"gpt-4o\"]\nclass Bot:\n    M4 = [\"o1-mini\"]\n    r = [client.chat.completions.create(model=m, messages=[]) for m in M4]\n",
+        // A definition from another scope (`global`) is not in the list's
+        // scope.
+        "if os.getenv(\"X\"):\n    M = \"gpt-4o\"\nelse:\n    M = \"o1-mini\"\ndef tune():\n    global M\n    M = \"o3-mini\"\nclient.chat.completions.create(model=M, messages=[])\n",
+    ] {
+        let found = usages(&format!("{header}{body}"));
+        assert_eq!(found.calls.len(), 1, "{body}");
+        assert!(found.calls[0].values.is_empty(), "{body}");
+        for gap in gaps(&found, GapKind::UnresolvedModel) {
+            assert!(!gap.values_complete, "{body}: {gap:?}");
+        }
+    }
+    // Inside the grammar: literal branches in one scope, a literal list.
+    let found = usages(&format!(
+        "{header}if os.getenv(\"X\"):\n    M = \"gpt-4o\"\nelse:\n    M = \"o1-mini\"\nclient.chat.completions.create(model=M, messages=[])\nfor m in [\"gpt-4o\", \"o1-mini\"]:\n    client.chat.completions.create(model=m, messages=[])\n"
+    ));
+    let listed = listed_with_completeness(&found);
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().all(|row| row.3), "{listed:?}");
+}
 
 #[test]
 fn candidate_lists_stay_linear_however_many_definitions_and_uses() {

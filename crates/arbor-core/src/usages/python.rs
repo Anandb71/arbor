@@ -1623,7 +1623,7 @@ impl<'t> Ctx<'t> {
                             let annotation = node.child_by_field_name("type");
                             self.record_target(left, value, annotation, scope, false, place);
                         }
-                        self.note_chained_alias(node, scope);
+                        self.note_chained_alias(node);
                     }
                     "augmented_assignment" => {
                         if let Some(left) = node.child_by_field_name("left") {
@@ -2015,9 +2015,9 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    /// `x = y = D` (each target aliases `D`; the inner one is seen by
-    /// [`Self::dict_use`]) and `self.d = x = D` (the dict is stored).
-    fn note_chained_alias(&mut self, assignment: Node<'t>, scope: usize) {
+    /// `x = y = D` and `self.d = x = D`: `D` is aliased or stored, so it
+    /// escapes (the inner target is also seen by [`Self::dict_use`]).
+    fn note_chained_alias(&mut self, assignment: Node<'t>) {
         let mut value = assignment.child_by_field_name("right");
         let mut chained = false;
         for _ in 0..MAX_DEPTH {
@@ -2029,22 +2029,9 @@ impl<'t> Ctx<'t> {
                 _ => break,
             }
         }
-        let (Some(value), true) = (value, chained) else {
-            return;
-        };
-        if value.kind() != "identifier" {
-            return;
-        }
-        let root = self.text(value);
-        match assignment.child_by_field_name("left") {
-            Some(target) if target.kind() == "identifier" => self.exposed.push(Exposed {
-                root,
-                node: value,
-                scope,
-                alias: Some(self.text(target)),
-            }),
-            _ => {
-                self.escaped.insert(root);
+        if let (Some(value), true) = (value, chained) {
+            if value.kind() == "identifier" {
+                self.escaped.insert(self.text(value));
             }
         }
     }
@@ -2157,7 +2144,11 @@ impl<'t> Ctx<'t> {
                     DictUse::Escape
                 }
             }
-            ("assignment", Some("right")) => match parent.child_by_field_name("left") {
+            // A whole dict or list aliased by another name may change
+            // through it: escaped (the supported grammar reads a container
+            // only through its one name). A part assigned to a name escapes
+            // its dict when that part is itself a container.
+            ("assignment", Some("right")) if part => match parent.child_by_field_name("left") {
                 Some(target) if target.kind() == "identifier" => DictUse::Alias(self.text(target)),
                 _ => DictUse::Escape,
             },
@@ -2166,65 +2157,19 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    /// Decides the exposed dict parts and aliases once every definition is
-    /// known: a part that hands out a nested container, or an unknown entry,
-    /// lets its dict change; a name held in the dict is exposed itself; and
-    /// every name aliased with an escaped one escapes too.
+    /// Decides the exposed dict parts once every definition is known: a
+    /// part that hands out a nested container or an entry that cannot be
+    /// read, whether to a call, a loop or another name, lets its dict
+    /// change, so the dict escapes; a name held in the dict is handed out
+    /// and escapes too. There is no alias tracking to get wrong: a whole
+    /// container assigned to another name has already escaped.
     fn settle_dict_escapes(&mut self) {
-        let mut links: Vec<(&'t str, &'t str)> = Vec::new();
         for exposed in std::mem::take(&mut self.exposed) {
             let (alters, names) = self.exposed_contents(&exposed);
-            match exposed.alias {
-                Some(target) => {
-                    if alters {
-                        links.push((target, exposed.root));
-                    }
-                    for name in names.iter() {
-                        links.push((target, name));
-                    }
-                }
-                None => {
-                    if alters {
-                        self.escaped.insert(exposed.root);
-                    }
-                    self.escaped.extend(names.iter().copied());
-                }
+            if alters {
+                self.escaped.insert(exposed.root);
             }
-        }
-        // Union the aliases; a class with one escaped name escapes whole.
-        let mut parent: HashMap<&'t str, &'t str> = HashMap::new();
-        fn find<'a>(parent: &mut HashMap<&'a str, &'a str>, name: &'a str) -> &'a str {
-            let mut root = name;
-            while let Some(&next) = parent.get(root) {
-                if next == root {
-                    break;
-                }
-                root = next;
-            }
-            let mut current = name;
-            while current != root {
-                let next = parent.get(current).copied().unwrap_or(root);
-                parent.insert(current, root);
-                current = next;
-            }
-            root
-        }
-        for (a, b) in &links {
-            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-            if ra != rb {
-                parent.insert(ra, rb);
-            }
-        }
-        let names: Vec<&'t str> = links.iter().flat_map(|(a, b)| [*a, *b]).collect();
-        let escaped_roots: HashSet<&'t str> = names
-            .iter()
-            .filter(|n| self.escaped.contains(*n))
-            .map(|n| find(&mut parent, n))
-            .collect();
-        for name in names {
-            if escaped_roots.contains(find(&mut parent, name)) {
-                self.escaped.insert(name);
-            }
+            self.escaped.extend(names.iter().copied());
         }
     }
 
@@ -2267,9 +2212,10 @@ impl<'t> Ctx<'t> {
         if node.kind() != "identifier" {
             return (true, none);
         }
-        // Not a same-file dict literal here: nothing to protect.
+        // Not a dict literal this file can read here (or past the depth
+        // limit): it escapes, so no later read can trust it.
         let Some(mut dict) = self.dict_node(node, exposed.scope, 0) else {
-            return (false, none);
+            return (true, none);
         };
         keys.reverse();
         let last = keys.len();
@@ -6255,9 +6201,11 @@ impl<'t> Ctx<'t> {
 
     /// The values the assignments of `name` that reach a use at byte `pos`
     /// of `scope` give it (see [`Self::assign_candidates`]), and whether
-    /// they are every value: only when each resolved and there were few
-    /// enough to read. When every definition reaches the use, the list is
-    /// the same for every use and is read once.
+    /// they are every value: only when each resolved, there were few
+    /// enough to read, and all are in the scope that binds the name (a
+    /// `global` or `nonlocal` write from another function is not). When
+    /// every definition reaches the use, the list is the same for every
+    /// use and is read once.
     fn name_candidates(
         &mut self,
         name: &str,
@@ -6276,10 +6224,11 @@ impl<'t> Ctx<'t> {
             }
         }
         let (reaching, all) = self.reaching_assigns(&memo_key.0, &reach);
+        let one_scope = reaching.iter().all(|a| a.scope == memo_key.0 .0);
         // A nested lookup collects nothing; its empty answer is not kept.
         let reading = self.collecting == 0;
         let (candidates, complete) = self.assign_candidates(&reaching, origin, name, depth);
-        let found = (candidates, complete && all);
+        let found = (candidates, complete && all && one_scope);
         if every_use && reading {
             self.reach_all_memo
                 .insert(memo_key, Rc::new((found.0.clone(), found.1)));
@@ -6351,7 +6300,7 @@ impl<'t> Ctx<'t> {
     }
 
     /// The items of the literal list, tuple or set a loop runs over (or of
-    /// one bound once to a name that never changes),
+    /// one bound once to a name that is never aliased, passed or mutated),
     /// resolved, and whether every item resolved. Called while candidates
     /// are being collected; read once per iterable, and at most
     /// [`MAX_CANDIDATE_READS`] items of it.
@@ -6378,6 +6327,15 @@ impl<'t> Ctx<'t> {
         origin: ValueOrigin,
         depth: u32,
     ) -> (Vec<Resolved>, bool) {
+        // A comprehension in a class body runs its first iterable in the
+        // class scope and the rest in its own: not read.
+        let in_class = self.scopes[scope].comprehension
+            && self.scopes[scope]
+                .parent
+                .is_some_and(|p| self.scopes[p].kind == ScopeKind::Class);
+        if in_class {
+            return (Vec::new(), false);
+        }
         let list = match iter.kind() {
             "list" | "tuple" | "set" => Some((iter, scope)),
             "identifier" => {
