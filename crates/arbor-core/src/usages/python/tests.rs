@@ -2005,6 +2005,13 @@ escaped(client)
         unknown,
         vec![(Some("mixed"), "parameter"), (Some("escaped"), "parameter")]
     );
+    // `ask` is public: other modules may pass another client, so its
+    // routing keeps a gap. `_send` is private: every call is in the file.
+    let partial: Vec<(Option<&str>, &str)> = gaps(&found, GapKind::AmbiguousClient)
+        .iter()
+        .map(|g| (g.symbol.as_deref(), g.reason.as_str()))
+        .collect();
+    assert_eq!(partial, vec![(Some("ask"), "in_file_callers")]);
 }
 
 #[test]
@@ -2572,4 +2579,173 @@ client.chat.completions.create(model="gpt-4", messages=[], extra_body={"cred": {
     let last = found.calls.last().unwrap();
     let keys: Vec<&str> = last.values.iter().map(|v| v.key.as_str()).collect();
     assert_eq!(keys, vec!["model"]);
+}
+
+/// `(line, routing, gap kinds and reasons at that line)` for every call.
+fn routes_and_gaps(found: &FileUsages) -> Vec<(u32, Routing, Vec<String>)> {
+    found
+        .calls
+        .iter()
+        .map(|c| {
+            let reasons = found
+                .gaps
+                .iter()
+                .filter(|g| g.span.map(|s| s.start_byte) == Some(c.span.start_byte))
+                .map(|g| format!("{}/{}", g.kind, g.reason))
+                .collect();
+            (c.span.line, c.routing, reasons)
+        })
+        .collect()
+}
+
+#[test]
+fn a_client_default_is_combined_with_its_callers() {
+    // A client-valued default was returned before the callers were read, so
+    // `ask5("x", c=gw)` was reported as `openai_direct` with no gap.
+    let found = usages(
+        r#"from openai import OpenAI
+client = OpenAI()
+gw = OpenAI(base_url="https://openrouter.ai/api/v1")
+def ask5(q, c=client):
+    return c.chat.completions.create(model="gpt-4", messages=[q])
+ask5("x", c=gw)
+def ask14(q, c=client):
+    return c.chat.completions.create(model="gpt-4", messages=[q])
+ask14("x", gw)
+f12 = lambda q, c=client: c.chat.completions.create(model="gpt-4", messages=[q])
+f12("x", c=gw)
+def _only_gw(q, c=client):
+    return c.chat.completions.create(model="gpt-4", messages=[q])
+_only_gw("x", c=gw)
+def _only_default(q, c=client):
+    return c.chat.completions.create(model="gpt-4", messages=[q])
+_only_default("x")
+def _unknown(q, c=client):
+    return c.chat.completions.create(model="gpt-4", messages=[q])
+_unknown("x", c=make())
+def _splat(q, c=client):
+    return c.chat.completions.create(model="gpt-4", messages=[q])
+_splat("x", **opts)
+def uncalled(q, c=client):
+    return c.chat.completions.create(model="gpt-4", messages=[q])
+"#,
+    );
+    let ambiguous = || vec!["ambiguous_client/multiple_assignments".to_string()];
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            // Public: the callers' client and the default are both possible.
+            (5, Routing::Unknown, ambiguous()),
+            (8, Routing::Unknown, ambiguous()),
+            (10, Routing::Unknown, ambiguous()),
+            // Private: every call is in the file.
+            (13, Routing::CustomBaseUrl, vec![]),
+            (16, Routing::OpenaiDirect, vec![]),
+            (25, Routing::OpenaiDirect, vec![]),
+        ]
+    );
+    // A caller passing an unknown client, or `**kwargs`, leaves the
+    // receiver unresolved.
+    let unknown: Vec<(u32, &str)> = gaps(&found, GapKind::UnknownClientFactory)
+        .iter()
+        .map(|g| (g.span.unwrap().line, g.reason.as_str()))
+        .collect();
+    assert_eq!(
+        unknown,
+        vec![(19, "factory_call"), (22, "unresolved_receiver")]
+    );
+}
+
+/// `(line, model value or "-", [(gap reason, listed values)])` for a call.
+type ValueRow = (u32, String, Vec<(String, Vec<String>)>);
+
+#[test]
+fn a_parameter_default_that_callers_override_keeps_a_gap() {
+    // A literal parameter default was reported with no gap even when the
+    // in-file callers pass other models.
+    let found = usages(
+        r#"from openai import OpenAI
+client = OpenAI()
+GPT_MODEL = "gpt-3.5-turbo"
+def ask(q, model="gpt-4o"):
+    return client.chat.completions.create(model=model, messages=[q])
+ask("hi", model="gpt-3.5-turbo")
+ask("hi", "o1-mini")
+ask("hi", "gpt-4o")
+def ask2(q, model: str = GPT_MODEL):
+    return client.chat.completions.create(model=model, messages=[q])
+ask2("hi")
+ask2("hi", model=GPT_MODEL)
+f13 = lambda q, model="gpt-4o": client.chat.completions.create(model=model, messages=[q])
+f13("x", model="gpt-3.5-turbo")
+def ask4(q, model="gpt-4o"):
+    return client.chat.completions.create(model=model, messages=[q])
+ask4("x", model=pick())
+def ask5(q, model):
+    return client.chat.completions.create(model=model, messages=[q])
+ask5("x", "o3-mini")
+ask5("y", model="o3-mini")
+ask5("z", "gpt-4.1")
+"#,
+    );
+    let rows: Vec<ValueRow> = found
+        .calls
+        .iter()
+        .map(|c| {
+            let value = value(c, "model").unwrap_or("-").to_string();
+            let gaps = found
+                .gaps
+                .iter()
+                .filter(|g| g.span.map(|s| s.start_byte) == Some(c.span.start_byte))
+                .map(|g| {
+                    let listed = g.values.iter().map(|v| v.value.clone()).collect();
+                    (g.reason.clone(), listed)
+                })
+                .collect();
+            (c.span.line, value, gaps)
+        })
+        .collect();
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                5,
+                "gpt-4o".to_string(),
+                vec![(
+                    "parameter_overridden".to_string(),
+                    s(&["gpt-3.5-turbo", "o1-mini"])
+                )]
+            ),
+            // Callers pass the default or nothing: no gap.
+            (10, "gpt-3.5-turbo".to_string(), vec![]),
+            (
+                13,
+                "gpt-4o".to_string(),
+                vec![("parameter_overridden".to_string(), s(&["gpt-3.5-turbo"]))]
+            ),
+            // A caller passes a value that does not resolve.
+            (
+                16,
+                "gpt-4o".to_string(),
+                vec![("parameter_overridden".to_string(), vec![])]
+            ),
+            // No default: the values the callers pass are listed.
+            (
+                19,
+                "-".to_string(),
+                vec![("parameter".to_string(), s(&["o3-mini", "gpt-4.1"]))]
+            ),
+        ]
+    );
+    let overridden = &gaps(&found, GapKind::UnresolvedModel)[0];
+    assert!(
+        overridden
+            .detail
+            .contains("its default is captured with origin `parameter_default`"),
+        "{}",
+        overridden.detail
+    );
+    // Each listed value points at the caller's literal.
+    assert_eq!(overridden.values[1].span.line, 7);
 }

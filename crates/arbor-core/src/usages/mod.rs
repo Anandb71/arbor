@@ -270,7 +270,9 @@ pub enum ValueOrigin {
     LocalConstant,
     /// The default of the enclosing function's parameter: a literal or a
     /// same-file constant (`def ask(model=GPT_MODEL)`). Callers may pass
-    /// another value.
+    /// another value; when an in-file caller does, the call also carries an
+    /// `unresolved_model` gap with reason `parameter_overridden` that lists
+    /// the values the callers pass.
     ParameterDefault,
     /// The literal fallback of an environment or configuration lookup:
     /// `os.getenv("MODEL", "gpt-4o")`, `os.environ.get(...)`,
@@ -280,6 +282,20 @@ pub enum ValueOrigin {
     /// the call also carries an `unresolved_model` gap: confirm before
     /// acting on it.
     EnvDefault,
+}
+
+impl ValueOrigin {
+    /// The snake_case name used in JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ValueOrigin::Literal => "literal",
+            ValueOrigin::ModuleConstant => "module_constant",
+            ValueOrigin::ClassConstant => "class_constant",
+            ValueOrigin::LocalConstant => "local_constant",
+            ValueOrigin::ParameterDefault => "parameter_default",
+            ValueOrigin::EnvDefault => "env_default",
+        }
+    }
 }
 
 /// A value captured for an allowlisted key ([`VALUE_KEYS`]).
@@ -362,7 +378,9 @@ pub enum GapKind {
     /// imported from another module.
     UnknownClientFactory,
     /// A binding assigned more than one kind of client, so routing depends on
-    /// a runtime branch.
+    /// a runtime branch (`multiple_assignments`), or a client known from
+    /// only some of the places it can come from: the in-file callers of a
+    /// function other modules may also call (`in_file_callers`).
     AmbiguousClient,
     /// `getattr` on a tracked binding, or an SDK method stored or passed as a
     /// value; calls through it are not tracked.
@@ -411,7 +429,9 @@ pub struct UsageGap {
     /// A sentence for people. Never contains a literal value.
     pub detail: String,
     /// Allowlisted values seen at an unconfirmed call
-    /// (`unknown_client_factory`), so it can be triaged.
+    /// (`unknown_client_factory`), or, for `unresolved_model`, values the key
+    /// may take that are known (what in-file callers pass for a parameter),
+    /// so it can be triaged. Never the call's value.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<CapturedValue>,
 }

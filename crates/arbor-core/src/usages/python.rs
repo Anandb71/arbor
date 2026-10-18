@@ -29,8 +29,14 @@
 //! past the search limits, every definition of the name counts.
 //!
 //! An untyped parameter used as a client resolves when every call to its
-//! function in this file passes the same tracked client. Other files may
-//! call it too; resolution is per file.
+//! function (or to a lambda assigned to a plain name) in this file passes
+//! the same tracked client. Other modules may call a public function too, so
+//! there the routing keeps an `ambiguous_client` gap (`in_file_callers`);
+//! a nested or `_private` function, or any function in a script, is called
+//! only from its file. A client default is combined with what the callers
+//! pass, and with itself for a public function. A model parameter default
+//! that an in-file caller overrides keeps a `parameter_overridden` gap
+//! listing the values the callers pass.
 
 use super::{
     is_capturable_value, is_credential_value, is_identifier_key, is_secret_key, is_value_key,
@@ -212,6 +218,11 @@ const MAX_NESTED_VALUES: usize = 32;
 /// Nested model values listed per file, so a dict expanded at thousands of
 /// calls cannot multiply the report.
 const MAX_FILE_NESTED_VALUES: usize = 4096;
+/// Candidate values listed with one gap, and per file.
+const MAX_CANDIDATES: usize = 16;
+const MAX_FILE_CANDIDATES: usize = 4096;
+/// In-file calls read for the values a parameter is given.
+const MAX_CALLERS_READ: usize = 256;
 
 /// Extracts SDK usages from a parsed Python file.
 pub fn extract(tree: &Tree, source: &str, file_path: &str) -> FileUsages {
@@ -453,6 +464,17 @@ struct Client {
     ambiguous: bool,
     /// Known only from a type annotation, not from a construction.
     typed: bool,
+    /// Why the routing may not hold at a call, reported there as an
+    /// `ambiguous_client` gap.
+    caveat: Option<ClientCaveat>,
+}
+
+/// Why a resolved client's routing may not be the one a request uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClientCaveat {
+    /// Every in-file caller of a function passes this client for
+    /// parameter `param`, but other modules may call it with another.
+    InFileCallers { param: String },
 }
 
 /// Where an untracked value came from, for gap details.
@@ -548,6 +570,11 @@ struct Unresolved {
     reason: &'static str,
     shape: String,
     via: Option<String>,
+    /// Values it may take that are known: what in-file callers pass for a
+    /// parameter, the entries of a dict looked up with a run-time key, the
+    /// assignments in each branch. Listed with the gap for triage, never
+    /// as the call's value.
+    candidates: Vec<Resolved>,
 }
 
 impl Unresolved {
@@ -556,7 +583,13 @@ impl Unresolved {
             reason,
             shape,
             via: None,
+            candidates: Vec::new(),
         }
+    }
+
+    fn with_candidates(mut self, candidates: Vec<Resolved>) -> Self {
+        self.candidates.extend(candidates);
+        self
     }
 
     fn via(mut self, name: &str) -> Self {
@@ -579,6 +612,7 @@ impl Unresolved {
             "imported_name" => "imported from another module",
             "unbound" => "not defined in this file",
             "splat" => "possibly passed through **kwargs",
+            "parameter_overridden" => "a parameter that in-file callers set to other values",
             "credential" => {
                 "credential-shaped (a secret-like name or value), so it is never captured"
             }
@@ -734,6 +768,9 @@ struct Scope {
     /// The body runs where it is written (a class body, a list, set or dict
     /// comprehension), not when called later.
     immediate: bool,
+    /// For a lambda assigned to a plain name (`ask = lambda q: ...`): that
+    /// name, through which its in-file calls are found.
+    bound_name: Option<String>,
 }
 
 impl Scope {
@@ -754,6 +791,7 @@ impl Scope {
             lambda: false,
             comprehension: false,
             immediate: kind == ScopeKind::Class,
+            bound_name: None,
         }
     }
 }
@@ -1013,6 +1051,27 @@ struct DictGet<'t> {
     scope: usize,
 }
 
+/// The model values in-file calls pass for one parameter.
+#[derive(Default)]
+struct CallerModels {
+    /// Distinct resolved values, at most [`MAX_CANDIDATES`].
+    values: Vec<Resolved>,
+    /// Some caller passes a value that does not resolve, passes it through
+    /// `*args`/`**kwargs`, or was not read.
+    unknown: bool,
+}
+
+/// How a call passes one parameter (see [`Ctx::param_slot`]).
+struct ParamSlot {
+    /// Index among the explicit positional arguments, `None` when the
+    /// parameter is keyword-only.
+    position: Option<usize>,
+    /// It may be passed by keyword (it is not positional-only).
+    keyword: bool,
+    /// The scope the function is defined in, where its defaults run.
+    parent: usize,
+}
+
 /// Where a parameter's argument is in one call.
 enum ArgFor<'t> {
     Found(Node<'t>),
@@ -1076,8 +1135,16 @@ struct Ctx<'t> {
     dict_nested: HashMap<usize, Rc<NestedList>>,
     /// Nested values that may still be listed in this file.
     nested_left: usize,
+    /// Candidate values that may still be listed with gaps in this file.
+    candidates_left: usize,
     attr_lookup_memo: HashMap<Key, Rc<[Assign<'t>]>>,
     caller_memo: HashMap<Key, Memo<Option<Val>>>,
+    /// Model values in-file callers pass for a parameter, by (function,
+    /// parameter).
+    caller_models: HashMap<Key, Rc<CallerModels>>,
+    /// Candidate values are being collected: a nested lookup does not
+    /// collect its own, so the work stays linear.
+    collecting: u32,
     name_call_index: HashMap<String, CallIndex<'t>>,
     method_call_index: HashMap<String, Rc<MethodCalls<'t>>>,
     /// Resolutions in progress: (kind, scope or id, name).
@@ -1089,6 +1156,9 @@ struct Ctx<'t> {
     cutoffs: u64,
     next_id: usize,
     openai_routing: Routing,
+    /// The file is a script (no extension, or `__main__.py`): other modules
+    /// do not import it, so its in-file callers are all the callers.
+    script: bool,
     out: FileUsages,
 }
 
@@ -1140,8 +1210,11 @@ impl<'t> Ctx<'t> {
             dict_contents_memo: HashMap::new(),
             dict_nested: HashMap::new(),
             nested_left: MAX_FILE_NESTED_VALUES,
+            candidates_left: MAX_FILE_CANDIDATES,
             attr_lookup_memo: HashMap::new(),
             caller_memo: HashMap::new(),
+            caller_models: HashMap::new(),
+            collecting: 0,
             name_call_index: HashMap::new(),
             method_call_index: HashMap::new(),
             visiting: HashSet::new(),
@@ -1149,6 +1222,7 @@ impl<'t> Ctx<'t> {
             cutoffs: 0,
             next_id: 0,
             openai_routing: Routing::OpenaiDirect,
+            script: is_script_path(file),
             out: FileUsages::new(file, "python"),
         }
     }
@@ -1241,7 +1315,7 @@ impl<'t> Ctx<'t> {
                         child_loop = None;
                     }
                     "lambda" => {
-                        inner = self.enter_lambda(node, scope);
+                        inner = self.enter_lambda(node, scope, frame.parent, frame.field);
                         child_loop = None;
                     }
                     "list_comprehension"
@@ -1831,7 +1905,13 @@ impl<'t> Ctx<'t> {
         id
     }
 
-    fn enter_lambda(&mut self, node: Node<'t>, parent: usize) -> usize {
+    fn enter_lambda(
+        &mut self,
+        node: Node<'t>,
+        parent: usize,
+        holder: Option<Node<'t>>,
+        field: Option<&'static str>,
+    ) -> usize {
         let class = match self.scopes[parent].kind {
             ScopeKind::Class => Some(parent),
             _ => self.scopes[parent].class,
@@ -1848,6 +1928,11 @@ impl<'t> Ctx<'t> {
         scope.symbol = self.scopes[parent].symbol.clone();
         scope.name = "<lambda>".to_string();
         scope.lambda = true;
+        scope.bound_name = holder
+            .filter(|h| h.kind() == "assignment" && field == Some("right"))
+            .and_then(|h| h.child_by_field_name("left"))
+            .filter(|left| left.kind() == "identifier")
+            .map(|left| self.text(left).to_string());
         let id = self.scopes.len();
         self.scopes.push(scope);
         if let Some(params) = node.child_by_field_name("parameters") {
@@ -2860,26 +2945,36 @@ impl<'t> Ctx<'t> {
                 return val;
             }
         }
+        // A client default holds only where a caller leaves the argument out.
+        let mut default_client = None;
         if let Some(default) = param.default {
             let parent = self.scopes[scope].parent.unwrap_or(0);
             let val = self.eval(default, parent, 0);
             if matches!(val, Val::Client { .. }) {
-                return val;
+                default_client = Some(val);
             }
         }
-        if let Some(val) = self.param_from_callers(scope, name) {
+        if let Some(val) = self.param_from_callers(scope, name, default_client.clone()) {
             return val;
         }
-        Val::untracked(Origin::Parameter {
-            name: name.to_string(),
+        default_client.unwrap_or_else(|| {
+            Val::untracked(Origin::Parameter {
+                name: name.to_string(),
+            })
         })
     }
 
-    /// The client every in-file call of `func` passes for parameter `name`,
-    /// when they all pass the same one. `None` when the function may be
-    /// called from elsewhere in the file (stored, passed, decorated, called
-    /// on another object) or when the callers disagree.
-    fn param_from_callers(&mut self, func: usize, name: &str) -> Option<Val> {
+    /// What the in-file calls of `func` pass for parameter `name`, memoized.
+    /// With a client default (`default_client`), every caller's argument is
+    /// combined with it: a caller passing another client makes the binding
+    /// ambiguous. Without one, the client every caller passes. `None` when
+    /// the calls cannot all be seen or (without a default) they disagree.
+    fn param_from_callers(
+        &mut self,
+        func: usize,
+        name: &str,
+        default_client: Option<Val>,
+    ) -> Option<Val> {
         let key = (func, name.to_string());
         let budget = self.budget();
         if let Some(found) = self.reuse(recall(&self.caller_memo, &key, budget)) {
@@ -2894,7 +2989,7 @@ impl<'t> Ctx<'t> {
             self.visiting.remove(&guard);
             return None;
         }
-        let found = self.callers_agree(func, name);
+        let found = self.callers_agree(func, name, default_client);
         self.leave_name();
         self.visiting.remove(&guard);
         let memo = self.memo(found.clone(), cutoffs, budget);
@@ -2902,50 +2997,36 @@ impl<'t> Ctx<'t> {
         found
     }
 
-    fn callers_agree(&mut self, func: usize, name: &str) -> Option<Val> {
-        let scope = &self.scopes[func];
-        if scope.lambda || scope.decorated {
+    fn callers_agree(
+        &mut self,
+        func: usize,
+        name: &str,
+        default_client: Option<Val>,
+    ) -> Option<Val> {
+        let vals = self.caller_vals(func, name)?;
+        if vals.is_empty() {
             return None;
         }
-        let parent = scope.parent?;
-        let method = self.scopes[parent].kind == ScopeKind::Class;
-        let shift = usize::from(method && !scope.staticmethod);
-        let index = scope.slots.iter().position(|s| s.name == name)?;
-        let slot = scope.slots[index].kind;
-        if index < shift || matches!(slot, SlotKind::VarArgs | SlotKind::VarKwargs) {
-            return None;
+        let private = self.is_private(func);
+        if let Some(default) = default_client {
+            // Other modules may call a public function without the
+            // argument, so its default stays possible.
+            let mut all = vals;
+            if !private {
+                all.push(default);
+            }
+            return Some(combine(all));
         }
-        let position =
-            matches!(slot, SlotKind::Positional | SlotKind::PositionalOnly).then(|| index - shift);
-        let keyword = (slot != SlotKind::PositionalOnly).then_some(name);
-
-        let calls = self.calls_of(func)?;
-        if calls.is_empty() {
-            return None;
-        }
-
-        let default = self
-            .params
-            .get(&(func, name.to_string()))
-            .and_then(|p| p.default);
-        let mut vals = Vec::new();
-        for &(call, call_scope) in calls.iter() {
-            let val = match argument_for(call, position, keyword, |n| self.text(n)) {
-                ArgFor::Found(expr) => self.eval(expr, call_scope, 0),
-                ArgFor::Missing => self.eval(default?, parent, 0),
-                ArgFor::Unknown => return None,
-            };
-            vals.push(val);
-        }
-        let real: Vec<Val> = vals
-            .into_iter()
-            .filter(|v| !matches!(v, Val::Untracked(Origin::Cycle)))
-            .collect();
-        let first = real.first()?.clone();
-        let agree = real.iter().all(|v| *v == first);
+        let first = vals.first()?.clone();
+        let agree = vals.iter().all(|v| *v == first);
         match first {
-            Val::Client { path, .. } if path.is_empty() => match combine(real) {
-                Val::Client { client, path } if path.is_empty() && !client.ambiguous => {
+            Val::Client { path, .. } if path.is_empty() => match combine(vals) {
+                Val::Client { mut client, path } if path.is_empty() && !client.ambiguous => {
+                    if !private && client.caveat.is_none() {
+                        client.caveat = Some(ClientCaveat::InFileCallers {
+                            param: name.to_string(),
+                        });
+                    }
                     Some(Val::Client { client, path })
                 }
                 _ => None,
@@ -2957,22 +3038,98 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    /// Every in-file call of function or method `func`, or `None` when some
-    /// may not be seen: it is a lambda or decorated, its name is used as a
-    /// value or bound more than once, or (for a method) it is called on
-    /// something other than `self`/`cls` of its class. Calls are indexed by
-    /// binding scope (by class for methods) once per name, so a file with
-    /// thousands of same-named functions stays linear.
-    fn calls_of(&mut self, func: usize) -> Option<CallSites<'t>> {
+    /// The value each in-file call of `func` passes for parameter `name`
+    /// (the default where a call leaves it out; unknown through `*args` or
+    /// `**kwargs`), self-references dropped. `None` when the calls cannot
+    /// all be seen or a call leaves out a parameter that has no default.
+    fn caller_vals(&mut self, func: usize, name: &str) -> Option<Vec<Val>> {
+        let slot = self.param_slot(func, name)?;
+        let calls = self.calls_of(func)?;
+        let default = self
+            .params
+            .get(&(func, name.to_string()))
+            .and_then(|p| p.default);
+        let keyword = slot.keyword.then_some(name);
+        let mut vals = Vec::new();
+        for &(call, call_scope) in calls.iter() {
+            let val = match argument_for(call, slot.position, keyword, |n| self.text(n)) {
+                ArgFor::Found(expr) => self.eval(expr, call_scope, 0),
+                ArgFor::Missing => self.eval(default?, slot.parent, 0),
+                ArgFor::Unknown => Val::untracked(Origin::Other),
+            };
+            if !matches!(val, Val::Untracked(Origin::Cycle)) {
+                vals.push(val);
+            }
+        }
+        Some(vals)
+    }
+
+    /// How a call passes parameter `name` of `func`: its position among
+    /// the explicit arguments (not for keyword-only parameters), whether it
+    /// may be passed by keyword, and the scope its default is evaluated in.
+    /// `None` for `self`/`cls`, `*args` and `**kwargs`.
+    fn param_slot(&self, func: usize, name: &str) -> Option<ParamSlot> {
         let scope = &self.scopes[func];
-        if scope.lambda || scope.decorated {
+        let parent = scope.parent?;
+        let method = self.scopes[parent].kind == ScopeKind::Class && !scope.lambda;
+        let shift = usize::from(method && !scope.staticmethod);
+        let index = scope.slots.iter().position(|s| s.name == name)?;
+        let slot = scope.slots[index].kind;
+        if index < shift || matches!(slot, SlotKind::VarArgs | SlotKind::VarKwargs) {
             return None;
         }
+        Some(ParamSlot {
+            position: matches!(slot, SlotKind::Positional | SlotKind::PositionalOnly)
+                .then(|| index - shift),
+            keyword: slot != SlotKind::PositionalOnly,
+            parent,
+        })
+    }
+
+    /// Whether every call of `func` can be in this file: a function nested
+    /// in another function or lambda, a `_private` (not dunder) function or
+    /// method, or anything in a script (an extensionless file or
+    /// `__main__.py`), which other modules do not import.
+    fn is_private(&self, func: usize) -> bool {
+        if self.script {
+            return true;
+        }
+        let scope = &self.scopes[func];
+        let Some(parent) = scope.parent else {
+            return false;
+        };
+        if self.scopes[parent].kind == ScopeKind::Function {
+            return true;
+        }
+        let name = match &scope.bound_name {
+            Some(name) if scope.lambda => name.as_str(),
+            _ => scope.name.as_str(),
+        };
+        name.starts_with('_') && !(name.starts_with("__") && name.ends_with("__"))
+    }
+
+    /// Every in-file call of function or method `func`, or `None` when some
+    /// may not be seen: it is decorated or a lambda not assigned to a plain
+    /// name, its name is used as a value or bound more than once, or (for a
+    /// method) it is called on something other than `self`/`cls` of its
+    /// class. Calls are indexed by binding scope (by class for methods) once
+    /// per name, so a file with thousands of same-named functions stays
+    /// linear.
+    fn calls_of(&mut self, func: usize) -> Option<CallSites<'t>> {
+        let scope = &self.scopes[func];
+        if scope.decorated || scope.comprehension {
+            return None;
+        }
+        let lambda = scope.lambda;
+        let fname = if lambda {
+            scope.bound_name.clone()?
+        } else {
+            scope.name.clone()
+        };
         let parent = scope.parent?;
-        let fname = scope.name.clone();
         let empty = || Rc::from(Vec::new());
         if self.scopes[parent].kind == ScopeKind::Class {
-            if self.attr_uses.get(fname.as_str())?.escapes {
+            if lambda || self.attr_uses.get(fname.as_str())?.escapes {
                 return None;
             }
             let index = self.method_calls(&fname);
@@ -2992,8 +3149,12 @@ impl<'t> Ctx<'t> {
         }
         let home = self.import_home(parent, &fname);
         let key = (home, fname.clone());
-        let only_def = self.functions.get(&key).map_or(0, Vec::len) == 1
-            && !self.assigns.contains_key(&key)
+        let defined_once = if lambda {
+            self.assigns.get(&key).map_or(0, Vec::len) == 1 && !self.functions.contains_key(&key)
+        } else {
+            self.functions.get(&key).map_or(0, Vec::len) == 1 && !self.assigns.contains_key(&key)
+        };
+        let only_def = defined_once
             && !self.imports.contains_key(&key)
             && !self.other_imports.contains_key(&key)
             && !self.params.contains_key(&key);
@@ -3097,6 +3258,7 @@ impl<'t> Ctx<'t> {
                             line: None,
                             ambiguous: false,
                             typed: true,
+                            caveat: None,
                         },
                         path: Vec::new(),
                     });
@@ -3326,6 +3488,7 @@ impl<'t> Ctx<'t> {
                 line: Some(built.span.line),
                 ambiguous: false,
                 typed: false,
+                caveat: None,
             };
         }
         let scope = self.call_scope.get(&call.id()).copied().unwrap_or(0);
@@ -3360,6 +3523,7 @@ impl<'t> Ctx<'t> {
             line: Some(span.line),
             ambiguous: false,
             typed: false,
+            caveat: None,
         }
     }
 
@@ -3506,6 +3670,7 @@ impl<'t> Ctx<'t> {
                         routing: Routing::GoogleGenerativeaiLegacy,
                         client_line: None,
                         ambiguous: false,
+                        caveat: None,
                     };
                     self.record_call(call, function, scope, target);
                 }
@@ -3518,6 +3683,7 @@ impl<'t> Ctx<'t> {
                     routing: self.module_routing(pkg),
                     client_line: None,
                     ambiguous: false,
+                    caveat: None,
                 };
                 self.record_call(call, function, scope, target);
             }
@@ -3529,6 +3695,7 @@ impl<'t> Ctx<'t> {
                     routing: self.module_routing(pkg),
                     client_line: None,
                     ambiguous: false,
+                    caveat: None,
                 };
                 self.record_call(call, function, scope, target);
             }
@@ -3540,6 +3707,7 @@ impl<'t> Ctx<'t> {
                     routing: client.routing,
                     client_line: client.line,
                     ambiguous: client.ambiguous,
+                    caveat: client.caveat,
                 };
                 self.record_call(call, function, scope, target);
             }
@@ -3670,7 +3838,7 @@ impl<'t> Ctx<'t> {
                 "model"
             };
             let unresolved = Unresolved::new("splat", "**kwargs".to_string());
-            self.unresolved_gap(&site, key, &unresolved, false);
+            self.unresolved_gap(&site, key, &unresolved, None);
         }
 
         if target.ambiguous {
@@ -3686,6 +3854,27 @@ impl<'t> Ctx<'t> {
                 detail: format!(
                     "the receiver of `{chain}` is assigned more than one kind of client or a non-client value, so its routing depends on a runtime branch"
                 ),
+                values: Vec::new(),
+            });
+        } else if let Some(caveat) = &target.caveat {
+            let (reason, detail) = match caveat {
+                ClientCaveat::InFileCallers { param } => (
+                    "in_file_callers",
+                    format!(
+                        "the receiver of `{chain}` is parameter `{param}`: every caller in this file passes the same client, but other modules may call the function with another one"
+                    ),
+                ),
+            };
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::AmbiguousClient,
+                sdk: Some(sdk),
+                file: self.file.clone(),
+                span: Some(span),
+                symbol: symbol.clone(),
+                chain: Some(chain.clone()),
+                key: None,
+                reason: reason.to_string(),
+                detail,
                 values: Vec::new(),
             });
         }
@@ -3743,14 +3932,13 @@ impl<'t> Ctx<'t> {
             Ok(resolved) if !resolved.caveats.is_empty() && !site.gap_worthy => {}
             Ok(mut resolved) => {
                 let caveats = std::mem::take(&mut resolved.caveats);
+                let origin = resolved.origin;
                 values.push(captured(key, resolved, positional));
                 for caveat in &caveats {
-                    self.unresolved_gap(site, key, caveat, true);
+                    self.unresolved_gap(site, key, caveat, Some(origin));
                 }
             }
-            Err(unresolved) if site.gap_worthy => {
-                self.unresolved_gap(site, key, &unresolved, false)
-            }
+            Err(unresolved) if site.gap_worthy => self.unresolved_gap(site, key, &unresolved, None),
             Err(_) => {}
         }
     }
@@ -3803,12 +3991,15 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// An `unresolved_model` gap for `key` at `site`. `captured` is the
+    /// origin of the value captured next to it, when the gap is that
+    /// value's caveat.
     fn unresolved_gap(
         &mut self,
         site: &Site<'_, 't>,
         key: &str,
         unresolved: &Unresolved,
-        fallback_captured: bool,
+        captured: Option<ValueOrigin>,
     ) {
         let chain = site.chain;
         let phrase = unresolved.phrase();
@@ -3823,9 +4014,22 @@ impl<'t> Ctx<'t> {
             Some(via) => format!("`{key}` for `{chain}` comes from `{via}`, which is {phrase}"),
             None => format!("`{key}` for `{chain}` is `{shape}`, which is {phrase}"),
         };
-        if fallback_captured {
-            detail.push_str("; its literal fallback is captured with origin `env_default`");
+        match captured {
+            Some(origin) if unresolved.reason == "parameter_overridden" => {
+                detail.push_str(&format!(
+                    "; its default is captured with origin `{}` and the values callers pass are listed",
+                    origin.as_str()
+                ));
+            }
+            Some(_) => {
+                detail.push_str("; its literal fallback is captured with origin `env_default`")
+            }
+            None if !unresolved.candidates.is_empty() => {
+                detail.push_str("; values it may take are listed")
+            }
+            None => {}
         }
+        let values = self.candidate_values(key, &unresolved.candidates);
         self.out.gaps.push(UsageGap {
             kind: GapKind::UnresolvedModel,
             sdk: Some(site.sdk),
@@ -3836,8 +4040,28 @@ impl<'t> Ctx<'t> {
             key: Some(key.to_string()),
             reason: unresolved.reason.to_string(),
             detail,
-            values: Vec::new(),
+            values,
         });
+    }
+
+    /// Candidate values listed with a gap for `key`: distinct, at most
+    /// [`MAX_CANDIDATES`] per gap and [`MAX_FILE_CANDIDATES`] per file.
+    fn candidate_values(&mut self, key: &str, candidates: &[Resolved]) -> Vec<CapturedValue> {
+        let mut seen = HashSet::new();
+        let mut listed = Vec::new();
+        for candidate in candidates {
+            if listed.len() >= MAX_CANDIDATES || self.candidates_left == 0 {
+                break;
+            }
+            if !seen.insert(candidate.value.as_str()) {
+                continue;
+            }
+            self.candidates_left -= 1;
+            let mut candidate = candidate.clone();
+            candidate.caveats.clear();
+            listed.push(captured(key, candidate, false));
+        }
+        listed
     }
 
     /// `getattr(client, name)` on a tracked binding.
@@ -4325,7 +4549,10 @@ impl<'t> Ctx<'t> {
             }
             let default = self.params.get(&key).and_then(|p| p.default);
             let Some(default) = default else {
-                return Err(Unresolved::new("parameter", name.to_string()));
+                // What in-file callers pass, for triage.
+                let passed = self.caller_models(home, name);
+                return Err(Unresolved::new("parameter", name.to_string())
+                    .with_candidates(passed.values.clone()));
             };
             // Defaults are evaluated where the function is defined.
             let parent = self.scopes[home].parent.unwrap_or(0);
@@ -4340,10 +4567,20 @@ impl<'t> Ctx<'t> {
                         .into_iter()
                         .map(|caveat| caveat.via(name))
                         .collect();
+                    // In-file callers that pass another value make the
+                    // default one of several.
+                    if let Some(caveat) = self.overridden(home, name, &resolved.value) {
+                        resolved.caveats.push(caveat);
+                    }
                     Ok(resolved)
                 }
                 Err(unresolved) if unresolved.reason == "credential" => Err(unresolved.via(name)),
-                Err(_) => Err(Unresolved::new("parameter", name.to_string())),
+                Err(unresolved) => {
+                    let passed = self.caller_models(home, name);
+                    Err(Unresolved::new("parameter", name.to_string())
+                        .with_candidates(unresolved.candidates)
+                        .with_candidates(passed.values.clone()))
+                }
             };
         }
         if defs.assigns > 0 {
@@ -4364,6 +4601,58 @@ impl<'t> Ctx<'t> {
         } else {
             Err(Unresolved::new("unbound", name.to_string()))
         }
+    }
+
+    /// The model values in-file calls of `func` pass for parameter `name`,
+    /// read once per parameter (at most [`MAX_CALLERS_READ`] calls). Empty
+    /// while candidates are being collected for another lookup.
+    fn caller_models(&mut self, func: usize, name: &str) -> Rc<CallerModels> {
+        let key = (func, name.to_string());
+        if let Some(found) = self.caller_models.get(&key) {
+            return Rc::clone(found);
+        }
+        if self.collecting > 0 {
+            return Rc::new(CallerModels::default());
+        }
+        let mut models = CallerModels::default();
+        if let (Some(slot), Some(calls)) = (self.param_slot(func, name), self.calls_of(func)) {
+            let keyword = slot.keyword.then_some(name);
+            self.collecting += 1;
+            for (i, &(call, call_scope)) in calls.iter().enumerate() {
+                if i >= MAX_CALLERS_READ {
+                    models.unknown = true;
+                    break;
+                }
+                match argument_for(call, slot.position, keyword, |n| self.text(n)) {
+                    ArgFor::Found(expr) => match self.resolve_value(expr, call_scope, 0) {
+                        Ok(resolved) => push_candidate(&mut models.values, resolved),
+                        Err(_) => models.unknown = true,
+                    },
+                    ArgFor::Missing => {}
+                    ArgFor::Unknown => models.unknown = true,
+                }
+            }
+            self.collecting -= 1;
+        }
+        let models = Rc::new(models);
+        self.caller_models.insert(key, Rc::clone(&models));
+        models
+    }
+
+    /// A `parameter_overridden` caveat when an in-file call passes `name`
+    /// a value other than its `default` (or one that does not resolve).
+    fn overridden(&mut self, func: usize, name: &str, default: &str) -> Option<Unresolved> {
+        let passed = self.caller_models(func, name);
+        let others: Vec<Resolved> = passed
+            .values
+            .iter()
+            .filter(|r| r.value != default)
+            .cloned()
+            .collect();
+        if others.is_empty() && !passed.unknown {
+            return None;
+        }
+        Some(Unresolved::new("parameter_overridden", name.to_string()).with_candidates(others))
     }
 
     /// A name or attribute assigned exactly once (`only`, out of `count`
@@ -4837,6 +5126,16 @@ impl<'t> Ctx<'t> {
     }
 }
 
+/// Whether `file` is a script other modules do not import: no extension
+/// (a shebang script) or `__main__.py`.
+fn is_script_path(file: &str) -> bool {
+    let path = std::path::Path::new(file);
+    path.extension().is_none()
+        || path
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("__main__.py"))
+}
+
 /// What an import statement binds, for [`SdkImport`].
 struct Binding<'a> {
     local: &'a str,
@@ -4854,6 +5153,7 @@ struct CallTarget {
     routing: Routing,
     client_line: Option<u32>,
     ambiguous: bool,
+    caveat: Option<ClientCaveat>,
 }
 
 /// The call a value or gap is reported for.
@@ -4880,6 +5180,15 @@ struct Args<'t> {
     literal_args: Vec<(Option<String>, Node<'t>)>,
     /// The expressions passed with `**`.
     splats: Vec<Node<'t>>,
+}
+
+/// Adds `resolved` to `values` unless its value is already there, keeping at
+/// most [`MAX_CANDIDATES`].
+fn push_candidate(values: &mut Vec<Resolved>, mut resolved: Resolved) {
+    if values.len() < MAX_CANDIDATES && values.iter().all(|v| v.value != resolved.value) {
+        resolved.caveats.clear();
+        values.push(resolved);
+    }
 }
 
 fn captured(key: &str, resolved: Resolved, positional: bool) -> CapturedValue {
@@ -5325,6 +5634,7 @@ fn combine(vals: Vec<Val>) -> Val {
                 line: if same_line { first.line } else { None },
                 ambiguous,
                 typed: false,
+                caveat: constructed.iter().find_map(|c| c.caveat.clone()),
             },
             path: Vec::new(),
         };
