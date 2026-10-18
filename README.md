@@ -233,6 +233,40 @@ claude mcp add --transport stdio --scope project arbor -- arbor bridge
 
 ---
 
+## Find code that calls retiring AI models
+
+OpenAI shuts down `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` on 14 January 2027, and Anthropic and Google retire models on their own dates. `arbor retirements` lists every call that uses a retired or retiring model. For each one it shows the replacement the provider lists and the arguments that have to change with it.
+
+```bash
+npx @anandb71/arbor-cli retirements .
+```
+
+```text
+3 calls use models OpenAI shuts down on 14 Jan 2027 (88 days)
+  app/chat.py:12  gpt-4o (MODEL, line 8) → gpt-6-luna
+                  also change: max_tokens → max_completion_tokens, add reasoning_effort="none" (for temperature, max_tokens)
+  app/chat.py:21  gpt-4o-mini (line 22) → gpt-6-luna  fallback of an environment or config lookup: confirm the deployed value
+                  check: stop and logit_bias are not supported on gpt-6-luna (400).
+```
+
+- **Runs locally.** No account, no API key, no telemetry; no code leaves your machine.
+- **Honest about confidence.** Literals are confirmed. `os.getenv("MODEL", "gpt-4o")` fallbacks are marked *confirm first*. Calls through Azure, OpenRouter or a proxy are listed apart (`--include-routed`), because the provider's dates may not apply there. Models Arbor cannot read are counted, not hidden.
+- **CI ready.** `--json`, `--markdown`, `--annotations`, and `--fail-within <days>`. Exit code 1 means a retired model is in use, or one retiring inside your window.
+- **Scope today:** Python with the `openai`, `anthropic` and Google GenAI SDKs. TypeScript and JavaScript are coming.
+
+GitHub Action (warns by default; it fails the build only if you ask it to):
+
+```yaml
+      - uses: Anandb71/arbor@vX.Y.Z   # the first release that includes arbor retirements
+        with:
+          mode: retirements
+          retirements-fail-on: never   # or: retired, or a number of days such as 90
+```
+
+[How it works, the data sources and the full scope →](docs/RETIREMENTS.md)
+
+---
+
 ## For AI agents (MCP)
 
 Arbor ships a production MCP server via `arbor bridge`. Stdio is the default; HTTP is opt-in for remote/enterprise.
@@ -291,6 +325,7 @@ Every tool returns `{ ok, tool, data, meta: { suggested_next_tool, suggested_nex
 | `arbor path <a> <b>` | Shortest call-graph path |
 | `arbor refactor <sym>` | Blast radius before refactoring |
 | `arbor usages` | OpenAI, Anthropic and Gemini SDK calls in Python: client routing (direct, Azure, custom `base_url`, Bedrock, Vertex), model IDs and typed gaps; never prints credentials. `--sdk openai\|anthropic\|google`, `--json`. What a value with no gap confirms: [docs/SDK_USAGES.md](docs/SDK_USAGES.md) |
+| `arbor retirements` | Calls to AI models their provider has retired or is retiring (Python): date and days left, listed replacement, the argument changes it needs. `--fail-within <days>`, `--include-routed`, `--json`, `--markdown`, `--annotations` ([guide](docs/RETIREMENTS.md)) |
 | `arbor diff` | Git-change impact report, per symbol: new symbols carry no blast radius. `--base <ref>` compares against the merge base (what a PR shows), `--staged` only staged changes |
 | `arbor check` | CI safety gate (`--max-blast-radius N`, `--base <ref>`) |
 | `arbor summary` | Auto-generate PR description (`--base <ref>`) |
@@ -379,6 +414,8 @@ jobs:
           comment-on-pr: true
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
+
+`mode: retirements` runs `arbor retirements` instead. It writes a job summary and annotates each call to a retiring model ([guide](docs/RETIREMENTS.md#in-ci-github-action)).
 
 ---
 

@@ -406,9 +406,10 @@ fn not_checked_lines(report: &RetirementReport, markdown: bool) -> Vec<String> {
             "arbor usages"
         };
         lines.push(format!(
-            "Not checked: {} {} the model from somewhere Arbor cannot read (an environment variable, a function argument, another module); {cmd} lists them.",
+            "Not checked: {} {} the model from somewhere Arbor cannot read (an environment variable, a function argument, another module); {cmd} lists {}.",
             calls(s.unreadable_calls),
-            if s.unreadable_calls == 1 { "takes" } else { "take" }
+            if s.unreadable_calls == 1 { "takes" } else { "take" },
+            if s.unreadable_calls == 1 { "it" } else { "them" }
         ));
     }
     if s.routed_calls > 0 && !report.options.include_routed {
