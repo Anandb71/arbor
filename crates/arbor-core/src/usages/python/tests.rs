@@ -2019,3 +2019,162 @@ fn syntax_errors_are_flagged() {
         .unwrap()
         .contains("syntax_errors"));
 }
+
+// ---------------------------------------------------------------------------
+// Re-review of #276: bounded output, env_default gaps everywhere
+// ---------------------------------------------------------------------------
+
+/// `CFG = {"k0": [{"model": "gpt-4"}, ...], ...}` with `keys` x `items`
+/// entries, expanded with `**` at `calls` requests.
+fn expanded_dict_source(keys: usize, items: usize, calls: usize) -> String {
+    let item = vec!["{\"model\": \"gpt-4\"}"; items].join(", ");
+    let entries: Vec<String> = (0..keys)
+        .map(|i| format!("    \"k{i}\": [{item}]"))
+        .collect();
+    let mut source = format!(
+        "from openai import OpenAI\nclient = OpenAI()\nCFG = {{\n{}\n}}\n",
+        entries.join(",\n")
+    );
+    for _ in 0..calls {
+        source.push_str("client.chat.completions.create(**CFG, messages=[])\n");
+    }
+    source
+}
+
+#[test]
+fn a_dict_expanded_at_many_calls_stays_bounded() {
+    // Each container in an expanded dict had its own 256-entry budget and
+    // the walk ran again at every call: this 109 KB file printed 831 MB of
+    // JSON and needed 1.9 GB of memory.
+    for (keys, items, calls) in [(64, 64, 500), (256, 256, 50), (16, 16, 2_000)] {
+        let source = expanded_dict_source(keys, items, calls);
+        let found = usages_within(&source, 10);
+        let json = serde_json::to_string(&found).unwrap();
+        assert!(
+            json.len() < 4_000_000 && json.len() < 40 * source.len(),
+            "{keys}x{items}x{calls}: {} bytes of JSON for {} bytes of source",
+            json.len(),
+            source.len()
+        );
+        assert_eq!(found.calls.len(), calls);
+        let listed: usize = found.calls.iter().map(|c| c.values.len()).sum();
+        assert!(listed <= 4096, "{listed} nested values listed");
+        for c in &found.calls {
+            assert!(
+                c.values.len() <= 32,
+                "{} values at one call",
+                c.values.len()
+            );
+            // Every call whose nested values were cut says so.
+            let start = c.span.start_byte;
+            assert!(
+                found.gaps.iter().any(|g| g.reason == "truncated"
+                    && g.span.map(|s| s.start_byte) == Some(start)),
+                "no truncated gap at line {}",
+                c.span.line
+            );
+        }
+    }
+
+    // A dict small enough to list in full is listed in full, once per call.
+    let found = usages(&expanded_dict_source(2, 3, 3));
+    for c in &found.calls {
+        let keys: Vec<&str> = c.values.iter().map(|v| v.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["k0.model"; 3]
+                .into_iter()
+                .chain(vec!["k1.model"; 3])
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn one_nested_budget_is_shared_by_every_argument_of_a_call() {
+    // Each literal argument used to get its own budget, so a call with many
+    // container arguments read (and listed) without bound.
+    let mut source = String::from("from openai import OpenAI\nclient = OpenAI()\nclient.chat.completions.create(model=\"gpt-4\", messages=[]");
+    for i in 0..200 {
+        source.push_str(&format!(
+            ", a{i}=[{{\"model\": \"gpt-4o\"}}, {{\"model\": \"o3\"}}]"
+        ));
+    }
+    source.push_str(")\n");
+    let found = usages(&source);
+    let c = &found.calls[0];
+    assert_eq!(c.values[0].key, "model");
+    assert!(c.values.len() <= 33, "{} values", c.values.len());
+    assert_eq!(
+        gaps(&found, GapKind::UnresolvedModel)[0].reason,
+        "truncated"
+    );
+}
+
+#[test]
+fn env_default_values_always_carry_a_gap() {
+    // The re-review's env fixture: nested fallbacks used to be captured as
+    // env_default with no gap, which reads as confirmed.
+    let found = usages(
+        r#"
+import os
+from openai import OpenAI
+from openai.types.chat import ChatCompletion
+
+client = OpenAI()
+client.chat.completions.create(model="gpt-4o", messages=[], extra_body={"model": os.getenv("M4", "gpt-3.5-turbo-0125")})
+client.chat.completions.create(model="gpt-4o", messages=[], extra_body={"fallbacks": [{"model": os.getenv("M5", "gpt-4-0613")}]})
+P7 = {"extra_body": {"model": os.getenv("M7", "o4-mini")}}
+client.chat.completions.create(model="gpt-4o", messages=[], **P7)
+client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": "x", "model": os.getenv("M12", "gpt-4-0314")}])
+P6 = {"model": os.getenv("M6", "o3-mini")}
+client.chat.completions.create(**P6, messages=[])
+ChatCompletion(model=os.getenv("M17", "gpt-4"))
+"#,
+    );
+    // Every env_default value sits next to a gap for its own key.
+    for c in &found.calls {
+        for v in c
+            .values
+            .iter()
+            .filter(|v| v.origin == ValueOrigin::EnvDefault)
+        {
+            assert!(
+                found
+                    .gaps
+                    .iter()
+                    .any(|g| g.span.map(|s| s.start_byte) == Some(c.span.start_byte)
+                        && g.key.as_deref() == Some(v.key.as_str())
+                        && g.reason == "env_var"),
+                "env_default `{}` at line {} has no gap",
+                v.key,
+                c.span.line
+            );
+        }
+    }
+    let env_keys: Vec<(u32, &str)> = found
+        .calls
+        .iter()
+        .flat_map(|c| {
+            c.values
+                .iter()
+                .filter(|v| v.origin == ValueOrigin::EnvDefault)
+                .map(move |v| (c.span.line, v.key.as_str()))
+        })
+        .collect();
+    assert_eq!(
+        env_keys,
+        vec![
+            (7, "extra_body.model"),
+            (8, "extra_body.fallbacks.model"),
+            (10, "extra_body.model"),
+            (11, "messages.model"),
+            (13, "model"),
+        ]
+    );
+    // On an SDK type no gap can be reported, so the fallback is not
+    // captured either.
+    let typed = call(&found, "ChatCompletion");
+    assert!(typed.values.is_empty(), "{:?}", typed.values);
+}

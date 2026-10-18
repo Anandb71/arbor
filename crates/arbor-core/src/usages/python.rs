@@ -198,10 +198,17 @@ const MAX_LITERAL_BYTES: usize = 4096;
 /// Most arguments an environment, config or dict lookup takes. A call with
 /// more is not a lookup and its arguments are not scanned.
 const MAX_LOOKUP_ARGS: usize = 8;
-/// Container entries a search for nested model keys reads per argument
-/// (`fallbacks=[{"model": ...}, ...]`); the rest of a huge literal is not
-/// read.
+/// Container entries a search for nested model keys reads: per call across
+/// all of its literal arguments (`fallbacks=[{"model": ...}, ...]`), and
+/// per dict literal for what its `**` expansion nests (read once, reused by
+/// every call that expands it). The rest of a huge literal is not read.
 const MAX_NESTED_ENTRIES: usize = 256;
+/// Nested model values listed per call. Past it, and past
+/// [`MAX_FILE_NESTED_VALUES`], the call gets a `truncated` gap instead.
+const MAX_NESTED_VALUES: usize = 32;
+/// Nested model values listed per file, so a dict expanded at thousands of
+/// calls cannot multiply the report.
+const MAX_FILE_NESTED_VALUES: usize = 4096;
 
 /// Extracts SDK usages from a parsed Python file.
 pub fn extract(tree: &Tree, source: &str, file_path: &str) -> FileUsages {
@@ -577,27 +584,68 @@ impl Unresolved {
 }
 
 /// A captured value before it is attached to a key.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Resolved {
     value: String,
     origin: ValueOrigin,
     name: Option<String>,
     span: Span,
-    /// For an [`ValueOrigin::EnvDefault`] fallback: why the deployed value is
-    /// still unknown (the call keeps an `unresolved_model` gap).
-    caveat: Option<Unresolved>,
+    /// Why the value may not be the one sent, each reported as an
+    /// `unresolved_model` gap next to it: the lookup behind an
+    /// [`ValueOrigin::EnvDefault`] fallback, or in-file callers that pass
+    /// their own value for a parameter default. A value that has one is
+    /// captured only where its gap can be reported.
+    caveats: Vec<Unresolved>,
 }
 
 impl Resolved {
     /// Names `name` as the binding the value came through: the value's own
-    /// name when it was written inline there, and the gap of its fallback.
+    /// name when it was written inline there, and the gaps of its caveats.
     fn through(mut self, name: &str, origin: ValueOrigin) -> Self {
         if self.name.is_none() || self.origin == origin {
             self.name = Some(name.to_string());
         }
-        self.caveat = self.caveat.map(|caveat| caveat.via(name));
+        self.caveats = self
+            .caveats
+            .into_iter()
+            .map(|caveat| caveat.via(name))
+            .collect();
         self
     }
+}
+
+/// A model value found inside a container argument or a `**` expansion.
+#[derive(Debug, Clone)]
+struct NestedValue {
+    /// The key path (`fallbacks.model`).
+    path: String,
+    positional: bool,
+    resolved: Resolved,
+}
+
+/// A bounded read of nested model values.
+struct NestedRead {
+    /// Container entries that may still be read.
+    left: usize,
+    /// Entries were left unread when the budget ran out.
+    cut: bool,
+    found: Vec<NestedValue>,
+}
+
+impl NestedRead {
+    fn new() -> Self {
+        Self {
+            left: MAX_NESTED_ENTRIES,
+            cut: false,
+            found: Vec::new(),
+        }
+    }
+}
+
+/// What a dict literal's `**` expansion nests, read once.
+struct NestedList {
+    found: Vec<NestedValue>,
+    cut: bool,
 }
 
 /// A memoized evaluation. `budget` is `None` when no resolution inside it
@@ -857,14 +905,22 @@ struct DictSummary<'t> {
     opaque: bool,
 }
 
-/// The pairs of a dict expanded with `**`.
+/// A dict expanded with `**`.
 struct Expansion<'t> {
-    pairs: Vec<(String, Node<'t>)>,
+    /// The dict literal.
+    node: Node<'t>,
+    /// Its summary: `expansion` holds the pairs that can matter.
+    summary: Rc<DictSummary<'t>>,
     scope: usize,
     name: Option<String>,
     origin: ValueOrigin,
+}
+
+impl Expansion<'_> {
     /// Part of it could not be read (`**other`, a computed key).
-    opaque: bool,
+    fn opaque(&self) -> bool {
+        self.summary.opaque
+    }
 }
 
 /// Where a parameter's argument is in one call.
@@ -918,6 +974,10 @@ struct Ctx<'t> {
     param_memo: HashMap<Key, Memo<Val>>,
     call_memo: HashMap<(usize, usize), Memo<Val>>,
     dict_cache: HashMap<usize, Rc<DictSummary<'t>>>,
+    /// What each expanded dict literal nests, by node id.
+    dict_nested: HashMap<usize, Rc<NestedList>>,
+    /// Nested values that may still be listed in this file.
+    nested_left: usize,
     attr_lookup_memo: HashMap<Key, Rc<[Assign<'t>]>>,
     caller_memo: HashMap<Key, Memo<Option<Val>>>,
     /// Resolutions in progress: (kind, scope or id, name).
@@ -975,6 +1035,8 @@ impl<'t> Ctx<'t> {
             param_memo: HashMap::new(),
             call_memo: HashMap::new(),
             dict_cache: HashMap::new(),
+            dict_nested: HashMap::new(),
+            nested_left: MAX_FILE_NESTED_VALUES,
             attr_lookup_memo: HashMap::new(),
             caller_memo: HashMap::new(),
             visiting: HashSet::new(),
@@ -2681,8 +2743,12 @@ impl<'t> Ctx<'t> {
         for splat in &args.splats {
             match self.expand_splat(*splat, scope) {
                 Some(expansion) => {
-                    base_url |= expansion.pairs.iter().any(|(k, _)| is_base_url_key(k));
-                    opaque |= expansion.opaque;
+                    base_url |= expansion
+                        .summary
+                        .expansion
+                        .iter()
+                        .any(|(k, _)| is_base_url_key(k));
+                    opaque |= expansion.opaque();
                 }
                 None => opaque = true,
             }
@@ -2987,6 +3053,7 @@ impl<'t> Ctx<'t> {
             gap_worthy,
         };
 
+        let gaps_before = self.out.gaps.len();
         let mut values = Vec::new();
         let mut keyed = false;
         for (key, expr) in &args.value_args {
@@ -3012,46 +3079,59 @@ impl<'t> Ctx<'t> {
             }
         }
 
+        // Model keys nested in literal arguments share one read budget per
+        // call; what an expanded dict nests is read once per dict.
+        let mut read = NestedRead::new();
         for (keyword, expr) in &args.literal_args {
             let prefix = keyword
                 .as_ref()
                 .map(|k| format!("{k}."))
                 .unwrap_or_default();
-            self.nested_values(*expr, &prefix, keyword.is_none(), scope, &mut values);
+            self.nested_values_in(*expr, &prefix, keyword.is_none(), scope, 0, &mut read);
         }
+        let mut nested = read.found;
+        let mut nested_cut = read.cut;
 
         // `**PARAMS` where `PARAMS` is a same-file dict literal.
         let mut opaque_splat = false;
+        let mut expanded: Vec<usize> = Vec::new();
         for splat in &args.splats {
             let Some(expansion) = self.expand_splat(*splat, scope) else {
                 opaque_splat = true;
                 continue;
             };
-            opaque_splat |= expansion.opaque;
-            for (key, value) in &expansion.pairs {
-                if is_value_key(key) {
-                    keyed = true;
-                    let label = expansion.name.as_ref().map(|n| format!("{n}[\"{key}\"]"));
-                    let result = self
-                        .resolve_value(*value, expansion.scope, 0)
-                        .map(|mut r| {
-                            if r.origin == ValueOrigin::Literal {
-                                r.origin = expansion.origin;
-                                r.name = label.clone();
-                            }
-                            r
-                        })
-                        .map_err(|u| match &label {
-                            Some(label) => u.via(label),
-                            None => u,
-                        });
-                    self.take_value(&site, key, false, result, &mut values);
-                } else if is_container(*value) {
-                    let prefix = format!("{key}.");
-                    self.nested_values(*value, &prefix, false, expansion.scope, &mut values);
-                }
+            opaque_splat |= expansion.opaque();
+            // `f(**P, **P)` is a TypeError; read each dict once.
+            if expanded.contains(&expansion.node.id()) {
+                continue;
             }
+            expanded.push(expansion.node.id());
+            for (key, value) in expansion.summary.expansion.iter() {
+                if !is_value_key(key) {
+                    continue;
+                }
+                keyed = true;
+                let label = expansion.name.as_ref().map(|n| format!("{n}[\"{key}\"]"));
+                let result = self
+                    .resolve_value(*value, expansion.scope, 0)
+                    .map(|mut r| {
+                        if r.origin == ValueOrigin::Literal {
+                            r.origin = expansion.origin;
+                            r.name = label.clone();
+                        }
+                        r
+                    })
+                    .map_err(|u| match &label {
+                        Some(label) => u.via(label),
+                        None => u,
+                    });
+                self.take_value(&site, key, false, result, &mut values);
+            }
+            let list = self.dict_nested(&expansion);
+            nested.extend(list.found.iter().cloned());
+            nested_cut |= list.cut;
         }
+        self.take_nested(&site, nested, nested_cut, &mut values);
 
         if !keyed && opaque_splat && (request || model_bearing) {
             let key = if member == "GenerativeModel" {
@@ -3078,6 +3158,22 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
             });
+        }
+
+        // The same value or gap reached twice (one dict expanded twice, one
+        // fallback behind two names) is listed once.
+        let mut seen_values = HashSet::new();
+        values.retain(|v| seen_values.insert((v.key.clone(), v.span.start_byte, v.value.clone())));
+        let mut seen_gaps = HashSet::new();
+        for gap in self.out.gaps.split_off(gaps_before) {
+            if seen_gaps.insert((
+                gap.kind,
+                gap.key.clone(),
+                gap.reason.clone(),
+                gap.detail.clone(),
+            )) {
+                self.out.gaps.push(gap);
+            }
         }
 
         self.out.calls.push(SdkCall {
@@ -3111,17 +3207,69 @@ impl<'t> Ctx<'t> {
         values: &mut Vec<CapturedValue>,
     ) {
         match result {
+            // A value whose gap cannot be reported here (an SDK type such as
+            // `ChatCompletion(model=os.getenv(...))`) is not captured: it
+            // would read as confirmed.
+            Ok(resolved) if !resolved.caveats.is_empty() && !site.gap_worthy => {}
             Ok(mut resolved) => {
-                let caveat = resolved.caveat.take();
+                let caveats = std::mem::take(&mut resolved.caveats);
                 values.push(captured(key, resolved, positional));
-                if let Some(caveat) = caveat.filter(|_| site.gap_worthy) {
-                    self.unresolved_gap(site, key, &caveat, true);
+                for caveat in &caveats {
+                    self.unresolved_gap(site, key, caveat, true);
                 }
             }
             Err(unresolved) if site.gap_worthy => {
                 self.unresolved_gap(site, key, &unresolved, false)
             }
             Err(_) => {}
+        }
+    }
+
+    /// Attaches nested model values, at most [`MAX_NESTED_VALUES`] per call
+    /// and [`MAX_FILE_NESTED_VALUES`] per file. Values cut by either limit,
+    /// or a read cut short after model values were found, leave a
+    /// `truncated` gap: the call may carry values the report does not list.
+    fn take_nested(
+        &mut self,
+        site: &Site<'_, 't>,
+        nested: Vec<NestedValue>,
+        read_cut: bool,
+        values: &mut Vec<CapturedValue>,
+    ) {
+        if nested.is_empty() {
+            return;
+        }
+        let mut seen: HashSet<(u32, String)> = HashSet::new();
+        let mut listed = 0;
+        let mut dropped = false;
+        for item in nested {
+            if !seen.insert((item.resolved.span.start_byte, item.path.clone())) {
+                continue;
+            }
+            if listed >= MAX_NESTED_VALUES || self.nested_left == 0 {
+                dropped = true;
+                continue;
+            }
+            listed += 1;
+            self.nested_left -= 1;
+            self.take_value(site, &item.path, item.positional, Ok(item.resolved), values);
+        }
+        if (dropped || read_cut) && site.gap_worthy {
+            let chain = site.chain;
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::UnresolvedModel,
+                sdk: Some(site.sdk),
+                file: self.file.clone(),
+                span: Some(self.span(site.call)),
+                symbol: self.symbol(site.scope),
+                chain: Some(chain.to_string()),
+                key: None,
+                reason: "truncated".to_string(),
+                detail: format!(
+                    "`{chain}` passes more nested model values than are read or listed ({listed} listed); the rest are not reported"
+                ),
+                values: Vec::new(),
+            });
         }
     }
 
@@ -3352,26 +3500,35 @@ impl<'t> Ctx<'t> {
         args
     }
 
+    /// What the containers in a dict literal's `**` expansion nest
+    /// (`**{"extra_body": {"model": ...}}`), read once per dict with one
+    /// budget and reused by every call that expands it.
+    fn dict_nested(&mut self, expansion: &Expansion<'t>) -> Rc<NestedList> {
+        if let Some(list) = self.dict_nested.get(&expansion.node.id()) {
+            return Rc::clone(list);
+        }
+        let mut read = NestedRead::new();
+        for (key, value) in expansion.summary.expansion.iter() {
+            if !is_value_key(key) && is_container(*value) {
+                let prefix = format!("{key}.");
+                self.nested_values_in(*value, &prefix, false, expansion.scope, 0, &mut read);
+            }
+        }
+        let list = Rc::new(NestedList {
+            found: read.found,
+            cut: read.cut,
+        });
+        self.dict_nested
+            .insert(expansion.node.id(), Rc::clone(&list));
+        list
+    }
+
     /// Allowlisted keys inside dict literals passed to a call
     /// (`fallbacks=[{"model": "claude-opus-4-8"}]`). Only identifier-shaped
     /// keys are followed and only keys [`is_value_key`] accepts are read; an
     /// unresolvable nested value is skipped, not reported, because the
-    /// argument may not configure the request at all. At most
-    /// [`MAX_NESTED_ENTRIES`] entries are read per argument, so a huge
-    /// literal expanded at many calls costs little at each.
-    fn nested_values(
-        &mut self,
-        node: Node<'t>,
-        prefix: &str,
-        positional: bool,
-        scope: usize,
-        out: &mut Vec<CapturedValue>,
-    ) {
-        let mut left = MAX_NESTED_ENTRIES;
-        self.nested_values_in(node, prefix, positional, scope, 0, &mut left, out);
-    }
-
-    #[allow(clippy::too_many_arguments)]
+    /// argument may not configure the request at all. `read` bounds the
+    /// entries read (see [`MAX_NESTED_ENTRIES`]).
     fn nested_values_in(
         &mut self,
         node: Node<'t>,
@@ -3379,8 +3536,7 @@ impl<'t> Ctx<'t> {
         positional: bool,
         scope: usize,
         depth: u32,
-        left: &mut usize,
-        out: &mut Vec<CapturedValue>,
+        read: &mut NestedRead,
     ) {
         if depth > 4 {
             return;
@@ -3389,10 +3545,11 @@ impl<'t> Ctx<'t> {
         match node.kind() {
             "dictionary" => {
                 for pair in node.named_children(&mut cursor) {
-                    if *left == 0 {
+                    if read.left == 0 {
+                        read.cut = true;
                         return;
                     }
-                    *left -= 1;
+                    read.left -= 1;
                     if pair.kind() != "pair" {
                         continue;
                     }
@@ -3413,29 +3570,26 @@ impl<'t> Ctx<'t> {
                     let path = format!("{prefix}{key}");
                     if is_value_key(&key) {
                         if let Ok(resolved) = self.resolve_value(value, scope, 0) {
-                            out.push(captured(&path, resolved, positional));
+                            read.found.push(NestedValue {
+                                path,
+                                positional,
+                                resolved,
+                            });
                         }
                     } else if is_container(value) {
                         let nested = format!("{path}.");
-                        self.nested_values_in(
-                            value,
-                            &nested,
-                            positional,
-                            scope,
-                            depth + 1,
-                            left,
-                            out,
-                        );
+                        self.nested_values_in(value, &nested, positional, scope, depth + 1, read);
                     }
                 }
             }
             "list" | "tuple" | "set" | "parenthesized_expression" => {
                 for item in node.named_children(&mut cursor) {
-                    if *left == 0 {
+                    if read.left == 0 {
+                        read.cut = true;
                         return;
                     }
-                    *left -= 1;
-                    self.nested_values_in(item, prefix, positional, scope, depth + 1, left, out);
+                    read.left -= 1;
+                    self.nested_values_in(item, prefix, positional, scope, depth + 1, read);
                 }
             }
             _ => {}
@@ -3507,7 +3661,7 @@ impl<'t> Ctx<'t> {
                     origin: ValueOrigin::Literal,
                     name: None,
                     span: self.span(expr),
-                    caveat: None,
+                    caveats: Vec::new(),
                 }),
                 Ok(value) if is_credential_value(&value) => {
                     Err(Unresolved::new("credential", self.render(expr)))
@@ -3627,7 +3781,11 @@ impl<'t> Ctx<'t> {
                         resolved.origin = ValueOrigin::ParameterDefault;
                         resolved.name = Some(name.to_string());
                     }
-                    resolved.caveat = resolved.caveat.map(|caveat| caveat.via(name));
+                    resolved.caveats = resolved
+                        .caveats
+                        .into_iter()
+                        .map(|caveat| caveat.via(name))
+                        .collect();
                     Ok(resolved)
                 }
                 Err(unresolved) if unresolved.reason == "credential" => Err(unresolved.via(name)),
@@ -3779,7 +3937,7 @@ impl<'t> Ctx<'t> {
         Some(match self.resolve_value(default, scope, depth + 1) {
             Ok(mut resolved) => {
                 resolved.origin = ValueOrigin::EnvDefault;
-                resolved.caveat = Some(Unresolved::new(reason, shape));
+                resolved.caveats.push(Unresolved::new(reason, shape));
                 Ok(resolved)
             }
             Err(unresolved) if unresolved.reason == "credential" => Err(unresolved),
@@ -3811,7 +3969,9 @@ impl<'t> Ctx<'t> {
         match self.resolve_value(right, scope, depth + 1) {
             Ok(mut resolved) => {
                 resolved.origin = ValueOrigin::EnvDefault;
-                resolved.caveat = Some(Unresolved::new("env_var", self.render(left)));
+                resolved
+                    .caveats
+                    .push(Unresolved::new("env_var", self.render(left)));
                 Some(Ok(resolved))
             }
             Err(unresolved) if unresolved.reason == "credential" => Some(Err(unresolved)),
@@ -3960,11 +4120,11 @@ impl<'t> Ctx<'t> {
         let dict = self.dict_node(expr, scope, 0)?;
         let summary = self.dict_summary(dict.node);
         Some(Expansion {
-            pairs: summary.expansion.clone(),
+            node: dict.node,
+            summary,
             scope: dict.scope,
             name: dict.name,
             origin: dict.origin,
-            opaque: summary.opaque,
         })
     }
 
