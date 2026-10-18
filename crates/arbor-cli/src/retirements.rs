@@ -20,9 +20,9 @@
 //! `--include-routed`.
 
 use arbor_core::retirements::{
-    bundled, check, python_literal, read_base_urls, Change, ChangeKind, CheckOptions, Confidence,
-    Date, DateKind, Decision, Finding, MatchKind, OptionStatus, RetirementReport, RoutingClass,
-    ScanInput, State, REPORT_VERSION,
+    bundled, check, python_literal, Change, ChangeKind, CheckOptions, Confidence, Date, DateKind,
+    Decision, Finding, MatchKind, OptionStatus, RetirementReport, RoutingClass, ScanInput, State,
+    REPORT_VERSION,
 };
 use arbor_core::usages::{is_unsafe_char, ValueOrigin};
 use arbor_watcher::usages::{scan_usages, UsageScanOptions};
@@ -143,8 +143,6 @@ fn build_report(args: &Args) -> Result<RetirementReport, String> {
         },
     )
     .map_err(|error| format!("cannot scan {}: {}", path.display(), error))?;
-    // Reported paths start with the path as given, so they open from here.
-    let base_urls = read_base_urls(&scan.clients, |file| std::fs::read_to_string(file).ok());
     let options = CheckOptions {
         today,
         fail_within: args.fail_within,
@@ -155,7 +153,6 @@ fn build_report(args: &Args) -> Result<RetirementReport, String> {
         calls: &scan.usages,
         gaps: &scan.gaps,
         clients: &scan.clients,
-        base_urls: &base_urls,
     };
     let mut report = check(input, data, &options);
     report.root = scan.root;

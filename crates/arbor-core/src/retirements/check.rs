@@ -27,7 +27,7 @@
 //! code (`ChatCompletion(...)`, `Message(...)`, `.model_validate(...)`) send
 //! nothing; they are counted in [`Summary::response_objects`] and skipped.
 
-use super::base_url::{BaseUrl, ClientBaseUrl};
+use super::base_url::{base_url_of, BaseUrl};
 use super::{
     Action, DateKind, EntryStatus, OptionStatus, ParamRule, RecipeInfo, RetirementData,
     Retirements, RuleEffect, Table, Verified,
@@ -68,9 +68,6 @@ pub struct ScanInput<'a> {
     pub calls: &'a [SdkCall],
     pub gaps: &'a [UsageGap],
     pub clients: &'a [ClientConstruction],
-    /// How each custom `base_url` reads ([`super::read_base_urls`]). Empty
-    /// when the sources were not read: those clients stay routed.
-    pub base_urls: &'a [ClientBaseUrl],
 }
 
 /// Where a model stands today.
@@ -468,7 +465,7 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
             response_objects += usize::from(!call.values.is_empty());
             continue;
         };
-        let class = call_routing(call, input.clients, input.base_urls);
+        let class = call_routing(call, input.clients, input.gaps);
         for value in &call.values {
             let Some(finding) = finding_for(
                 data,
@@ -507,7 +504,7 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
                 };
                 (
                     Site::Call(call, kind),
-                    call_routing(call, input.clients, input.base_urls),
+                    call_routing(call, input.clients, input.gaps),
                     Confidence::ConfirmFirst,
                 )
             }
@@ -689,20 +686,11 @@ struct CallRouting {
     base_url: Option<BaseUrl>,
 }
 
-fn call_routing(
-    call: &SdkCall,
-    clients: &[ClientConstruction],
-    base_urls: &[ClientBaseUrl],
-) -> CallRouting {
-    let base_url = (call.routing == Routing::CustomBaseUrl)
-        .then(|| {
-            let line = call.client_line?;
-            base_urls
-                .iter()
-                .find(|b| b.file == call.file && b.line == line)
-                .map(|b| b.base_url)
-        })
-        .flatten();
+/// The routing [`crate::usages`] decided. A `base_url` is already routed by
+/// its host there (the provider's own host is direct; an environment-only or
+/// unresolved value is unknown), so it is followed as it is and only named.
+fn call_routing(call: &SdkCall, clients: &[ClientConstruction], gaps: &[UsageGap]) -> CallRouting {
+    let base_url = base_url_of(call, gaps, clients);
     let (class, table) = match call.routing {
         Routing::OpenaiDirect => (RoutingClass::Direct, Some(Table::Openai)),
         Routing::AnthropicDirect => (RoutingClass::Direct, Some(Table::Anthropic)),
@@ -712,18 +700,10 @@ fn call_routing(
         Routing::GoogleGenai | Routing::GoogleGenerativeaiLegacy => {
             (RoutingClass::Direct, Some(Table::GeminiApi))
         }
-        Routing::CustomBaseUrl => match base_url {
-            // The provider's own host, or the SDK's default: a direct call.
-            Some(BaseUrl::ProviderHost | BaseUrl::EnvProviderDefault) => {
-                (RoutingClass::Direct, Some(sdk_table(call.sdk)))
-            }
-            // Set by the deployment, or not readable: listed, not hidden.
-            Some(BaseUrl::EnvOnly | BaseUrl::Unreadable) => (RoutingClass::Unknown, None),
-            Some(BaseUrl::OtherHost) | None => (RoutingClass::Routed, None),
-        },
-        Routing::AzureOpenai | Routing::AnthropicBedrock | Routing::AnthropicVertex => {
-            (RoutingClass::Routed, None)
-        }
+        Routing::AzureOpenai
+        | Routing::CustomBaseUrl
+        | Routing::AnthropicBedrock
+        | Routing::AnthropicVertex => (RoutingClass::Routed, None),
         Routing::Unknown => (RoutingClass::Unknown, None),
     };
     CallRouting {
@@ -2128,7 +2108,6 @@ mod tests {
             calls,
             gaps,
             clients: &[],
-            base_urls: &[],
         };
         check(input, bundled().unwrap(), opts)
     }
@@ -2571,7 +2550,6 @@ mod tests {
             calls: std::slice::from_ref(&bison),
             gaps: &[],
             clients: std::slice::from_ref(&vertex),
-            base_urls: &[],
         };
         let report = check(input, bundled().unwrap(), &options("2026-10-18"));
         let finding = &report.findings[0];
@@ -2659,12 +2637,15 @@ mod tests {
     }
 
     #[test]
-    fn a_base_url_on_the_provider_host_is_direct() {
+    fn base_url_routing_follows_the_usage_scan() {
+        // The usage scan routes a base_url by its host: the provider's own
+        // host stays direct, an environment lookup adds a gap, another host
+        // is custom_base_url.
         let model = "gpt-3.5-turbo-0613";
-        let at = |line: u32| {
+        let at = |line: u32, routing: Routing| {
             let mut c = call(
                 Sdk::Openai,
-                Routing::CustomBaseUrl,
+                routing,
                 "client.chat.completions.create",
                 model,
                 &[],
@@ -2673,56 +2654,101 @@ mod tests {
             c.client_line = Some(line - 20);
             c
         };
-        let calls = [at(21), at(22), at(23), at(24), at(25)];
-        let base_urls: Vec<ClientBaseUrl> = [
-            BaseUrl::ProviderHost,
-            BaseUrl::EnvProviderDefault,
-            BaseUrl::EnvOnly,
-            BaseUrl::Unreadable,
-            BaseUrl::OtherHost,
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(i, base_url)| ClientBaseUrl {
+        let calls = [
+            at(21, Routing::OpenaiDirect),
+            at(22, Routing::OpenaiDirect),
+            at(23, Routing::Unknown),
+            at(24, Routing::Unknown),
+            at(25, Routing::CustomBaseUrl),
+            at(26, Routing::OpenaiDirect),
+        ];
+        let client = |line: u32| ClientConstruction {
+            sdk: Sdk::Openai,
+            package: "openai".into(),
+            constructor: "openai.OpenAI".into(),
+            chain: "OpenAI".into(),
+            binding: Some("client".into()),
+            scope: crate::usages::ClientScope::Module,
+            routing: Routing::OpenaiDirect,
+            is_async: false,
+            kwargs: if line == 6 {
+                Vec::new()
+            } else {
+                vec!["base_url".into()]
+            },
+            splat: false,
             file: "app.py".into(),
-            line: i as u32 + 1,
-            base_url,
-        })
-        .collect();
-        let input = ScanInput {
-            calls: &calls,
-            gaps: &[],
-            clients: &[],
-            base_urls: &base_urls,
+            span: span(line),
+            symbol: None,
         };
-        let report = check(input, bundled().unwrap(), &options("2026-10-18"));
+        let clients: Vec<ClientConstruction> = (1..=6).map(client).collect();
+        let gap = |line: u32, reason: &str| UsageGap {
+            kind: GapKind::AmbiguousClient,
+            sdk: Some(Sdk::Openai),
+            file: "app.py".into(),
+            span: Some(span(line)),
+            symbol: None,
+            chain: Some("client.chat.completions.create".into()),
+            key: None,
+            reason: reason.into(),
+            detail: String::new(),
+            values: Vec::new(),
+            values_complete: false,
+        };
+        let gaps = [
+            gap(22, "base_url_env"),
+            gap(23, "base_url_env"),
+            gap(24, "base_url_unresolved"),
+        ];
+        let run_with = |opts: &CheckOptions| {
+            let input = ScanInput {
+                calls: &calls,
+                gaps: &gaps,
+                clients: &clients,
+            };
+            check(input, bundled().unwrap(), opts)
+        };
+        let report = run_with(&options("2026-10-18"));
         let class = |line: u32| {
             report
                 .findings
                 .iter()
                 .find(|f| f.line == line)
-                .map(|f| (f.routing_class, f.fails))
+                .map(|f| (f.routing_class, f.base_url, f.fails))
         };
-        assert_eq!(class(21), Some((RoutingClass::Direct, true)));
-        assert_eq!(class(22), Some((RoutingClass::Direct, true)));
+        assert_eq!(
+            class(21),
+            Some((RoutingClass::Direct, Some(BaseUrl::ProviderHost), true))
+        );
+        assert_eq!(
+            class(22),
+            Some((
+                RoutingClass::Direct,
+                Some(BaseUrl::EnvProviderDefault),
+                true
+            ))
+        );
         // Listed with routing unknown, and not counted by default.
-        assert_eq!(class(23), Some((RoutingClass::Unknown, false)));
-        assert_eq!(class(24), Some((RoutingClass::Unknown, false)));
+        assert_eq!(
+            class(23),
+            Some((RoutingClass::Unknown, Some(BaseUrl::EnvOnly), false))
+        );
+        assert_eq!(
+            class(24),
+            Some((RoutingClass::Unknown, Some(BaseUrl::Unreadable), false))
+        );
         assert_eq!(class(25), None, "another host stays routed");
+        assert_eq!(class(26), Some((RoutingClass::Direct, None, true)));
         assert_eq!(report.summary.routed_calls, 1);
         assert_eq!(report.summary.uncounted, 2);
-        assert_eq!(report.findings[0].base_url, Some(BaseUrl::ProviderHost));
 
         let mut opts = options("2026-10-18");
         opts.count_unconfirmed = true;
-        let input = ScanInput {
-            calls: &calls,
-            gaps: &[],
-            clients: &[],
-            base_urls: &base_urls,
-        };
-        let report = check(input, bundled().unwrap(), &opts);
-        assert_eq!(report.summary.failing, 4);
+        assert_eq!(run_with(&opts).summary.failing, 5);
+        opts.include_routed = true;
+        let report = run_with(&opts);
+        assert_eq!(report.summary.failing, 6);
+        assert_eq!(report.routed[0].base_url, Some(BaseUrl::OtherHost));
     }
 
     #[test]
@@ -2869,7 +2895,6 @@ mod tests {
             calls: std::slice::from_ref(&gemini),
             gaps: &[],
             clients: std::slice::from_ref(&vertex),
-            base_urls: &[],
         };
         let report = check(input, bundled().unwrap(), &options("2026-10-18"));
         let finding = &report.findings[0];
@@ -2883,7 +2908,6 @@ mod tests {
             calls: std::slice::from_ref(&gemini),
             gaps: &[],
             clients: std::slice::from_ref(&vertex),
-            base_urls: &[],
         };
         let report = check(input, bundled().unwrap(), &options("2026-10-20"));
         assert_eq!(report.findings[0].status, State::Unconfirmed);

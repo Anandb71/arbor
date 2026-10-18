@@ -12,15 +12,14 @@
 //! have moved on.
 //!
 //! [`check`] matches the model values that [`crate::usages`] found at SDK
-//! calls against this data. Nothing in [`check`] reads files, runs code or
-//! reaches the network; [`read_base_urls`] parses source text its caller
-//! hands it.
+//! calls against this data. Nothing here reads files, runs code or reaches
+//! the network.
 
 mod base_url;
 mod check;
 mod date;
 
-pub use base_url::{read_base_urls, BaseUrl, ClientBaseUrl};
+pub use base_url::BaseUrl;
 pub use check::{
     check, python_literal, CallKind, ChainStep, Change, ChangeKind, CheckOptions, Confidence,
     DataInfo, Decision, DecisionOption, Finding, FixKind, MatchKind, NextShutdown, OptionEffect,
