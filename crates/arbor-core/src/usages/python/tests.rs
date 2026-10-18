@@ -2476,3 +2476,58 @@ fn same_named_nested_functions_resolve_their_callers_in_linear_time() {
     // stay gaps.
     assert_eq!(gaps(&found, GapKind::UnknownClientFactory).len(), 3_000);
 }
+
+// ---------------------------------------------------------------------------
+// Second re-review of #276
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_dict_get_default_resolves_where_the_call_runs() {
+    // The default of `DEFAULTS.get("model", M)` was resolved in the dict's
+    // scope, so the module's `M` was reported for a request that sends the
+    // function's own `M`.
+    let found = usages(
+        r#"
+from openai import OpenAI
+client = OpenAI()
+DEFAULTS = {"temperature": 0}
+M = "gpt-3.5-turbo-instruct"
+def ask4():
+    M = "gpt-4o"
+    return client.chat.completions.create(model=DEFAULTS.get("model", M), messages=[])
+client.chat.completions.create(model=DEFAULTS.get("model", M), messages=[])
+"#,
+    );
+    let models: Vec<(&str, ValueOrigin)> = found
+        .calls
+        .iter()
+        .map(|c| (c.values[0].value.as_str(), c.values[0].origin))
+        .collect();
+    assert_eq!(
+        models,
+        vec![
+            ("gpt-4o", ValueOrigin::LocalConstant),
+            ("gpt-3.5-turbo-instruct", ValueOrigin::ModuleConstant)
+        ]
+    );
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn a_refused_lookup_key_is_never_echoed() {
+    // `D.get(<credential-shaped key>, ...)` put the key itself in the gap's
+    // detail.
+    let found = usages(
+        r#"
+from openai import OpenAI
+client = OpenAI()
+D3 = {"a": "b"}
+client.chat.completions.create(model=D3.get("sk-proj-tokenFAKEFAKE0000fakekeyXYZ", "gpt-4"), messages=[])
+"#,
+    );
+    let json = serde_json::to_string(&found).unwrap();
+    assert!(!json.contains("FAKEFAKE"), "{json}");
+    let refused = &gaps(&found, GapKind::UnresolvedModel)[0];
+    assert_eq!(refused.reason, "credential");
+    assert!(refused.detail.contains("D3.get(...)"), "{}", refused.detail);
+}

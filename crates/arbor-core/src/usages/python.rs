@@ -1003,6 +1003,16 @@ impl Expansion<'_> {
     }
 }
 
+/// A `D.get(key, default)` call on a same-file dict literal.
+#[derive(Clone, Copy)]
+struct DictGet<'t> {
+    call: Node<'t>,
+    key: Option<Node<'t>>,
+    default: Option<Node<'t>>,
+    /// The scope the call is in, where its default is evaluated.
+    scope: usize,
+}
+
 /// Where a parameter's argument is in one call.
 enum ArgFor<'t> {
     Found(Node<'t>),
@@ -4429,7 +4439,13 @@ impl<'t> Ctx<'t> {
                 let default = positional.get(1).copied().or_else(|| keyword("default"));
                 if let Some(object) = function.child_by_field_name("object") {
                     if let Some(dict) = self.dict_node(object, scope, 0) {
-                        if let Some(found) = self.dict_get_value(&dict, key, default, depth) {
+                        let get = DictGet {
+                            call,
+                            key,
+                            default,
+                            scope,
+                        };
+                        if let Some(found) = self.dict_get_value(&dict, get, depth) {
                             return Some(found);
                         }
                     }
@@ -4521,22 +4537,24 @@ impl<'t> Ctx<'t> {
 
     /// The value of `dict.get(key, default)` on a same-file dict literal:
     /// the entry when the key is there, the default when it certainly is not.
+    /// The default is an argument of the call, so it is resolved where the
+    /// call runs, not where the dict is written.
     fn dict_get_value(
         &mut self,
         dict: &DictRef<'t>,
-        key: Option<Node<'t>>,
-        default: Option<Node<'t>>,
+        get: DictGet<'t>,
         depth: u32,
     ) -> Option<Result<Resolved, Unresolved>> {
-        let key = self.literal(key?).ok()?;
+        let key = self.literal(get.key?).ok()?;
         if is_secret_key(&key) {
-            return Some(Err(Unresolved::new("credential", key)));
+            // The key is a literal: name the call, never the key.
+            return Some(Err(Unresolved::new("credential", self.render(get.call))));
         }
         match self.dict_lookup(dict.node, &key) {
             Lookup::Found(value) => Some(self.dict_entry(dict, &key, value, depth)),
             Lookup::Absent => {
-                let default = default?;
-                Some(self.resolve_value(default, dict.scope, depth + 1))
+                let default = get.default?;
+                Some(self.resolve_value(default, get.scope, depth + 1))
             }
             Lookup::Unknown => None,
         }
