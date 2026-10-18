@@ -3469,18 +3469,25 @@ fn self_attributes_see_subclasses_and_outside_writes() {
     // were invisible and the base's `gpt-4o` was reported with no gap.
     let header = "from openai import OpenAI\nclient = OpenAI()\n";
     let reassigned = || vec!["reassigned".to_string()];
-    for (body, line) in [
-        (
-            r#"class Base:
+    // A direct subclass that overrides it is one more assignment.
+    let rows = rows_of(&format!(
+        "{header}{}",
+        r#"class Base:
     MODEL = "gpt-4o"
     def go(self):
         return client.chat.completions.create(model=self.MODEL, messages=[])
 class Fast(Base):
     MODEL = "o1-mini"
 Fast().go()
-"#,
-            6,
-        ),
+"#
+    ));
+    assert_eq!(rows, vec![(6, "-".to_string(), reassigned())]);
+    // Policy round (P2): a write of the attribute on any other object, and
+    // an attribute only subclasses assign, are dynamic features. The
+    // value the class gives is kept with a `dynamic_feature` gap; the
+    // writes are no longer copied into every class's lookup.
+    let dynamic = || vec!["dynamic_feature".to_string()];
+    for (body, line, value) in [
         (
             r#"class Bot:
     model = "gpt-4o"
@@ -3491,6 +3498,7 @@ bot.model = "o1-mini"
 bot.go()
 "#,
             6,
+            "gpt-4o",
         ),
         (
             r#"class Bot2:
@@ -3502,6 +3510,7 @@ setattr(b2, "model", "o1-mini")
 b2.go()
 "#,
             6,
+            "gpt-4o",
         ),
         (
             r#"class Lazy:
@@ -3511,15 +3520,19 @@ class Real(Lazy):
     model = "gpt-4o"
 "#,
             5,
+            "gpt-4o",
         ),
     ] {
         let found = usages(&format!("{header}{body}"));
         let rows = values_and_gaps(&found);
-        assert_eq!(rows, vec![(line, "-".to_string(), reassigned())], "{body}");
+        assert_eq!(rows, vec![(line, value.to_string(), dynamic())], "{body}");
     }
-    // An attribute named at run time may be any of them.
-    for body in [
-        r#"class Cfg:
+    // An attribute named at run time may be any of them: `setattr(self,
+    // ...)` in the class, and `__dict__` or `vars()` anywhere in the file,
+    // which may rebind anything (so the route keeps a gap too).
+    for (body, reasons) in [
+        (
+            r#"class Cfg:
     model = "gpt-4o"
     def __init__(self, **kw):
         for k, v in kw.items():
@@ -3527,31 +3540,46 @@ class Real(Lazy):
     def go(self):
         return client.chat.completions.create(model=self.model, messages=[])
 "#,
-        r#"class Cfg:
+            dynamic(),
+        ),
+        (
+            r#"class Cfg:
     model = "gpt-4o"
     def go(self):
         return client.chat.completions.create(model=self.model, messages=[])
 c = Cfg()
 c.__dict__.update(opts)
 "#,
-        r#"class Cfg:
+            vec!["dynamic_feature".to_string(), "dynamic_feature".to_string()],
+        ),
+        (
+            r#"class Cfg:
     model = "gpt-4o"
     def go(self):
         return client.chat.completions.create(model=self.model, messages=[])
 c = Cfg()
 vars(c)[key] = value
 "#,
+            vec!["dynamic_feature".to_string(), "dynamic_feature".to_string()],
+        ),
     ] {
         let rows = rows_of(&format!("{header}{body}"));
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1, "-", "{body}");
-        assert_eq!(rows[0].2, reassigned(), "{body}");
+        assert_eq!(rows[0].1, "gpt-4o", "{body}");
+        assert_eq!(rows[0].2, reasons, "{body}");
     }
-    // A class read by name is not an instance: outside writes do not reach.
+    // Policy round (P2): `k` is not known to be an instance, so a write of
+    // `MODEL` on it may be a write of the class's: a read by class name
+    // keeps a gap too.
     let rows = rows_of(&format!(
         "{header}class K:\n    MODEL = \"gpt-4o\"\nk = K()\nk.MODEL = \"o1-mini\"\nclient.chat.completions.create(model=K.MODEL, messages=[])\n"
     ));
-    assert_eq!(rows, vec![(7, "gpt-4o".to_string(), vec![])]);
+    assert_eq!(rows, vec![(7, "gpt-4o".to_string(), dynamic())]);
+    // With no other write, a read by class name is the supported grammar.
+    let rows = rows_of(&format!(
+        "{header}class K:\n    MODEL = \"gpt-4o\"\nclient.chat.completions.create(model=K.MODEL, messages=[])\n"
+    ));
+    assert_eq!(rows, vec![(5, "gpt-4o".to_string(), vec![])]);
 }
 
 #[test]
@@ -3656,7 +3684,6 @@ fn dicts_aliased_by_a_chain_a_class_attribute_or_the_namespace_are_not_read() {
         "CFG3 = {\"model\": \"gpt-4o\"}\nclass K3:\n    cfg = CFG3\n    def tune(self):\n        self.cfg[\"model\"] = \"o3-mini\"\nclient.chat.completions.create(**CFG3, messages=[])\n",
         "CFG4 = {\"model\": \"gpt-4o\"}\nclass K4:\n    cfg = CFG4\nx = K4.cfg\nx[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**CFG4, messages=[])\n",
         "CFG5 = {\"model\": \"gpt-4o\"}\nclass K5:\n    cfg = CFG5\n    def tune(self):\n        self.cfg.update(model=\"o1-mini\")\nclient.chat.completions.create(**CFG5, messages=[])\n",
-        "CFG7 = {\"model\": \"gpt-4o\"}\nglobals()[\"CFG7\"][\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**CFG7, messages=[])\n",
         // Policy round (P2): read only, but aliased: the supported grammar
         // reads a dict only through its one name.
         "CFG = {\"model\": \"gpt-4o\"}\nclass K:\n    cfg = CFG\nprint(K.cfg[\"model\"])\nclient.chat.completions.create(**CFG, messages=[])\n",
@@ -3667,6 +3694,19 @@ fn dicts_aliased_by_a_chain_a_class_attribute_or_the_namespace_are_not_read() {
         assert_eq!(rows[0].1, "-", "{body}");
         assert_eq!(rows[0].2, vec!["splat".to_string()], "{body}");
     }
+    // `globals()` may rebind anything in the file (policy round, P2): the
+    // route keeps a `dynamic_feature` gap too.
+    let rows = rows_of(&format!(
+        "{header}CFG7 = {{\"model\": \"gpt-4o\"}}\nglobals()[\"CFG7\"][\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**CFG7, messages=[])\n"
+    ));
+    assert_eq!(
+        rows,
+        vec![(
+            5,
+            "-".to_string(),
+            vec!["splat".to_string(), "dynamic_feature".to_string()]
+        )]
+    );
     // Read without an alias, the dict resolves.
     let rows = rows_of(&format!(
         "{header}CFG = {{\"model\": \"gpt-4o\"}}\nprint(CFG[\"model\"], len(CFG))\nclient.chat.completions.create(**CFG, messages=[])\n"
@@ -3743,11 +3783,17 @@ fn match_captures_except_targets_star_imports_and_globals_rebind() {
         assert_eq!(rows[0].1, "gpt-4o", "{source}");
         assert!(rows[0].2.is_empty(), "{source}: {:?}", rows[0].2);
     }
-    // At module level, `globals()["M"] = v` is `M = v`.
+    // At module level, `globals()["M"] = v` is `M = v`; `globals()` may
+    // rebind anything else too (policy round, P2), so the value and the
+    // route keep a `dynamic_feature` gap.
     let rows = rows_of(&format!(
         "{header}M = \"gpt-4o\"\nglobals()[\"M\"] = \"o1-mini\"\nclient.chat.completions.create(model=M, messages=[])\n"
     ));
-    assert_eq!(rows, vec![(6, "o1-mini".to_string(), vec![])]);
+    let dynamic = || "dynamic_feature".to_string();
+    assert_eq!(
+        rows,
+        vec![(6, "o1-mini".to_string(), vec![dynamic(), dynamic()])]
+    );
     // A client, or a constructor, the wildcard import may rebind is
     // ambiguous; one imported after it still resolves.
     let found = usages(
@@ -3985,25 +4031,60 @@ fn writes_and_lookups_through_dunders_and_the_module_object_are_seen() {
     for body in [
         "class A:\n    model = \"gpt-4o\"\n    def fast(self):\n        object.__setattr__(self, \"model\", \"o1-mini\")\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n",
         "class A:\n    model = \"gpt-4o\"\n    def fast(self):\n        super().__setattr__(\"model\", \"o1-mini\")\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n",
-        "class A:\n    model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\na = A()\na.__setattr__(\"model\", \"o1-mini\")\n",
-        "M = \"gpt-4o\"\ndef tune():\n    sys.modules[__name__].M = \"o1-mini\"\nclient.chat.completions.create(model=M, messages=[])\n",
-        "M = \"gpt-4o\"\ndef tune():\n    setattr(sys.modules[__name__], \"M\", \"o1-mini\")\nclient.chat.completions.create(model=M, messages=[])\n",
     ] {
         let rows = rows_of(&format!("{header}{body}"));
         assert_eq!(rows.len(), 1, "{body}");
         assert_eq!(rows[0].1, "-", "{body}");
         assert_eq!(rows[0].2, vec!["reassigned".to_string()], "{body}");
     }
-    for body in [
-        "class Bot:\n    def ask(self, q, model=\"gpt-4o\"):\n        return client.chat.completions.create(model=model, messages=[q])\nbot = Bot()\ngetattr(bot, \"ask\")(\"hi\", model=\"o1-mini\")\n",
-        "class Bot:\n    def ask(self, q, model=\"gpt-4o\"):\n        return client.chat.completions.create(model=model, messages=[q])\nbot = Bot()\ngetattr(bot, action)(\"hi\", model=\"o1-mini\")\n",
-        "def ask(q, model=\"gpt-4o\"):\n    return client.chat.completions.create(model=model, messages=[q])\nglobals()[\"ask\"](\"hi\", model=\"o1-mini\")\n",
-        "def ask(q, model=\"gpt-4o\"):\n    return client.chat.completions.create(model=model, messages=[q])\nglobals()[name](\"hi\", model=\"o1-mini\")\n",
+    // Policy round (P2): a write on another object is a dynamic feature
+    // (the class's value is kept with the gap), and `sys.modules` may
+    // rebind anything in the file, so the route keeps a gap too.
+    let dynamic = || "dynamic_feature".to_string();
+    for (body, value, reasons) in [
+        (
+            "class A:\n    model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\na = A()\na.__setattr__(\"model\", \"o1-mini\")\n",
+            "gpt-4o",
+            vec![dynamic()],
+        ),
+        (
+            "M = \"gpt-4o\"\ndef tune():\n    sys.modules[__name__].M = \"o1-mini\"\nclient.chat.completions.create(model=M, messages=[])\n",
+            "-",
+            vec!["reassigned".to_string(), dynamic()],
+        ),
+        (
+            "M = \"gpt-4o\"\ndef tune():\n    setattr(sys.modules[__name__], \"M\", \"o1-mini\")\nclient.chat.completions.create(model=M, messages=[])\n",
+            "-",
+            vec!["reassigned".to_string(), dynamic()],
+        ),
+    ] {
+        let rows = rows_of(&format!("{header}{body}"));
+        assert_eq!(rows, vec![(rows[0].0, value.to_string(), reasons)], "{body}");
+    }
+    for (body, reasons) in [
+        (
+            "class Bot:\n    def ask(self, q, model=\"gpt-4o\"):\n        return client.chat.completions.create(model=model, messages=[q])\nbot = Bot()\ngetattr(bot, \"ask\")(\"hi\", model=\"o1-mini\")\n",
+            vec!["unseen_callers".to_string()],
+        ),
+        (
+            "class Bot:\n    def ask(self, q, model=\"gpt-4o\"):\n        return client.chat.completions.create(model=model, messages=[q])\nbot = Bot()\ngetattr(bot, action)(\"hi\", model=\"o1-mini\")\n",
+            vec!["unseen_callers".to_string()],
+        ),
+        // `globals()` anywhere: the default and the route keep a
+        // `dynamic_feature` gap too.
+        (
+            "def ask(q, model=\"gpt-4o\"):\n    return client.chat.completions.create(model=model, messages=[q])\nglobals()[\"ask\"](\"hi\", model=\"o1-mini\")\n",
+            vec!["unseen_callers".to_string(), dynamic(), dynamic()],
+        ),
+        (
+            "def ask(q, model=\"gpt-4o\"):\n    return client.chat.completions.create(model=model, messages=[q])\nglobals()[name](\"hi\", model=\"o1-mini\")\n",
+            vec!["unseen_callers".to_string(), dynamic(), dynamic()],
+        ),
     ] {
         let rows = rows_of(&format!("{header}{body}"));
         assert_eq!(rows.len(), 1, "{body}");
         assert_eq!(rows[0].1, "gpt-4o", "{body}");
-        assert_eq!(rows[0].2, vec!["unseen_callers".to_string()], "{body}");
+        assert_eq!(rows[0].2, reasons, "{body}");
     }
 }
 
@@ -4018,10 +4099,13 @@ fn annotated_fields_of_data_classes_are_constructor_defaults() {
         "class Agent(BaseModel):\n    model: str = \"gpt-4o\"\n    def run(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n",
         "class Agent(NamedTuple):\n    model: str = \"gpt-4o\"\n    def run(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n",
     ] {
+        // Policy round (P2): a class decorator, or a base from outside the
+        // file, is a dynamic feature; the field's default is kept with
+        // the gap.
         let rows = rows_of(&format!("{header}{body}"));
         assert_eq!(rows.len(), 1, "{body}");
-        assert_eq!(rows[0].1, "-", "{body}");
-        assert_eq!(rows[0].2, vec!["reassigned".to_string()], "{body}");
+        assert_eq!(rows[0].1, "gpt-4o", "{body}");
+        assert_eq!(rows[0].2, vec!["dynamic_feature".to_string()], "{body}");
     }
     // A plain class's annotated attribute is a class attribute.
     let rows = rows_of(&format!(
@@ -4053,69 +4137,28 @@ fn rows_gapped(source: &str, confirmed: &[u32]) -> Vec<(u32, String, Vec<String>
 }
 
 #[test]
-fn dicts_and_lists_aliased_or_mutated_through_any_name_are_not_read() {
-    // Finding 6: `params = DEFAULTS; params |= {...}`, a nested list
-    // extended with `+=` through a name, an alias assigned in one branch
-    // and a chain of more than 8 aliases left the literal's value with no
-    // gap. Now any alias of a whole container, and any name given a
-    // nested container, makes the dict a gap.
-    let header = "import os\nfrom openai import OpenAI\nclient = OpenAI()\n";
-    let mut chain = String::from("D = {\"model\": \"gpt-4o\"}\na0 = D\n");
-    for i in 1..70 {
-        chain.push_str(&format!("a{i} = a{}\n", i - 1));
+fn self_attribute_reads_stay_linear_however_many_classes_and_outside_writes() {
+    // Finding 1: every outside write of `.model` was copied into each
+    // class's lookup, so N classes x M writes took 150 bytes a pair (1.28
+    // MB: 11 GB). Now any outside write of the name is one dynamic
+    // feature, read in constant time per class.
+    let mut source = String::from("from openai import OpenAI\nclient = OpenAI()\n");
+    for i in 0..2_000 {
+        source.push_str(&format!(
+            "class C{i}:\n    model = 'gpt-4o'\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n"
+        ));
     }
-    chain.push_str(
-        "a69[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**D, messages=[])\n",
-    );
-    for body in [
-        "DEFAULTS = {\"model\": \"gpt-4o\", \"temperature\": 0}\nparams = DEFAULTS\nparams |= {\"model\": \"o1-mini\"}\nclient.chat.completions.create(**DEFAULTS, messages=[])\n".to_string(),
-        "P = {\"model\": \"gpt-4o\", \"extra_body\": {\"fallbacks\": [{\"model\": \"gpt-4o-mini\"}]}}\nfb = P[\"extra_body\"][\"fallbacks\"]\nfb += [{\"model\": \"o1-mini\"}]\nclient.chat.completions.create(**P, messages=[])\n".to_string(),
-        "D = {\"model\": \"gpt-4o\"}\nif os.getenv(\"X\"):\n    cfg = D\nelse:\n    cfg = {\"model\": \"gpt-4o-mini\"}\nparams = cfg\nparams[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**D, messages=[])\n".to_string(),
-        "D = {\"model\": \"gpt-4o\"}\nQ = D if os.getenv(\"X\") else {}\nQ[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**D, messages=[])\n".to_string(),
-        "D = {\"model\": \"gpt-4o\"}\nfor d in (D,):\n    d[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**D, messages=[])\n".to_string(),
-        chain,
-    ] {
-        let rows = rows_gapped(&format!("{header}{body}"), &[]);
-        assert!(rows.iter().all(|r| r.1 == "-"), "{body}: {rows:?}");
+    for i in 0..4_000 {
+        source.push_str(&format!("o{}.model = 'o1-mini-{i}'\n", i % 7));
     }
-    // A copy is not an alias.
-    let rows = rows_gapped(
-        &format!("{header}P18 = {{\"model\": \"gpt-4o\"}}\nns = dict(**P18)\nclient.chat.completions.create(**P18, messages=[])\n"),
-        &[6],
-    );
-    assert_eq!(rows, vec![(6, "gpt-4o".to_string(), vec![])]);
-}
-
-#[test]
-fn values_complete_only_for_one_scope_with_no_alias_or_mutation() {
-    // Finding 11: a list mutated through an alias, and a class-body
-    // comprehension's first iterable, were listed as complete.
-    let header = "import os\nfrom openai import OpenAI\nclient = OpenAI()\n";
-    for body in [
-        "L = [\"gpt-4o\"]\nB = L\nB.append(\"o1-mini\")\nfor m in L:\n    client.chat.completions.create(model=m, messages=[])\n",
-        "L = [\"gpt-4o\"]\nB = L\nB[0] = \"o1-mini\"\nfor m in L:\n    client.chat.completions.create(model=m, messages=[])\n",
-        "L = [\"gpt-4o\"]\nB = L\nB += [\"o1-mini\"]\nfor m in L:\n    client.chat.completions.create(model=m, messages=[])\n",
-        "L = [\"gpt-4o\"]\nB = L\nB.extend([\"o1-mini\"])\nr = [client.chat.completions.create(model=m, messages=[]) for m in L]\n",
-        "L = [\"gpt-4o\"]\nL.append(\"o1-mini\")\ndef run():\n    for m in L:\n        client.chat.completions.create(model=m, messages=[])\n",
-        "M4 = [\"gpt-4o\"]\nclass Bot:\n    M4 = [\"o1-mini\"]\n    r = [client.chat.completions.create(model=m, messages=[]) for m in M4]\n",
-        // A definition from another scope (`global`) is not in the list's
-        // scope.
-        "if os.getenv(\"X\"):\n    M = \"gpt-4o\"\nelse:\n    M = \"o1-mini\"\ndef tune():\n    global M\n    M = \"o3-mini\"\nclient.chat.completions.create(model=M, messages=[])\n",
-    ] {
-        let found = usages(&format!("{header}{body}"));
-        assert_eq!(found.calls.len(), 1, "{body}");
-        assert!(found.calls[0].values.is_empty(), "{body}");
-        for gap in gaps(&found, GapKind::UnresolvedModel) {
-            assert!(!gap.values_complete, "{body}: {gap:?}");
-        }
-    }
-    // Inside the grammar: literal branches in one scope, a literal list.
-    let found = usages(&format!(
-        "{header}if os.getenv(\"X\"):\n    M = \"gpt-4o\"\nelse:\n    M = \"o1-mini\"\nclient.chat.completions.create(model=M, messages=[])\nfor m in [\"gpt-4o\", \"o1-mini\"]:\n    client.chat.completions.create(model=m, messages=[])\n"
-    ));
-    let listed = listed_with_completeness(&found);
-    assert_eq!(listed.len(), 2);
-    assert!(listed.iter().all(|row| row.3), "{listed:?}");
+    let found = usages_within(&source, 10);
+    assert_eq!(found.calls.len(), 2_000);
+    // The class's value is kept, with the gap naming the first write.
+    assert!(found.gaps.iter().all(|g| g.reason == "dynamic_feature"));
+    assert_eq!(found.gaps.len(), 2_000);
+    assert!(found.gaps[0]
+        .detail
+        .contains("a write of the attribute on another object at line 8003"));
 }
 
 #[test]
@@ -4163,6 +4206,348 @@ fn candidate_lists_stay_linear_however_many_definitions_and_uses() {
             .iter()
             .all(|g| !g.values_complete));
     }
+}
+
+#[test]
+fn class_attributes_read_by_name_see_every_dynamic_write() {
+    // Finding 3: `Settings.MODEL` read only the class body, so a
+    // `setattr` loader, a helper given the class, a decorator, an alias, a
+    // loop over classes or a write in a function defined above the class
+    // left `gpt-4o` with no gap.
+    let header = "import os\nfrom openai import OpenAI\nclient = OpenAI()\n";
+    for body in [
+        "class Settings:\n    MODEL = \"gpt-4o\"\ndef load(overrides):\n    for k, v in overrides.items():\n        setattr(Settings, k, v)\nload({\"MODEL\": \"o1-mini\"})\nclient.chat.completions.create(model=Settings.MODEL, messages=[])\n",
+        "class Settings:\n    MODEL = \"gpt-4o\"\nfor key in (\"MODEL\",):\n    if key in os.environ:\n        setattr(Settings, key, os.environ[key])\nclient.chat.completions.create(model=Settings.MODEL, messages=[])\n",
+        "class Settings:\n    MODEL = \"gpt-4o\"\ndef configure(cfg):\n    cfg.MODEL = \"o1-mini\"\nconfigure(Settings)\nclient.chat.completions.create(model=Settings.MODEL, messages=[])\n",
+        "def use_mini(cls):\n    cls.MODEL = \"gpt-4o-mini\"\n    return cls\n@use_mini\nclass Settings:\n    MODEL = \"gpt-4o\"\nclient.chat.completions.create(model=Settings.MODEL, messages=[])\n",
+        "class Bot4:\n    model = \"gpt-4o\"\nAlias4 = Bot4\nAlias4.model = \"o1-mini\"\nclient.chat.completions.create(model=Bot4.model, messages=[])\n",
+        "class Bot5:\n    model = \"gpt-4o\"\nfor k5 in (Bot5,):\n    k5.model = \"o1-mini\"\nclient.chat.completions.create(model=Bot5.model, messages=[])\n",
+        "def tweak1():\n    Bot1.model = \"o1-mini\"\nclass Bot1:\n    model = \"gpt-4o\"\ntweak1()\nclient.chat.completions.create(model=Bot1.model, messages=[])\n",
+        "class Bot9:\n    model = \"gpt-4o\"\ntype.__setattr__(Bot9, \"model\", \"o1-mini\")\nclient.chat.completions.create(model=Bot9.model, messages=[])\n",
+        "class Bot:\n    model = \"gpt-4o\"\nBot = make(Bot)\nclient.chat.completions.create(model=Bot.model, messages=[])\n",
+    ] {
+        rows_gapped(&format!("{header}{body}"), &[]);
+    }
+    // The same for a client attribute: the route keeps a gap.
+    let found = usages(
+        r#"from openai import OpenAI
+GW = "https://openrouter.ai/api/v1"
+class Svc1:
+    client = OpenAI()
+def configure1(k):
+    k.client = OpenAI(base_url=GW)
+configure1(Svc1)
+Svc1.client.chat.completions.create(model="gpt-4o", messages=[])
+def gateway(cls):
+    cls.client = OpenAI(base_url=GW)
+    return cls
+@gateway
+class Svc2:
+    client = OpenAI()
+Svc2.client.chat.completions.create(model="gpt-4o", messages=[])
+def reroute4():
+    Svc4.client = OpenAI(base_url=GW)
+class Svc4:
+    client = OpenAI()
+reroute4()
+Svc4.client.chat.completions.create(model="gpt-4o", messages=[])
+"#,
+    );
+    let routes = routes_and_gaps(&found);
+    assert_eq!(routes.len(), 3);
+    for (line, _, reasons) in routes {
+        assert!(!reasons.is_empty(), "line {line}");
+    }
+    // Inside the grammar a class constant read by name resolves.
+    let rows = rows_gapped(
+        &format!("{header}class K:\n    MODEL = \"gpt-4o\"\nclient.chat.completions.create(model=K.MODEL, messages=[])\n"),
+        &[6],
+    );
+    assert_eq!(rows, vec![(6, "gpt-4o".to_string(), vec![])]);
+}
+
+#[test]
+fn multiple_or_deep_inheritance_is_a_dynamic_feature() {
+    // Finding 4: `class C(A, B)` was read depth first, so `Root.model`
+    // (`gpt-4o`) was reported where Python's MRO reads `B.model`
+    // (`o1-mini`); and finding 8: past 64 subclasses, or 64 levels, the
+    // walk stopped silently.
+    let header = "from openai import OpenAI\nclient = OpenAI()\nGW = \"https://gw.example/v1\"\n";
+    let diamond = "class Root:\n    model = \"gpt-4o\"\n    client = OpenAI()\nclass A(Root):\n    pass\nclass B(Root):\n    model = \"o1-mini\"\n    client = OpenAI(base_url=GW)\n";
+    for tail in [
+        "class C(A, B):\n    def ask(self):\n        return client.chat.completions.create(model=self.model, messages=[])\nC().ask()\n",
+        "class C(A, B):\n    pass\nclient.chat.completions.create(model=C.model, messages=[])\n",
+    ] {
+        let rows = rows_gapped(&format!("{header}{diamond}{tail}"), &[]);
+        assert!(rows.iter().all(|r| r.1 != "gpt-4o"), "{rows:?}");
+    }
+    let found = usages(&format!(
+        "{header}{diamond}class C(A, B):\n    pass\nC.client.chat.completions.create(model=\"gpt-4o\", messages=[])\n"
+    ));
+    let receiver = &gaps(&found, GapKind::UnknownClientFactory)[0];
+    assert_eq!(receiver.reason, "dynamic_feature");
+    assert!(receiver.detail.contains("multiple inheritance"));
+
+    // 70 empty subclasses and a 71st that overrides; a 70-deep chain.
+    let mut wide = format!(
+        "{header}class Base:\n    model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n"
+    );
+    for i in 0..70 {
+        wide.push_str(&format!("class S{i}(Base):\n    pass\n"));
+    }
+    wide.push_str("class Last(Base):\n    model = \"o1-mini\"\nLast().go()\n");
+    let mut deep = format!(
+        "{header}class B0:\n    model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n"
+    );
+    for i in 1..70 {
+        deep.push_str(&format!("class B{i}(B{}):\n    pass\n", i - 1));
+    }
+    deep.push_str("class B70(B69):\n    model = \"o1-mini\"\nB70().go()\n");
+    for source in [wide, deep] {
+        let rows = rows_gapped(&source, &[]);
+        assert_eq!(rows.len(), 1);
+    }
+    // One level of single inheritance is the supported grammar.
+    let rows = rows_gapped(
+        &format!("{header}class Base:\n    model = \"gpt-4o\"\nclass Child(Base):\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n"),
+        &[8],
+    );
+    assert_eq!(rows, vec![(8, "gpt-4o".to_string(), vec![])]);
+}
+
+#[test]
+fn fields_inherited_through_a_same_file_base_are_dynamic() {
+    // Finding 5: the data-class check stopped at a same-file base, so a
+    // shared pydantic base (`AppModel(BaseModel)`) or a decorated base
+    // left the field default `gpt-4o` with no gap.
+    let header = "from dataclasses import dataclass\nfrom pydantic import BaseModel\nfrom openai import OpenAI\nclient = OpenAI()\n";
+    for body in [
+        "class AppModel(BaseModel):\n    pass\nclass AgentConfig(AppModel):\n    model: str = \"gpt-4o\"\n    def ask(self, q):\n        return client.chat.completions.create(model=self.model, messages=[q])\nAgentConfig(model=\"o1-mini\").ask(\"hi\")\n",
+        "@dataclass\nclass Base:\n    model: str = \"gpt-4o\"\nclass Agent(Base):\n    def ask(self, q):\n        return client.chat.completions.create(model=self.model, messages=[q])\nAgent(model=\"o1-mini\").ask(\"hi\")\n",
+        "class Meta(type):\n    pass\nclass Base(metaclass=Meta):\n    pass\nclass Agent(Base):\n    model: str = \"gpt-4o\"\n    def ask(self, q):\n        return client.chat.completions.create(model=self.model, messages=[q])\n",
+        "import enum\nclass M14(str, enum.Enum):\n    FAST = \"gpt-4o-mini\"\nclient.chat.completions.create(model=M14.FAST, messages=[])\n",
+    ] {
+        rows_gapped(&format!("{header}{body}"), &[]);
+    }
+    let found = usages(&format!(
+        "{header}class AppModel(BaseModel):\n    pass\nclass Svc(AppModel):\n    client: OpenAI = OpenAI()\n    def ask(self, q):\n        return self.client.chat.completions.create(model=\"gpt-4o\", messages=[q])\nSvc(client=OpenAI(base_url=\"https://gw.example/v1\")).ask(\"x\")\n"
+    ));
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![(
+            10,
+            Routing::OpenaiDirect,
+            vec!["ambiguous_client/dynamic_feature".to_string()]
+        )]
+    );
+}
+
+#[test]
+fn dicts_and_lists_aliased_or_mutated_through_any_name_are_not_read() {
+    // Finding 6: `params = DEFAULTS; params |= {...}`, a nested list
+    // extended with `+=` through a name, an alias assigned in one branch
+    // and a chain of more than 8 aliases left the literal's value with no
+    // gap. Now any alias of a whole container, and any name given a
+    // nested container, makes the dict a gap.
+    let header = "import os\nfrom openai import OpenAI\nclient = OpenAI()\n";
+    let mut chain = String::from("D = {\"model\": \"gpt-4o\"}\na0 = D\n");
+    for i in 1..70 {
+        chain.push_str(&format!("a{i} = a{}\n", i - 1));
+    }
+    chain.push_str(
+        "a69[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**D, messages=[])\n",
+    );
+    for body in [
+        "DEFAULTS = {\"model\": \"gpt-4o\", \"temperature\": 0}\nparams = DEFAULTS\nparams |= {\"model\": \"o1-mini\"}\nclient.chat.completions.create(**DEFAULTS, messages=[])\n".to_string(),
+        "P = {\"model\": \"gpt-4o\", \"extra_body\": {\"fallbacks\": [{\"model\": \"gpt-4o-mini\"}]}}\nfb = P[\"extra_body\"][\"fallbacks\"]\nfb += [{\"model\": \"o1-mini\"}]\nclient.chat.completions.create(**P, messages=[])\n".to_string(),
+        "D = {\"model\": \"gpt-4o\"}\nif os.getenv(\"X\"):\n    cfg = D\nelse:\n    cfg = {\"model\": \"gpt-4o-mini\"}\nparams = cfg\nparams[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**D, messages=[])\n".to_string(),
+        "D = {\"model\": \"gpt-4o\"}\nQ = D if os.getenv(\"X\") else {}\nQ[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**D, messages=[])\n".to_string(),
+        "D = {\"model\": \"gpt-4o\"}\nfor d in (D,):\n    d[\"model\"] = \"o1-mini\"\nclient.chat.completions.create(**D, messages=[])\n".to_string(),
+        chain,
+    ] {
+        let rows = rows_gapped(&format!("{header}{body}"), &[]);
+        assert!(rows.iter().all(|r| r.1 == "-"), "{body}: {rows:?}");
+    }
+    // A copy is not an alias.
+    let rows = rows_gapped(
+        &format!("{header}P18 = {{\"model\": \"gpt-4o\"}}\nns = dict(**P18)\nclient.chat.completions.create(**P18, messages=[])\n"),
+        &[6],
+    );
+    assert_eq!(rows, vec![(6, "gpt-4o".to_string(), vec![])]);
+}
+
+#[test]
+fn instances_built_without_their_class_name_are_unseen_constructor_calls() {
+    // Finding 7: `type(self)(model=...)`, `self.__class__(**...)` and
+    // `cls(...)` were not counted as calls of `__init__`, so its default
+    // was reported with no gap.
+    let header = "from openai import OpenAI\nclient = OpenAI()\n";
+    for clone in [
+        "return type(self)(model=\"o1-mini\")",
+        "return self.__class__(**{\"model\": self.model, **overrides})",
+        "klass = self.__class__\n        return klass(model=\"o1-mini\")",
+    ] {
+        let source = format!(
+            "{header}class _Agent:\n    def __init__(self, model=\"gpt-4o\"):\n        self.model = model\n    def other(self, **overrides):\n        {clone}\n    def run(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n_Agent().other().run()\n"
+        );
+        let rows = rows_gapped(&source, &[]);
+        assert_eq!(rows.len(), 1, "{clone}");
+        assert_eq!(rows[0].1, "gpt-4o", "{clone}");
+        assert_eq!(rows[0].2, vec!["unseen_callers".to_string()], "{clone}");
+    }
+    let found = usages(&format!(
+        "{header}class _Svc:\n    def __init__(self, client=OpenAI()):\n        self.client = client\n    def clone_with(self, client):\n        return type(self)(client=client)\n    def ask(self, q):\n        return self.client.chat.completions.create(model=\"gpt-4o\", messages=[q])\n_Svc().clone_with(OpenAI(base_url=\"https://gw.example/v1\")).ask(\"x\")\n"
+    ));
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![(
+            9,
+            Routing::OpenaiDirect,
+            vec!["ambiguous_client/unseen_callers".to_string()]
+        )]
+    );
+}
+
+#[test]
+fn environment_writes_with_run_time_names_may_set_the_endpoint() {
+    // Finding 9: a loop over `os.environ[k] = v`, a name held in a
+    // constant, `os.environ |= {...}`, an alias of `os.environ` and
+    // `__setitem__` left `OpenAI()` `openai_direct` with no gap.
+    let header = "import os\nfrom openai import OpenAI\nGW = \"https://openrouter.ai/api/v1\"\n";
+    for body in [
+        "for k, v in {\"OPENAI_BASE_URL\": GW}.items():\n    os.environ[k] = v\n",
+        "KEY = \"OPENAI_BASE_URL\"\nos.environ[KEY] = GW\n",
+        "os.environ |= {\"OPENAI_BASE_URL\": GW}\n",
+        "env = os.environ\nenv[\"OPENAI_BASE_URL\"] = GW\n",
+        "os.environ.__setitem__(\"OPENAI_BASE_URL\", GW)\n",
+        "os.environ.update(**overrides)\n",
+        "os.putenv(name, GW)\n",
+        "from os import environ\nenviron[key] = GW\n",
+    ] {
+        let found = usages(&format!(
+            "{header}{body}client = OpenAI()\nclient.chat.completions.create(model=\"gpt-4o\", messages=[])\n"
+        ));
+        let routes = routes_and_gaps(&found);
+        assert_eq!(routes.len(), 1, "{body}");
+        assert_eq!(routes[0].1, Routing::Unknown, "{body}");
+        assert_eq!(routes[0].2.len(), 1, "{body}");
+    }
+    // Reads, copies and a WSGI-style `environ` are not writes.
+    let found = usages(&format!(
+        "{header}x = os.environ.get(\"X\")\ny = dict(os.environ)\nz = {{**os.environ, \"A\": \"b\"}}\ndef app(environ, start):\n    environ[\"wsgi.x\"] = 1\nclient = OpenAI()\nclient.chat.completions.create(model=\"gpt-4o\", messages=[])\n"
+    ));
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![(10, Routing::OpenaiDirect, vec![])]
+    );
+}
+
+#[test]
+fn the_most_dynamic_features_downgrade_the_whole_file() {
+    // Finding 10 and nit 13: the module namespace written through
+    // `me = sys.modules[__name__]`, `g = globals()`, `setup(globals())`,
+    // `setattr(this, ...)`, `exec`, `obj.__dict__`, `import __main__` and
+    // the module importing itself left the old constant with no gap. Any
+    // of them now makes every value not written at its call, and every
+    // route, a `dynamic_feature` gap naming the feature and its line.
+    let header =
+        "import sys, importlib\nfrom openai import OpenAI\nclient = OpenAI()\nM = \"gpt-4o\"\n";
+    for (body, feature) in [
+        (
+            "me = sys.modules[__name__]\nme.M = \"o1-mini\"\n",
+            "`sys.modules` at line 5",
+        ),
+        (
+            "g = globals()\ng[\"M\"] = \"o1-mini\"\n",
+            "`globals()` at line 5",
+        ),
+        (
+            "def setup(ns):\n    ns[\"M\"] = \"o1-mini\"\nsetup(globals())\n",
+            "`globals()` at line 7",
+        ),
+        (
+            "this = sys.modules[__name__]\nsetattr(this, \"M\", \"o1-mini\")\n",
+            "`sys.modules` at line 5",
+        ),
+        ("exec(\"M = 'o1-mini'\")\n", "`exec` at line 5"),
+        ("exec(open(\"override.py\").read())\n", "`exec` at line 5"),
+        (
+            "d = obj.__dict__\nd[\"model\"] = \"o1-mini\"\n",
+            "`__dict__` at line 5",
+        ),
+        (
+            "import __main__; __main__.M = \"o1-mini\"\n",
+            "`import __main__` at line 5",
+        ),
+        (
+            "importlib.import_module(__name__).M = \"o1-mini\"\n",
+            "the module importing itself at line 5",
+        ),
+        (
+            "vars(sys.modules[__name__])[\"M\"] = \"o1-mini\"\n",
+            "at line 5",
+        ),
+    ] {
+        let source = format!(
+            "{header}{body}client.chat.completions.create(model=M, messages=[])\nclient.chat.completions.create(model=\"gpt-4o\", messages=[])\n"
+        );
+        let found = usages(&source);
+        let rows = rows_gapped(&source, &[]);
+        assert_eq!(rows.len(), 2, "{body}");
+        // A literal at the call is never downgraded; the route is.
+        assert_eq!(rows[1].1, "gpt-4o", "{body}");
+        assert_eq!(rows[1].2, vec!["dynamic_feature".to_string()], "{body}");
+        let route = gaps(&found, GapKind::AmbiguousClient);
+        assert!(
+            route[0].detail.contains(feature),
+            "{body}: {}",
+            route[0].detail
+        );
+    }
+    // The module's routing too: `sys.modules["openai"]` may be configured.
+    let found = usages(
+        "import openai\nimport sys\nmod = sys.modules[\"openai\"]\nmod.base_url = \"https://gw.example/v1\"\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+    );
+    assert_eq!(routes_and_gaps(&found)[0].2.len(), 1);
+    // `if __name__ == "__main__":` is not a dynamic feature.
+    let found = usages(
+        "from openai import OpenAI\nclient = OpenAI()\nM = \"gpt-4o\"\nif __name__ == \"__main__\":\n    client.chat.completions.create(model=M, messages=[])\n",
+    );
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn values_complete_only_for_one_scope_with_no_alias_or_mutation() {
+    // Finding 11: a list mutated through an alias, and a class-body
+    // comprehension's first iterable, were listed as complete.
+    let header = "import os\nfrom openai import OpenAI\nclient = OpenAI()\n";
+    for body in [
+        "L = [\"gpt-4o\"]\nB = L\nB.append(\"o1-mini\")\nfor m in L:\n    client.chat.completions.create(model=m, messages=[])\n",
+        "L = [\"gpt-4o\"]\nB = L\nB[0] = \"o1-mini\"\nfor m in L:\n    client.chat.completions.create(model=m, messages=[])\n",
+        "L = [\"gpt-4o\"]\nB = L\nB += [\"o1-mini\"]\nfor m in L:\n    client.chat.completions.create(model=m, messages=[])\n",
+        "L = [\"gpt-4o\"]\nB = L\nB.extend([\"o1-mini\"])\nr = [client.chat.completions.create(model=m, messages=[]) for m in L]\n",
+        "L = [\"gpt-4o\"]\nL.append(\"o1-mini\")\ndef run():\n    for m in L:\n        client.chat.completions.create(model=m, messages=[])\n",
+        "M4 = [\"gpt-4o\"]\nclass Bot:\n    M4 = [\"o1-mini\"]\n    r = [client.chat.completions.create(model=m, messages=[]) for m in M4]\n",
+        // A definition from another scope (`global`) is not in the list's
+        // scope.
+        "if os.getenv(\"X\"):\n    M = \"gpt-4o\"\nelse:\n    M = \"o1-mini\"\ndef tune():\n    global M\n    M = \"o3-mini\"\nclient.chat.completions.create(model=M, messages=[])\n",
+        // `exec` may add any value.
+        "if os.getenv(\"X\"):\n    M = \"gpt-4o\"\nelse:\n    M = \"o1-mini\"\nexec(code)\nclient.chat.completions.create(model=M, messages=[])\n",
+    ] {
+        let found = usages(&format!("{header}{body}"));
+        assert_eq!(found.calls.len(), 1, "{body}");
+        assert!(found.calls[0].values.is_empty(), "{body}");
+        for gap in gaps(&found, GapKind::UnresolvedModel) {
+            assert!(!gap.values_complete, "{body}: {gap:?}");
+        }
+    }
+    // Inside the grammar: literal branches in one scope, a literal list.
+    let found = usages(&format!(
+        "{header}if os.getenv(\"X\"):\n    M = \"gpt-4o\"\nelse:\n    M = \"o1-mini\"\nclient.chat.completions.create(model=M, messages=[])\nfor m in [\"gpt-4o\", \"o1-mini\"]:\n    client.chat.completions.create(model=m, messages=[])\n"
+    ));
+    let listed = listed_with_completeness(&found);
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().all(|row| row.3), "{listed:?}");
 }
 
 #[test]
@@ -4215,7 +4600,8 @@ i.chat.completions.create(model="gpt-4o", messages=[])
     );
     let json = serde_json::to_string(&found).unwrap();
     assert!(!json.contains("pw@") && !json.contains("gw.example"));
-    // Module configuration: the provider's own host stays direct.
+    // Module configuration: the provider's own host stays direct; one set
+    // inside a function may not have run.
     let found = usages(
         "import openai\nopenai.base_url = \"https://api.openai.com/v1/\"\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
     );
@@ -4223,4 +4609,87 @@ i.chat.completions.create(model="gpt-4o", messages=[])
         routes_and_gaps(&found),
         vec![(3, Routing::OpenaiDirect, vec![])]
     );
+    let found = usages(
+        "import openai\nGW = \"https://gw.example/v1\"\ndef setup():\n    openai.base_url = GW\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+    );
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![(
+            5,
+            Routing::CustomBaseUrl,
+            vec!["ambiguous_client/dynamic_feature".to_string()]
+        )]
+    );
+}
+
+#[test]
+fn attribute_hooks_and_shadowing_methods_are_dynamic() {
+    // P2: a class that defines `__getattr__`/`__setattr__`, a method or
+    // property named like the attribute, and `delattr` with a run-time
+    // name may hand out anything.
+    let header = "from openai import OpenAI\nclient = OpenAI()\n";
+    for body in [
+        "class Bot:\n    model = \"gpt-4o\"\n    def __setattr__(self, k, v):\n        object.__setattr__(self, k, v)\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n",
+        "class Bot:\n    model = \"gpt-4o\"\n    @property\n    def model(self):\n        return \"o1-mini\"\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n",
+        "class Bot:\n    model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\nb = Bot()\ndelattr(b, name)\n",
+    ] {
+        rows_gapped(&format!("{header}{body}"), &[]);
+    }
+}
+
+#[test]
+fn deleting_a_name_or_attribute_is_a_write() {
+    // `del Child.model` makes `Child.model` read the base's value, and
+    // `del M` unbinds the constant: each is an assignment of no value, so
+    // a later read keeps a gap instead of the deleted value.
+    let header = "from openai import OpenAI\nclient = OpenAI()\n";
+    for body in [
+        "class Base:\n    model = \"gpt-4o\"\nclass Child(Base):\n    model = \"o1-mini\"\ndel Child.model\nclient.chat.completions.create(model=Child.model, messages=[])\n",
+        "class Bot:\n    model = \"gpt-4o\"\n    def reset(self):\n        del self.model\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n",
+        "M = \"gpt-4o\"\ndel M\nclient.chat.completions.create(model=M, messages=[])\n",
+        "M = \"gpt-4o\"\nN = \"o1-mini\"\ndel N, M\nclient.chat.completions.create(model=M, messages=[])\n",
+    ] {
+        let rows = rows_gapped(&format!("{header}{body}"), &[]);
+        assert_eq!(rows.len(), 1, "{body}");
+        assert_eq!(rows[0].1, "-", "{body}");
+    }
+    // Deleting a dict entry still only makes the dict unreadable.
+    let rows = rows_of(&format!(
+        "{header}D = {{\"model\": \"gpt-4o\", \"x\": 1}}\ndel D[\"x\"]\nclient.chat.completions.create(**D, messages=[])\n"
+    ));
+    assert_eq!(rows, vec![(5, "-".to_string(), vec!["splat".to_string()])]);
+}
+
+#[test]
+fn locals_in_a_function_is_not_a_dynamic_feature() {
+    // A function's `locals()` (or `vars()`) cannot rebind its names, so it
+    // leaves the file's values alone; at module level it is the module's
+    // namespace, and `vars(obj)` is `obj.__dict__`: both downgrade the
+    // file.
+    let header = "from openai import OpenAI\nclient = OpenAI()\nM = \"gpt-4o\"\n";
+    let rows = rows_of(&format!(
+        "{header}def show():\n    print(\"{{x}}\".format(**locals()), vars())\nclient.chat.completions.create(model=M, messages=[])\n"
+    ));
+    assert_eq!(rows, vec![(6, "gpt-4o".to_string(), vec![])]);
+    for (body, feature) in [
+        ("print(locals())\n", "`locals()` at line 4"),
+        ("print(vars(args))\n", "`vars()` at line 4"),
+        (
+            "def f():\n    print([locals() for _ in range(1)])\n",
+            "`locals()` at line 5",
+        ),
+    ] {
+        let source =
+            format!("{header}{body}client.chat.completions.create(model=M, messages=[])\n");
+        let found = usages(&source);
+        let rows = rows_gapped(&source, &[]);
+        assert_eq!(rows.len(), 1, "{body}");
+        assert_eq!(rows[0].1, "gpt-4o", "{body}");
+        let route = gaps(&found, GapKind::AmbiguousClient);
+        assert!(
+            route[0].detail.contains(feature),
+            "{body}: {}",
+            route[0].detail
+        );
+    }
 }

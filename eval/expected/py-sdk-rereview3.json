@@ -32,7 +32,7 @@
     {"at": "app/credentials.py:11", "chain": "client.chat.completions.create", "routing": "openai_direct"},
     {"at": "app/credentials.py:18", "chain": "client.chat.completions.create", "routing": "openai_direct"},
     {"at": "app/credentials.py:20", "chain": "client.chat.completions.create", "routing": "openai_direct"},
-    {"at": "app/credentials.py:30", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/credentials.py:30", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
 
     {"at": "app/dicts.py:15", "chain": "client.chat.completions.create", "routing": "openai_direct"},
     {"at": "app/dicts.py:20", "chain": "client.chat.completions.create", "routing": "openai_direct"},
@@ -55,8 +55,8 @@
 
     {"at": "app/imports.py:5", "chain": "OpenAI().chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4"}},
 
-    {"at": "app/outside.py:12", "chain": "client.chat.completions.create", "routing": "openai_direct"},
-    {"at": "app/outside.py:28", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/outside.py:12", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "app/outside.py:28", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"engine": "gpt-4o"}},
     {"at": "app/outside.py:33", "chain": "router.chat.completions.create", "routing": "unknown", "values": {"model": "gpt-4"}},
 
     {"at": "app/overrides.py:8", "chain": "client.chat.completions.create", "routing": "openai_direct"},
@@ -91,9 +91,15 @@
     {"at": "app/agent.py:35", "kind": "unresolved_model", "reason": "parameter_default"},
 
     {"at": "app/bindings.py:18", "kind": "ambiguous_client", "reason": "multiple_assignments"},
+    {"at": "app/bindings.py:29", "kind": "ambiguous_client", "reason": "dynamic_feature"},
     {"at": "app/bindings.py:29", "kind": "unresolved_model", "reason": "reassigned"},
+    {"at": "app/bindings.py:36", "kind": "ambiguous_client", "reason": "dynamic_feature"},
     {"at": "app/bindings.py:36", "kind": "unresolved_model", "reason": "reassigned"},
+    {"at": "app/bindings.py:43", "kind": "ambiguous_client", "reason": "dynamic_feature"},
     {"at": "app/bindings.py:43", "kind": "unresolved_model", "reason": "reassigned"},
+    {"at": "app/bindings.py:47", "kind": "ambiguous_client", "reason": "dynamic_feature"},
+    {"at": "app/bindings.py:47", "kind": "unresolved_model", "reason": "dynamic_feature"},
+    {"at": "app/bindings.py:55", "kind": "ambiguous_client", "reason": "dynamic_feature"},
     {"at": "app/bindings.py:55", "kind": "unresolved_model", "reason": "reassigned"},
 
     {"at": "app/candidates.py:11", "kind": "unresolved_model", "reason": "reassigned"},
@@ -105,12 +111,17 @@
     {"at": "app/credentials.py:11", "kind": "unresolved_model", "reason": "non_literal"},
     {"at": "app/credentials.py:18", "kind": "unresolved_model", "reason": "env_var"},
     {"at": "app/credentials.py:20", "kind": "unresolved_model", "reason": "env_var"},
-    {"at": "app/credentials.py:30", "kind": "unresolved_model", "reason": "reassigned"},
+    {"at": "app/credentials.py:30", "kind": "unresolved_model", "reason": "dynamic_feature"},
 
+    {"at": "app/dicts.py:15", "kind": "ambiguous_client", "reason": "dynamic_feature"},
     {"at": "app/dicts.py:15", "kind": "unresolved_model", "reason": "splat"},
+    {"at": "app/dicts.py:20", "kind": "ambiguous_client", "reason": "dynamic_feature"},
     {"at": "app/dicts.py:20", "kind": "unresolved_model", "reason": "splat"},
+    {"at": "app/dicts.py:32", "kind": "ambiguous_client", "reason": "dynamic_feature"},
     {"at": "app/dicts.py:32", "kind": "unresolved_model", "reason": "subscript"},
+    {"at": "app/dicts.py:36", "kind": "ambiguous_client", "reason": "dynamic_feature"},
     {"at": "app/dicts.py:36", "kind": "unresolved_model", "reason": "splat"},
+    {"at": "app/dicts.py:41", "kind": "ambiguous_client", "reason": "dynamic_feature"},
     {"at": "app/dicts.py:41", "kind": "unresolved_model", "reason": "splat"},
 
     {"at": "app/escapes.py:13", "kind": "unresolved_model", "reason": "unseen_callers"},
@@ -125,8 +136,8 @@
     {"at": "app/factories.py:23", "kind": "ambiguous_client", "reason": "multiple_assignments"},
     {"at": "app/factories.py:30", "kind": "ambiguous_client", "reason": "multiple_assignments"},
 
-    {"at": "app/outside.py:12", "kind": "unresolved_model", "reason": "reassigned"},
-    {"at": "app/outside.py:28", "kind": "unresolved_model", "reason": "reassigned"},
+    {"at": "app/outside.py:12", "kind": "unresolved_model", "reason": "dynamic_feature"},
+    {"at": "app/outside.py:28", "kind": "unresolved_model", "reason": "dynamic_feature"},
     {"at": "app/outside.py:33", "kind": "ambiguous_client", "reason": "base_url_assigned"},
 
     {"at": "app/overrides.py:8", "kind": "unresolved_model", "reason": "reassigned"},
@@ -142,5 +153,5 @@
   ],
   "known_missing": [],
   "known_extra": [],
-  "notes": "Synthetic. Truth is what each line does at run time, except where a policy turns a value into a gap. agent.py:13 reports the __init__ default with a parameter_overridden gap because the constructor call passes o1-mini; agent.py:24 is public, so its client default and the constructor call's gateway are both possible; agent.py:35 is built without the argument, but Quiet is public, so another module may build it with another model: the default keeps a parameter_default gap (policy round). escapes.py:13, :21, :28 and :40 report their default with an unseen_callers gap (the function is passed to an executor, partially applied, mapped or decorated); escapes.py:47 keeps the client default's routing with an unseen_callers gap, :54 with a parameter_default gap (public), and _private_client at :58 has none. bindings.py:47 is globals()[\"MODEL7\"] = \"o3-mini\" at module level, which is MODEL7 = \"o3-mini\": the value is right; bindings.py:55 may be rebound by tune() at any time. overrides.py:10 is assigned after the wildcard import, so it resolves; overrides.py:8 is written before it. subclass.py:27 is a class with no subclass in the file; dicts.py:41 is only read through its aliases, but a dict reached through another name is outside the supported grammar (policy round), so it is a splat gap. Gap values (the models a run-time choice may give) and values_complete are not compared here; the unit tests check them. credentials.py lists no credential-shaped value anywhere: the loop item, the dict entries under a non-identifier, a secret-named and a credential-shaped key, the conditional's side and the setattr value are all refused, and imports.py's clipped module path drops its middle marker."
+  "notes": "Synthetic. Truth is what each line does at run time, except where a policy turns a value into a gap. agent.py:13 reports the __init__ default with a parameter_overridden gap because the constructor call passes o1-mini; agent.py:24 is public, so its client default and the constructor call's gateway are both possible; agent.py:35 is built without the argument, but Quiet is public, so another module may build it with another model: the default keeps a parameter_default gap (policy round). escapes.py:13, :21, :28 and :40 report their default with an unseen_callers gap (the function is passed to an executor, partially applied, mapped or decorated); escapes.py:47 keeps the client default's routing with an unseen_callers gap, :54 with a parameter_default gap (public), and _private_client at :58 has none. bindings.py:47 is globals()[\"MODEL7\"] = \"o3-mini\" at module level, which is MODEL7 = \"o3-mini\": the value is right; bindings.py:55 may be rebound by tune() at any time. overrides.py:10 is assigned after the wildcard import, so it resolves; overrides.py:8 is written before it. subclass.py:27 is a class with no subclass in the file; dicts.py:41 is only read through its aliases, but a dict reached through another name is outside the supported grammar (policy round), so it is a splat gap. Policy round: globals() in bindings.py and dicts.py may rebind anything in those files, so every route there, and every value not written at its call (bindings.py:47), keeps a dynamic_feature gap; outside.py:12 and :28 and credentials.py:30 read a class attribute that a write on another object (bot.model = ..., setattr(h, \"model\", ...)) or a setattr with a run-time name may change, so the class's own value is reported with a dynamic_feature gap and the outside writes are no longer copied into the lookup. Gap values (the models a run-time choice may give) and values_complete are not compared here; the unit tests check them. credentials.py lists no credential-shaped value anywhere: the loop item, the dict entries under a non-identifier, a secret-named and a credential-shaped key, the conditional's side and the setattr value are all refused, and imports.py's clipped module path drops its middle marker."
 }

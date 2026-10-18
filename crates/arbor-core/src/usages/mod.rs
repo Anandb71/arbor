@@ -15,8 +15,8 @@
 //!   `from google import genai`).
 //! - [`ClientConstruction`]: each client built from a tracked constructor,
 //!   with its [`Routing`] decided from the constructor and its keyword
-//!   arguments (`AzureOpenAI(...)` is `azure_openai`, `OpenAI(base_url=...)`
-//!   is `custom_base_url`).
+//!   arguments (`AzureOpenAI(...)` is `azure_openai`; `OpenAI(base_url=...)`
+//!   is `custom_base_url` unless the URL is the provider's own host).
 //! - [`SdkCall`]: each call whose member chain is rooted at a tracked binding
 //!   (`client.chat.completions.create`, `openai.ChatCompletion.create`,
 //!   `self.client.messages.create`, `genai.GenerativeModel(...)`). A call
@@ -31,6 +31,12 @@
 //!   lookup with a literal fallback (`os.getenv("MODEL", "gpt-4o")`) is both:
 //!   the fallback is captured with origin [`ValueOrigin::EnvDefault`] and the
 //!   call keeps its gap, because the deployed value may differ.
+//!
+//! A value or route with no gap is confirmed only inside a small supported
+//! grammar; everything outside it, and anything a dynamic feature of the file
+//! (`exec`, `globals()`, `setattr` with a run-time name, a class decorator,
+//! ...) may change, keeps a gap. `docs/SDK_USAGES.md` states the grammar, the
+//! dynamic features and the bounds.
 //!
 //! # Credentials
 //!
@@ -115,8 +121,10 @@ pub enum Routing {
     OpenaiDirect,
     /// `AzureOpenAI` / `AsyncAzureOpenAI`, or `openai.api_type = "azure"`.
     AzureOpenai,
-    /// Any client given `base_url` / `api_base` (OpenRouter, LiteLLM, a
-    /// local server), or a module-level `openai.api_base` / `base_url`.
+    /// A client given a `base_url` / `api_base` whose host is not the
+    /// provider's own (OpenRouter, LiteLLM, a local server), or a
+    /// module-level `openai.api_base` / `base_url` set that way. A `base_url`
+    /// of `api.openai.com` or `api.anthropic.com` is direct.
     CustomBaseUrl,
     /// `Anthropic()` / `AsyncAnthropic()` with no `base_url`.
     AnthropicDirect,
@@ -132,8 +140,10 @@ pub enum Routing {
     /// constructor, a client typed only by annotation, a binding assigned
     /// more than one kind of client, a direct client given a `base_url`
     /// after it is built or built in a file that sets `OPENAI_BASE_URL` /
-    /// `ANTHROPIC_BASE_URL` (both with an `ambiguous_client` gap at each
-    /// call), a non-literal or non-Azure
+    /// `ANTHROPIC_BASE_URL` or writes the environment with a run-time name,
+    /// a `base_url` read from the environment with no fallback or one that
+    /// does not resolve to a string (each with an `ambiguous_client` gap at
+    /// each call), a non-literal or non-Azure
     /// `openai.api_type`, or a hosted-platform client this list does not name
     /// (`BedrockOpenAI`, `OpenAI(provider=...)`, `AnthropicAWS`,
     /// `AnthropicFoundry`, `AnthropicGoogleCloud` and their async variants).
@@ -273,9 +283,12 @@ pub enum ValueOrigin {
     LocalConstant,
     /// The default of the enclosing function's parameter: a literal or a
     /// same-file constant (`def ask(model=GPT_MODEL)`). Callers may pass
-    /// another value; when an in-file caller does, the call also carries an
-    /// `unresolved_model` gap with reason `parameter_overridden` that lists
-    /// the values the callers pass.
+    /// another value. With no gap only when every call of the function is in
+    /// this file and none passes another value; otherwise the call also
+    /// carries an `unresolved_model` gap: `parameter_overridden` (listing the
+    /// values in-file callers pass), `unseen_callers` (some calls cannot be
+    /// seen) or `parameter_default` (a public function another module may
+    /// call).
     ParameterDefault,
     /// The literal fallback of an environment or configuration lookup:
     /// `os.getenv("MODEL", "gpt-4o")`, `os.environ.get(...)`,
@@ -376,7 +389,11 @@ pub enum GapKind {
     /// (environment, config attribute, function call, f-string, parameter,
     /// `**kwargs`, a name imported from another module...), or a call that
     /// takes a model passes none (`missing_model`: the SDK or server
-    /// default applies).
+    /// default applies). A value captured next to such a gap is one the code
+    /// names but cannot confirm: an environment fallback, a parameter
+    /// default (`parameter_default`, `parameter_overridden`,
+    /// `unseen_callers`) or a value a dynamic feature of the file may change
+    /// (`dynamic_feature`, which names the feature and its line).
     UnresolvedModel,
     /// A call shaped like an SDK endpoint whose receiver is not a tracked
     /// client: built by an unknown factory, passed in as a parameter, or
@@ -387,7 +404,10 @@ pub enum GapKind {
     /// only some of the places it can come from: the in-file callers of a
     /// function other modules may also call (`in_file_callers`), a client
     /// whose `base_url` is assigned after it is built (`base_url_assigned`),
-    /// or a file that sets the SDK's endpoint variable (`endpoint_env`).
+    /// a file that sets the SDK's endpoint variable (`endpoint_env`), a
+    /// `base_url` read from the environment (`base_url_env`) or not resolved
+    /// (`base_url_unresolved`), or a receiver or configuration a dynamic
+    /// feature of the file may change (`dynamic_feature`).
     AmbiguousClient,
     /// `getattr` on a tracked binding, or an SDK method stored or passed as a
     /// value; calls through it are not tracked.

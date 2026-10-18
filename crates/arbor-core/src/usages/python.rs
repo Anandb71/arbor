@@ -1,27 +1,60 @@
 //! Python SDK usage extraction.
 //!
+//! # Soundness policy
+//!
+//! A value or route reported with no gap is confirmed: a consumer acts on it
+//! without asking. Python is too dynamic to make that hold by resolving every
+//! shape, so this module resolves a small **supported grammar** exactly and
+//! turns everything else into a gap. `docs/SDK_USAGES.md` states the grammar
+//! in full; in short, a value or route has no gap only when it is:
+//!
+//! - a string literal written at the call (never downgraded);
+//! - a name with one reaching assignment of such a value, in the scope that
+//!   binds it (module constant, local, enclosing local);
+//! - a class attribute assigned once, read by class name or through
+//!   `self`/`cls`, in a class with no decorator, class keyword or second
+//!   base, at most one same-file level of inheritance and at most 16
+//!   direct subclasses;
+//! - a parameter default of a function whose calls are all in this file (a
+//!   nested or `_private` function, a private class's `__init__`, anything
+//!   in a script), none of which passes another value;
+//! - an entry of a same-file dict literal read by literal key, when the dict
+//!   is only ever used through its one name;
+//! - a client from a tracked constructor with no `base_url`, or one that
+//!   resolves to a string (the provider's own host is direct, another host
+//!   is `custom_base_url`), in a file that does not configure the endpoint
+//!   some other way.
+//!
+//! The collection walk also records **dynamic features** that can change a
+//! resolved name, class, dict or the environment (`exec`, `globals()`,
+//! `sys.modules`, `__dict__`, `setattr` with a run-time name, attribute
+//! hooks, decorators and metaclasses on a class whose attributes are read,
+//! multiple or deep inheritance, a class used as a value, environment
+//! writes with run-time names, ...). A value or route one of them may affect
+//! keeps a `dynamic_feature` gap naming the feature and its line; the most
+//! dynamic ones affect the whole file. Replacing a precise but costly
+//! resolution with such a gap is always acceptable, so each lookup does a
+//! bounded amount of work (see the `MAX_*` constants) and the whole pass is
+//! linear in the file.
+//!
+//! # Passes
+//!
 //! Two passes over the tree-sitter tree:
 //!
 //! 1. **Collect.** One iterative walk records scopes (module, class,
 //!    function, lambda), imports, every assignment target (names, `self.x`,
 //!    class attributes, `with ... as`, `except ... as`, `match` captures,
-//!    walrus, `global`, `nonlocal`, `globals()["NAME"]`, and a wildcard
+//!    walrus, `global`, `nonlocal`, `globals()["NAME"]`, `del`, and a wildcard
 //!    import from another module, which may bind any module-level name),
-//!    parameters, every
-//!    call, every attribute chain used as a value, and where each binding
-//!    takes effect. Parent kinds and field names travel down the walk, so no
-//!    node is asked for its parent: tree-sitter answers that by descending
-//!    from the root, which made deep trees quadratic.
+//!    parameters, every call, every attribute chain used as a value, where
+//!    each binding takes effect, and the dynamic features. Parent kinds and
+//!    field names travel down the walk, so no node is asked for its parent:
+//!    tree-sitter answers that by descending from the root, which made deep
+//!    trees quadratic.
 //! 2. **Analyze.** Each call's callee is evaluated against those bindings.
 //!    A chain rooted at a tracked SDK binding becomes a construction or a
 //!    call; an SDK-shaped chain on an unknown receiver, `getattr` on a
 //!    tracked binding and an unresolved model value become typed gaps.
-//!
-//! `self.x` and `cls.x` read a class attribute that the class, a base, any
-//! same-file subclass (the instance may be one) or an outside write
-//! (`bot.model = ...`, `setattr(bot, "model", ...)`) may set; a write with
-//! a run-time attribute name (`setattr(obj, name, ...)`, `vars(obj)[k]`)
-//! may set any of them.
 //!
 //! Names resolve the way Python scopes them, approximately: function and
 //! lambda locals, parameters and imports shadow enclosing functions, class
@@ -42,16 +75,15 @@
 //! An untyped parameter used as a client resolves when every call to its
 //! function (or to a lambda assigned to a plain name) in this file passes
 //! the same tracked client. Other modules may call a public function too, so
-//! there the routing keeps an `ambiguous_client` gap (`in_file_callers`);
-//! a nested or `_private` function, or any function in a script, is called
-//! only from its file. A client default is combined with what the callers
-//! pass, and with itself for a public function, which keeps a
+//! there the routing keeps an `ambiguous_client` gap (`in_file_callers`),
+//! and a public function's model or client default keeps a
 //! `parameter_default` gap. The calls of `__init__` are the calls of its
 //! class; a method's are every call of its name, on any object. A function
 //! whose calls cannot all be seen (it is decorated, passed, stored or bound
-//! twice) keeps an `unseen_callers` gap on a client or model default. A
-//! model parameter default that an in-file caller overrides keeps a
-//! `parameter_overridden` gap listing the values the callers pass.
+//! twice, or instances are built without naming their class) keeps an
+//! `unseen_callers` gap on a client or model default. A model parameter
+//! default that an in-file caller overrides keeps a `parameter_overridden`
+//! gap listing the values the callers pass.
 
 use super::{
     is_capturable_value, is_credential_value, is_identifier_key, is_secret_key, is_value_key,
@@ -207,12 +239,16 @@ const MAX_DEPTH: u32 = 64;
 /// chain of names that each use the previous one more than once stays
 /// linear instead of doubling per link.
 const MAX_NAME_DEPTH: u32 = 64;
-/// Inheritance search bounds: base-class hops, classes visited per lookup and
-/// bases read per class. Real hierarchies are far smaller; a pathological
-/// file (every class listing every class as a base) stays linear.
-const MAX_BASE_DEPTH: u32 = 8;
-const MAX_CLASSES_VISITED: usize = 64;
+/// Bases read per class when same-file subclasses are indexed.
 const MAX_BASES: usize = 32;
+/// Direct same-file subclasses a `self.x` read looks at, and assignments
+/// of the attribute taken from each. Past either, the read is a
+/// `dynamic_feature` gap instead of a longer walk.
+const MAX_SUBCLASSES: usize = 16;
+const MAX_SUBCLASS_ASSIGNS: usize = 4;
+/// Assignments of one attribute read per lookup. More is a gap anyway
+/// (`reassigned`), so the rest are not copied.
+const MAX_ATTR_ASSIGNS: usize = 64;
 /// Definitions a reaching-definition search may look at before it gives up
 /// and counts every definition of the name.
 const MAX_REACH_SCAN: usize = 64;
@@ -542,10 +578,31 @@ enum ClientCaveat {
     /// The file sets an environment variable the SDK reads its endpoint
     /// from (`os.environ["OPENAI_BASE_URL"] = ...`).
     EndpointEnv { var: &'static str },
+    /// The file writes the environment with a name known only at run time
+    /// or through an alias of `os.environ`, which may set the endpoint
+    /// variable.
+    EnvWrite(Feature),
     /// The `base_url` given to the constructor is read from the environment
     /// with no fallback (`env`), falls back to the provider's own host
     /// (`fallback`), or does not resolve to a string.
     BaseUrl { env: bool, fallback: bool },
+    /// A dynamic feature of the file may rebind or replace the client.
+    Dynamic(Feature),
+}
+
+/// A Python feature that can change what a name, attribute, dict or the
+/// environment holds at run time (see "Dynamic features" in the module
+/// documentation), and the line it is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Feature {
+    what: &'static str,
+    line: u32,
+}
+
+impl Feature {
+    fn describe(self) -> String {
+        format!("{} at line {}", self.what, self.line)
+    }
 }
 
 /// How the `base_url` given to a direct client routes it.
@@ -647,6 +704,8 @@ enum Origin {
     /// FakeClient as Maker`); calling it builds an ambiguous client of the
     /// first constructor's package.
     MixedClasses(Pkg),
+    /// A dynamic feature of the file may rebind or replace the value.
+    Dynamic(Feature),
     Other,
 }
 
@@ -744,6 +803,17 @@ impl Unresolved {
         self
     }
 
+    /// A `dynamic_feature` gap naming `feature`.
+    fn dynamic(feature: Feature) -> Self {
+        Self::new("dynamic_feature", feature.describe())
+    }
+
+    /// Marks the candidates as possibly partial.
+    fn incomplete(mut self) -> Self {
+        self.complete = Some(false);
+        self
+    }
+
     /// Whether the candidates are known to be every value.
     fn complete(&self) -> bool {
         self.complete == Some(true) && !self.candidates.is_empty()
@@ -779,6 +849,7 @@ impl Unresolved {
             "parameter_default" => {
                 "a parameter of a function other modules may call with another value"
             }
+            "dynamic_feature" => "something this file may change at run time",
             _ => "not a string literal",
         }
     }
@@ -936,6 +1007,12 @@ struct Scope {
     /// `NamedTuple`, `mod.Base`) or a class keyword (`metaclass=...`), whose
     /// constructor may set annotated attributes from its arguments.
     external_bases: bool,
+    /// For a class: why attributes read through it may change at run time
+    /// whatever its body says: a decorator, a metaclass or other class
+    /// keyword, or more than one base.
+    class_feature: Option<Feature>,
+    /// The 1-based line the scope starts on (set for classes).
+    line: u32,
     staticmethod: bool,
     lambda: bool,
     /// A list, set or dict comprehension or a generator expression: its
@@ -965,6 +1042,8 @@ impl Scope {
             slots: Vec::new(),
             decorated: false,
             external_bases: false,
+            class_feature: None,
+            line: 0,
             staticmethod: false,
             lambda: false,
             comprehension: false,
@@ -1120,6 +1199,8 @@ struct Frame<'t> {
     inner_loop: Option<usize>,
     /// The parent's parent.
     grand: Option<Node<'t>>,
+    /// Inside a type annotation, where a name is a type, not a value.
+    annotation: bool,
 }
 
 /// A `for` or `while` statement, for loop-carried definitions.
@@ -1252,6 +1333,26 @@ struct CallerModels {
     complete: bool,
 }
 
+/// What an attribute read through a class (`Bot.model`, `self.model`) may
+/// hold: the assignments the supported grammar sees, and the dynamic
+/// feature that may change it whatever they say.
+struct AttrLookup<'t> {
+    assigns: Rc<[Assign<'t>]>,
+    dynamic: Option<Feature>,
+}
+
+/// A class's place in its hierarchy, for attribute reads.
+#[derive(Clone, Copy)]
+struct ClassShape {
+    /// Its one same-file base class.
+    base: Option<usize>,
+    /// It or that base has a base outside this file, whose metaclass or
+    /// constructor may turn class attributes into fields.
+    external: bool,
+    /// Why its attributes may change whatever its body says.
+    feature: Option<Feature>,
+}
+
 /// Candidate values read once for a dict literal.
 struct DictCandidates {
     values: Vec<Resolved>,
@@ -1307,16 +1408,45 @@ struct Ctx<'t> {
     subclasses: HashMap<usize, Vec<usize>>,
     config_assigns: Vec<ConfigAssign<'t>>,
     /// Attribute writes on objects other than `self`/`cls`/a class, by
-    /// attribute name: any instance's attribute may be one of them.
-    outside_attr_writes: HashMap<&'t str, Vec<Assign<'t>>>,
+    /// attribute name (the first one): any instance's or class's attribute
+    /// of that name may be one of them.
+    outside_attr_writes: HashMap<&'t str, Feature>,
     /// Writes whose attribute name is known only at run time
-    /// (`setattr(obj, name, v)`, `obj.__dict__.update(...)`,
-    /// `vars(obj)[k] = v`): on `self`/`cls` of a class, or (`None`) on
-    /// another object. Any attribute may be one of them.
-    wild_attr_writes: HashSet<Option<usize>>,
+    /// (`setattr(self, name, v)`, `delattr`, `__setattr__`) on `self`/`cls`
+    /// of a class: any attribute of its instances may be one of them.
+    wild_attr_writes: HashMap<usize, Feature>,
+    /// The same on any other object: any attribute of anything.
+    wild_attr_any: Option<Feature>,
     /// The objects written that way, for clients re-routed after they are
     /// built.
     wild_attr_objects: Vec<(Node<'t>, usize)>,
+    /// The first feature that may rebind any name, attribute or dict of the
+    /// file (`exec`, `eval`, `compile`, `globals()`, `locals()`, `vars()`,
+    /// `sys.modules`, `__dict__`, `import __main__`, importing the module
+    /// itself): every value not written at its call, and every route, is
+    /// then a `dynamic_feature` gap.
+    file_dynamic: Option<Feature>,
+    /// A class defines `__getattr__`, `__getattribute__`, `__setattr__`,
+    /// `__delattr__` or `__init_subclass__`: any attribute read may run it.
+    attr_hooks: Option<Feature>,
+    /// The environment is written with a name known only at run time
+    /// (`os.environ[key] = v`, `os.environ |= {...}`, `update(**cfg)`) or
+    /// through an alias of `os.environ` (`env = os.environ`).
+    env_wild: Option<Feature>,
+    /// The same through a bare `environ`, which counts only when the file
+    /// imports it from `os` (a WSGI `environ` is a request's).
+    bare_environ_wild: Option<Feature>,
+    /// Instances may be built without naming their class
+    /// (`type(self)(...)`, `self.__class__(...)`, `cls(...)`): no class's
+    /// constructor calls are all seen.
+    dynamic_constructors: Option<Feature>,
+    /// Names used as a value other than to read an attribute, call or
+    /// subclass it (stored, aliased, passed, returned): a class of that
+    /// name may be changed by whatever receives it.
+    class_escapes: HashMap<&'t str, Feature>,
+    /// Base names that more than one same-file class has: their classes
+    /// may have subclasses this file cannot attribute.
+    ambiguous_base_names: HashSet<String>,
     /// A method or module function may be called by a name known only at
     /// run time (`getattr(obj, name)(...)`, `globals()[name](...)`): no
     /// method's (or, for the namespace, no function's) calls are all seen.
@@ -1363,8 +1493,12 @@ struct Ctx<'t> {
     nested_left: usize,
     /// Candidate values that may still be listed with gaps in this file.
     candidates_left: usize,
-    attr_lookup_memo: HashMap<Key, Rc<[Assign<'t>]>>,
-    dyn_attr_lookup_memo: HashMap<Key, Rc<[Assign<'t>]>>,
+    /// A class's own assignments of an attribute (its body and
+    /// `self.x = ...`), read once per class and name.
+    own_attr_memo: HashMap<Key, Rc<[Assign<'t>]>>,
+    /// Attribute lookups through a class name, and through `self`/`cls`.
+    class_attr_memo: HashMap<Key, Rc<AttrLookup<'t>>>,
+    self_attr_memo: HashMap<Key, Rc<AttrLookup<'t>>>,
     /// The items a loop runs over, read once per iterable and origin.
     loop_items_memo: HashMap<(usize, ValueOrigin), CandidateList>,
     /// Candidates of a name every definition of which reaches the use,
@@ -1402,6 +1536,9 @@ struct Ctx<'t> {
     /// packages with such a client that could not be singled out.
     rerouted: HashSet<usize>,
     rerouted_pkgs: HashSet<Pkg>,
+    /// A `base_url` written on an object this file cannot identify, which
+    /// may be any of its clients.
+    rerouted_any: Option<Feature>,
     /// Why the module-level OpenAI API's routing may not hold.
     openai_caveat: Option<ClientCaveat>,
     /// Wildcard imports from other modules, in order, and whether there
@@ -1448,8 +1585,16 @@ impl<'t> Ctx<'t> {
             subclasses: HashMap::new(),
             config_assigns: Vec::new(),
             outside_attr_writes: HashMap::new(),
-            wild_attr_writes: HashSet::new(),
+            wild_attr_writes: HashMap::new(),
+            wild_attr_any: None,
             wild_attr_objects: Vec::new(),
+            file_dynamic: None,
+            attr_hooks: None,
+            env_wild: None,
+            bare_environ_wild: None,
+            dynamic_constructors: None,
+            class_escapes: HashMap::new(),
+            ambiguous_base_names: HashSet::new(),
             dynamic_method_calls: false,
             dynamic_function_calls: false,
             calls: Vec::new(),
@@ -1475,8 +1620,9 @@ impl<'t> Ctx<'t> {
             dict_nested: HashMap::new(),
             nested_left: MAX_FILE_NESTED_VALUES,
             candidates_left: MAX_FILE_CANDIDATES,
-            attr_lookup_memo: HashMap::new(),
-            dyn_attr_lookup_memo: HashMap::new(),
+            own_attr_memo: HashMap::new(),
+            class_attr_memo: HashMap::new(),
+            self_attr_memo: HashMap::new(),
             loop_items_memo: HashMap::new(),
             reach_all_memo: HashMap::new(),
             caller_memo: HashMap::new(),
@@ -1494,6 +1640,7 @@ impl<'t> Ctx<'t> {
             env_writes: HashSet::new(),
             rerouted: HashSet::new(),
             rerouted_pkgs: HashSet::new(),
+            rerouted_any: None,
             openai_caveat: None,
             module_stars: Vec::new(),
             dynamic_globals: false,
@@ -1568,6 +1715,7 @@ impl<'t> Ctx<'t> {
             stmt: None,
             inner_loop: None,
             grand: None,
+            annotation: false,
         }];
         // One cursor, reset at each node, walks every node's children.
         let mut cursor = root.walk();
@@ -1694,10 +1842,24 @@ impl<'t> Ctx<'t> {
                     }
                     "delete_statement" => {
                         for target in named_children(node) {
-                            self.note_mutated_root(target);
+                            let targets = match target.kind() {
+                                "expression_list" => named_children(target),
+                                _ => vec![target],
+                            };
+                            for target in targets {
+                                // `del M` and `del Bot.model` unbind what a
+                                // later read sees (a base's attribute, or
+                                // nothing): an assignment of no value.
+                                if matches!(target.kind(), "identifier" | "attribute") {
+                                    self.record_target(target, None, None, scope, true, place);
+                                } else {
+                                    self.note_mutated_root(target);
+                                }
+                            }
                         }
                     }
                     "call" => {
+                        self.note_dynamic_call(node, scope);
                         self.note_attr_write_call(node, scope, place);
                         self.calls.push((node, scope));
                         self.call_scope.insert(node.id(), scope);
@@ -1731,10 +1893,15 @@ impl<'t> Ctx<'t> {
                         self.note_attr_use(node, &frame, scope);
                         self.note_env_read(node);
                         self.note_dict_attribute(node, &frame);
+                        self.note_dynamic_attribute(node, &frame);
                     }
                     "identifier" => {
                         self.note_name_use(node, &frame, scope);
                         self.note_dict_name(node, &frame, scope);
+                        self.note_class_use(node, &frame);
+                        if self.text(node) == "environ" {
+                            self.note_environ_use(node, &frame, true);
+                        }
                     }
                     _ => {}
                 }
@@ -1756,6 +1923,7 @@ impl<'t> Ctx<'t> {
             // They are pushed in order, then that run is reversed, so the
             // walk stays pre-order without a list per node.
             let first = stack.len();
+            let annotation = frame.annotation || node.kind() == "type";
             cursor.reset(node);
             if cursor.goto_first_child() {
                 loop {
@@ -1770,6 +1938,7 @@ impl<'t> Ctx<'t> {
                             stmt: child_stmt,
                             inner_loop: child_loop,
                             grand: frame.parent,
+                            annotation,
                         });
                     }
                     if !cursor.goto_next_sibling() {
@@ -1872,17 +2041,23 @@ impl<'t> Ctx<'t> {
 
     /// Records the names of environment variables set by `node`: an
     /// assignment target `os.environ["NAME"]`, or a call to
-    /// `os.environ.setdefault("NAME", ...)`, `os.environ.update(...)` or
-    /// `os.putenv("NAME", ...)`. Only names written as literals are seen.
+    /// `os.environ.setdefault("NAME", ...)`, `os.environ.update(...)`,
+    /// `os.environ.__setitem__("NAME", ...)` or `os.putenv("NAME", ...)`. A
+    /// name that is not a literal may be any variable: the write is a
+    /// dynamic feature ([`Ctx::env_wild`]).
     fn note_env_write(&mut self, node: Node<'t>) {
         let environ =
             |n: Node<'t>| matches!(self.render_links(n, 4).as_str(), "os.environ" | "environ");
         let mut names: Vec<String> = Vec::new();
+        let mut wild = false;
+        let mut bare = false;
         match node.kind() {
             "subscript" => {
-                if node.child_by_field_name("value").is_some_and(environ) {
-                    if let Some(name) = single_subscript(node).and_then(|k| self.literal(k).ok()) {
-                        names.push(name);
+                if let Some(value) = node.child_by_field_name("value").filter(|v| environ(*v)) {
+                    bare = value.kind() == "identifier";
+                    match single_subscript(node).and_then(|k| self.literal(k).ok()) {
+                        Some(name) => names.push(name),
+                        None => wild = true,
                     }
                 }
             }
@@ -1897,8 +2072,12 @@ impl<'t> Ctx<'t> {
                     "attribute" => function.child_by_field_name("attribute"),
                     _ => None,
                 };
-                if !last.is_some_and(|n| matches!(self.text(n), "putenv" | "setdefault" | "update"))
-                {
+                if !last.is_some_and(|n| {
+                    matches!(
+                        self.text(n),
+                        "putenv" | "setdefault" | "update" | "__setitem__"
+                    )
+                }) {
                     return;
                 }
                 let (positional, keywords) = call_arguments(node, |n| self.text(n));
@@ -1907,23 +2086,35 @@ impl<'t> Ctx<'t> {
                     .child_by_field_name("attribute")
                     .map(|a| self.text(a))
                     .unwrap_or_default();
-                let on_environ = function.child_by_field_name("object").is_some_and(environ);
+                let object = function.child_by_field_name("object");
+                let on_environ = object.is_some_and(environ);
+                bare = object.is_some_and(|o| o.kind() == "identifier");
                 if matches!(callee.as_str(), "os.putenv" | "putenv")
-                    || (on_environ && method == "setdefault")
+                    || (on_environ && matches!(method, "setdefault" | "__setitem__"))
                 {
-                    if let Some(name) = positional.first().and_then(|k| self.literal(*k).ok()) {
-                        names.push(name);
+                    bare = false;
+                    match positional.first().and_then(|k| self.literal(*k).ok()) {
+                        Some(name) => names.push(name),
+                        None => wild = true,
                     }
                 } else if on_environ && method == "update" {
                     names.extend(keywords.iter().map(|(k, _)| k.clone()));
+                    let splat = node.child_by_field_name("arguments").is_some_and(|args| {
+                        named_children(args)
+                            .iter()
+                            .any(|a| matches!(a.kind(), "dictionary_splat" | "list_splat"))
+                    });
+                    wild |= splat;
                     for arg in positional {
-                        if arg.kind() == "dictionary" {
-                            for (key, _) in
-                                dict_entries(arg, |n| self.literal(n).ok(), |n| self.text(n))
-                                    .into_iter()
-                                    .flatten()
-                            {
-                                names.push(key);
+                        if arg.kind() != "dictionary" {
+                            // A name, a call or pairs: any variable.
+                            wild = true;
+                            continue;
+                        }
+                        for entry in dict_entries(arg, |n| self.literal(n).ok(), |n| self.text(n)) {
+                            match entry {
+                                Some((key, _)) => names.push(key),
+                                None => wild = true,
                             }
                         }
                     }
@@ -1931,7 +2122,229 @@ impl<'t> Ctx<'t> {
             }
             _ => {}
         }
+        if wild {
+            let feature =
+                Self::feature("an environment variable written with a run-time name", node);
+            if bare {
+                self.bare_environ_wild.get_or_insert(feature);
+            } else {
+                self.env_wild.get_or_insert(feature);
+            }
+        }
         self.env_writes.extend(names);
+    }
+
+    /// The 1-based line `node` starts on.
+    fn line_of(node: Node<'t>) -> u32 {
+        node.start_position().row as u32 + 1
+    }
+
+    fn feature(what: &'static str, node: Node<'t>) -> Feature {
+        Feature {
+            what,
+            line: Self::line_of(node),
+        }
+    }
+
+    /// Records the first feature that may rebind anything in the file.
+    fn note_file_dynamic(&mut self, what: &'static str, node: Node<'t>) {
+        self.file_dynamic.get_or_insert(Self::feature(what, node));
+    }
+
+    /// `exec`, `eval`, `compile`, `globals()`, `vars(obj)` (an object's
+    /// `__dict__`), `locals()` and `vars()` outside a function (where they
+    /// are the module's or the class body's namespace; a function's
+    /// `locals()` cannot rebind its names), the module importing itself,
+    /// and instances built without naming their class (`type(self)(...)`,
+    /// `cls(...)`).
+    fn note_dynamic_call(&mut self, call: Node<'t>, scope: usize) {
+        let Some(function) = call.child_by_field_name("function") else {
+            return;
+        };
+        // `__import__(__name__)`, `importlib.import_module(__name__)`.
+        let imports_itself = |cx: &Self| {
+            call_arguments(call, |n| cx.text(n))
+                .0
+                .first()
+                .is_some_and(|arg| match arg.kind() {
+                    "identifier" => cx.text(*arg) == "__name__",
+                    _ => cx.plain_literal(*arg) == Some("__main__"),
+                })
+        };
+        match function.kind() {
+            "identifier" => {
+                let what = match self.text(function) {
+                    "exec" => "`exec`",
+                    "eval" => "`eval`",
+                    "compile" => "`compile`",
+                    "globals" => "`globals()`",
+                    "locals" | "vars"
+                        if self.scopes[scope].kind == ScopeKind::Function
+                            && !self.scopes[scope].comprehension
+                            && call_arguments(call, |n| self.text(n)).0.is_empty() =>
+                    {
+                        return;
+                    }
+                    "locals" => "`locals()`",
+                    "vars" => "`vars()`",
+                    "__import__" if imports_itself(self) => "the module importing itself",
+                    "import_module" if imports_itself(self) => "the module importing itself",
+                    "cls" => {
+                        self.dynamic_constructors
+                            .get_or_insert(Self::feature("`cls(...)`", call));
+                        return;
+                    }
+                    _ => return,
+                };
+                self.note_file_dynamic(what, call);
+            }
+            "attribute" => {
+                let imports = function
+                    .child_by_field_name("attribute")
+                    .is_some_and(|a| matches!(self.text(a), "import_module" | "reload"));
+                if imports && imports_itself(self) {
+                    self.note_file_dynamic("the module importing itself", call);
+                }
+            }
+            "call" => {
+                // `type(self)(...)`.
+                let inner = function.child_by_field_name("function");
+                if inner.is_some_and(|f| f.kind() == "identifier" && self.text(f) == "type")
+                    && call_arguments(function, |n| self.text(n)).0.len() == 1
+                {
+                    self.dynamic_constructors
+                        .get_or_insert(Self::feature("`type(...)(...)`", call));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `x.__dict__`, `sys.modules`, `x.__class__` and uses of `os.environ`.
+    fn note_dynamic_attribute(&mut self, node: Node<'t>, frame: &Frame<'t>) {
+        let Some(attr) = node.child_by_field_name("attribute") else {
+            return;
+        };
+        let object = node.child_by_field_name("object");
+        let on =
+            |name: &str| object.is_some_and(|o| o.kind() == "identifier" && self.text(o) == name);
+        match self.text(attr) {
+            "__dict__" => self.note_file_dynamic("`__dict__`", node),
+            "modules" if on("sys") => self.note_file_dynamic("`sys.modules`", node),
+            "__class__" => {
+                self.dynamic_constructors
+                    .get_or_insert(Self::feature("`__class__`", node));
+            }
+            "environ" if on("os") => self.note_environ_use(node, frame, false),
+            _ => {}
+        }
+    }
+
+    /// `os.environ` (or a bare `environ`) used other than to read it or to
+    /// write a variable named by a literal: assigned to another name,
+    /// passed to a call, updated in place. Any variable, the SDK's endpoint
+    /// variable among them, may then be set.
+    fn note_environ_use(&mut self, node: Node<'t>, frame: &Frame<'t>, bare: bool) {
+        let Some(parent) = frame.parent else {
+            return;
+        };
+        let reads = match (parent.kind(), frame.field) {
+            // `os.environ[...]`: a read, or a write `note_env_write` sees.
+            ("subscript", Some("value")) => true,
+            ("attribute", Some("object")) => {
+                let method = parent
+                    .child_by_field_name("attribute")
+                    .map(|a| self.text(a))
+                    .unwrap_or_default();
+                // Writes through `setdefault`, `update` and `__setitem__` are
+                // read by `note_env_write`; removals cannot add an endpoint.
+                matches!(
+                    method,
+                    "get"
+                        | "copy"
+                        | "keys"
+                        | "items"
+                        | "values"
+                        | "__contains__"
+                        | "__getitem__"
+                        | "setdefault"
+                        | "update"
+                        | "__setitem__"
+                        | "pop"
+                        | "popitem"
+                        | "clear"
+                        | "__delitem__"
+                )
+            }
+            // `{**os.environ, ...}` copies it.
+            ("comparison_operator", _)
+            | ("expression_statement", _)
+            | ("dictionary_splat", _)
+            | ("for_statement" | "for_in_clause", Some("right")) => true,
+            ("argument_list", _) => {
+                let callee = frame
+                    .grand
+                    .and_then(|call| call.child_by_field_name("function"))
+                    .map(|f| self.render_links(f, 4))
+                    .unwrap_or_default();
+                READ_ONLY_CALLS.contains(&callee.as_str())
+                    || SHALLOW_CALLS.contains(&callee.as_str())
+            }
+            (kind, field) => bare && is_declaration(kind, field),
+        };
+        if reads {
+            return;
+        }
+        let feature = Self::feature("`os.environ` aliased, passed or updated in place", node);
+        if bare {
+            self.bare_environ_wild.get_or_insert(feature);
+        } else {
+            self.env_wild.get_or_insert(feature);
+        }
+    }
+
+    /// A name used as a value other than to read or write one of its
+    /// attributes, call it, subclass it, test it or annotate with it: if a
+    /// class has that name, whatever receives it may change its attributes.
+    fn note_class_use(&mut self, node: Node<'t>, frame: &Frame<'t>) {
+        let Some(parent) = frame.parent else {
+            return;
+        };
+        if frame.annotation || self.class_escapes.contains_key(self.text(node)) {
+            return;
+        }
+        let safe = match (parent.kind(), frame.field) {
+            ("attribute", Some("object")) | ("call", Some("function")) => true,
+            ("argument_list", _) => match frame.grand {
+                Some(grand) if grand.kind() == "class_definition" => true,
+                Some(grand) if grand.kind() == "call" => grand
+                    .child_by_field_name("function")
+                    .filter(|f| f.kind() == "identifier")
+                    .is_some_and(|f| {
+                        matches!(
+                            self.text(f),
+                            "isinstance"
+                                | "issubclass"
+                                | "type"
+                                | "super"
+                                | "print"
+                                | "repr"
+                                | "str"
+                                | "id"
+                                | "hash"
+                        )
+                    }),
+                _ => false,
+            },
+            ("comparison_operator", _) | ("expression_statement", _) | ("type", _) => true,
+            (kind, field) => is_declaration(kind, field),
+        };
+        if !safe {
+            let name = self.text(node);
+            self.class_escapes
+                .entry(name)
+                .or_insert_with(|| Self::feature("the class used as a value", node));
+        }
     }
 
     /// `D[k] = v`, `del D[k]`, `D["a"]["b"] = v`, `H.d["k"] = v`,
@@ -2297,6 +2710,20 @@ impl<'t> Ctx<'t> {
         scope.class = class;
         scope.symbol = Some(clip_owned(symbol));
         scope.name = name.clone();
+        if self.scopes[parent].kind == ScopeKind::Class
+            && matches!(
+                name.as_str(),
+                "__getattr__"
+                    | "__getattribute__"
+                    | "__setattr__"
+                    | "__delattr__"
+                    | "__init_subclass__"
+            )
+        {
+            // Any attribute read or write may run it.
+            self.attr_hooks
+                .get_or_insert(Self::feature("an attribute hook (`__getattr__`...)", node));
+        }
         if let Some(wrapper) = wrapper.filter(|w| w.kind() == "decorated_definition") {
             for decorator in named_children(wrapper) {
                 if decorator.kind() != "decorator" {
@@ -2465,17 +2892,44 @@ impl<'t> Ctx<'t> {
             .unwrap_or_default();
         let mut bases = Vec::new();
         let mut external_bases = false;
+        let mut other_bases = 0usize;
+        let mut keywords = false;
         if let Some(list) = node.child_by_field_name("superclasses") {
             for base in named_children(list) {
-                if matches!(base.kind(), "identifier" | "attribute") {
-                    let text = self.text(base);
-                    external_bases |= !self.classes_by_name.contains_key(text);
-                    bases.push(text.to_string());
-                } else if base.kind() != "comment" {
-                    external_bases = true;
+                match base.kind() {
+                    "identifier" | "attribute" => {
+                        let text = self.text(base);
+                        // Bases that add no attributes and no metaclass
+                        // that rewrites them.
+                        if matches!(text, "object" | "ABC" | "abc.ABC") {
+                            continue;
+                        }
+                        external_bases |= !self.classes_by_name.contains_key(text);
+                        bases.push(text.to_string());
+                    }
+                    "keyword_argument" | "dictionary_splat" => {
+                        keywords = true;
+                        external_bases = true;
+                    }
+                    "comment" => {}
+                    _ => {
+                        other_bases += 1;
+                        external_bases = true;
+                    }
                 }
             }
         }
+        let decorated = wrapper.is_some_and(|w| w.kind() == "decorated_definition");
+        let line = node.start_position().row as u32 + 1;
+        let what = if decorated {
+            Some("a class decorator")
+        } else if keywords {
+            Some("a metaclass or class keyword")
+        } else if bases.len() + other_bases > 1 {
+            Some("multiple inheritance")
+        } else {
+            None
+        };
         let id = self.scopes.len();
         let mut scope = Scope::new(
             ScopeKind::Class,
@@ -2488,7 +2942,9 @@ impl<'t> Ctx<'t> {
         scope.name = name.clone();
         scope.bases = bases;
         scope.external_bases = external_bases;
-        scope.decorated = wrapper.is_some_and(|w| w.kind() == "decorated_definition");
+        scope.decorated = decorated;
+        scope.class_feature = what.map(|what| Feature { what, line });
+        scope.line = line;
         self.scopes.push(scope);
         self.classes_by_name.entry(name).or_default().push(id);
         id
@@ -2662,10 +3118,12 @@ impl<'t> Ctx<'t> {
                 return;
             }
         }
+        // Any instance's or class's attribute of that name may be this one:
+        // reads of it are `dynamic_feature` gaps (the values are not
+        // copied into every class's lookup).
         self.outside_attr_writes
             .entry(attr)
-            .or_default()
-            .push(assign);
+            .or_insert_with(|| Self::feature("a write of the attribute on another object", object));
         self.config_assigns.push(ConfigAssign {
             object,
             attr,
@@ -2751,8 +3209,15 @@ impl<'t> Ctx<'t> {
         }
         let own = (object.kind() == "identifier" && matches!(self.text(object), "self" | "cls"))
             || is_super_call(object, |n| self.text(n));
-        let class = if own { self.scopes[scope].class } else { None };
-        self.wild_attr_writes.insert(class);
+        let feature = Self::feature("an attribute written with a run-time name", object);
+        match own.then(|| self.scopes[scope].class).flatten() {
+            Some(class) => {
+                self.wild_attr_writes.entry(class).or_insert(feature);
+            }
+            None => {
+                self.wild_attr_any.get_or_insert(feature);
+            }
+        }
         self.wild_attr_objects.push((object, scope));
     }
 
@@ -2777,7 +3242,9 @@ impl<'t> Ctx<'t> {
             last,
             "getattr"
                 | "setattr"
+                | "delattr"
                 | "__setattr__"
+                | "__delattr__"
                 | "update"
                 | "setdefault"
                 | "__setitem__"
@@ -2811,23 +3278,21 @@ impl<'t> Ctx<'t> {
             return;
         }
         // `setattr(obj, name, v)`, `object.__setattr__(obj, name, v)`,
-        // `obj.__setattr__(name, v)`.
-        let dunder = function.kind() == "attribute"
-            && function
-                .child_by_field_name("attribute")
-                .is_some_and(|a| self.text(a) == "__setattr__");
-        let setattr = function.kind() == "identifier" && self.text(function) == "setattr";
-        let target = if setattr || (dunder && positional.len() >= 3) {
-            Some((
-                positional.first().copied(),
-                positional.get(1),
-                positional.get(2),
-            ))
+        // `obj.__setattr__(name, v)`, and the same with `delattr`, which
+        // writes no value (the read falls back to whatever else holds it).
+        let dunder =
+            function.kind() == "attribute" && matches!(last, "__setattr__" | "__delattr__");
+        let builtin = function.kind() == "identifier" && matches!(last, "setattr" | "delattr");
+        let deleting = matches!(last, "delattr" | "__delattr__");
+        let explicit = if deleting { 2 } else { 3 };
+        let value_at = |i: usize| (!deleting).then(|| positional.get(i)).flatten();
+        let target = if builtin || (dunder && positional.len() >= explicit) {
+            Some((positional.first().copied(), positional.get(1), value_at(2)))
         } else if dunder {
             Some((
                 function.child_by_field_name("object"),
                 positional.first(),
-                positional.get(1),
+                value_at(1),
             ))
         } else {
             None
@@ -2986,6 +3451,10 @@ impl<'t> Ctx<'t> {
                 continue;
             };
             let written = self.text(module_node);
+            if written == "__main__" {
+                // The running script's namespace, which may be this one.
+                self.note_file_dynamic("`import __main__`", node);
+            }
             let module = clip(written);
             let Some((pkg, rest)) = Pkg::of_module(written) else {
                 let local = match alias {
@@ -3227,11 +3696,16 @@ impl<'t> Ctx<'t> {
                 continue;
             }
             for base in self.scopes[class].bases.iter().take(MAX_BASES) {
-                // Any class of that name may be the base.
-                for &parent in self.classes_by_name.get(base).into_iter().flatten() {
-                    if parent != class {
-                        self.subclasses.entry(parent).or_default().push(class);
+                match self.classes_by_name.get(base).map(Vec::as_slice) {
+                    Some([parent]) if *parent != class => {
+                        self.subclasses.entry(*parent).or_default().push(class);
                     }
+                    // Any class of that name may be the base: none of them
+                    // knows its subclasses (no walk over every pair).
+                    Some(many) if many.len() > 1 => {
+                        self.ambiguous_base_names.insert(base.clone());
+                    }
+                    _ => {}
                 }
             }
         }
@@ -3610,10 +4084,31 @@ impl<'t> Ctx<'t> {
         if matches!(name, "self" | "cls") {
             return self.scopes[scope].class.map(|class| (class, true));
         }
+        // The one class of that name, which nothing else rebinds (`Bot =
+        // wrap(Bot)`, an import, a function of the same name).
         match self.classes_by_name.get(name).map(Vec::as_slice) {
-            Some([class]) if !self.is_bound_locally(name, scope) => Some((*class, false)),
+            Some([class])
+                if !self.is_bound_locally(name, scope)
+                    && !self.binds(self.class_home(*class), name) =>
+            {
+                Some((*class, false))
+            }
             _ => None,
         }
+    }
+
+    /// The scope a class definition binds its name in: the enclosing
+    /// function, else the module.
+    fn class_home(&self, class: usize) -> usize {
+        let mut parent = self.scopes[class].parent;
+        while let Some(p) = parent {
+            match self.scopes[p].kind {
+                ScopeKind::Function => return p,
+                ScopeKind::Module => return 0,
+                ScopeKind::Class => parent = self.scopes[p].parent,
+            }
+        }
+        0
     }
 
     /// Whether `name` is assigned or a parameter in a function scope between
@@ -4138,10 +4633,13 @@ impl<'t> Ctx<'t> {
         };
         let home = self.import_home(parent, &name);
         let key = (home, name.clone());
-        // A class decorator may wrap or replace the class.
+        // A class decorator may wrap or replace the class, and an instance
+        // built without naming its class (`type(self)(...)`, `cls(...)`,
+        // `self.__class__(...)`) is a constructor call this index misses.
         let unique = self.classes_by_name.get(&name).map_or(0, Vec::len) == 1
             && !self.binds(home, &name)
-            && !self.scopes[class].decorated;
+            && !self.scopes[class].decorated
+            && self.dynamic_constructors.is_none();
         let escapes = self
             .name_uses
             .get(name.as_str())
@@ -4239,59 +4737,217 @@ impl<'t> Ctx<'t> {
         None
     }
 
-    /// All assignments to attribute `attr` of `class`: class-body names and
-    /// `self.attr = ...`, falling back to same-file base classes. Each class
-    /// is visited once per lookup and the answer is memoized, so a file
-    /// whose classes all list each other as bases stays cheap.
-    fn attr_assignments(&mut self, class: usize, attr: &str) -> Rc<[Assign<'t>]> {
+    /// A class's own assignments of attribute `attr`: class-body names and
+    /// `self.attr = ...`, `cls.attr = ...` or `Class.attr = ...`, read once
+    /// per class and name.
+    fn own_attrs(&mut self, class: usize, attr: &str) -> Rc<[Assign<'t>]> {
         let key = (class, attr.to_string());
-        if let Some(found) = self.attr_lookup_memo.get(&key) {
+        if let Some(found) = self.own_attr_memo.get(&key) {
             return Rc::clone(found);
         }
-        let mut visited = HashSet::new();
-        let found: Rc<[Assign<'t>]> = self
-            .attr_assignments_in(class, attr, 0, &mut visited)
-            .into();
-        self.attr_lookup_memo.insert(key, Rc::clone(&found));
+        let mut found: Vec<Assign<'t>> = Vec::new();
+        found.extend(self.assigns.get(&key).into_iter().flatten().copied());
+        found.extend(self.attr_assigns.get(&key).into_iter().flatten().copied());
+        let found: Rc<[Assign<'t>]> = Rc::from(found);
+        self.own_attr_memo.insert(key, Rc::clone(&found));
         found
     }
 
-    fn attr_assignments_in(
-        &self,
-        class: usize,
-        attr: &str,
-        depth: u32,
-        visited: &mut HashSet<usize>,
-    ) -> Vec<Assign<'t>> {
-        if !visited.insert(class) {
-            return Vec::new();
-        }
-        let key = (class, attr.to_string());
-        let mut found: Vec<Assign<'t>> = self.assigns.get(&key).cloned().unwrap_or_default();
-        found.extend(self.attr_assigns.get(&key).cloned().unwrap_or_default());
-        if !found.is_empty() || depth >= MAX_BASE_DEPTH {
-            return found;
-        }
-        for base in self.scopes[class].bases.iter().take(MAX_BASES) {
-            if visited.len() >= MAX_CLASSES_VISITED {
-                break;
-            }
-            if let Some([base_class]) = self.classes_by_name.get(base).map(Vec::as_slice) {
-                let inherited = self.attr_assignments_in(*base_class, attr, depth + 1, visited);
-                if !inherited.is_empty() {
-                    return inherited;
+    /// Where `class` sits in its hierarchy: its one same-file base (one
+    /// level only), whether a base comes from outside the file, and why its
+    /// attributes may change whatever its body says (see [`ClassShape`]).
+    fn class_shape(&self, class: usize) -> ClassShape {
+        let scope = &self.scopes[class];
+        let mut shape = ClassShape {
+            base: None,
+            external: scope.external_bases,
+            feature: scope.class_feature,
+        };
+        let [base] = scope.bases.as_slice() else {
+            return shape;
+        };
+        let at = |what| {
+            Some(Feature {
+                what,
+                line: scope.line,
+            })
+        };
+        match self.classes_by_name.get(base).map(Vec::as_slice) {
+            Some([parent]) if *parent != class && !self.binds(0, base) => {
+                let parent_scope = &self.scopes[*parent];
+                shape.base = Some(*parent);
+                shape.external |= parent_scope.external_bases;
+                if shape.feature.is_none() {
+                    if parent_scope.class_feature.is_some() {
+                        shape.feature =
+                            at("a base class with a decorator, a metaclass or several bases");
+                    } else if parent_scope
+                        .bases
+                        .iter()
+                        .any(|b| self.classes_by_name.contains_key(b))
+                    {
+                        shape.feature = at("inheritance more than one level deep");
+                    }
                 }
             }
+            Some(_) if shape.feature.is_none() => {
+                shape.feature = at("a base class name bound more than once");
+            }
+            _ => {}
         }
+        shape
+    }
+
+    /// What attribute `attr` read through `class` may hold: by the class's
+    /// name (`Bot.model`) or, when `through_self`, through `self`/`cls` in
+    /// its methods, where the instance may also be a direct subclass's.
+    ///
+    /// The supported grammar: the class's own assignments, else its one
+    /// same-file base's, plus (through `self`) those of at most
+    /// [`MAX_SUBCLASSES`] direct subclasses that have no subclasses of
+    /// their own. Anything else that may change the attribute is a dynamic
+    /// feature, reported as a gap instead of resolved: a decorator,
+    /// metaclass or several bases on the class, its base or a subclass;
+    /// deeper inheritance; an attribute hook; a write of that attribute
+    /// name on any other object; a write with a run-time name; the class
+    /// used as a value; a method of the same name; a class attribute of a
+    /// class with a base outside the file. Memoized; constant work per
+    /// lookup, however many classes and writes the file has.
+    fn attr_lookup(&mut self, class: usize, attr: &str, through_self: bool) -> Rc<AttrLookup<'t>> {
+        let key = (class, attr.to_string());
+        let memo = if through_self {
+            &self.self_attr_memo
+        } else {
+            &self.class_attr_memo
+        };
+        if let Some(found) = memo.get(&key) {
+            return Rc::clone(found);
+        }
+        let shape = self.class_shape(class);
+        let line = self.scopes[class].line;
+        let at = |what| Feature { what, line };
+        let shadowed = |cx: &Self, c: usize| cx.functions.contains_key(&(c, attr.to_string()));
+        let mut dynamic = shape
+            .feature
+            .or(self.attr_hooks)
+            .or(self.wild_attr_any)
+            .or_else(|| self.outside_attr_writes.get(attr).copied())
+            .or_else(|| self.wild_attr_writes.get(&class).copied())
+            .or_else(|| {
+                shape
+                    .base
+                    .and_then(|b| self.wild_attr_writes.get(&b).copied())
+            })
+            .or_else(|| {
+                self.class_escapes
+                    .get(self.scopes[class].name.as_str())
+                    .copied()
+            });
+        if dynamic.is_none()
+            && (shadowed(self, class) || shape.base.is_some_and(|b| shadowed(self, b)))
+        {
+            dynamic = Some(at("a method of the same name"));
+        }
+        let mut from = class;
+        let mut assigns = self.own_attrs(class, attr);
+        if assigns.is_empty() {
+            if let Some(base) = shape.base {
+                from = base;
+                assigns = self.own_attrs(base, attr);
+            }
+        }
+        // A class attribute of a class with a base from outside the file
+        // may be a field its constructor sets (a dataclass, a pydantic or
+        // attrs model, a NamedTuple) or one its metaclass rewrites (an
+        // enum member).
+        let external = if from == class {
+            shape.external
+        } else {
+            self.scopes[from].external_bases
+        };
+        if dynamic.is_none() && external && assigns.iter().any(|a| a.scope == from) {
+            dynamic = Some(at(
+                "a class attribute of a class with a base outside this file",
+            ));
+        }
+        let mut extra: Vec<Assign<'t>> = Vec::new();
+        if through_self {
+            if dynamic.is_none() && self.ambiguous_base_names.contains(&self.scopes[class].name) {
+                dynamic = Some(at("a base class name more than one class has"));
+            }
+            let subs: Vec<usize> = self
+                .subclasses
+                .get(&class)
+                .map(|subs| subs.iter().take(MAX_SUBCLASSES + 1).copied().collect())
+                .unwrap_or_default();
+            if subs.len() > MAX_SUBCLASSES {
+                dynamic.get_or_insert(at("more than 16 subclasses"));
+            }
+            for &sub in subs.iter().take(MAX_SUBCLASSES) {
+                let sub_line = self.scopes[sub].line;
+                let found = if self.subclasses.contains_key(&sub) {
+                    Some("inheritance more than one level deep")
+                } else if self.scopes[sub].class_feature.is_some() {
+                    Some("a subclass with a decorator, a metaclass or several bases")
+                } else if self.wild_attr_writes.contains_key(&sub) {
+                    Some("an attribute written with a run-time name")
+                } else if shadowed(self, sub) {
+                    Some("a method of the same name")
+                } else {
+                    None
+                };
+                if let Some(what) = found {
+                    dynamic.get_or_insert(Feature {
+                        what,
+                        line: sub_line,
+                    });
+                }
+                let own = self.own_attrs(sub, attr);
+                if own.len() > MAX_SUBCLASS_ASSIGNS {
+                    dynamic.get_or_insert(Feature {
+                        what: "more assignments in a subclass than are read",
+                        line: sub_line,
+                    });
+                }
+                extra.extend(own.iter().take(MAX_SUBCLASS_ASSIGNS).copied());
+            }
+            // Set only by subclasses: an abstract attribute, which
+            // subclasses in other modules may set too.
+            if assigns.is_empty() && !extra.is_empty() {
+                dynamic.get_or_insert(at("an attribute only subclasses assign"));
+            }
+        }
+        if assigns.len() > MAX_ATTR_ASSIGNS {
+            dynamic.get_or_insert(at("more assignments of the attribute than are read"));
+        }
+        let assigns: Rc<[Assign<'t>]> = if extra.is_empty() && assigns.len() <= MAX_ATTR_ASSIGNS {
+            assigns
+        } else {
+            assigns
+                .iter()
+                .take(MAX_ATTR_ASSIGNS)
+                .copied()
+                .chain(extra)
+                .collect()
+        };
+        let found = Rc::new(AttrLookup { assigns, dynamic });
+        let memo = if through_self {
+            &mut self.self_attr_memo
+        } else {
+            &mut self.class_attr_memo
+        };
+        memo.insert(key, Rc::clone(&found));
         found
     }
 
     /// The value of attribute `attr` of `class`, read through `self`/`cls`
-    /// when `dynamic` (see [`Self::dynamic_attr_assignments`]).
-    fn resolve_attr(&mut self, class: usize, attr: &str, dynamic: bool) -> Val {
+    /// when `through_self` (see [`Self::attr_lookup`]). A dynamic feature
+    /// is combined in as a value of its own: a client next to it keeps a
+    /// `dynamic_feature` gap.
+    fn resolve_attr(&mut self, class: usize, attr: &str, through_self: bool) -> Val {
         let key = (class, attr.to_string());
         let budget = self.budget();
-        let memo = if dynamic {
+        let memo = if through_self {
             &self.dyn_attr_memo
         } else {
             &self.attr_memo
@@ -4299,7 +4955,11 @@ impl<'t> Ctx<'t> {
         if let Some(val) = self.reuse(recall(memo, &key, budget)) {
             return val;
         }
-        let guard = (if dynamic { 5u8 } else { 1u8 }, class, attr.to_string());
+        let guard = (
+            if through_self { 5u8 } else { 1u8 },
+            class,
+            attr.to_string(),
+        );
         if !self.visiting.insert(guard.clone()) {
             return Val::untracked(Origin::Cycle);
         }
@@ -4308,128 +4968,31 @@ impl<'t> Ctx<'t> {
             self.visiting.remove(&guard);
             return Val::untracked(Origin::Other);
         }
-        let assigns = if dynamic {
-            self.dynamic_attr_assignments(class, attr)
-        } else {
-            self.attr_assignments(class, attr)
-        };
-        let val = if assigns.is_empty() {
+        let lookup = self.attr_lookup(class, attr, through_self);
+        let mut vals: Vec<Val> = lookup
+            .assigns
+            .iter()
+            .map(|a| self.assign_value_memo(*a))
+            .collect();
+        if let Some(feature) = lookup.dynamic {
+            vals.push(Val::untracked(Origin::Dynamic(feature)));
+        }
+        let val = if vals.is_empty() {
             Val::untracked(Origin::UnassignedAttribute {
                 name: attr.to_string(),
             })
         } else {
-            let vals = assigns.iter().map(|a| self.assign_value_memo(*a)).collect();
             combine(vals)
         };
         self.leave_name();
         self.visiting.remove(&guard);
         let memo = self.memo(val.clone(), cutoffs, budget);
-        if dynamic {
+        if through_self {
             self.dyn_attr_memo.insert(key, memo);
         } else {
             self.attr_memo.insert(key, memo);
         }
         val
-    }
-
-    /// The assignments `self.attr` / `cls.attr` may read in a method of
-    /// `class`: the class's own or inherited ones, those of every same-file
-    /// subclass (the instance may be one), outside writes of that
-    /// attribute name on other objects, and an unknown value when a write
-    /// names its attribute at run time anywhere in the hierarchy (or on
-    /// another object), or when only something other than the class itself
-    /// assigns it. Memoized; at most [`MAX_CLASSES_VISITED`] classes.
-    fn dynamic_attr_assignments(&mut self, class: usize, attr: &str) -> Rc<[Assign<'t>]> {
-        let key = (class, attr.to_string());
-        if let Some(found) = self.dyn_attr_lookup_memo.get(&key) {
-            return Rc::clone(found);
-        }
-        let own = self.attr_assignments(class, attr);
-        let mut found: Vec<Assign<'t>> = own.to_vec();
-        let mut hierarchy = vec![class];
-        let mut seen: HashSet<usize> = HashSet::from([class]);
-        let mut next = 0;
-        while next < hierarchy.len() && seen.len() < MAX_CLASSES_VISITED {
-            let current = hierarchy[next];
-            next += 1;
-            for &sub in self.subclasses.get(&current).into_iter().flatten() {
-                if seen.len() >= MAX_CLASSES_VISITED || !seen.insert(sub) {
-                    continue;
-                }
-                let sub_key = (sub, attr.to_string());
-                found.extend(self.assigns.get(&sub_key).into_iter().flatten().copied());
-                found.extend(
-                    self.attr_assigns
-                        .get(&sub_key)
-                        .into_iter()
-                        .flatten()
-                        .copied(),
-                );
-                hierarchy.push(sub);
-            }
-        }
-        hierarchy.extend(self.base_classes(class));
-        found.extend(
-            self.outside_attr_writes
-                .get(attr)
-                .into_iter()
-                .flatten()
-                .copied(),
-        );
-        let wild = self.wild_attr_writes.contains(&None)
-            || hierarchy
-                .iter()
-                .any(|c| self.wild_attr_writes.contains(&Some(*c)));
-        // `model: str = "gpt-4o"` in a dataclass, a pydantic model or a
-        // NamedTuple is a field default: the constructor may set another.
-        let field = found.iter().any(|a| {
-            let class = &self.scopes[a.scope];
-            class.kind == ScopeKind::Class
-                && a.annotation.is_some()
-                && (class.decorated || class.external_bases)
-        });
-        if wild || field || (own.is_empty() && !found.is_empty()) {
-            let unknown = Assign {
-                id: self.fresh_id(),
-                scope: class,
-                value: None,
-                annotation: None,
-                unknowable: true,
-                place: Place {
-                    at: 0,
-                    region: None,
-                },
-                iter: None,
-            };
-            found.push(unknown);
-        }
-        let found: Rc<[Assign<'t>]> = Rc::from(found);
-        self.dyn_attr_lookup_memo.insert(key, Rc::clone(&found));
-        found
-    }
-
-    /// The same-file base classes of `class`, transitively, at most
-    /// [`MAX_CLASSES_VISITED`].
-    fn base_classes(&self, class: usize) -> Vec<usize> {
-        let mut found: Vec<usize> = Vec::new();
-        let mut queue = vec![(class, 0u32)];
-        while let Some((current, depth)) = queue.pop() {
-            if depth >= MAX_BASE_DEPTH {
-                continue;
-            }
-            for base in self.scopes[current].bases.iter().take(MAX_BASES) {
-                for &parent in self.classes_by_name.get(base).into_iter().flatten() {
-                    if found.len() >= MAX_CLASSES_VISITED {
-                        return found;
-                    }
-                    if parent != class && !found.contains(&parent) {
-                        found.push(parent);
-                        queue.push((parent, depth + 1));
-                    }
-                }
-            }
-        }
-        found
     }
 
     fn member(&mut self, base: Val, attr: &str) -> Val {
@@ -4710,8 +5273,9 @@ impl<'t> Ctx<'t> {
 
     /// Why a client built by `class` may not reach the endpoint its
     /// constructor names: when it names none (`base_url` absent or `None`),
-    /// the SDK reads its endpoint variable, which this file may set
-    /// ([`ClientCaveat::EndpointEnv`]).
+    /// the SDK reads its endpoint variable, which this file sets
+    /// ([`ClientCaveat::EndpointEnv`]) or may set through a run-time name or
+    /// an alias of `os.environ` ([`ClientCaveat::EnvWrite`]).
     fn endpoint_env(&self, class: ClientClass, base_url: BaseUrl) -> Option<ClientCaveat> {
         if !matches!(class.family, Family::OpenaiDirect | Family::AnthropicDirect)
             || base_url != BaseUrl::Absent
@@ -4722,6 +5286,7 @@ impl<'t> Ctx<'t> {
             .iter()
             .find(|(pkg, var)| *pkg == class.pkg && self.env_writes.contains(*var))
             .map(|(_, var)| ClientCaveat::EndpointEnv { var })
+            .or_else(|| self.env_wild.map(ClientCaveat::EnvWrite))
     }
 
     /// The name a constructed client is assigned to, and how it is held.
@@ -4804,6 +5369,17 @@ impl<'t> Ctx<'t> {
             });
             return;
         }
+        // A bare `environ` is the process environment only when imported
+        // from `os`.
+        let environ_from_os = self
+            .other_imports
+            .get(&(0, "environ".to_string()))
+            .is_some_and(|defs| defs.iter().any(|d| &*d.module == "os"));
+        if environ_from_os {
+            if let Some(feature) = self.bare_environ_wild {
+                self.env_wild.get_or_insert(feature);
+            }
+        }
         self.openai_routing = self.module_openai_routing();
         if let Some(var) = OPENAI_MODULE_ENV
             .iter()
@@ -4813,6 +5389,11 @@ impl<'t> Ctx<'t> {
                 self.openai_routing = Routing::Unknown;
             }
             self.openai_caveat = Some(ClientCaveat::EndpointEnv { var });
+        } else if let Some(feature) = self.env_wild {
+            if self.openai_routing == Routing::OpenaiDirect {
+                self.openai_routing = Routing::Unknown;
+            }
+            self.openai_caveat = Some(ClientCaveat::EnvWrite(feature));
         }
         self.note_rerouted_clients();
         for (call, scope) in self.calls.clone() {
@@ -4864,6 +5445,24 @@ impl<'t> Ctx<'t> {
                 continue;
             }
             let attr = assign.attr;
+            let routes = matches!(
+                attr,
+                "api_type"
+                    | "api_base"
+                    | "base_url"
+                    | "azure_endpoint"
+                    | "azure_ad_token"
+                    | "azure_ad_token_provider"
+            ) || attr.starts_with("bedrock_");
+            // Set in a function, the configuration holds only once (and if)
+            // the function runs.
+            if routes && self.scopes[assign.scope].kind == ScopeKind::Function {
+                self.openai_caveat
+                    .get_or_insert(ClientCaveat::Dynamic(Self::feature(
+                        "the SDK configured inside a function, which may not run first",
+                        assign.object,
+                    )));
+            }
             match attr {
                 "api_type" => match assign.value.and_then(|v| self.literal(v).ok()) {
                     Some(kind) => match kind.to_ascii_lowercase().as_str() {
@@ -4925,17 +5524,34 @@ impl<'t> Ctx<'t> {
             .chain(self.wild_attr_objects.iter().copied())
             .collect();
         for (object, scope) in written {
-            if let Val::Client { client, path } = self.eval(object, scope, 0) {
-                if !path.is_empty() {
-                    continue;
-                }
-                match client.site {
+            match self.eval(object, scope, 0) {
+                Val::Client { client, path } if path.is_empty() => match client.site {
                     Some(site) => {
                         self.rerouted.insert(site);
                     }
                     None => {
                         self.rerouted_pkgs.insert(client.pkg);
                     }
+                },
+                // An SDK module is routed by `module_openai_routing`; a
+                // member of a client, or `self` of a same-file class, is not
+                // a client.
+                Val::Client { .. }
+                | Val::Module { .. }
+                | Val::Symbol { .. }
+                | Val::Class(_)
+                | Val::Result(_)
+                | Val::GoogleNs => {}
+                // `self`/`cls`, or a same-file class by name: not a client.
+                _ if object.kind() == "identifier"
+                    && (matches!(self.text(object), "self" | "cls")
+                        || self.class_receiver(object, scope).is_some()) => {}
+                // An object this file cannot identify may be any client.
+                _ => {
+                    self.rerouted_any.get_or_insert(Self::feature(
+                        "a `base_url` written on an object this file cannot identify",
+                        object,
+                    ));
                 }
             }
         }
@@ -4960,6 +5576,14 @@ impl<'t> Ctx<'t> {
                 client.routing = Routing::Unknown;
             }
             client.caveat = Some(ClientCaveat::BaseUrlAssigned);
+        } else if let Some(feature) = self.rerouted_any {
+            let direct = matches!(
+                client.routing,
+                Routing::OpenaiDirect | Routing::AnthropicDirect
+            );
+            if direct && client.caveat.is_none() && !client.ambiguous {
+                client.caveat = Some(ClientCaveat::Dynamic(feature));
+            }
         }
         client
     }
@@ -5239,6 +5863,13 @@ impl<'t> Ctx<'t> {
                         "this file sets `{var}`, which the SDK reads its endpoint from, so `{chain}` may send its requests elsewhere"
                     ),
                 ),
+                ClientCaveat::EnvWrite(feature) => (
+                    "dynamic_feature",
+                    format!(
+                        "this file may set the SDK's endpoint variable ({}), so `{chain}` may send its requests elsewhere",
+                        feature.describe()
+                    ),
+                ),
                 ClientCaveat::BaseUrl { env: true, .. } => (
                     "base_url_env",
                     format!(
@@ -5257,6 +5888,13 @@ impl<'t> Ctx<'t> {
                         "the `base_url` of the client behind `{chain}` does not resolve to a string in this file, so its endpoint is not known"
                     ),
                 ),
+                ClientCaveat::Dynamic(feature) => (
+                    "dynamic_feature",
+                    format!(
+                        "the receiver of `{chain}` may be rebound or replaced at run time: {}",
+                        feature.describe()
+                    ),
+                ),
             };
             self.out.gaps.push(UsageGap {
                 kind: GapKind::AmbiguousClient,
@@ -5268,6 +5906,25 @@ impl<'t> Ctx<'t> {
                 key: None,
                 reason: reason.to_string(),
                 detail,
+                values: Vec::new(),
+                values_complete: false,
+            });
+        } else if let Some(feature) = self.file_dynamic {
+            // Anything in this file may be rebound, the receiver and the
+            // SDK's configuration included.
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::AmbiguousClient,
+                sdk: Some(sdk),
+                file: self.file.clone(),
+                span: Some(span),
+                symbol: symbol.clone(),
+                chain: Some(chain.clone()),
+                key: None,
+                reason: "dynamic_feature".to_string(),
+                detail: format!(
+                    "this file may rebind any name or attribute at run time ({}), so the routing of `{chain}` is not confirmed",
+                    feature.describe()
+                ),
                 values: Vec::new(),
                 values_complete: false,
             });
@@ -5319,6 +5976,23 @@ impl<'t> Ctx<'t> {
         result: Result<Resolved, Unresolved>,
         values: &mut Vec<CapturedValue>,
     ) {
+        // In a file that may rebind anything at run time, only a value
+        // written at the call itself is confirmed.
+        let result = result.map(|mut resolved| {
+            let flagged = resolved
+                .caveats
+                .iter()
+                .any(|c| c.reason == "dynamic_feature");
+            if let (Some(feature), false) = (self.file_dynamic, flagged) {
+                if !within(site.call, resolved.span) {
+                    let name = resolved.name.clone().unwrap_or_else(|| key.to_string());
+                    resolved
+                        .caveats
+                        .push(Unresolved::dynamic(feature).via(&name));
+                }
+            }
+            resolved
+        });
         match result {
             // A value whose gap cannot be reported here (an SDK type such as
             // `ChatCompletion(model=os.getenv(...))`) is not captured: it
@@ -5406,6 +6080,12 @@ impl<'t> Ctx<'t> {
             _ if unresolved.reason == "missing_model" => {
                 format!("`{key}` for `{chain}` is not passed, so the SDK or server default applies")
             }
+            Some(via) if unresolved.reason == "dynamic_feature" => format!(
+                "`{key}` for `{chain}` comes from `{via}`, which may change at run time: {shape}"
+            ),
+            None if unresolved.reason == "dynamic_feature" => {
+                format!("`{key}` for `{chain}` may change at run time: {shape}")
+            }
             Some(via) if !shape.is_empty() && via != shape => {
                 format!("`{key}` for `{chain}` comes from `{via}`, which is {phrase} (`{shape}`)")
             }
@@ -5413,7 +6093,14 @@ impl<'t> Ctx<'t> {
             None => format!("`{key}` for `{chain}` is `{shape}`, which is {phrase}"),
         };
         let (values, cut) = self.candidate_values(key, &unresolved.candidates);
-        let complete = unresolved.complete() && !cut;
+        // A file that may rebind anything at run time can complete a list
+        // only with literals written at the call.
+        let rebinding = self.file_dynamic.is_some()
+            && !unresolved
+                .candidates
+                .iter()
+                .all(|c| within(site.call, c.span));
+        let complete = unresolved.complete() && !cut && !rebinding;
         let listed = if complete {
             "every other value it may take is listed"
         } else {
@@ -5446,6 +6133,12 @@ impl<'t> Ctx<'t> {
             Some(origin) if unresolved.reason == "parameter_default" => {
                 detail.push_str(&format!(
                     "; its default is captured with origin `{}`",
+                    origin.as_str()
+                ));
+            }
+            Some(origin) if unresolved.reason == "dynamic_feature" => {
+                detail.push_str(&format!(
+                    "; its value is captured with origin `{}`",
                     origin.as_str()
                 ));
             }
@@ -5581,6 +6274,14 @@ impl<'t> Ctx<'t> {
             Origin::Unbound => (
                 "unbound",
                 format!("`{root}` is not assigned in this file"),
+                shape_sdk,
+            ),
+            Origin::Dynamic(feature) => (
+                "dynamic_feature",
+                format!(
+                    "the receiver of `{chain}` may be rebound or replaced at run time: {}",
+                    feature.describe()
+                ),
                 shape_sdk,
             ),
             _ => (
@@ -5882,12 +6583,15 @@ impl<'t> Ctx<'t> {
                     if is_secret_key(&attr) || self.chain_has_secret_name(object) {
                         return Err(Unresolved::new("credential", rendered));
                     }
-                    if let Some((class, dynamic)) = self.class_receiver(object, scope) {
-                        let assigns = if dynamic {
-                            self.dynamic_attr_assignments(class, &attr)
-                        } else {
-                            self.attr_assignments(class, &attr)
-                        };
+                    if let Some((class, through_self)) = self.class_receiver(object, scope) {
+                        let lookup = self.attr_lookup(class, &attr, through_self);
+                        let assigns = Rc::clone(&lookup.assigns);
+                        let dynamic = lookup.dynamic;
+                        // Nothing the grammar reads, and a dynamic feature
+                        // that may set it.
+                        if let (true, Some(feature)) = (assigns.is_empty(), dynamic) {
+                            return Err(Unresolved::dynamic(feature).via(&rendered));
+                        }
                         let only = match assigns.as_ref() {
                             [assign] => Some(*assign),
                             _ => None,
@@ -5899,7 +6603,14 @@ impl<'t> Ctx<'t> {
                             depth,
                         ) {
                             Ok(resolved) => {
-                                Ok(resolved.through(&rendered, ValueOrigin::ClassConstant))
+                                let mut resolved =
+                                    resolved.through(&rendered, ValueOrigin::ClassConstant);
+                                if let Some(feature) = dynamic {
+                                    resolved
+                                        .caveats
+                                        .push(Unresolved::dynamic(feature).via(&rendered));
+                                }
+                                Ok(resolved)
                             }
                             Err(unresolved) if unresolved.reason == "reassigned" => {
                                 let (candidates, complete) = self.assign_candidates(
@@ -5908,9 +6619,17 @@ impl<'t> Ctx<'t> {
                                     &rendered,
                                     depth,
                                 );
-                                Err(unresolved
-                                    .via(&rendered)
-                                    .with_candidates(candidates, complete))
+                                // Complete only for assignments in one
+                                // scope (a class body's branches), with no
+                                // dynamic feature (P4).
+                                let one_scope = assigns.iter().all(|a| a.scope == assigns[0].scope);
+                                Err(unresolved.via(&rendered).with_candidates(
+                                    candidates,
+                                    complete && one_scope && dynamic.is_none(),
+                                ))
+                            }
+                            Err(unresolved) if dynamic.is_some() => {
+                                Err(unresolved.via(&rendered).incomplete())
                             }
                             Err(unresolved) => Err(unresolved.via(&rendered)),
                         };
@@ -7071,6 +7790,11 @@ fn push_candidate(values: &mut Vec<Resolved>, mut resolved: Resolved) -> bool {
     true
 }
 
+/// Whether `span` lies inside `node`: a literal written at that call.
+fn within(node: Node<'_>, span: Span) -> bool {
+    node.start_byte() <= span.start_byte as usize && span.end_byte as usize <= node.end_byte()
+}
+
 fn captured(key: &str, resolved: Resolved, positional: bool) -> CapturedValue {
     let family = model_family(&resolved.value);
     CapturedValue {
@@ -7477,6 +8201,30 @@ fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
 /// and self-references are ignored next to a real value. A client mixed with
 /// a different client or with an unknown value is ambiguous.
 fn combine(vals: Vec<Val>) -> Val {
+    // A dynamic feature next to the values: a client keeps them with a
+    // `dynamic_feature` caveat; anything else is replaced by it.
+    let dynamic = vals.iter().find_map(|v| match v {
+        Val::Untracked(Origin::Dynamic(feature)) => Some(*feature),
+        _ => None,
+    });
+    if let Some(feature) = dynamic {
+        let rest: Vec<Val> = vals
+            .into_iter()
+            .filter(|v| !matches!(v, Val::Untracked(Origin::Dynamic(_))))
+            .collect();
+        if rest.is_empty() {
+            return Val::untracked(Origin::Dynamic(feature));
+        }
+        return match combine(rest) {
+            Val::Client { mut client, path } => {
+                if client.caveat.is_none() {
+                    client.caveat = Some(ClientCaveat::Dynamic(feature));
+                }
+                Val::Client { client, path }
+            }
+            _ => Val::untracked(Origin::Dynamic(feature)),
+        };
+    }
     let real: Vec<Val> = vals
         .iter()
         .filter(|v| {
