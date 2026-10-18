@@ -178,9 +178,10 @@ runs:
 
         # The job summary. Its exit code says whether anything is failing:
         # 0 nothing, 1 retired (or retiring within the window), 2 error.
+        # (`shell: bash` runs with -e, so the exit code is caught, not fatal.)
         REPORT="$(mktemp)"
-        arbor retirements "$TARGET" --markdown ${ARGS[@]+"${ARGS[@]}"} > "$REPORT"
-        CODE=$?
+        CODE=0
+        arbor retirements "$TARGET" --markdown ${ARGS[@]+"${ARGS[@]}"} > "$REPORT" || CODE=$?
         if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
           cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
         else
