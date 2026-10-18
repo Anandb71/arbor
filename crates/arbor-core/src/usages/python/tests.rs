@@ -2978,3 +2978,58 @@ fn listed_values_stay_bounded_per_gap_and_per_file() {
     let json = serde_json::to_string(&found).unwrap();
     assert!(json.len() < 8_000_000, "{} bytes", json.len());
 }
+
+#[test]
+fn a_long_name_reported_at_every_use_cannot_multiply_the_report() {
+    // A name written once and repeated in every record (a function's
+    // symbol, a constant behind a short alias, a client bound to a long
+    // attribute chain) made a 1.5 MB file print 0.4 to 1 GB of JSON.
+    let long = "x".repeat(10_000);
+    let calls = 2_000;
+    let shapes = [
+        format!(
+            "def f{long}():\n{}",
+            "    client.chat.completions.create()\n".repeat(calls)
+        ),
+        format!(
+            "{long} = os.getenv('M')\nM = {long}\n{}",
+            "client.chat.completions.create(model=M)\n".repeat(calls)
+        ),
+        format!("c = client.{long}.{long}\n{}", "c.create()\n".repeat(calls)),
+        format!(
+            "from {long} import x\n{}",
+            "x.chat.completions.create(model=\"gpt-4\")\n".repeat(calls)
+        ),
+    ];
+    for body in shapes {
+        let source = format!("import os\nfrom openai import OpenAI\nclient = OpenAI()\n{body}");
+        let found = usages_within(&source, 10);
+        let json = serde_json::to_string(&found).unwrap();
+        // A call and its gap fit in 2 KB however long the name: before,
+        // each repeated the whole 10 KB (or 20 KB) name.
+        assert!(
+            json.len() < calls * 2_000,
+            "{} bytes of JSON for {calls} calls",
+            json.len()
+        );
+        assert!(!json.contains(&"x".repeat(MAX_TEXT_FOR_TESTS + 1)));
+    }
+}
+
+/// The longest run of one name a report may hold (see `MAX_TEXT`).
+const MAX_TEXT_FOR_TESTS: usize = 200;
+
+#[test]
+fn a_file_reports_at_most_twenty_thousand_records() {
+    let mut source = String::from("from openai import OpenAI\n");
+    for _ in 0..25_000 {
+        source.push_str("x.chat.completions.create(model=\"gpt-4\")\n");
+    }
+    let found = usages_within(&source, 10);
+    assert_eq!(found.gaps.len(), 20_001);
+    let last = found.gaps.last().unwrap();
+    assert_eq!(
+        (last.reason.as_str(), last.span.unwrap().line),
+        ("truncated", 20_002)
+    );
+}

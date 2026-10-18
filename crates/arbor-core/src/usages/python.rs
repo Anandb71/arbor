@@ -226,6 +226,18 @@ const MAX_CALLERS_READ: usize = 256;
 /// Definitions, or dict entries, read for the values a name or a lookup
 /// with a run-time key may take.
 const MAX_CANDIDATE_READS: usize = 64;
+/// Longest name, chain or expression shape reported, in bytes: a longer one
+/// keeps its start and end around `...`. A name defined once and reported
+/// at every use (a function's symbol, a constant behind an alias, a client
+/// bound to a long attribute chain) can then not multiply the report.
+const MAX_TEXT: usize = 200;
+/// Longest member path followed off a tracked binding. SDK paths are a few
+/// segments (`beta.threads.runs.steps.list`).
+const MAX_PATH: usize = 32;
+/// Calls, gaps and clients reported per file. Past it, the rest of the file
+/// is one `truncated` gap: the report stays proportional to real code
+/// however a generated file repeats itself.
+const MAX_FILE_RECORDS: usize = 20_000;
 
 /// Extracts SDK usages from a parsed Python file.
 pub fn extract(tree: &Tree, source: &str, file_path: &str) -> FileUsages {
@@ -605,7 +617,7 @@ impl Unresolved {
     fn new(reason: &'static str, shape: String) -> Self {
         Self {
             reason,
-            shape,
+            shape: clip_owned(shape),
             via: None,
             candidates: Vec::new(),
         }
@@ -618,7 +630,7 @@ impl Unresolved {
 
     fn via(mut self, name: &str) -> Self {
         if self.via.is_none() {
-            self.via = Some(name.to_string());
+            self.via = Some(clip(name));
         }
         self
     }
@@ -665,7 +677,7 @@ impl Resolved {
     /// name when it was written inline there, and the gaps of its caveats.
     fn through(mut self, name: &str, origin: ValueOrigin) -> Self {
         if self.name.is_none() || self.origin == origin {
-            self.name = Some(name.to_string());
+            self.name = Some(clip(name));
         }
         self.caveats = self
             .caveats
@@ -1947,7 +1959,7 @@ impl<'t> Ctx<'t> {
             node.end_byte(),
         );
         scope.class = class;
-        scope.symbol = Some(symbol);
+        scope.symbol = Some(clip_owned(symbol));
         scope.name = name.clone();
         if let Some(wrapper) = wrapper.filter(|w| w.kind() == "decorated_definition") {
             for decorator in named_children(wrapper) {
@@ -2131,7 +2143,7 @@ impl<'t> Ctx<'t> {
             node.end_byte(),
         );
         scope.class = Some(id);
-        scope.symbol = Some(name.clone());
+        scope.symbol = Some(clip(&name));
         scope.name = name.clone();
         scope.bases = bases;
         self.scopes.push(scope);
@@ -2995,7 +3007,9 @@ impl<'t> Ctx<'t> {
             _ => None,
         });
         match module {
-            Some(module) => Val::untracked(Origin::Imported { module }),
+            Some(module) => Val::untracked(Origin::Imported {
+                module: clip_owned(module),
+            }),
             None => Val::untracked(Origin::Unbound),
         }
     }
@@ -3452,6 +3466,11 @@ impl<'t> Ctx<'t> {
     }
 
     fn member(&mut self, base: Val, attr: &str) -> Val {
+        if base.path().len() >= MAX_PATH {
+            return Val::untracked(Origin::Other);
+        }
+        let clipped = clip(attr);
+        let attr = clipped.as_str();
         match base {
             Val::Module { pkg, mut path } => {
                 if let Some(class) = client_class(pkg, attr) {
@@ -3702,7 +3721,7 @@ impl<'t> Ctx<'t> {
                     }
                     ScopeKind::Function => ClientScope::Local,
                 };
-                (Some(name), held)
+                (Some(clip_owned(name)), held)
             }
             "attribute" => (Some(self.render(target)), ClientScope::Attribute),
             _ => (Some(self.render(target)), ClientScope::Inline),
@@ -3726,11 +3745,40 @@ impl<'t> Ctx<'t> {
         }
         self.note_rerouted_clients();
         for (call, scope) in self.calls.clone() {
+            if self.records() >= MAX_FILE_RECORDS {
+                return self.truncate_file(call, scope);
+            }
             self.analyze_call(call, scope);
         }
         for (reference, scope) in self.refs.clone() {
+            if self.records() >= MAX_FILE_RECORDS {
+                return self.truncate_file(reference, scope);
+            }
             self.analyze_reference(reference, scope);
         }
+    }
+
+    /// Calls, gaps and clients reported so far.
+    fn records(&self) -> usize {
+        self.out.calls.len() + self.out.gaps.len() + self.out.clients.len()
+    }
+
+    /// Stops the analysis at `node`: the rest of the file is one gap.
+    fn truncate_file(&mut self, node: Node<'t>, scope: usize) {
+        self.out.gaps.push(UsageGap {
+            kind: GapKind::UnresolvedModel,
+            sdk: None,
+            file: self.file.clone(),
+            span: Some(self.span(node)),
+            symbol: self.symbol(scope),
+            chain: None,
+            key: None,
+            reason: "truncated".to_string(),
+            detail: format!(
+                "this file reports more than {MAX_FILE_RECORDS} calls, clients and gaps; nothing from this line on is analyzed"
+            ),
+            values: Vec::new(),
+        });
     }
 
     /// Routing of the module-level OpenAI API, from `openai.api_type`,
@@ -3924,7 +3972,7 @@ impl<'t> Ctx<'t> {
         let symbol = self.symbol(scope);
         let args = self.arguments(call);
         let sdk = target.pkg.sdk();
-        let member = strip_wrappers(&target.member);
+        let member = clip_owned(strip_wrappers(&target.member));
         let request = is_request(&member);
         let model_bearing = is_model_bearing(&member);
 
@@ -5446,7 +5494,7 @@ impl<'t> Ctx<'t> {
         for suffix in suffixes.iter().rev() {
             rendered.push_str(suffix);
         }
-        rendered
+        clip_owned(rendered)
     }
 
     fn has_args(&self, call: Node<'t>) -> bool {
@@ -5468,6 +5516,33 @@ impl<'t> Ctx<'t> {
             .gaps
             .sort_by_key(|g| (g.span.map(|s| s.start_byte).unwrap_or(0), g.kind));
         self.out
+    }
+}
+
+/// `text`, or its first and last bytes around `...` when it is longer than
+/// [`MAX_TEXT`].
+fn clip(text: &str) -> String {
+    if text.len() <= MAX_TEXT {
+        return text.to_string();
+    }
+    let half = (MAX_TEXT - 3) / 2;
+    let mut head = half;
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len() - half;
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}...{}", &text[..head], &text[tail..])
+}
+
+/// [`clip`] for an owned string, which is returned as is when short.
+fn clip_owned(text: String) -> String {
+    if text.len() <= MAX_TEXT {
+        text
+    } else {
+        clip(&text)
     }
 }
 
@@ -5544,7 +5619,7 @@ fn captured(key: &str, resolved: Resolved, positional: bool) -> CapturedValue {
         key: key.to_string(),
         value: resolved.value,
         origin: resolved.origin,
-        name: resolved.name,
+        name: resolved.name.map(clip_owned),
         positional,
         span: resolved.span,
         model_family: family,
