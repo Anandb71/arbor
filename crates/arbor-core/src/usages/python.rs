@@ -863,8 +863,13 @@ struct Scope {
     /// For a function or lambda: its parameters in order.
     slots: Vec<Slot>,
     /// Decorated with something other than `staticmethod`/`classmethod`, so
-    /// a framework may call it.
+    /// a framework may call it. For a class: decorated at all
+    /// (`@dataclass`), so its annotated attributes may be fields.
     decorated: bool,
+    /// For a class: a base that is not a same-file class (`BaseModel`,
+    /// `NamedTuple`, `mod.Base`) or a class keyword (`metaclass=...`), whose
+    /// constructor may set annotated attributes from its arguments.
+    external_bases: bool,
     staticmethod: bool,
     lambda: bool,
     /// A list, set or dict comprehension or a generator expression: its
@@ -893,6 +898,7 @@ impl Scope {
             end,
             slots: Vec::new(),
             decorated: false,
+            external_bases: false,
             staticmethod: false,
             lambda: false,
             comprehension: false,
@@ -1506,7 +1512,7 @@ impl<'t> Ctx<'t> {
                         child_loop = None;
                     }
                     "class_definition" => {
-                        inner = self.enter_class(node, scope);
+                        inner = self.enter_class(node, scope, frame.parent);
                         child_loop = None;
                     }
                     "lambda" => {
@@ -2428,16 +2434,21 @@ impl<'t> Ctx<'t> {
         self.scopes[scope].slots = slots;
     }
 
-    fn enter_class(&mut self, node: Node<'t>, parent: usize) -> usize {
+    fn enter_class(&mut self, node: Node<'t>, parent: usize, wrapper: Option<Node<'t>>) -> usize {
         let name = node
             .child_by_field_name("name")
             .map(|n| self.text(n).to_string())
             .unwrap_or_default();
         let mut bases = Vec::new();
+        let mut external_bases = false;
         if let Some(list) = node.child_by_field_name("superclasses") {
             for base in named_children(list) {
                 if matches!(base.kind(), "identifier" | "attribute") {
-                    bases.push(self.text(base).to_string());
+                    let text = self.text(base);
+                    external_bases |= !self.classes_by_name.contains_key(text);
+                    bases.push(text.to_string());
+                } else if base.kind() != "comment" {
+                    external_bases = true;
                 }
             }
         }
@@ -2452,6 +2463,8 @@ impl<'t> Ctx<'t> {
         scope.symbol = Some(clip(&name));
         scope.name = name.clone();
         scope.bases = bases;
+        scope.external_bases = external_bases;
+        scope.decorated = wrapper.is_some_and(|w| w.kind() == "decorated_definition");
         self.scopes.push(scope);
         self.classes_by_name.entry(name).or_default().push(id);
         id
@@ -4090,8 +4103,10 @@ impl<'t> Ctx<'t> {
         };
         let home = self.import_home(parent, &name);
         let key = (home, name.clone());
-        let unique =
-            self.classes_by_name.get(&name).map_or(0, Vec::len) == 1 && !self.binds(home, &name);
+        // A class decorator may wrap or replace the class.
+        let unique = self.classes_by_name.get(&name).map_or(0, Vec::len) == 1
+            && !self.binds(home, &name)
+            && !self.scopes[class].decorated;
         let escapes = self
             .name_uses
             .get(name.as_str())
@@ -4330,7 +4345,15 @@ impl<'t> Ctx<'t> {
             || hierarchy
                 .iter()
                 .any(|c| self.wild_attr_writes.contains(&Some(*c)));
-        if wild || (own.is_empty() && !found.is_empty()) {
+        // `model: str = "gpt-4o"` in a dataclass, a pydantic model or a
+        // NamedTuple is a field default: the constructor may set another.
+        let field = found.iter().any(|a| {
+            let class = &self.scopes[a.scope];
+            class.kind == ScopeKind::Class
+                && a.annotation.is_some()
+                && (class.decorated || class.external_bases)
+        });
+        if wild || field || (own.is_empty() && !found.is_empty()) {
             let unknown = Assign {
                 id: self.fresh_id(),
                 scope: class,

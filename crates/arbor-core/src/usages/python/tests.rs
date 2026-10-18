@@ -3932,3 +3932,26 @@ fn writes_and_lookups_through_dunders_and_the_module_object_are_seen() {
         assert_eq!(rows[0].2, vec!["unseen_callers".to_string()], "{body}");
     }
 }
+
+#[test]
+fn annotated_fields_of_data_classes_are_constructor_defaults() {
+    // `model: str = "gpt-4o"` in a dataclass, a pydantic model or a
+    // NamedTuple was read through `self` as a class constant, though
+    // `Agent(model="o1-mini")` sets the instance's field.
+    let header = "from dataclasses import dataclass\nfrom typing import NamedTuple\nfrom pydantic import BaseModel\nfrom openai import OpenAI\nclient = OpenAI()\n";
+    for body in [
+        "@dataclass\nclass Agent:\n    model: str = \"gpt-4o\"\n    def run(self):\n        return client.chat.completions.create(model=self.model, messages=[])\nAgent(model=\"o1-mini\").run()\n",
+        "class Agent(BaseModel):\n    model: str = \"gpt-4o\"\n    def run(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n",
+        "class Agent(NamedTuple):\n    model: str = \"gpt-4o\"\n    def run(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n",
+    ] {
+        let rows = rows_of(&format!("{header}{body}"));
+        assert_eq!(rows.len(), 1, "{body}");
+        assert_eq!(rows[0].1, "-", "{body}");
+        assert_eq!(rows[0].2, vec!["reassigned".to_string()], "{body}");
+    }
+    // A plain class's annotated attribute is a class attribute.
+    let rows = rows_of(&format!(
+        "{header}class Plain:\n    model: str = \"gpt-4o\"\n    def run(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n"
+    ));
+    assert_eq!(rows, vec![(9, "gpt-4o".to_string(), vec![])]);
+}
