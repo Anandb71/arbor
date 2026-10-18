@@ -234,10 +234,14 @@ const MAX_TEXT: usize = 200;
 /// Longest member path followed off a tracked binding. SDK paths are a few
 /// segments (`beta.threads.runs.steps.list`).
 const MAX_PATH: usize = 32;
-/// Calls, gaps and clients reported per file. Past it, the rest of the file
-/// is one `truncated` gap: the report stays proportional to real code
-/// however a generated file repeats itself.
+/// Imports, calls, gaps and clients reported per file. Past it, the rest of
+/// the file is one `truncated` gap: the report stays proportional to real
+/// code however a generated file repeats itself.
 const MAX_FILE_RECORDS: usize = 20_000;
+/// Names bound by import statements per file. A file that binds more is
+/// not analyzed past its imports (one `truncated` gap): a name it no longer
+/// binds could change what any call resolves to.
+const MAX_FILE_IMPORTS: usize = MAX_FILE_RECORDS;
 
 /// Extracts SDK usages from a parsed Python file.
 pub fn extract(tree: &Tree, source: &str, file_path: &str) -> FileUsages {
@@ -284,17 +288,22 @@ impl Pkg {
         }
     }
 
-    /// The package a dotted module path belongs to, and the rest of the path.
+    /// The package a dotted module path belongs to, and the rest of the
+    /// path: at most [`MAX_PATH`] segments, each clipped, so a generated
+    /// module path is not copied in full into every name it imports.
     fn of_module(module: &str) -> Option<(Pkg, Vec<String>)> {
-        let parts: Vec<&str> = module.split('.').map(str::trim).collect();
-        let (pkg, used) = match parts.as_slice() {
-            ["openai", ..] => (Pkg::Openai, 1),
-            ["anthropic", ..] => (Pkg::Anthropic, 1),
-            ["google", "genai", ..] => (Pkg::GoogleGenai, 2),
-            ["google", "generativeai", ..] => (Pkg::GoogleGenerativeai, 2),
+        let mut parts = module.split('.').map(str::trim);
+        let pkg = match (parts.next(), parts.clone().next()) {
+            (Some("openai"), _) => Pkg::Openai,
+            (Some("anthropic"), _) => Pkg::Anthropic,
+            (Some("google"), Some("genai")) => Pkg::GoogleGenai,
+            (Some("google"), Some("generativeai")) => Pkg::GoogleGenerativeai,
             _ => return None,
         };
-        Some((pkg, parts[used..].iter().map(|s| s.to_string()).collect()))
+        if matches!(pkg, Pkg::GoogleGenai | Pkg::GoogleGenerativeai) {
+            parts.next();
+        }
+        Some((pkg, parts.take(MAX_PATH).map(clip).collect()))
     }
 }
 
@@ -883,7 +892,9 @@ struct ImportDef {
 
 #[derive(Clone)]
 struct OtherImport {
-    module: String,
+    /// The module as written, clipped, shared by every name one statement
+    /// imports.
+    module: Rc<str>,
     place: Place,
 }
 
@@ -1213,6 +1224,10 @@ struct Ctx<'t> {
     rerouted_pkgs: HashSet<Pkg>,
     /// Why the module-level OpenAI API's routing may not hold.
     openai_caveat: Option<ClientCaveat>,
+    /// Names bound by imports so far, and the import statement at which
+    /// [`MAX_FILE_IMPORTS`] was reached.
+    import_bindings: usize,
+    import_cut: Option<Node<'t>>,
     out: FileUsages,
 }
 
@@ -1282,6 +1297,8 @@ impl<'t> Ctx<'t> {
             rerouted: HashSet::new(),
             rerouted_pkgs: HashSet::new(),
             openai_caveat: None,
+            import_bindings: 0,
+            import_cut: None,
             out: FileUsages::new(file, "python"),
         }
     }
@@ -1498,6 +1515,14 @@ impl<'t> Ctx<'t> {
                     }
                     _ => {}
                 }
+            }
+            // An import's names were read above and bind nothing else: its
+            // children (one per imported name) are not walked.
+            if matches!(
+                node.kind(),
+                "import_statement" | "import_from_statement" | "future_import_statement"
+            ) {
+                continue;
             }
             let (block_end, child_stmt) = match node.kind() {
                 "module" | "block" => (node.end_byte(), None),
@@ -2285,18 +2310,38 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    fn other_import(&mut self, scope: usize, local: String, module: String, place: Place) {
+    fn other_import(&mut self, scope: usize, local: String, module: &Rc<str>, place: Place) {
         let home = self.import_home(scope, &local);
         self.other_imports
             .entry((home, local))
             .or_default()
-            .push(OtherImport { module, place });
+            .push(OtherImport {
+                module: Rc::clone(module),
+                place,
+            });
+    }
+
+    /// Counts one more imported name at `statement`: `false` once the file
+    /// has bound [`MAX_FILE_IMPORTS`], and from then on.
+    fn import_budget(&mut self, statement: Node<'t>) -> bool {
+        if self.import_cut.is_some() {
+            return false;
+        }
+        if self.import_bindings >= MAX_FILE_IMPORTS {
+            self.import_cut = Some(statement);
+            return false;
+        }
+        self.import_bindings += 1;
+        true
     }
 
     fn import_statement(&mut self, node: Node<'t>, scope: usize, place: Place) {
         let mut cursor = node.walk();
         let names: Vec<Node<'t>> = node.children_by_field_name("name", &mut cursor).collect();
         for item in names {
+            if !self.import_budget(node) {
+                return;
+            }
             let (module_node, alias) = match item.kind() {
                 "aliased_import" => (
                     item.child_by_field_name("name"),
@@ -2307,13 +2352,14 @@ impl<'t> Ctx<'t> {
             let Some(module_node) = module_node else {
                 continue;
             };
-            let module = self.text(module_node).to_string();
-            let Some((pkg, rest)) = Pkg::of_module(&module) else {
+            let written = self.text(module_node);
+            let module = clip(written);
+            let Some((pkg, rest)) = Pkg::of_module(written) else {
                 let local = match alias {
                     Some(alias) => self.text(alias).to_string(),
-                    None => module.split('.').next().unwrap_or("").to_string(),
+                    None => written.split('.').next().unwrap_or("").to_string(),
                 };
-                self.other_import(scope, local, module, place);
+                self.other_import(scope, local, &Rc::from(module), place);
                 continue;
             };
             let (local, val) = match alias {
@@ -2328,7 +2374,7 @@ impl<'t> Ctx<'t> {
                         ("google".to_string(), Val::GoogleNs)
                     }
                     _ => (
-                        module.split('.').next().unwrap_or("").to_string(),
+                        written.split('.').next().unwrap_or("").to_string(),
                         Val::Module {
                             pkg,
                             path: Vec::new(),
@@ -2348,10 +2394,16 @@ impl<'t> Ctx<'t> {
     }
 
     fn import_from(&mut self, node: Node<'t>, scope: usize, place: Place) {
+        if self.import_cut.is_some() {
+            return;
+        }
         let Some(module_node) = node.child_by_field_name("module_name") else {
             return;
         };
-        let module = self.text(module_node).to_string();
+        // Read and clipped once: every name below shares it.
+        let written = self.text(module_node);
+        let module = clip(written);
+        let shared: Rc<str> = Rc::from(module.as_str());
         let relative = module_node.kind() == "relative_import";
 
         let mut cursor = node.walk();
@@ -2363,12 +2415,15 @@ impl<'t> Ctx<'t> {
         let target = if relative {
             None
         } else {
-            Pkg::of_module(&module)
+            Pkg::of_module(written)
         };
 
         if wildcard {
             if let Some((pkg, _)) = target {
                 for class in CLASSES.iter().filter(|c| c.pkg == pkg) {
+                    if !self.import_budget(node) {
+                        return;
+                    }
                     let key = (self.import_home(scope, class.name), class.name.to_string());
                     self.imports.entry(key).or_default().push(ImportDef {
                         val: Val::Class(*class),
@@ -2388,6 +2443,9 @@ impl<'t> Ctx<'t> {
         }
 
         for item in names {
+            if !self.import_budget(node) {
+                return;
+            }
             let (name_node, alias) = match item.kind() {
                 "aliased_import" => (
                     item.child_by_field_name("name"),
@@ -2404,12 +2462,12 @@ impl<'t> Ctx<'t> {
                 .unwrap_or_else(|| name.clone());
 
             // `from google import genai` / `from google import generativeai`.
-            if !relative && module == "google" {
+            if !relative && written == "google" {
                 let pkg = match name.as_str() {
                     "genai" => Pkg::GoogleGenai,
                     "generativeai" => Pkg::GoogleGenerativeai,
                     _ => {
-                        self.other_import(scope, local, module.clone(), place);
+                        self.other_import(scope, local, &shared, place);
                         continue;
                     }
                 };
@@ -2429,7 +2487,7 @@ impl<'t> Ctx<'t> {
             }
 
             let Some((pkg, rest)) = target.clone() else {
-                self.other_import(scope, local, module.clone(), place);
+                self.other_import(scope, local, &shared, place);
                 continue;
             };
             let (val, kind) = match client_class(pkg, &name) {
@@ -2478,8 +2536,8 @@ impl<'t> Ctx<'t> {
             sdk: binding.pkg.sdk(),
             package: binding.pkg.package().to_string(),
             module: binding.module.to_string(),
-            name: binding.name,
-            local: binding.local.to_string(),
+            name: binding.name.map(clip_owned),
+            local: clip(binding.local),
             kind: binding.kind,
             file: self.file.clone(),
             span,
@@ -3008,13 +3066,11 @@ impl<'t> Ctx<'t> {
                 .other_imports
                 .get(key)
                 .and_then(|v| v.get(*i))
-                .map(|o| o.module.clone()),
+                .map(|o| o.module.to_string()),
             _ => None,
         });
         match module {
-            Some(module) => Val::untracked(Origin::Imported {
-                module: clip_owned(module),
-            }),
+            Some(module) => Val::untracked(Origin::Imported { module }),
             None => Val::untracked(Origin::Unbound),
         }
     }
@@ -3750,6 +3806,25 @@ impl<'t> Ctx<'t> {
     // ------------------------------------------------------------------
 
     fn analyze(&mut self) {
+        if let Some(statement) = self.import_cut {
+            // A name the file no longer binds could change what any call
+            // resolves to: report nothing rather than something wrong.
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::UnresolvedModel,
+                sdk: None,
+                file: self.file.clone(),
+                span: Some(self.span(statement)),
+                symbol: None,
+                chain: None,
+                key: None,
+                reason: "truncated".to_string(),
+                detail: format!(
+                    "this file binds more than {MAX_FILE_IMPORTS} imported names, so its calls are not analyzed"
+                ),
+                values: Vec::new(),
+            });
+            return;
+        }
         self.openai_routing = self.module_openai_routing();
         if let Some(var) = OPENAI_MODULE_ENV
             .iter()
@@ -3775,9 +3850,9 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    /// Calls, gaps and clients reported so far.
+    /// Imports, calls, gaps and clients reported so far.
     fn records(&self) -> usize {
-        self.out.calls.len() + self.out.gaps.len() + self.out.clients.len()
+        self.out.imports.len() + self.out.calls.len() + self.out.gaps.len() + self.out.clients.len()
     }
 
     /// Stops the analysis at `node`: the rest of the file is one gap.
@@ -3792,7 +3867,7 @@ impl<'t> Ctx<'t> {
             key: None,
             reason: "truncated".to_string(),
             detail: format!(
-                "this file reports more than {MAX_FILE_RECORDS} calls, clients and gaps; nothing from this line on is analyzed"
+                "this file reports more than {MAX_FILE_RECORDS} imports, calls, clients and gaps; nothing from this line on is analyzed"
             ),
             values: Vec::new(),
         });

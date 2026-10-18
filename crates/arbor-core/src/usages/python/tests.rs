@@ -3026,11 +3026,12 @@ fn a_file_reports_at_most_twenty_thousand_records() {
         source.push_str("x.chat.completions.create(model=\"gpt-4\")\n");
     }
     let found = usages_within(&source, 10);
-    assert_eq!(found.gaps.len(), 20_001);
+    // The import counts too: 19,999 gaps, then the truncated one.
+    assert_eq!(found.imports.len() + found.gaps.len(), 20_001);
     let last = found.gaps.last().unwrap();
     assert_eq!(
         (last.reason.as_str(), last.span.unwrap().line),
-        ("truncated", 20_002)
+        ("truncated", 20_001)
     );
 }
 
@@ -3064,4 +3065,67 @@ CL17.chat.completions.create(model="gpt-4", messages=[])
             (12, Routing::OpenaiDirect, vec![]),
         ]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Third review of #276
+// ---------------------------------------------------------------------------
+
+#[test]
+fn imports_stay_bounded_however_many_names_a_statement_binds() {
+    // Every imported name copied the whole module path into its record, its
+    // binding and (for another module) its gap detail, and imports were not
+    // counted against the record cap: a 34 KB file printed 43.5 MB of JSON
+    // and peaked at 1.4 GB, a 2 MB one crashed after 100 s.
+    let names = vec!["a"; 10_000].join(", ");
+    let deep = ".x".repeat(2_000);
+    let call = "OpenAI().chat.completions.create(model=\"gpt-4\", messages=[])\n";
+    for source in [
+        format!("from openai{deep} import ({names})\nfrom openai import OpenAI\n{call}"),
+        format!(
+            "import openai\nfrom mylib{deep} import ({names})\nfrom openai import OpenAI\n{call}"
+        ),
+        format!("from openai import OpenAI\nimport openai{deep} as oa\n{call}"),
+    ] {
+        let found = usages_within(&source, 10);
+        let json = serde_json::to_string(&found).unwrap();
+        // About 400 bytes per imported name (the module clipped to 200).
+        assert!(
+            json.len() < 5_000_000,
+            "{} bytes of JSON for {} bytes of source",
+            json.len(),
+            source.len()
+        );
+        assert!(found
+            .imports
+            .iter()
+            .all(|i| i.module.len() <= MAX_TEXT_FOR_TESTS));
+        // The call after the imports is still analyzed.
+        assert_eq!(found.calls.len(), 1);
+        assert_eq!(value(&found.calls[0], "model"), Some("gpt-4"));
+    }
+
+    // More imported names than a file may bind: the imports stop at the cap
+    // and no call is analyzed, since a name left unbound could change what
+    // any of them resolves to.
+    let mut source = String::from("from openai import OpenAI\nclient = OpenAI()\n");
+    for _ in 0..3_000 {
+        source.push_str("from openai.types import (a, b, c, d, e, f, g, h)\n");
+    }
+    source.push_str("from openai import AzureOpenAI as OpenAI\n");
+    source.push_str("client.chat.completions.create(model=\"gpt-4\", messages=[])\n");
+    let found = usages_within(&source, 10);
+    assert_eq!(found.imports.len(), 20_000);
+    assert!(found.calls.is_empty() && found.clients.is_empty());
+    let gap = found.gaps.last().unwrap();
+    assert_eq!(
+        (gap.reason.as_str(), gap.span.unwrap().line),
+        ("truncated", 2_502)
+    );
+
+    // Wildcard imports bind every client class: they count as well.
+    let source = "from openai import *\n".repeat(5_000);
+    let found = usages_within(&source, 10);
+    assert!(found.imports.len() < 5_000, "{}", found.imports.len());
+    assert_eq!(found.gaps.len(), 1);
 }
