@@ -864,8 +864,14 @@ struct ConfigAssign<'t> {
 struct MethodCalls<'t> {
     /// Some call is on another object.
     foreign: bool,
-    by_class: HashMap<usize, Rc<[(Node<'t>, usize)]>>,
+    by_class: HashMap<usize, CallSites<'t>>,
 }
+
+/// Calls and the scope each is in.
+type CallSites<'t> = Rc<[(Node<'t>, usize)]>;
+
+/// Calls of one name, by the scope that binds the name at each.
+type CallIndex<'t> = Rc<HashMap<usize, CallSites<'t>>>;
 
 /// Calls of a function or method name, and whether the name is also used as
 /// a value (passed, stored, decorated, rebound).
@@ -1062,7 +1068,7 @@ struct Ctx<'t> {
     nested_left: usize,
     attr_lookup_memo: HashMap<Key, Rc<[Assign<'t>]>>,
     caller_memo: HashMap<Key, Memo<Option<Val>>>,
-    name_call_index: HashMap<String, Rc<HashMap<usize, Rc<[(Node<'t>, usize)]>>>>,
+    name_call_index: HashMap<String, CallIndex<'t>>,
     method_call_index: HashMap<String, Rc<MethodCalls<'t>>>,
     /// Resolutions in progress: (kind, scope or id, name).
     visiting: HashSet<(u8, usize, String)>,
@@ -2947,7 +2953,7 @@ impl<'t> Ctx<'t> {
     /// something other than `self`/`cls` of its class. Calls are indexed by
     /// binding scope (by class for methods) once per name, so a file with
     /// thousands of same-named functions stays linear.
-    fn calls_of(&mut self, func: usize) -> Option<Rc<[(Node<'t>, usize)]>> {
+    fn calls_of(&mut self, func: usize) -> Option<CallSites<'t>> {
         let scope = &self.scopes[func];
         if scope.lambda || scope.decorated {
             return None;
@@ -2990,7 +2996,7 @@ impl<'t> Ctx<'t> {
 
     /// The calls of bare name `name`, grouped by the scope that binds the
     /// name at each call. Built once per name.
-    fn name_calls(&mut self, name: &str) -> Rc<HashMap<usize, Rc<[(Node<'t>, usize)]>>> {
+    fn name_calls(&mut self, name: &str) -> CallIndex<'t> {
         if let Some(index) = self.name_call_index.get(name) {
             return Rc::clone(index);
         }
@@ -3001,7 +3007,7 @@ impl<'t> Ctx<'t> {
                 grouped.entry(home).or_default().push((call, call_scope));
             }
         }
-        let index: Rc<HashMap<usize, Rc<[(Node<'t>, usize)]>>> = Rc::new(
+        let index: CallIndex<'t> = Rc::new(
             grouped
                 .into_iter()
                 .map(|(home, calls)| (home, Rc::from(calls)))
