@@ -420,8 +420,8 @@ def openai_dated(recipe: dict) -> tuple[list, list]:
         outcome = str(live.get("outcome", ""))
         if value.get("basis") == "models_api":
             notes.append(
-                f"OpenAI's models API gives this alias shutdown date {human_date(date)} "
-                f"(checked {human_date(verified_on)}); it serves {value['default_snapshot']} until then."
+                f"{model} is an alias: OpenAI's deprecations page does not list it, but its models API "
+                f"gives it shutdown date {human_date(date)} (checked {human_date(verified_on)})."
             )
         elif value.get("kind") == "listed_variant" and "404" in outcome:
             status = "shut_down"
