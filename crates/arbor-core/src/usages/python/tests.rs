@@ -2646,7 +2646,12 @@ def uncalled(q, c=client):
             // Private: every call is in the file.
             (13, Routing::CustomBaseUrl, vec![]),
             (16, Routing::OpenaiDirect, vec![]),
-            (25, Routing::OpenaiDirect, vec![]),
+            // Public with no caller here: other modules may pass another.
+            (
+                25,
+                Routing::OpenaiDirect,
+                vec!["ambiguous_client/parameter_default".to_string()]
+            ),
         ]
     );
     // A caller passing an unknown client, or `**kwargs`, leaves the
@@ -3217,4 +3222,162 @@ def run_d():
         .map(|v| v.value.as_str())
         .collect();
     assert_eq!(listed, vec!["gpt-4o", "o1-mini"]);
+}
+
+#[test]
+fn a_function_used_as_a_value_keeps_a_gap_on_its_defaults() {
+    // Only direct calls were read, so a default overridden through an
+    // executor, `functools.partial`, `map`, a callback or a task queue
+    // reported `gpt-4o` (or the default's routing) with no gap.
+    let found = usages(
+        r#"import functools
+from concurrent.futures import ThreadPoolExecutor
+from openai import OpenAI
+client = OpenAI()
+gw = OpenAI(base_url="https://gw.example/v1")
+def ask5(q, model="gpt-4o"):
+    return client.chat.completions.create(model=model, messages=[q])
+with ThreadPoolExecutor() as pool:
+    pool.submit(ask5, "hi", "o1-mini")
+def ask6(q, model="gpt-4o"):
+    return client.chat.completions.create(model=model, messages=[q])
+fast6 = functools.partial(ask6, model="o1-mini")
+def ask7(q, model="gpt-4o"):
+    return client.chat.completions.create(model=model, messages=[q])
+list(map(ask7, ["a", "b"], ["o1-mini", "o3-mini"]))
+def _ask8(q, model="gpt-4o"):
+    return client.chat.completions.create(model=model, messages=[q])
+callbacks = {"fast": lambda q: _ask8(q, model="o1-mini"), "slow": _ask8}
+def task(f):
+    return f
+@task
+def ask9(q, model="gpt-4o"):
+    return client.chat.completions.create(model=model, messages=[q])
+ask9.delay("hi", model="o1-mini")
+def ask10(q, c=client):
+    return c.chat.completions.create(model="gpt-4", messages=[q])
+via_gw = functools.partial(ask10, c=gw)
+def _ask11(q, c=client):
+    return c.chat.completions.create(model="gpt-4", messages=[q])
+_ask11("x")
+def ask12(q, model="gpt-4o"):
+    return client.chat.completions.create(model=model, messages=[q])
+ask12("x")
+"#,
+    );
+    let rows: Vec<(u32, String, Vec<String>)> = values_and_gaps(&found);
+    let unseen = || vec!["unseen_callers".to_string()];
+    assert_eq!(
+        rows,
+        vec![
+            (7, "gpt-4o".to_string(), unseen()),
+            (11, "gpt-4o".to_string(), unseen()),
+            (14, "gpt-4o".to_string(), unseen()),
+            (17, "gpt-4o".to_string(), unseen()),
+            (23, "gpt-4o".to_string(), unseen()),
+            (26, "gpt-4".to_string(), unseen()),
+            // Private and called only directly: the default holds.
+            (29, "gpt-4".to_string(), vec![]),
+            // Public, called here only without the argument.
+            (32, "gpt-4o".to_string(), vec![]),
+        ]
+    );
+    // The values the visible calls pass are listed with the gap.
+    let listed: Vec<&str> = found
+        .gaps
+        .iter()
+        .find(|g| g.span.unwrap().line == 17)
+        .unwrap()
+        .values
+        .iter()
+        .map(|v| v.value.as_str())
+        .collect();
+    assert_eq!(listed, vec!["o1-mini"]);
+    // The client default keeps its routing, with the gap beside it.
+    assert_eq!(
+        routes_and_gaps(&found)[5],
+        (
+            26,
+            Routing::OpenaiDirect,
+            vec!["ambiguous_client/unseen_callers".to_string()]
+        )
+    );
+}
+
+#[test]
+fn a_method_default_is_weighed_against_calls_on_any_object() {
+    // Calls on an instance (`bot.ask(...)`) were not read, so the method's
+    // default was reported with no gap.
+    let found = usages(
+        r#"from openai import OpenAI
+client = OpenAI()
+class Bot:
+    def ask(self, q, model="gpt-4o"):
+        return client.chat.completions.create(model=model, messages=[q])
+    def plain(self, q, model="gpt-4o"):
+        return client.chat.completions.create(model=model, messages=[q])
+bot = Bot()
+bot.ask("hi", model="o1-mini")
+bot.plain("hi")
+"#,
+    );
+    assert_eq!(
+        values_and_gaps(&found),
+        vec![
+            (
+                5,
+                "gpt-4o".to_string(),
+                vec!["parameter_overridden".to_string()]
+            ),
+            (7, "gpt-4o".to_string(), vec![]),
+        ]
+    );
+}
+
+#[test]
+fn init_defaults_are_weighed_against_constructor_calls() {
+    // Building a class was not counted as calling its `__init__`, so a
+    // default stored on `self` reported `gpt-4o` and the default client
+    // `openai_direct` while the constructor call passed another.
+    let found = usages(
+        r#"from openai import OpenAI
+client = OpenAI()
+class Agent:
+    def __init__(self, model="gpt-4o"):
+        self.model = model
+    def run(self):
+        return client.chat.completions.create(model=self.model, messages=[])
+Agent(model="o1-mini").run()
+class Svc2:
+    def __init__(self, c=client):
+        self.c = c
+    def go(self):
+        return self.c.chat.completions.create(model="gpt-4", messages=[])
+Svc2(OpenAI(base_url="https://gw.example/v1")).go()
+class Quiet:
+    def __init__(self, model="gpt-4o"):
+        self.model = model
+    def run(self):
+        return client.chat.completions.create(model=self.model, messages=[])
+q: Quiet = Quiet()
+"#,
+    );
+    assert_eq!(
+        values_and_gaps(&found),
+        vec![
+            (
+                7,
+                "gpt-4o".to_string(),
+                vec!["parameter_overridden".to_string()]
+            ),
+            (
+                13,
+                "gpt-4".to_string(),
+                vec!["multiple_assignments".to_string()]
+            ),
+            // Built here without the argument (an annotation is not a use).
+            (19, "gpt-4o".to_string(), vec![]),
+        ]
+    );
+    assert_eq!(found.calls[1].routing, Routing::Unknown);
 }

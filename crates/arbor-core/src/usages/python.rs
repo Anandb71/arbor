@@ -36,9 +36,13 @@
 //! there the routing keeps an `ambiguous_client` gap (`in_file_callers`);
 //! a nested or `_private` function, or any function in a script, is called
 //! only from its file. A client default is combined with what the callers
-//! pass, and with itself for a public function. A model parameter default
-//! that an in-file caller overrides keeps a `parameter_overridden` gap
-//! listing the values the callers pass.
+//! pass, and with itself for a public function, which keeps a
+//! `parameter_default` gap. The calls of `__init__` are the calls of its
+//! class; a method's are every call of its name, on any object. A function
+//! whose calls cannot all be seen (it is decorated, passed, stored or bound
+//! twice) keeps an `unseen_callers` gap on a client or model default. A
+//! model parameter default that an in-file caller overrides keeps a
+//! `parameter_overridden` gap listing the values the callers pass.
 
 use super::{
     is_capturable_value, is_credential_value, is_identifier_key, is_secret_key, is_value_key,
@@ -504,6 +508,11 @@ enum ClientCaveat {
     /// Every in-file caller of a function passes this client for
     /// parameter `param`, but other modules may call it with another.
     InFileCallers { param: String },
+    /// The client is the default of parameter `param`: other modules may
+    /// call the (public) function with another one, or (`unseen`) the
+    /// function is decorated, passed or stored, so callers this file does
+    /// not show may.
+    ParameterDefault { param: String, unseen: bool },
     /// `client.base_url = ...` after the client is built.
     BaseUrlAssigned,
     /// The file sets an environment variable the SDK reads its endpoint
@@ -666,6 +675,9 @@ impl Unresolved {
             "unbound" => "not defined in this file",
             "splat" => "possibly passed through **kwargs",
             "parameter_overridden" => "a parameter that in-file callers set to other values",
+            "unseen_callers" => {
+                "a parameter of a function that is decorated, passed or stored, so callers this file does not show may set it"
+            }
             "credential" => {
                 "credential-shaped (a secret-like name or value), so it is never captured"
             }
@@ -956,13 +968,6 @@ struct ConfigAssign<'t> {
     scope: usize,
 }
 
-/// Calls of a method name on `self`/`cls`, by calling class.
-struct MethodCalls<'t> {
-    /// Some call is on another object.
-    foreign: bool,
-    by_class: HashMap<usize, CallSites<'t>>,
-}
-
 /// Calls and the scope each is in.
 type CallSites<'t> = Rc<[(Node<'t>, usize)]>;
 
@@ -1117,6 +1122,9 @@ struct CallerModels {
     /// Some caller passes a value that does not resolve, passes it through
     /// `*args`/`**kwargs`, or was not read.
     unknown: bool,
+    /// Some calls cannot be seen: the function is decorated, passed,
+    /// stored or bound more than once (see [`Ctx::visible_calls`]).
+    unseen: bool,
 }
 
 /// How a call passes one parameter (see [`Ctx::param_slot`]).
@@ -1210,7 +1218,7 @@ struct Ctx<'t> {
     /// collect its own, so the work stays linear.
     collecting: u32,
     name_call_index: HashMap<String, CallIndex<'t>>,
-    method_call_index: HashMap<String, Rc<MethodCalls<'t>>>,
+    method_call_index: HashMap<String, CallSites<'t>>,
     /// Resolutions in progress: (kind, scope or id, name).
     visiting: HashSet<(u8, usize, String)>,
     /// Current nesting of name resolutions, and how many were cut off at
@@ -1582,6 +1590,8 @@ impl<'t> Ctx<'t> {
                     .push((parent, scope));
                 return;
             }
+            // An annotation names a type; it does not pass the value on.
+            ("type", _) => true,
             _ => is_declaration(parent.kind(), frame.field),
         };
         if !declaration {
@@ -3191,11 +3201,24 @@ impl<'t> Ctx<'t> {
         if let Some(val) = self.param_from_callers(scope, name, default_client.clone()) {
             return val;
         }
-        default_client.unwrap_or_else(|| {
-            Val::untracked(Origin::Parameter {
+        match default_client {
+            // No in-file call passes the argument, or the calls cannot all
+            // be seen: the default holds only where nobody else calls.
+            Some(Val::Client { mut client, path }) => {
+                let unseen = self.calls_of(scope).is_none();
+                if (unseen || !self.is_private(scope)) && client.caveat.is_none() {
+                    client.caveat = Some(ClientCaveat::ParameterDefault {
+                        param: name.to_string(),
+                        unseen,
+                    });
+                }
+                Val::Client { client, path }
+            }
+            Some(other) => other,
+            None => Val::untracked(Origin::Parameter {
                 name: name.to_string(),
-            })
-        })
+            }),
+        }
     }
 
     /// What the in-file calls of `func` pass for parameter `name`, memoized.
@@ -3244,12 +3267,24 @@ impl<'t> Ctx<'t> {
         let private = self.is_private(func);
         if let Some(default) = default_client {
             // Other modules may call a public function without the
-            // argument, so its default stays possible.
+            // argument, so its default stays possible, and with another
+            // client, so the result keeps a gap.
             let mut all = vals;
             if !private {
                 all.push(default);
             }
-            return Some(combine(all));
+            return Some(match combine(all) {
+                Val::Client { mut client, path } if !private => {
+                    if !client.ambiguous && client.caveat.is_none() {
+                        client.caveat = Some(ClientCaveat::ParameterDefault {
+                            param: name.to_string(),
+                            unseen: false,
+                        });
+                    }
+                    Val::Client { client, path }
+                }
+                other => other,
+            });
         }
         let first = vals.first()?.clone();
         let agree = vals.iter().all(|v| *v == first);
@@ -3279,6 +3314,9 @@ impl<'t> Ctx<'t> {
     fn caller_vals(&mut self, func: usize, name: &str) -> Option<Vec<Val>> {
         let slot = self.param_slot(func, name)?;
         let calls = self.calls_of(func)?;
+        if calls.len() > MAX_CALLERS_READ {
+            return None;
+        }
         let default = self
             .params
             .get(&(func, name.to_string()))
@@ -3343,18 +3381,31 @@ impl<'t> Ctx<'t> {
     }
 
     /// Every in-file call of function or method `func`, or `None` when some
-    /// may not be seen: it is decorated or a lambda not assigned to a plain
-    /// name, its name is used as a value or bound more than once, or (for a
-    /// method) it is called on something other than `self`/`cls` of its
-    /// class. Calls are indexed by binding scope (by class for methods) once
-    /// per name, so a file with thousands of same-named functions stays
-    /// linear.
+    /// may not be seen (see [`Self::visible_calls`]).
     fn calls_of(&mut self, func: usize) -> Option<CallSites<'t>> {
+        match self.visible_calls(func) {
+            Some((calls, true)) => Some(calls),
+            _ => None,
+        }
+    }
+
+    /// The in-file calls of function or method `func` that can be seen, and
+    /// whether they are all of its calls. They are not when it is
+    /// decorated, its name is used as a value (passed, stored, partially
+    /// applied, `ask.delay(...)`) or bound more than once; `None` for a
+    /// comprehension or a lambda not assigned to a plain name, which is
+    /// never called by name. A method's calls are every call of its name on
+    /// any object (a superset: an unrelated method of the same name only
+    /// adds candidates), and `__init__`'s are the calls of its class. Calls
+    /// are indexed once per name (by binding scope for functions), so a file
+    /// with thousands of same-named functions stays linear.
+    fn visible_calls(&mut self, func: usize) -> Option<(CallSites<'t>, bool)> {
         let scope = &self.scopes[func];
-        if scope.decorated || scope.comprehension {
+        if scope.comprehension {
             return None;
         }
         let lambda = scope.lambda;
+        let decorated = scope.decorated;
         let fname = if lambda {
             scope.bound_name.clone()?
         } else {
@@ -3363,23 +3414,19 @@ impl<'t> Ctx<'t> {
         let parent = scope.parent?;
         let empty = || Rc::from(Vec::new());
         if self.scopes[parent].kind == ScopeKind::Class {
-            if lambda || self.attr_uses.get(fname.as_str())?.escapes {
+            if lambda {
                 return None;
             }
-            let index = self.method_calls(&fname);
-            if index.foreign {
-                return None;
+            if fname == "__init__" {
+                let (calls, all) = self.constructor_calls(parent);
+                return Some((calls, all && !decorated));
             }
-            return match index.by_class.len() {
-                0 => Some(empty()),
-                1 => match index.by_class.get(&parent) {
-                    Some(calls) => Some(Rc::clone(calls)),
-                    // Only another class calls a method of this name on
-                    // `self`: it may inherit this one.
-                    None => None,
-                },
-                _ => None,
-            };
+            let escapes = self
+                .attr_uses
+                .get(fname.as_str())
+                .is_some_and(|uses| uses.escapes);
+            let calls = self.method_calls(&fname);
+            return Some((calls, !escapes && !decorated));
         }
         let home = self.import_home(parent, &fname);
         let key = (home, fname.clone());
@@ -3392,11 +3439,38 @@ impl<'t> Ctx<'t> {
             && !self.imports.contains_key(&key)
             && !self.other_imports.contains_key(&key)
             && !self.params.contains_key(&key);
-        if !only_def || self.name_uses.get(fname.as_str())?.escapes {
-            return None;
-        }
+        let escapes = self
+            .name_uses
+            .get(fname.as_str())
+            .is_some_and(|uses| uses.escapes);
         let index = self.name_calls(&fname);
-        Some(index.get(&home).map_or_else(empty, Rc::clone))
+        let calls = index.get(&home).map_or_else(empty, Rc::clone);
+        Some((calls, only_def && !escapes && !decorated))
+    }
+
+    /// The calls that run `__init__` of `class`: calls of the class name
+    /// where it binds to this class. They are all of them only when the
+    /// class is the one class of that name, its name is bound nowhere else
+    /// and is never used as a value (subclassed, passed, stored, its
+    /// `__init__` called explicitly).
+    fn constructor_calls(&mut self, class: usize) -> (CallSites<'t>, bool) {
+        let name = self.scopes[class].name.clone();
+        let Some(parent) = self.scopes[class].parent else {
+            return (Rc::from(Vec::new()), false);
+        };
+        let home = self.import_home(parent, &name);
+        let key = (home, name.clone());
+        let unique =
+            self.classes_by_name.get(&name).map_or(0, Vec::len) == 1 && !self.binds(home, &name);
+        let escapes = self
+            .name_uses
+            .get(name.as_str())
+            .is_some_and(|uses| uses.escapes);
+        let index = self.name_calls(&key.1);
+        let calls = index
+            .get(&home)
+            .map_or_else(|| Rc::from(Vec::new()), Rc::clone);
+        (calls, unique && !escapes)
     }
 
     /// The calls of bare name `name`, grouped by the scope that binds the
@@ -3423,41 +3497,18 @@ impl<'t> Ctx<'t> {
         index
     }
 
-    /// The calls of method name `name` on `self`/`cls`, grouped by the
-    /// calling class. Built once per name.
-    fn method_calls(&mut self, name: &str) -> Rc<MethodCalls<'t>> {
-        if let Some(index) = self.method_call_index.get(name) {
-            return Rc::clone(index);
+    /// Every call of method name `name`, on any object. Built once per name.
+    fn method_calls(&mut self, name: &str) -> CallSites<'t> {
+        if let Some(calls) = self.method_call_index.get(name) {
+            return Rc::clone(calls);
         }
-        let mut foreign = false;
-        let mut grouped: HashMap<usize, Vec<(Node<'t>, usize)>> = HashMap::new();
-        if let Some(uses) = self.attr_uses.get(name) {
-            for &(call, call_scope) in &uses.calls {
-                let object = call
-                    .child_by_field_name("function")
-                    .and_then(|f| f.child_by_field_name("object"));
-                let class = self.scopes[call_scope].class;
-                match (object, class) {
-                    (Some(object), Some(class))
-                        if object.kind() == "identifier"
-                            && matches!(self.text(object), "self" | "cls") =>
-                    {
-                        grouped.entry(class).or_default().push((call, call_scope));
-                    }
-                    _ => foreign = true,
-                }
-            }
-        }
-        let index = Rc::new(MethodCalls {
-            foreign,
-            by_class: grouped
-                .into_iter()
-                .map(|(class, calls)| (class, Rc::from(calls)))
-                .collect(),
-        });
+        let calls: CallSites<'t> = match self.attr_uses.get(name) {
+            Some(uses) => Rc::from(uses.calls.as_slice()),
+            None => Rc::from(Vec::new()),
+        };
         self.method_call_index
-            .insert(name.to_string(), Rc::clone(&index));
-        index
+            .insert(name.to_string(), Rc::clone(&calls));
+        calls
     }
 
     fn assign_value(&mut self, assign: Assign<'t>) -> Val {
@@ -4261,6 +4312,18 @@ impl<'t> Ctx<'t> {
                         "the receiver of `{chain}` is parameter `{param}`: every caller in this file passes the same client, but other modules may call the function with another one"
                     ),
                 ),
+                ClientCaveat::ParameterDefault { param, unseen: false } => (
+                    "parameter_default",
+                    format!(
+                        "the receiver of `{chain}` is the default of parameter `{param}`, but other modules may call the function with another client"
+                    ),
+                ),
+                ClientCaveat::ParameterDefault { param, unseen: true } => (
+                    "unseen_callers",
+                    format!(
+                        "the receiver of `{chain}` is the default of parameter `{param}`, but the function is decorated, passed or stored, so a caller this file does not show may pass another client"
+                    ),
+                ),
                 ClientCaveat::BaseUrlAssigned => (
                     "base_url_assigned",
                     format!(
@@ -4432,6 +4495,15 @@ impl<'t> Ctx<'t> {
                     "; its default is captured with origin `{}` and the values callers pass are listed",
                     origin.as_str()
                 ));
+            }
+            Some(origin) if unresolved.reason == "unseen_callers" => {
+                detail.push_str(&format!(
+                    "; its default is captured with origin `{}`",
+                    origin.as_str()
+                ));
+                if !unresolved.candidates.is_empty() {
+                    detail.push_str(", and other values in-file calls pass are listed");
+                }
             }
             Some(_) => {
                 detail.push_str("; its literal fallback is captured with origin `env_default`");
@@ -5067,7 +5139,9 @@ impl<'t> Ctx<'t> {
             return Rc::new(CallerModels::default());
         }
         let mut models = CallerModels::default();
-        if let (Some(slot), Some(calls)) = (self.param_slot(func, name), self.calls_of(func)) {
+        let visible = self.visible_calls(func);
+        models.unseen = !matches!(visible, Some((_, true)));
+        if let (Some(slot), Some((calls, _))) = (self.param_slot(func, name), visible) {
             let keyword = slot.keyword.then_some(name);
             self.collecting += 1;
             for (i, &(call, call_scope)) in calls.iter().enumerate() {
@@ -5092,7 +5166,9 @@ impl<'t> Ctx<'t> {
     }
 
     /// A `parameter_overridden` caveat when an in-file call passes `name`
-    /// a value other than its `default` (or one that does not resolve).
+    /// a value other than its `default` (or one that does not resolve), and
+    /// an `unseen_callers` one when some calls of the function cannot be
+    /// seen (it is decorated, passed, stored or bound twice).
     fn overridden(&mut self, func: usize, name: &str, default: &str) -> Option<Unresolved> {
         let passed = self.caller_models(func, name);
         let others: Vec<Resolved> = passed
@@ -5101,10 +5177,14 @@ impl<'t> Ctx<'t> {
             .filter(|r| r.value != default)
             .cloned()
             .collect();
-        if others.is_empty() && !passed.unknown {
+        let reason = if passed.unseen {
+            "unseen_callers"
+        } else if !others.is_empty() || passed.unknown {
+            "parameter_overridden"
+        } else {
             return None;
-        }
-        Some(Unresolved::new("parameter_overridden", name.to_string()).with_candidates(others))
+        };
+        Some(Unresolved::new(reason, name.to_string()).with_candidates(others))
     }
 
     /// The assignments of `name` that reach a use at byte `pos` of `scope`,
