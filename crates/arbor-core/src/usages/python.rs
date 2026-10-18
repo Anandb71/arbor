@@ -17,11 +17,13 @@
 //! Names resolve the way Python scopes them, approximately: function and
 //! lambda locals, parameters and imports shadow enclosing functions, class
 //! bodies are skipped from inside methods, comprehensions have their own
-//! scope, and `global` re-homes an assignment to the module. A use sees its
+//! scope, `global` re-homes an assignment to the module and `nonlocal` to
+//! the enclosing function that binds the name. A use sees its
 //! reaching definitions: the nearest definition that dominates it in
 //! straight-line code, every definition between that one and the use (in a
 //! branch), later ones in a loop that runs the use again without passing
-//! the dominating one, and `global` assignments made by functions. Class
+//! the dominating one, and `global` or `nonlocal` assignments made by
+//! nested or other functions, which may run at any time. Class
 //! bodies and list, set and dict comprehensions run where they are written,
 //! so their uses are placed there. A use from a function, lambda or
 //! generator sees what reaches its definition plus every later definition,
@@ -250,6 +252,7 @@ pub fn extract(tree: &Tree, source: &str, file_path: &str) -> FileUsages {
     }
     let mut cx = Ctx::new(source, file_path);
     cx.collect(tree.root_node());
+    cx.place_nonlocal_assigns();
     cx.index_definitions();
     cx.settle_dict_escapes();
     cx.analyze();
@@ -800,6 +803,8 @@ struct Scope {
     /// For a class or function: its own name.
     name: String,
     globals: HashSet<String>,
+    /// Names declared `nonlocal` in this function.
+    nonlocals: HashSet<String>,
     /// For a class: base class names as written.
     bases: Vec<String>,
     /// Byte range of the scope's node.
@@ -832,6 +837,7 @@ impl Scope {
             symbol: None,
             name: String::new(),
             globals: HashSet::new(),
+            nonlocals: HashSet::new(),
             bases: Vec::new(),
             start,
             end,
@@ -1148,6 +1154,9 @@ struct Ctx<'t> {
     sdk_imported: HashSet<Sdk>,
     assigns: HashMap<Key, Vec<Assign<'t>>>,
     attr_assigns: HashMap<Key, Vec<Assign<'t>>>,
+    /// Assignments to a `nonlocal` name, by the declaring function: placed
+    /// in the scope that binds the name once every binding is known.
+    nonlocal_assigns: Vec<(usize, String, Assign<'t>)>,
     params: HashMap<Key, Param<'t>>,
     /// Function definitions, keyed by the scope their name binds in.
     functions: HashMap<Key, Vec<usize>>,
@@ -1254,6 +1263,7 @@ impl<'t> Ctx<'t> {
             sdk_imported: HashSet::new(),
             assigns: HashMap::new(),
             attr_assigns: HashMap::new(),
+            nonlocal_assigns: Vec::new(),
             params: HashMap::new(),
             functions: HashMap::new(),
             classes_by_name: HashMap::new(),
@@ -1464,11 +1474,17 @@ impl<'t> Ctx<'t> {
                             self.record_target(name, value, None, home, false, place);
                         }
                     }
-                    "global_statement" => {
+                    "global_statement" | "nonlocal_statement" => {
                         if self.scopes[scope].kind == ScopeKind::Function {
+                            let global = node.kind() == "global_statement";
                             for name in named_children(node) {
                                 let name = self.text(name).to_string();
-                                self.scopes[scope].globals.insert(name);
+                                let declared = &mut self.scopes[scope];
+                                if global {
+                                    declared.globals.insert(name);
+                                } else {
+                                    declared.nonlocals.insert(name);
+                                }
                             }
                         }
                     }
@@ -2231,10 +2247,13 @@ impl<'t> Ctx<'t> {
         match target.kind() {
             "identifier" => {
                 let name = self.text(target).to_string();
-                let home = if self.scopes[scope].kind == ScopeKind::Function
-                    && self.scopes[scope].globals.contains(&name)
+                let current = &self.scopes[scope];
+                let home = if current.kind == ScopeKind::Function && current.globals.contains(&name)
                 {
                     0
+                } else if current.kind == ScopeKind::Function && current.nonlocals.contains(&name) {
+                    self.nonlocal_assigns.push((scope, name, assign));
+                    return;
                 } else {
                     scope
                 };
@@ -2303,11 +2322,22 @@ impl<'t> Ctx<'t> {
     /// module-level.
     fn import_home(&self, scope: usize, name: &str) -> usize {
         let current = &self.scopes[scope];
-        if current.kind == ScopeKind::Function && !current.globals.contains(name) {
-            scope
-        } else {
-            0
+        if current.kind != ScopeKind::Function || current.globals.contains(name) {
+            return 0;
         }
+        if current.nonlocals.contains(name) {
+            // `nonlocal x` then `import x` / `def x()`: the enclosing
+            // function's binding.
+            let mut parent = current.parent;
+            while let Some(p) = parent {
+                match self.scopes[p].kind {
+                    ScopeKind::Function => return p,
+                    ScopeKind::Module => return 0,
+                    ScopeKind::Class => parent = self.scopes[p].parent,
+                }
+            }
+        }
+        scope
     }
 
     fn other_import(&mut self, scope: usize, local: String, module: &Rc<str>, place: Place) {
@@ -2542,6 +2572,36 @@ impl<'t> Ctx<'t> {
             file: self.file.clone(),
             span,
         });
+    }
+
+    /// Moves each assignment to a `nonlocal` name into the nearest
+    /// enclosing function that binds the name (Python's rule), or the
+    /// nearest enclosing function when none does. Its value expression
+    /// stays in the nested function, so it reaches every use there as a
+    /// definition that may run at any time.
+    fn place_nonlocal_assigns(&mut self) {
+        for (declared, name, assign) in std::mem::take(&mut self.nonlocal_assigns) {
+            let mut nearest = None;
+            let mut home = None;
+            let mut current = self.scopes[declared].parent;
+            while let Some(s) = current {
+                let scope = &self.scopes[s];
+                match scope.kind {
+                    ScopeKind::Module => break,
+                    ScopeKind::Class => {}
+                    ScopeKind::Function => {
+                        nearest.get_or_insert(s);
+                        if !scope.nonlocals.contains(&name) && self.binds(s, &name) {
+                            home = Some(s);
+                            break;
+                        }
+                    }
+                }
+                current = scope.parent;
+            }
+            let home = home.or(nearest).unwrap_or(declared);
+            self.assigns.entry((home, name)).or_default().push(assign);
+        }
     }
 
     /// Orders every name's definitions by position, for reaching-definition

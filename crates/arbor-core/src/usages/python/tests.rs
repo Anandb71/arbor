@@ -3129,3 +3129,92 @@ fn imports_stay_bounded_however_many_names_a_statement_binds() {
     assert!(found.imports.len() < 5_000, "{}", found.imports.len());
     assert_eq!(found.gaps.len(), 1);
 }
+
+#[test]
+fn a_nonlocal_rebinding_reaches_the_enclosing_function() {
+    // `nonlocal` was ignored, so the nested assignment bound a name of its
+    // own and the enclosing call reported `gpt-4o` and an `openai_direct`
+    // client with no gap.
+    let found = usages(
+        r#"from openai import OpenAI, AzureOpenAI
+client = OpenAI()
+def run_a():
+    c = OpenAI()
+    def switch():
+        nonlocal c
+        c = AzureOpenAI()
+    switch()
+    return c.chat.completions.create(model="gpt-4o", messages=[])
+def run_b():
+    model = "gpt-4o"
+    def pick():
+        nonlocal model
+        model = "o1-mini"
+    pick()
+    return client.chat.completions.create(model=model, messages=[])
+def run_c():
+    model = "gpt-4o"
+    def middle():
+        nonlocal model
+        def inner():
+            nonlocal model
+            model = "o3-mini"
+        inner()
+    middle()
+    return client.chat.completions.create(model=model, messages=[])
+def run_d():
+    model = "gpt-4o"
+    def reader():
+        return client.chat.completions.create(model=model, messages=[])
+    return reader()
+"#,
+    );
+    let rows: Vec<(u32, Routing, String, Vec<String>)> = found
+        .calls
+        .iter()
+        .map(|c| {
+            let reasons = found
+                .gaps
+                .iter()
+                .filter(|g| g.span.map(|s| s.start_byte) == Some(c.span.start_byte))
+                .map(|g| g.reason.clone())
+                .collect();
+            let model = value(c, "model").unwrap_or("-").to_string();
+            (c.span.line, c.routing, model, reasons)
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                9,
+                Routing::Unknown,
+                "gpt-4o".to_string(),
+                vec!["multiple_assignments".to_string()]
+            ),
+            (
+                16,
+                Routing::OpenaiDirect,
+                "-".to_string(),
+                vec!["reassigned".to_string()]
+            ),
+            (
+                26,
+                Routing::OpenaiDirect,
+                "-".to_string(),
+                vec!["reassigned".to_string()]
+            ),
+            // No `nonlocal`: the nested function only reads.
+            (30, Routing::OpenaiDirect, "gpt-4o".to_string(), vec![]),
+        ]
+    );
+    let listed: Vec<&str> = gaps(&found, GapKind::UnresolvedModel)
+        .iter()
+        .find(|g| g.span.unwrap().line == 16)
+        .unwrap()
+        .values
+        .iter()
+        .map(|v| v.value.as_str())
+        .collect();
+    assert_eq!(listed, vec!["gpt-4o", "o1-mini"]);
+}
