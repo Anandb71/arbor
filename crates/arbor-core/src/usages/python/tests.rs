@@ -3900,3 +3900,35 @@ class Bot:
         )]
     );
 }
+
+#[test]
+fn writes_and_lookups_through_dunders_and_the_module_object_are_seen() {
+    // `object.__setattr__(self, ...)`, `super().__setattr__(...)` and
+    // `sys.modules[__name__].M = ...` wrote what a call reads without
+    // being counted; `getattr(bot, "ask")(...)` called a method with an
+    // argument no caller showed.
+    let header = "import sys\nfrom openai import OpenAI\nclient = OpenAI()\n";
+    for body in [
+        "class A:\n    model = \"gpt-4o\"\n    def fast(self):\n        object.__setattr__(self, \"model\", \"o1-mini\")\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n",
+        "class A:\n    model = \"gpt-4o\"\n    def fast(self):\n        super().__setattr__(\"model\", \"o1-mini\")\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n",
+        "class A:\n    model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\na = A()\na.__setattr__(\"model\", \"o1-mini\")\n",
+        "M = \"gpt-4o\"\ndef tune():\n    sys.modules[__name__].M = \"o1-mini\"\nclient.chat.completions.create(model=M, messages=[])\n",
+        "M = \"gpt-4o\"\ndef tune():\n    setattr(sys.modules[__name__], \"M\", \"o1-mini\")\nclient.chat.completions.create(model=M, messages=[])\n",
+    ] {
+        let rows = rows_of(&format!("{header}{body}"));
+        assert_eq!(rows.len(), 1, "{body}");
+        assert_eq!(rows[0].1, "-", "{body}");
+        assert_eq!(rows[0].2, vec!["reassigned".to_string()], "{body}");
+    }
+    for body in [
+        "class Bot:\n    def ask(self, q, model=\"gpt-4o\"):\n        return client.chat.completions.create(model=model, messages=[q])\nbot = Bot()\ngetattr(bot, \"ask\")(\"hi\", model=\"o1-mini\")\n",
+        "class Bot:\n    def ask(self, q, model=\"gpt-4o\"):\n        return client.chat.completions.create(model=model, messages=[q])\nbot = Bot()\ngetattr(bot, action)(\"hi\", model=\"o1-mini\")\n",
+        "def ask(q, model=\"gpt-4o\"):\n    return client.chat.completions.create(model=model, messages=[q])\nglobals()[\"ask\"](\"hi\", model=\"o1-mini\")\n",
+        "def ask(q, model=\"gpt-4o\"):\n    return client.chat.completions.create(model=model, messages=[q])\nglobals()[name](\"hi\", model=\"o1-mini\")\n",
+    ] {
+        let rows = rows_of(&format!("{header}{body}"));
+        assert_eq!(rows.len(), 1, "{body}");
+        assert_eq!(rows[0].1, "gpt-4o", "{body}");
+        assert_eq!(rows[0].2, vec!["unseen_callers".to_string()], "{body}");
+    }
+}

@@ -1242,6 +1242,11 @@ struct Ctx<'t> {
     /// The objects written that way, for clients re-routed after they are
     /// built.
     wild_attr_objects: Vec<(Node<'t>, usize)>,
+    /// A method or module function may be called by a name known only at
+    /// run time (`getattr(obj, name)(...)`, `globals()[name](...)`): no
+    /// method's (or, for the namespace, no function's) calls are all seen.
+    dynamic_method_calls: bool,
+    dynamic_function_calls: bool,
     calls: Vec<(Node<'t>, usize)>,
     refs: Vec<(Node<'t>, usize)>,
     call_scope: HashMap<usize, usize>,
@@ -1363,6 +1368,8 @@ impl<'t> Ctx<'t> {
             outside_attr_writes: HashMap::new(),
             wild_attr_writes: HashSet::new(),
             wild_attr_objects: Vec::new(),
+            dynamic_method_calls: false,
+            dynamic_function_calls: false,
             calls: Vec::new(),
             refs: Vec::new(),
             call_scope: HashMap::new(),
@@ -1623,6 +1630,7 @@ impl<'t> Ctx<'t> {
                     "subscript" => {
                         self.note_env_read(node);
                         self.note_dict_part(node, &frame, scope);
+                        self.note_namespace_lookup(node);
                     }
                     "parenthesized_expression"
                     | "boolean_operator"
@@ -2579,6 +2587,24 @@ impl<'t> Ctx<'t> {
         assign: Assign<'t>,
         scope: usize,
     ) {
+        // `super().__setattr__(...)` writes the instance.
+        if is_super_call(object, |n| self.text(n)) {
+            if let Some(class) = self.scopes[scope].class {
+                self.attr_assigns
+                    .entry((class, attr.to_string()))
+                    .or_default()
+                    .push(assign);
+                return;
+            }
+        }
+        // `sys.modules[__name__].MODEL = v` rebinds a module-level name.
+        if self.is_module_object(object) {
+            self.assigns
+                .entry((0, attr.to_string()))
+                .or_default()
+                .push(assign);
+            return;
+        }
         if object.kind() == "identifier" {
             let object_name = self.text(object);
             if matches!(object_name, "self" | "cls") {
@@ -2660,26 +2686,125 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// `globals()["ask"]` hands out `ask`; `globals()[name]` may hand out
+    /// any module-level function.
+    fn note_namespace_lookup(&mut self, node: Node<'t>) {
+        if !node
+            .child_by_field_name("value")
+            .is_some_and(|v| is_namespace_call(v, |n| self.text(n)))
+        {
+            return;
+        }
+        match single_subscript(node).and_then(|k| self.plain_literal(k)) {
+            Some(name) => self.name_uses.entry(name).or_default().escapes = true,
+            None => self.dynamic_function_calls = true,
+        }
+    }
+
+    /// `sys.modules[...]`: a module object, taken to be this one.
+    fn is_module_object(&self, node: Node<'t>) -> bool {
+        node.kind() == "subscript" && self.render_links(node, 4) == "sys.modules[...]"
+    }
+
     /// A write to an attribute named only at run time.
     fn note_wild_attr_write(&mut self, object: Node<'t>, scope: usize) {
-        let own = object.kind() == "identifier" && matches!(self.text(object), "self" | "cls");
+        if self.is_module_object(object) {
+            self.dynamic_globals = true;
+            return;
+        }
+        let own = (object.kind() == "identifier" && matches!(self.text(object), "self" | "cls"))
+            || is_super_call(object, |n| self.text(n));
         let class = if own { self.scopes[scope].class } else { None };
         self.wild_attr_writes.insert(class);
         self.wild_attr_objects.push((object, scope));
     }
 
-    /// `setattr(obj, "attr", value)`, `setattr(obj, name, value)`,
-    /// `obj.__dict__.update(...)` and `vars(obj).update(...)`.
+    /// `setattr(obj, "attr", value)`, `setattr(obj, name, value)`, the same
+    /// through `__setattr__`, `obj.__dict__.update(...)`,
+    /// `vars(obj).update(...)`, and `getattr(obj, name)`, which may hand
+    /// out any method.
     fn note_attr_write_call(&mut self, call: Node<'t>, scope: usize, place: Place) {
         let Some(function) = call.child_by_field_name("function") else {
             return;
         };
-        if function.kind() == "identifier" && self.text(function) == "setattr" {
-            let (positional, _) = call_arguments(call, |n| self.text(n));
-            let (Some(&object), Some(&name)) = (positional.first(), positional.get(1)) else {
+        let last = match function.kind() {
+            "identifier" => self.text(function),
+            "attribute" => function
+                .child_by_field_name("attribute")
+                .map(|a| self.text(a))
+                .unwrap_or_default(),
+            _ => return,
+        };
+        // Most calls are none of these: decide before reading arguments.
+        if !matches!(
+            last,
+            "getattr"
+                | "setattr"
+                | "__setattr__"
+                | "update"
+                | "setdefault"
+                | "__setitem__"
+                | "__init__"
+        ) {
+            return;
+        }
+        let (positional, _) = call_arguments(call, |n| self.text(n));
+        if function.kind() == "identifier" && self.text(function) == "getattr" {
+            // A method or function looked up by name may be called with
+            // any arguments.
+            match positional
+                .get(1)
+                .map(|name| (name, self.plain_literal(*name)))
+            {
+                Some((_, Some(name))) => {
+                    self.attr_uses.entry(name).or_default().escapes = true;
+                    self.name_uses.entry(name).or_default().escapes = true;
+                }
+                Some((_, None)) => {
+                    self.dynamic_method_calls = true;
+                    if positional
+                        .first()
+                        .is_some_and(|object| self.is_module_object(*object))
+                    {
+                        self.dynamic_function_calls = true;
+                    }
+                }
+                None => {}
+            }
+            return;
+        }
+        // `setattr(obj, name, v)`, `object.__setattr__(obj, name, v)`,
+        // `obj.__setattr__(name, v)`.
+        let dunder = function.kind() == "attribute"
+            && function
+                .child_by_field_name("attribute")
+                .is_some_and(|a| self.text(a) == "__setattr__");
+        let target = if function.kind() == "identifier" && self.text(function) == "setattr" {
+            Some((
+                positional.first().copied(),
+                positional.get(1),
+                positional.get(2),
+            ))
+        } else if dunder && positional.len() >= 3 {
+            Some((
+                positional.first().copied(),
+                positional.get(1),
+                positional.get(2),
+            ))
+        } else if dunder {
+            Some((
+                function.child_by_field_name("object"),
+                positional.first(),
+                positional.get(1),
+            ))
+        } else {
+            None
+        };
+        if let Some((object, name, value)) = target {
+            let (Some(object), Some(&name)) = (object, name) else {
                 return;
             };
-            let value = positional.get(2).copied();
+            let value = value.copied();
             match self.plain_literal(name) {
                 Some(attr) => {
                     let assign = Assign {
@@ -3929,10 +4054,11 @@ impl<'t> Ctx<'t> {
                 let (calls, all) = self.constructor_calls(parent);
                 return Some((calls, all && !decorated));
             }
-            let escapes = self
-                .attr_uses
-                .get(fname.as_str())
-                .is_some_and(|uses| uses.escapes);
+            let escapes = self.dynamic_method_calls
+                || self
+                    .attr_uses
+                    .get(fname.as_str())
+                    .is_some_and(|uses| uses.escapes);
             let calls = self.method_calls(&fname);
             return Some((calls, !escapes && !decorated));
         }
@@ -3947,10 +4073,11 @@ impl<'t> Ctx<'t> {
             && !self.imports.contains_key(&key)
             && !self.other_imports.contains_key(&key)
             && !self.params.contains_key(&key);
-        let escapes = self
-            .name_uses
-            .get(fname.as_str())
-            .is_some_and(|uses| uses.escapes);
+        let escapes = (self.dynamic_function_calls && home == 0)
+            || self
+                .name_uses
+                .get(fname.as_str())
+                .is_some_and(|uses| uses.escapes);
         let index = self.name_calls(&fname);
         let calls = index.get(&home).map_or_else(empty, Rc::clone);
         Some((calls, only_def && !escapes && !decorated))
@@ -6840,6 +6967,14 @@ fn chain_root_name<'t>(mut node: Node<'t>, text: impl Fn(Node<'t>) -> &'t str) -
         };
     }
     None
+}
+
+/// `super()`.
+fn is_super_call<'t>(node: Node<'t>, text: impl Fn(Node<'t>) -> &'t str) -> bool {
+    node.kind() == "call"
+        && node
+            .child_by_field_name("function")
+            .is_some_and(|f| f.kind() == "identifier" && text(f) == "super")
 }
 
 /// `globals()`, `locals()` or `vars()` with no argument: the namespace
