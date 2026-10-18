@@ -660,7 +660,26 @@ fn log_filter(verbose: bool, long_running: bool, env: Option<String>) -> String 
 }
 
 async fn run() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            use clap::error::ErrorKind;
+            let informational = matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            );
+            // `arbor usages --json` promises JSON on stdout, argument
+            // errors included.
+            if !informational && usages::wants_json(std::env::args_os().skip(1)) {
+                let _ = error.print();
+                usages::print_json_error(&error.render().to_string());
+                std::process::exit(error.exit_code());
+            }
+            error.exit()
+        }
+    };
 
     // Logs go to stderr and never mix with a report on stdout. A one-shot
     // command already says what it did on stdout, so by default it logs only

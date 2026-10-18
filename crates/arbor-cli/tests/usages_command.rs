@@ -122,6 +122,10 @@ fn json_errors_are_json_on_stdout() {
         vec!["usages", "--sdk", "cohere", ".", "--json"],
         vec!["usages", "", "--json"],
         vec!["usages", "does-not-exist", "--json"],
+        // Argument errors from the parser itself.
+        vec!["usages", ".", "--json", "--sdk"],
+        vec!["usages", ".", "extra", "--json"],
+        vec!["-v", "usages", "--json", "--no-such-flag"],
     ] {
         let output = arbor(dir.path(), &args);
         assert!(!output.status.success(), "{args:?}");
@@ -130,6 +134,13 @@ fn json_errors_are_json_on_stdout() {
         assert_eq!(error["version"], 1, "{args:?}");
         assert!(error["error"].as_str().is_some_and(|e| !e.is_empty()));
     }
+    // Help is still help, and other commands keep clap's own errors.
+    let help = arbor(dir.path(), &["usages", "--json", "--help"]);
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage:"));
+    let other = arbor(dir.path(), &["callers", "--json"]);
+    assert!(!other.status.success());
+    assert!(other.stdout.is_empty());
 }
 
 #[test]

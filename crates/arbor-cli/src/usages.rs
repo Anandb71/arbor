@@ -4,7 +4,8 @@
 //! The scan itself lives in [`arbor_watcher::usages`]; this module only
 //! prints it. `--json` prints the full [`UsageReport`] and nothing else on
 //! stdout; when the scan cannot run (a missing or empty path, an unknown
-//! `--sdk`), it prints `{"version", "error"}` instead. Human output escapes
+//! `--sdk`, or an argument the parser rejects), it prints
+//! `{"version", "error"}` instead. Human output escapes
 //! control characters, so a scanned file cannot drive the terminal.
 
 use arbor_core::usages::{is_unsafe_char, CapturedValue, GapKind, Sdk, SdkCall, ValueOrigin};
@@ -54,15 +55,37 @@ pub fn run(path: &str, sdk: Option<&str>, json: bool) -> Result<()> {
 /// object on stdout so a caller parsing stdout always gets JSON.
 fn fail(json: bool, message: String) -> Result<()> {
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "version": arbor_watcher::usages::USAGE_REPORT_VERSION,
-                "error": message,
-            }))?
-        );
+        print_json_error(&message);
     }
     Err(clean(&message).into())
+}
+
+/// Prints `{"version", "error"}` on stdout. A multi-line message (an
+/// argument error with its usage line) keeps its first line.
+pub fn print_json_error(message: &str) {
+    let first = message
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(message);
+    let error = serde_json::json!({
+        "version": arbor_watcher::usages::USAGE_REPORT_VERSION,
+        "error": first.strip_prefix("error: ").unwrap_or(first),
+    });
+    if let Ok(text) = serde_json::to_string_pretty(&error) {
+        println!("{text}");
+    }
+}
+
+/// Whether the command line (without the program name) runs `usages` with
+/// `--json`: global flags may come first, and `--` ends the options.
+pub fn wants_json(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    let mut args = args.into_iter();
+    let command = args.find(|arg| arg == "--" || !arg.to_string_lossy().starts_with('-'));
+    command.is_some_and(|c| c == "usages")
+        && args
+            .take_while(|arg| arg != "--")
+            .any(|arg| arg == "--json")
 }
 
 /// `text` with control and bidirectional-override characters escaped.
