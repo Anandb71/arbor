@@ -3837,3 +3837,18 @@ for m in ("gpt-4o", "o1-mini"):
     let json = serde_json::to_string(gap).unwrap();
     assert!(!json.contains("values_complete"), "{json}");
 }
+
+#[test]
+fn a_repeated_keyword_is_read_once() {
+    // tree-sitter accepts `f(model=A, model=A, ...)` (Python does not):
+    // each copy was resolved again, which made one 4 MiB call take 5.8 s.
+    let mut source = String::from(
+        "import os\nfrom openai import OpenAI\nclient = OpenAI()\nA = os.getenv(\"MODEL\", \"gpt-4o\")\nclient.chat.completions.create(",
+    );
+    source.push_str(&"model=A, ".repeat(30_000));
+    source.push_str("messages=[])\n");
+    let found = usages_within(&source, 10);
+    assert_eq!(found.calls.len(), 1);
+    assert_eq!(found.calls[0].values.len(), 1);
+    assert_eq!(found.gaps.len(), 1);
+}

@@ -1472,6 +1472,8 @@ impl<'t> Ctx<'t> {
             inner_loop: None,
             grand: None,
         }];
+        // One cursor, reset at each node, walks every node's children.
+        let mut cursor = root.walk();
         while let Some(frame) = stack.pop() {
             let node = frame.node;
             let scope = frame.scope;
@@ -1653,21 +1655,31 @@ impl<'t> Ctx<'t> {
             };
             // Punctuation and keywords carry nothing: only named children
             // are walked, which also keeps the stack small on deep chains.
-            for (child, field) in children_with_fields(node).into_iter().rev() {
-                if !child.is_named() {
-                    continue;
+            // They are pushed in order, then that run is reversed, so the
+            // walk stays pre-order without a list per node.
+            let first = stack.len();
+            cursor.reset(node);
+            if cursor.goto_first_child() {
+                loop {
+                    let child = cursor.node();
+                    if child.is_named() {
+                        stack.push(Frame {
+                            node: child,
+                            scope: inner,
+                            parent: Some(node),
+                            field: cursor.field_name(),
+                            block_end,
+                            stmt: child_stmt,
+                            inner_loop: child_loop,
+                            grand: frame.parent,
+                        });
+                    }
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
                 }
-                stack.push(Frame {
-                    node: child,
-                    scope: inner,
-                    parent: Some(node),
-                    field,
-                    block_end,
-                    stmt: child_stmt,
-                    inner_loop: child_loop,
-                    grand: frame.parent,
-                });
             }
+            stack[first..].reverse();
         }
         // The walk is pre-order, so this is already sorted; keep it so.
         self.env_reads.sort_unstable();
@@ -1780,6 +1792,17 @@ impl<'t> Ctx<'t> {
                 let Some(function) = node.child_by_field_name("function") else {
                     return;
                 };
+                // Most calls are something else: decide from the last name
+                // before rendering anything.
+                let last = match function.kind() {
+                    "identifier" => Some(function),
+                    "attribute" => function.child_by_field_name("attribute"),
+                    _ => None,
+                };
+                if !last.is_some_and(|n| matches!(self.text(n), "putenv" | "setdefault" | "update"))
+                {
+                    return;
+                }
                 let (positional, keywords) = call_arguments(node, |n| self.text(n));
                 let callee = self.render_links(function, 4);
                 let method = function
@@ -4787,8 +4810,14 @@ impl<'t> Ctx<'t> {
         let gaps_before = self.out.gaps.len();
         let mut values = Vec::new();
         let mut keyed = false;
+        // A keyword repeated with the same expression (a syntax error
+        // tree-sitter accepts) is read once.
+        let mut read_args: HashSet<(&str, &str)> = HashSet::new();
         for (key, expr) in &args.value_args {
             keyed = true;
+            if !read_args.insert((key.as_str(), self.text(*expr))) {
+                continue;
+            }
             let result = self.resolve_value(*expr, scope, 0);
             self.take_value(&site, key, false, result, &mut values);
         }
@@ -5204,7 +5233,8 @@ impl<'t> Ctx<'t> {
         scope: usize,
         origin: Origin,
     ) {
-        if sdk_shape(&self.render_links(function, 8)).is_none() {
+        // Every SDK shape has a member: a bare name never matches.
+        if function.kind() == "identifier" || sdk_shape(&self.render_links(function, 8)).is_none() {
             return;
         }
         let chain = self.render(function);
@@ -7023,21 +7053,6 @@ fn children(node: Node<'_>) -> Vec<Node<'_>> {
 fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).collect()
-}
-
-/// Every child with the field it fills in `node`.
-fn children_with_fields(node: Node<'_>) -> Vec<(Node<'_>, Option<&'static str>)> {
-    let mut out = Vec::with_capacity(node.child_count());
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            out.push((cursor.node(), cursor.field_name()));
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
-    out
 }
 
 /// Combines every value a binding is given. Placeholders (`None`, literals)
