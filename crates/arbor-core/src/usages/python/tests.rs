@@ -2890,3 +2890,91 @@ client.files.list()
         ]
     );
 }
+
+#[test]
+fn lookups_with_a_run_time_key_list_the_values_they_may_take() {
+    // Track C: `MODELS[os.getenv("TIER")]` was a bare gap. The dict's
+    // values (never one under a secret-named key) are now listed with it,
+    // and so are the values of a name assigned in two branches, through a
+    // parameter default too.
+    let found = usages(
+        r#"import os
+from openai import OpenAI
+client = OpenAI()
+MODELS = {"fast": "gpt-4o-mini", "smart": "o1-mini", "legacy": "gpt-3.5-turbo", "api_key": "hunter2-E3", "dup": "o1-mini"}
+client.chat.completions.create(model=MODELS[os.getenv("TIER")], messages=[])
+tier = input()
+client.chat.completions.create(model=MODELS[tier], messages=[])
+client.chat.completions.create(model=MODELS.get(tier, "gpt-4"), messages=[])
+client.chat.completions.create(model=MODELS.get(tier), messages=[])
+if os.getenv("FAST"):
+    M = "gpt-3.5-turbo-0125"
+else:
+    M = "gpt-4-0613"
+def ask(q, model=M):
+    return client.chat.completions.create(model=model, messages=[q])
+client.chat.completions.create(model=M, messages=[])
+class Bot:
+    def a(self):
+        self.model = "o1-preview"
+    def b(self):
+        self.model = "gpt-4-32k"
+    def go(self):
+        return client.chat.completions.create(model=self.model, messages=[])
+"#,
+    );
+    let json = serde_json::to_string(&found).unwrap();
+    assert!(!json.contains("hunter2"), "{json}");
+    let listed: Vec<(u32, &str, Vec<&str>)> = gaps(&found, GapKind::UnresolvedModel)
+        .iter()
+        .map(|g| {
+            let values = g.values.iter().map(|v| v.value.as_str()).collect();
+            (g.span.unwrap().line, g.reason.as_str(), values)
+        })
+        .collect();
+    let dict = vec!["gpt-4o-mini", "o1-mini", "gpt-3.5-turbo"];
+    let branches = vec!["gpt-3.5-turbo-0125", "gpt-4-0613"];
+    assert_eq!(
+        listed,
+        vec![
+            (5, "env_var", dict.clone()),
+            (7, "subscript", dict.clone()),
+            (8, "function_call", dict.clone()),
+            (9, "function_call", dict),
+            (15, "parameter", branches.clone()),
+            (16, "reassigned", branches),
+            (23, "reassigned", vec!["o1-preview", "gpt-4-32k"]),
+        ]
+    );
+    // Listed values are never the call's own value.
+    let values: Vec<usize> = found.calls.iter().map(|c| c.values.len()).collect();
+    assert_eq!(values, vec![0, 0, 1, 0, 0, 0, 0]);
+    // Each listed value points at its literal.
+    let fast = &gaps(&found, GapKind::UnresolvedModel)[0].values[0];
+    assert_eq!(
+        (fast.span.line, fast.name.as_deref()),
+        (4, Some("MODELS[\"fast\"]"))
+    );
+}
+
+#[test]
+fn listed_values_stay_bounded_per_gap_and_per_file() {
+    // A 2,000-entry dict looked up with a run-time key at 2,000 calls: at
+    // most 16 values per gap and 4,096 per file, read once per dict.
+    let entries: Vec<String> = (0..2_000)
+        .map(|i| format!("\"k{i}\": \"gpt-4-{i}\""))
+        .collect();
+    let mut source = format!(
+        "from openai import OpenAI\nclient = OpenAI()\nD = {{{}}}\n",
+        entries.join(", ")
+    );
+    for _ in 0..2_000 {
+        source.push_str("client.chat.completions.create(model=D[k], messages=[])\n");
+    }
+    let found = usages_within(&source, 10);
+    let per_gap: Vec<usize> = found.gaps.iter().map(|g| g.values.len()).collect();
+    assert!(per_gap.iter().all(|n| *n <= 16));
+    assert_eq!(per_gap.iter().sum::<usize>(), 4_096);
+    let json = serde_json::to_string(&found).unwrap();
+    assert!(json.len() < 8_000_000, "{} bytes", json.len());
+}

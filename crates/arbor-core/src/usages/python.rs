@@ -223,6 +223,9 @@ const MAX_CANDIDATES: usize = 16;
 const MAX_FILE_CANDIDATES: usize = 4096;
 /// In-file calls read for the values a parameter is given.
 const MAX_CALLERS_READ: usize = 256;
+/// Definitions, or dict entries, read for the values a name or a lookup
+/// with a run-time key may take.
+const MAX_CANDIDATE_READS: usize = 64;
 
 /// Extracts SDK usages from a parsed Python file.
 pub fn extract(tree: &Tree, source: &str, file_path: &str) -> FileUsages {
@@ -1163,6 +1166,9 @@ struct Ctx<'t> {
     /// Model values in-file callers pass for a parameter, by (function,
     /// parameter).
     caller_models: HashMap<Key, Rc<CallerModels>>,
+    /// The values a dict literal's entries hold, by node id and the name
+    /// the dict is used through.
+    dict_candidates_memo: HashMap<(usize, Option<String>), Rc<[Resolved]>>,
     /// Candidate values are being collected: a nested lookup does not
     /// collect its own, so the work stays linear.
     collecting: u32,
@@ -1245,6 +1251,7 @@ impl<'t> Ctx<'t> {
             attr_lookup_memo: HashMap::new(),
             caller_memo: HashMap::new(),
             caller_models: HashMap::new(),
+            dict_candidates_memo: HashMap::new(),
             collecting: 0,
             name_call_index: HashMap::new(),
             method_call_index: HashMap::new(),
@@ -4227,7 +4234,10 @@ impl<'t> Ctx<'t> {
                 ));
             }
             Some(_) => {
-                detail.push_str("; its literal fallback is captured with origin `env_default`")
+                detail.push_str("; its literal fallback is captured with origin `env_default`");
+                if !unresolved.candidates.is_empty() {
+                    detail.push_str(", and other values it may take are listed");
+                }
             }
             None if !unresolved.candidates.is_empty() => {
                 detail.push_str("; values it may take are listed")
@@ -4654,10 +4664,26 @@ impl<'t> Ctx<'t> {
                             [assign] => Some(*assign),
                             _ => None,
                         };
-                        return self
-                            .single_constant(only, assigns.len(), ValueOrigin::ClassConstant, depth)
-                            .map(|r| r.through(&rendered, ValueOrigin::ClassConstant))
-                            .map_err(|u| u.via(&rendered));
+                        return match self.single_constant(
+                            only,
+                            assigns.len(),
+                            ValueOrigin::ClassConstant,
+                            depth,
+                        ) {
+                            Ok(resolved) => {
+                                Ok(resolved.through(&rendered, ValueOrigin::ClassConstant))
+                            }
+                            Err(unresolved) if unresolved.reason == "reassigned" => {
+                                let candidates = self.assign_candidates(
+                                    &assigns,
+                                    ValueOrigin::ClassConstant,
+                                    &rendered,
+                                    depth,
+                                );
+                                Err(unresolved.via(&rendered).with_candidates(candidates))
+                            }
+                            Err(unresolved) => Err(unresolved.via(&rendered)),
+                        };
                     }
                 }
                 let reason = if self.contains_env(expr) {
@@ -4687,7 +4713,16 @@ impl<'t> Ctx<'t> {
                 } else {
                     "subscript"
                 };
-                Err(Unresolved::new(reason, self.render(expr)))
+                // `MODELS[os.getenv("TIER")]`: the dict's values are the
+                // candidates.
+                let candidates = match expr.child_by_field_name("value") {
+                    Some(base) => match self.dict_node(base, scope, 0) {
+                        Some(dict) => self.dict_candidates(&dict).to_vec(),
+                        None => Vec::new(),
+                    },
+                    None => Vec::new(),
+                };
+                Err(Unresolved::new(reason, self.render(expr)).with_candidates(candidates))
             }
             "boolean_operator" => {
                 if let Some(result) = self.or_fallback(expr, scope, depth) {
@@ -4751,7 +4786,12 @@ impl<'t> Ctx<'t> {
         let imported = defs.imported;
         if defs.param {
             if defs.assigns > 0 || imported {
-                return Err(Unresolved::new("reassigned", name.to_string()));
+                let reaching = self.reaching_assigns(name, scope, pos);
+                let origin = constant_origin(self.scopes[home].kind);
+                let candidates = self.assign_candidates(&reaching, origin, name, depth);
+                return Err(
+                    Unresolved::new("reassigned", name.to_string()).with_candidates(candidates)
+                );
             }
             let default = self.params.get(&key).and_then(|p| p.default);
             let Some(default) = default else {
@@ -4797,10 +4837,16 @@ impl<'t> Ctx<'t> {
             let only = defs
                 .only_assign
                 .and_then(|i| self.assigns.get(&key).and_then(|v| v.get(i)).copied());
-            return self
-                .single_constant(only, defs.assigns, origin, depth)
-                .map(|r| r.through(name, origin))
-                .map_err(|u| u.via(name));
+            return match self.single_constant(only, defs.assigns, origin, depth) {
+                Ok(resolved) => Ok(resolved.through(name, origin)),
+                // Assigned in more than one branch: what each assigns.
+                Err(unresolved) if unresolved.reason == "reassigned" => {
+                    let reaching = self.reaching_assigns(name, scope, pos);
+                    let candidates = self.assign_candidates(&reaching, origin, name, depth);
+                    Err(unresolved.via(name).with_candidates(candidates))
+                }
+                Err(unresolved) => Err(unresolved.via(name)),
+            };
         }
         if imported {
             Err(Unresolved::new("imported_name", name.to_string()))
@@ -4859,6 +4905,86 @@ impl<'t> Ctx<'t> {
             return None;
         }
         Some(Unresolved::new("parameter_overridden", name.to_string()).with_candidates(others))
+    }
+
+    /// The assignments of `name` that reach a use at byte `pos` of `scope`,
+    /// at most [`MAX_CANDIDATE_READS`].
+    fn reaching_assigns(&self, name: &str, scope: usize, pos: usize) -> Vec<Assign<'t>> {
+        let (key, at) = self.locate(name, scope, pos);
+        let Some(assigns) = self.assigns.get(&key) else {
+            return Vec::new();
+        };
+        match self.reaching(&key, at) {
+            Reach::All => assigns.iter().take(MAX_CANDIDATE_READS).copied().collect(),
+            Reach::Subset(defs) => defs
+                .iter()
+                .filter_map(|def| match def {
+                    DefRef::Assign(i) => assigns.get(*i).copied(),
+                    _ => None,
+                })
+                .take(MAX_CANDIDATE_READS)
+                .collect(),
+        }
+    }
+
+    /// The values `assigns` give a name, for a `reassigned` gap: each
+    /// assignment resolved on its own (without collecting candidates of
+    /// its own), distinct, at most [`MAX_CANDIDATES`].
+    fn assign_candidates(
+        &mut self,
+        assigns: &[Assign<'t>],
+        origin: ValueOrigin,
+        name: &str,
+        depth: u32,
+    ) -> Vec<Resolved> {
+        if self.collecting > 0 {
+            return Vec::new();
+        }
+        self.collecting += 1;
+        let mut found = Vec::new();
+        for assign in assigns.iter().take(MAX_CANDIDATE_READS) {
+            let Some(value) = assign.value.filter(|_| !assign.unknowable) else {
+                continue;
+            };
+            if let Ok(mut resolved) = self.resolve_value(value, assign.scope, depth + 1) {
+                if resolved.origin == ValueOrigin::Literal {
+                    resolved.origin = origin;
+                }
+                push_candidate(&mut found, resolved.through(name, origin));
+            }
+        }
+        self.collecting -= 1;
+        found
+    }
+
+    /// The values a dict literal's entries hold, for a lookup whose key is
+    /// known only at run time: the first [`MAX_CANDIDATE_READS`] entries
+    /// under identifier keys (never under a secret-named or
+    /// credential-shaped key), distinct, at most [`MAX_CANDIDATES`]. Read
+    /// once per dict.
+    fn dict_candidates(&mut self, dict: &DictRef<'t>) -> Rc<[Resolved]> {
+        let key = (dict.node.id(), dict.name.clone());
+        if let Some(found) = self.dict_candidates_memo.get(&key) {
+            return Rc::clone(found);
+        }
+        if self.collecting > 0 {
+            return Rc::from(Vec::new());
+        }
+        self.collecting += 1;
+        let mut found = Vec::new();
+        let entries = dict_entries(dict.node, |n| self.literal(n).ok(), |n| self.text(n));
+        for (entry_key, value) in entries.into_iter().take(MAX_CANDIDATE_READS).flatten() {
+            if !is_identifier_key(&entry_key) {
+                continue;
+            }
+            if let Ok(resolved) = self.dict_entry(dict, &entry_key, value, 0) {
+                push_candidate(&mut found, resolved);
+            }
+        }
+        self.collecting -= 1;
+        let found: Rc<[Resolved]> = Rc::from(found);
+        self.dict_candidates_memo.insert(key, Rc::clone(&found));
+        found
     }
 
     /// A name or attribute assigned exactly once (`only`, out of `count`
@@ -4928,6 +5054,7 @@ impl<'t> Ctx<'t> {
                 .find(|(k, _)| k.as_str() == name)
                 .map(|(_, v)| *v)
         };
+        let mut candidates: Vec<Resolved> = Vec::new();
         let (lookup_key, default, reason) = match rendered.as_str() {
             "os.getenv"
             | "getenv"
@@ -4967,6 +5094,9 @@ impl<'t> Ctx<'t> {
                         if let Some(found) = self.dict_get_value(&dict, get, depth) {
                             return Some(found);
                         }
+                        // A key known only at run time: the dict's values
+                        // are the candidates.
+                        candidates = self.dict_candidates(&dict).to_vec();
                     }
                 }
                 let reason = if self.contains_env(function) {
@@ -4978,7 +5108,6 @@ impl<'t> Ctx<'t> {
             }
             _ => return None,
         };
-        let default = default?;
         let shape = self.render(call);
         // The name being looked up must not be a credential's.
         if let Some(lookup_key) = lookup_key {
@@ -4989,14 +5118,24 @@ impl<'t> Ctx<'t> {
                 return Some(Err(Unresolved::new("credential", shape)));
             }
         }
+        let Some(default) = default else {
+            if candidates.is_empty() {
+                return None;
+            }
+            return Some(Err(
+                Unresolved::new(reason, shape).with_candidates(candidates)
+            ));
+        };
         Some(match self.resolve_value(default, scope, depth + 1) {
             Ok(mut resolved) => {
                 resolved.origin = ValueOrigin::EnvDefault;
-                resolved.caveats.push(Unresolved::new(reason, shape));
+                resolved
+                    .caveats
+                    .push(Unresolved::new(reason, shape).with_candidates(candidates));
                 Ok(resolved)
             }
             Err(unresolved) if unresolved.reason == "credential" => Err(unresolved),
-            Err(_) => Err(Unresolved::new(reason, shape)),
+            Err(_) => Err(Unresolved::new(reason, shape).with_candidates(candidates)),
         })
     }
 
