@@ -2779,13 +2779,8 @@ impl<'t> Ctx<'t> {
             && function
                 .child_by_field_name("attribute")
                 .is_some_and(|a| self.text(a) == "__setattr__");
-        let target = if function.kind() == "identifier" && self.text(function) == "setattr" {
-            Some((
-                positional.first().copied(),
-                positional.get(1),
-                positional.get(2),
-            ))
-        } else if dunder && positional.len() >= 3 {
+        let setattr = function.kind() == "identifier" && self.text(function) == "setattr";
+        let target = if setattr || (dunder && positional.len() >= 3) {
             Some((
                 positional.first().copied(),
                 positional.get(1),
