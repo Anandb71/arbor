@@ -2965,7 +2965,8 @@ class Bot:
 #[test]
 fn listed_values_stay_bounded_per_gap_and_per_file() {
     // A 2,000-entry dict looked up with a run-time key at 2,000 calls: at
-    // most 16 values per gap and 4,096 per file, read once per dict.
+    // most 32 values per gap and 4,096 per file, read once per dict, and
+    // never marked complete.
     let entries: Vec<String> = (0..2_000)
         .map(|i| format!("\"k{i}\": \"gpt-4-{i}\""))
         .collect();
@@ -2978,8 +2979,9 @@ fn listed_values_stay_bounded_per_gap_and_per_file() {
     }
     let found = usages_within(&source, 10);
     let per_gap: Vec<usize> = found.gaps.iter().map(|g| g.values.len()).collect();
-    assert!(per_gap.iter().all(|n| *n <= 16));
+    assert!(per_gap.iter().all(|n| *n <= 32));
     assert_eq!(per_gap.iter().sum::<usize>(), 4_096);
+    assert!(found.gaps.iter().all(|g| !g.values_complete));
     let json = serde_json::to_string(&found).unwrap();
     assert!(json.len() < 8_000_000, "{} bytes", json.len());
 }
@@ -3691,4 +3693,147 @@ fn match_captures_except_targets_star_imports_and_globals_rebind() {
             (10, Routing::OpenaiDirect)
         ]
     );
+}
+
+/// `(line, reason, listed values, complete)` for every `unresolved_model` gap.
+fn listed_with_completeness(found: &FileUsages) -> Vec<(u32, String, Vec<String>, bool)> {
+    gaps(found, GapKind::UnresolvedModel)
+        .iter()
+        .map(|g| {
+            (
+                g.span.unwrap().line,
+                g.reason.clone(),
+                g.values.iter().map(|v| v.value.clone()).collect(),
+                g.values_complete,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn listed_values_say_whether_they_are_complete() {
+    // A gap's `values` were silently partial: a loop over a literal list,
+    // a dict key that is not an identifier, the 17th branch, a tuple
+    // unpacking and `+=` were dropped, so a consumer reading the list as
+    // complete missed `o1-mini` or `gpt-4-0613`.
+    let mut branches = String::from("k = os.getenv(\"K\")\nif k == \"0\": M3 = \"gpt-4o-0\"\n");
+    for i in 1..17 {
+        branches.push_str(&format!("elif k == \"{i}\": M3 = \"gpt-4o-{i}\"\n"));
+    }
+    branches.push_str("else: M3 = \"o1-mini\"\n");
+    let source = format!(
+        r#"import os
+from openai import OpenAI
+client = OpenAI()
+model = "gpt-4o"
+for model in ["gpt-4-0613"]:
+    client.chat.completions.create(model=model, messages=[])
+TIERS = {{"fast-tier": "o1-mini", "default": "gpt-4o"}}
+client.chat.completions.create(model=TIERS[os.getenv("TIER", "default")], messages=[])
+M7 = "gpt-4o"
+if os.getenv("Y"):
+    M7, temp = "o1-mini", 0
+client.chat.completions.create(model=M7, messages=[])
+M8 = "gpt-4"
+if os.getenv("Z"):
+    M8 += "-0613"
+client.chat.completions.create(model=M8, messages=[])
+if os.getenv("X"):
+    M4 = "gpt-4o"
+else:
+    M4 = os.environ["LEGACY_MODEL"]
+client.chat.completions.create(model=M4, messages=[])
+if os.getenv("F"):
+    M9 = "gpt-4o"
+else:
+    M9 = "o1-mini"
+client.chat.completions.create(model=M9, messages=[])
+client.chat.completions.create(model="gpt-4o" if os.getenv("F") else "o3-mini", messages=[])
+def _private(q, model):
+    return client.chat.completions.create(model=model, messages=[q])
+_private("a", "gpt-4o")
+_private("b", "o1-mini")
+def public(q, model):
+    return client.chat.completions.create(model=model, messages=[q])
+public("a", "gpt-4o")
+def _mixed(q, model):
+    return client.chat.completions.create(model=model, messages=[q])
+_mixed("a", "gpt-4o")
+_mixed("b", load_model())
+def _over(q, model="gpt-4o"):
+    return client.chat.completions.create(model=model, messages=[q])
+_over("a", model="o1-mini")
+for m in ("gpt-4o", "o1-mini"):
+    client.chat.completions.create(model=m, messages=[])
+{branches}client.chat.completions.create(model=M3, messages=[])
+"#
+    );
+    let found = usages(&source);
+    let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let mut eighteen = strings(&["gpt-4o-0"]);
+    eighteen.extend((1..17).map(|i| format!("gpt-4o-{i}")));
+    eighteen.push("o1-mini".to_string());
+    assert_eq!(
+        listed_with_completeness(&found),
+        vec![
+            // The loop item is listed; the outer value too (a superset).
+            (
+                6,
+                "reassigned".into(),
+                strings(&["gpt-4o", "gpt-4-0613"]),
+                true
+            ),
+            // A key that is not an identifier still lists its value.
+            (8, "env_var".into(), strings(&["o1-mini", "gpt-4o"]), true),
+            // Tuple unpacking and `+=` are not read: partial.
+            (12, "reassigned".into(), strings(&["gpt-4o"]), false),
+            (16, "reassigned".into(), strings(&["gpt-4"]), false),
+            // One branch reads the environment: partial.
+            (21, "reassigned".into(), strings(&["gpt-4o"]), false),
+            (
+                26,
+                "reassigned".into(),
+                strings(&["gpt-4o", "o1-mini"]),
+                true
+            ),
+            // The condition reads the environment; both sides are listed.
+            (27, "env_var".into(), strings(&["gpt-4o", "o3-mini"]), true),
+            // Every caller of a private function is here.
+            (
+                29,
+                "parameter".into(),
+                strings(&["gpt-4o", "o1-mini"]),
+                true
+            ),
+            // Other modules may call a public one.
+            (33, "parameter".into(), strings(&["gpt-4o"]), false),
+            (36, "parameter".into(), strings(&["gpt-4o"]), false),
+            (
+                40,
+                "parameter_overridden".into(),
+                strings(&["o1-mini"]),
+                true
+            ),
+            (
+                43,
+                "non_literal".into(),
+                strings(&["gpt-4o", "o1-mini"]),
+                true
+            ),
+            (63, "reassigned".into(), eighteen, true),
+        ]
+    );
+    // Past 32 values the list is cut and says so.
+    let mut many = String::from("import os\nfrom openai import OpenAI\nclient = OpenAI()\nk = os.getenv(\"K\")\nif k == \"0\": M = \"m-0\"\n");
+    for i in 1..40 {
+        many.push_str(&format!("elif k == \"{i}\": M = \"m-{i}\"\n"));
+    }
+    many.push_str("client.chat.completions.create(model=M, messages=[])\n");
+    let found = usages(&many);
+    let gap = &gaps(&found, GapKind::UnresolvedModel)[0];
+    assert_eq!(gap.values.len(), 32);
+    assert!(!gap.values_complete);
+    assert!(gap.detail.contains("not necessarily all"), "{}", gap.detail);
+    let json = serde_json::to_string(gap).unwrap();
+    assert!(!json.contains("values_complete"), "{json}");
 }

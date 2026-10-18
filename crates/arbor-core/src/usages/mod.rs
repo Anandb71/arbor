@@ -437,10 +437,20 @@ pub struct UsageGap {
     pub detail: String,
     /// Allowlisted values seen at an unconfirmed call
     /// (`unknown_client_factory`), or, for `unresolved_model`, values the key
-    /// may take that are known (what in-file callers pass for a parameter),
-    /// so it can be triaged. Never the call's value.
+    /// may take that are known (what in-file callers pass for a parameter,
+    /// the entries of a dict looked up with a run-time key, the value each
+    /// branch assigns, the items a loop runs over), so it can be triaged.
+    /// Never the call's value. Partial unless [`Self::values_complete`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<CapturedValue>,
+    /// `values`, together with the value captured for the same key at the
+    /// call (a parameter default, an `env_default` fallback), are every
+    /// value the key can take as far as this file shows. `false` (omitted
+    /// from JSON) whenever the list may be partial: a definition, entry or
+    /// caller did not resolve, some callers cannot be seen, another module
+    /// may call the function, or a limit cut the list.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub values_complete: bool,
 }
 
 /// Everything one file says about tracked SDKs.

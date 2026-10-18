@@ -238,7 +238,7 @@ const MAX_NESTED_VALUES: usize = 32;
 /// calls cannot multiply the report.
 const MAX_FILE_NESTED_VALUES: usize = 4096;
 /// Candidate values listed with one gap, and per file.
-const MAX_CANDIDATES: usize = 16;
+const MAX_CANDIDATES: usize = 32;
 const MAX_FILE_CANDIDATES: usize = 4096;
 /// In-file calls read for the values a parameter is given.
 const MAX_CALLERS_READ: usize = 256;
@@ -649,9 +649,13 @@ struct Unresolved {
     via: Option<String>,
     /// Values it may take that are known: what in-file callers pass for a
     /// parameter, the entries of a dict looked up with a run-time key, the
-    /// assignments in each branch. Listed with the gap for triage, never
-    /// as the call's value.
+    /// assignments in each branch, the items a loop runs over. Listed with
+    /// the gap for triage, never as the call's value.
     candidates: Vec<Resolved>,
+    /// Whether `candidates` (with the value captured next to the gap, if
+    /// any) are every value it can take: `Some(true)` only when every
+    /// source added was complete.
+    complete: Option<bool>,
 }
 
 impl Unresolved {
@@ -661,12 +665,25 @@ impl Unresolved {
             shape: clip_owned(shape),
             via: None,
             candidates: Vec::new(),
+            complete: None,
         }
     }
 
-    fn with_candidates(mut self, candidates: Vec<Resolved>) -> Self {
-        self.candidates.extend(candidates);
+    /// Adds the values one source says it may take, and whether that
+    /// source listed all of its values.
+    fn with_candidates(mut self, candidates: Vec<Resolved>, complete: bool) -> Self {
+        for candidate in candidates {
+            if !push_candidate(&mut self.candidates, candidate) {
+                self.complete = Some(false);
+            }
+        }
+        self.complete = Some(self.complete.unwrap_or(true) && complete);
         self
+    }
+
+    /// Whether the candidates are known to be every value.
+    fn complete(&self) -> bool {
+        self.complete == Some(true) && !self.candidates.is_empty()
     }
 
     fn via(mut self, name: &str) -> Self {
@@ -909,6 +926,8 @@ struct Assign<'t> {
     /// Bound by a loop, an unpacking or an augmented assignment.
     unknowable: bool,
     place: Place,
+    /// For a plain-name loop target: what the loop runs over.
+    iter: Option<Node<'t>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1149,6 +1168,16 @@ struct CallerModels {
     /// Some calls cannot be seen: the function is decorated, passed,
     /// stored or bound more than once (see [`Ctx::visible_calls`]).
     unseen: bool,
+    /// `values` are every value the parameter is given: every call is
+    /// seen and read, each passes a value that resolves (or none), and the
+    /// function is called only from this file.
+    complete: bool,
+}
+
+/// Candidate values read once for a dict literal.
+struct DictCandidates {
+    values: Vec<Resolved>,
+    complete: bool,
 }
 
 /// How a call passes one parameter (see [`Ctx::param_slot`]).
@@ -1254,7 +1283,7 @@ struct Ctx<'t> {
     caller_models: HashMap<Key, Rc<CallerModels>>,
     /// The values a dict literal's entries hold, by node id and the name
     /// the dict is used through.
-    dict_candidates_memo: HashMap<(usize, Option<String>), Rc<[Resolved]>>,
+    dict_candidates_memo: HashMap<(usize, Option<String>), Rc<DictCandidates>>,
     /// Candidate values are being collected: a nested lookup does not
     /// collect its own, so the work stays linear.
     collecting: u32,
@@ -1287,6 +1316,8 @@ struct Ctx<'t> {
     /// a run-time name (see [`DefRef::Dynamic`]).
     module_stars: Vec<(Place, Rc<str>)>,
     dynamic_globals: bool,
+    /// While a plain-name loop target is recorded: what the loop runs over.
+    loop_iter: Option<Node<'t>>,
     /// Names bound by imports so far, and the import statement at which
     /// [`MAX_FILE_IMPORTS`] was reached.
     import_bindings: usize,
@@ -1369,6 +1400,7 @@ impl<'t> Ctx<'t> {
             openai_caveat: None,
             module_stars: Vec::new(),
             dynamic_globals: false,
+            loop_iter: None,
             import_bindings: 0,
             import_cut: None,
             out: FileUsages::new(file, "python"),
@@ -1481,23 +1513,9 @@ impl<'t> Ctx<'t> {
                             parent: frame.inner_loop,
                         });
                         child_loop = Some(loops.len() - 1);
-                        if let Some(left) = node.child_by_field_name("left") {
-                            let place = Place {
-                                at: left.end_byte(),
-                                region: None,
-                            };
-                            self.record_target(left, None, None, scope, true, place);
-                        }
+                        self.record_loop_target(node, scope);
                     }
-                    "for_in_clause" => {
-                        if let Some(left) = node.child_by_field_name("left") {
-                            let place = Place {
-                                at: left.end_byte(),
-                                region: None,
-                            };
-                            self.record_target(left, None, None, scope, true, place);
-                        }
-                    }
+                    "for_in_clause" => self.record_loop_target(node, scope),
                     "import_statement" => self.import_statement(node, scope, place),
                     "import_from_statement" => self.import_from(node, scope, place),
                     "assignment" => {
@@ -1653,6 +1671,24 @@ impl<'t> Ctx<'t> {
         }
         // The walk is pre-order, so this is already sorted; keep it so.
         self.env_reads.sort_unstable();
+    }
+
+    /// The target of a `for` statement or clause: bound once per item, so it
+    /// never dominates; a plain name keeps what the loop runs over, whose
+    /// items are the values it may take.
+    fn record_loop_target(&mut self, node: Node<'t>, scope: usize) {
+        let Some(left) = node.child_by_field_name("left") else {
+            return;
+        };
+        let place = Place {
+            at: left.end_byte(),
+            region: None,
+        };
+        if left.kind() == "identifier" {
+            self.loop_iter = node.child_by_field_name("right");
+        }
+        self.record_target(left, None, None, scope, true, place);
+        self.loop_iter = None;
     }
 
     /// Records a call or value use of a bare name, for resolving parameters
@@ -2430,6 +2466,7 @@ impl<'t> Ctx<'t> {
             annotation,
             unknowable,
             place,
+            iter: self.loop_iter,
         };
         match target.kind() {
             "identifier" => {
@@ -2623,6 +2660,7 @@ impl<'t> Ctx<'t> {
                         annotation: None,
                         unknowable: value.is_none(),
                         place,
+                        iter: None,
                     };
                     self.record_attr_write(object, attr, assign, scope);
                 }
@@ -4149,6 +4187,7 @@ impl<'t> Ctx<'t> {
                     at: 0,
                     region: None,
                 },
+                iter: None,
             };
             found.push(unknown);
         }
@@ -4477,6 +4516,7 @@ impl<'t> Ctx<'t> {
                     "this file binds more than {MAX_FILE_IMPORTS} imported names, so its calls are not analyzed"
                 ),
                 values: Vec::new(),
+                values_complete: false,
             });
             return;
         }
@@ -4525,6 +4565,7 @@ impl<'t> Ctx<'t> {
                 "this file reports more than {MAX_FILE_RECORDS} imports, calls, clients and gaps; nothing from this line on is analyzed"
             ),
             values: Vec::new(),
+            values_complete: false,
         });
     }
 
@@ -4852,6 +4893,7 @@ impl<'t> Ctx<'t> {
                     "the receiver of `{chain}` is assigned more than one kind of client or a non-client value, so its routing depends on a runtime branch"
                 ),
                 values: Vec::new(),
+                values_complete: false,
             });
         } else if let Some(caveat) = &target.caveat {
             let (reason, detail) = match caveat {
@@ -4897,6 +4939,7 @@ impl<'t> Ctx<'t> {
                 reason: reason.to_string(),
                 detail,
                 values: Vec::new(),
+                values_complete: false,
             });
         }
 
@@ -5008,6 +5051,7 @@ impl<'t> Ctx<'t> {
                     "`{chain}` passes more nested model values than are read or listed ({listed} listed); the rest are not reported"
                 ),
                 values: Vec::new(),
+                values_complete: false,
             });
         }
     }
@@ -5038,34 +5082,47 @@ impl<'t> Ctx<'t> {
             Some(via) => format!("`{key}` for `{chain}` comes from `{via}`, which is {phrase}"),
             None => format!("`{key}` for `{chain}` is `{shape}`, which is {phrase}"),
         };
+        let (values, cut) = self.candidate_values(key, &unresolved.candidates);
+        let complete = unresolved.complete() && !cut;
+        let listed = if complete {
+            "every other value it may take is listed"
+        } else {
+            "some values it may take are listed, not necessarily all"
+        };
         match captured {
             Some(origin) if unresolved.reason == "parameter_overridden" => {
                 detail.push_str(&format!(
-                    "; its default is captured with origin `{}` and the values callers pass are listed",
+                    "; its default is captured with origin `{}`",
                     origin.as_str()
                 ));
+                if complete {
+                    detail.push_str(", and every other value in-file callers pass is listed");
+                } else if !values.is_empty() {
+                    detail
+                        .push_str(", and some values callers pass are listed, not necessarily all");
+                }
             }
             Some(origin) if unresolved.reason == "unseen_callers" => {
                 detail.push_str(&format!(
                     "; its default is captured with origin `{}`",
                     origin.as_str()
                 ));
-                if !unresolved.candidates.is_empty() {
-                    detail.push_str(", and other values in-file calls pass are listed");
+                if !values.is_empty() {
+                    detail.push_str(
+                        ", and some values in-file calls pass are listed, not necessarily all",
+                    );
                 }
             }
             Some(_) => {
                 detail.push_str("; its literal fallback is captured with origin `env_default`");
-                if !unresolved.candidates.is_empty() {
-                    detail.push_str(", and other values it may take are listed");
+                if !values.is_empty() {
+                    detail.push_str(&format!(", and {listed}"));
                 }
             }
-            None if !unresolved.candidates.is_empty() => {
-                detail.push_str("; values it may take are listed")
-            }
+            None if complete => detail.push_str("; every value it may take is listed"),
+            None if !values.is_empty() => detail.push_str(&format!("; {listed}")),
             None => {}
         }
-        let values = self.candidate_values(key, &unresolved.candidates);
         self.out.gaps.push(UsageGap {
             kind: GapKind::UnresolvedModel,
             sdk: Some(site.sdk),
@@ -5076,28 +5133,34 @@ impl<'t> Ctx<'t> {
             key: Some(key.to_string()),
             reason: unresolved.reason.to_string(),
             detail,
+            values_complete: complete && !values.is_empty(),
             values,
         });
     }
 
     /// Candidate values listed with a gap for `key`: distinct, at most
-    /// [`MAX_CANDIDATES`] per gap and [`MAX_FILE_CANDIDATES`] per file.
-    fn candidate_values(&mut self, key: &str, candidates: &[Resolved]) -> Vec<CapturedValue> {
+    /// [`MAX_CANDIDATES`] per gap and [`MAX_FILE_CANDIDATES`] per file; and
+    /// whether a limit cut the list.
+    fn candidate_values(
+        &mut self,
+        key: &str,
+        candidates: &[Resolved],
+    ) -> (Vec<CapturedValue>, bool) {
         let mut seen = HashSet::new();
         let mut listed = Vec::new();
         for candidate in candidates {
-            if listed.len() >= MAX_CANDIDATES || self.candidates_left == 0 {
-                break;
-            }
             if !seen.insert(candidate.value.as_str()) {
                 continue;
+            }
+            if listed.len() >= MAX_CANDIDATES || self.candidates_left == 0 {
+                return (listed, true);
             }
             self.candidates_left -= 1;
             let mut candidate = candidate.clone();
             candidate.caveats.clear();
             listed.push(captured(key, candidate, false));
         }
-        listed
+        (listed, false)
     }
 
     /// `getattr(client, name)` on a tracked binding.
@@ -5129,6 +5192,7 @@ impl<'t> Ctx<'t> {
                 "`getattr` on `{rendered}` picks the SDK member at run time; calls through it are not tracked"
             ),
             values: Vec::new(),
+            values_complete: false,
         });
     }
 
@@ -5207,6 +5271,7 @@ impl<'t> Ctx<'t> {
             reason: reason.to_string(),
             detail,
             values,
+            values_complete: false,
         });
     }
 
@@ -5236,6 +5301,7 @@ impl<'t> Ctx<'t> {
                 "`{rendered}` is stored or passed as a value; calls through it are not tracked"
             ),
             values: Vec::new(),
+            values_complete: false,
         });
     }
 
@@ -5499,13 +5565,15 @@ impl<'t> Ctx<'t> {
                                 Ok(resolved.through(&rendered, ValueOrigin::ClassConstant))
                             }
                             Err(unresolved) if unresolved.reason == "reassigned" => {
-                                let candidates = self.assign_candidates(
+                                let (candidates, complete) = self.assign_candidates(
                                     &assigns,
                                     ValueOrigin::ClassConstant,
                                     &rendered,
                                     depth,
                                 );
-                                Err(unresolved.via(&rendered).with_candidates(candidates))
+                                Err(unresolved
+                                    .via(&rendered)
+                                    .with_candidates(candidates, complete))
                             }
                             Err(unresolved) => Err(unresolved.via(&rendered)),
                         };
@@ -5540,14 +5608,17 @@ impl<'t> Ctx<'t> {
                 };
                 // `MODELS[os.getenv("TIER")]`: the dict's values are the
                 // candidates.
-                let candidates = match expr.child_by_field_name("value") {
-                    Some(base) => match self.dict_node(base, scope, 0) {
-                        Some(dict) => self.dict_candidates(&dict).to_vec(),
-                        None => Vec::new(),
-                    },
-                    None => Vec::new(),
-                };
-                Err(Unresolved::new(reason, self.render(expr)).with_candidates(candidates))
+                let unresolved = Unresolved::new(reason, self.render(expr));
+                let dict = expr
+                    .child_by_field_name("value")
+                    .and_then(|base| self.dict_node(base, scope, 0));
+                Err(match dict {
+                    Some(dict) => {
+                        let found = self.dict_candidates(&dict);
+                        unresolved.with_candidates(found.values.clone(), found.complete)
+                    }
+                    None => unresolved,
+                })
             }
             "boolean_operator" => {
                 if let Some(result) = self.or_fallback(expr, scope, depth) {
@@ -5566,7 +5637,10 @@ impl<'t> Ctx<'t> {
                 } else {
                     "conditional"
                 };
-                Err(Unresolved::new(reason, self.render(expr)))
+                // `"gpt-4o" if fast else "o1"`: each side is a candidate.
+                let (candidates, complete) = self.branch_candidates(expr, scope, depth);
+                Err(Unresolved::new(reason, self.render(expr))
+                    .with_candidates(candidates, complete))
             }
             _ => Err(Unresolved::new("non_literal", self.render(expr))),
         }
@@ -5611,19 +5685,19 @@ impl<'t> Ctx<'t> {
         let imported = defs.imported;
         if defs.param {
             if defs.assigns > 0 || imported {
-                let reaching = self.reaching_assigns(name, scope, pos);
+                // The parameter's own values are not listed: partial.
+                let (reaching, _) = self.reaching_assigns(name, scope, pos);
                 let origin = constant_origin(self.scopes[home].kind);
-                let candidates = self.assign_candidates(&reaching, origin, name, depth);
-                return Err(
-                    Unresolved::new("reassigned", name.to_string()).with_candidates(candidates)
-                );
+                let (candidates, _) = self.assign_candidates(&reaching, origin, name, depth);
+                return Err(Unresolved::new("reassigned", name.to_string())
+                    .with_candidates(candidates, false));
             }
             let default = self.params.get(&key).and_then(|p| p.default);
             let Some(default) = default else {
                 // What in-file callers pass, for triage.
                 let passed = self.caller_models(home, name);
                 return Err(Unresolved::new("parameter", name.to_string())
-                    .with_candidates(passed.values.clone()));
+                    .with_candidates(passed.values.clone(), passed.complete));
             };
             // Defaults are evaluated where the function is defined.
             let parent = self.scopes[home].parent.unwrap_or(0);
@@ -5648,15 +5722,21 @@ impl<'t> Ctx<'t> {
                 Err(unresolved) if unresolved.reason == "credential" => Err(unresolved.via(name)),
                 Err(unresolved) => {
                     let passed = self.caller_models(home, name);
+                    let default_complete = unresolved.complete();
                     Err(Unresolved::new("parameter", name.to_string())
-                        .with_candidates(unresolved.candidates)
-                        .with_candidates(passed.values.clone()))
+                        .with_candidates(unresolved.candidates, default_complete)
+                        .with_candidates(passed.values.clone(), passed.complete))
                 }
             };
         }
         if defs.assigns > 0 {
             if imported {
-                return Err(Unresolved::new("reassigned", name.to_string()));
+                // What the assignments give; the import's value is unknown.
+                let (reaching, _) = self.reaching_assigns(name, scope, pos);
+                let origin = constant_origin(self.scopes[home].kind);
+                let (candidates, _) = self.assign_candidates(&reaching, origin, name, depth);
+                return Err(Unresolved::new("reassigned", name.to_string())
+                    .with_candidates(candidates, false));
             }
             let origin = constant_origin(self.scopes[home].kind);
             let only = defs
@@ -5666,9 +5746,12 @@ impl<'t> Ctx<'t> {
                 Ok(resolved) => Ok(resolved.through(name, origin)),
                 // Assigned in more than one branch: what each assigns.
                 Err(unresolved) if unresolved.reason == "reassigned" => {
-                    let reaching = self.reaching_assigns(name, scope, pos);
-                    let candidates = self.assign_candidates(&reaching, origin, name, depth);
-                    Err(unresolved.via(name).with_candidates(candidates))
+                    let (reaching, all) = self.reaching_assigns(name, scope, pos);
+                    let (candidates, complete) =
+                        self.assign_candidates(&reaching, origin, name, depth);
+                    Err(unresolved
+                        .via(name)
+                        .with_candidates(candidates, complete && all))
                 }
                 Err(unresolved) => Err(unresolved.via(name)),
             };
@@ -5694,7 +5777,9 @@ impl<'t> Ctx<'t> {
         let mut models = CallerModels::default();
         let visible = self.visible_calls(func);
         models.unseen = !matches!(visible, Some((_, true)));
+        let mut read = false;
         if let (Some(slot), Some((calls, _))) = (self.param_slot(func, name), visible) {
+            read = true;
             let keyword = slot.keyword.then_some(name);
             self.collecting += 1;
             for (i, &(call, call_scope)) in calls.iter().enumerate() {
@@ -5704,7 +5789,15 @@ impl<'t> Ctx<'t> {
                 }
                 match argument_for(call, slot.position, keyword, |n| self.text(n)) {
                     ArgFor::Found(expr) => match self.resolve_value(expr, call_scope, 0) {
-                        Ok(resolved) => push_candidate(&mut models.values, resolved),
+                        Ok(resolved) if resolved.caveats.is_empty() => {
+                            if !push_candidate(&mut models.values, resolved) {
+                                models.unknown = true;
+                            }
+                        }
+                        Ok(resolved) => {
+                            push_candidate(&mut models.values, resolved);
+                            models.unknown = true;
+                        }
                         Err(_) => models.unknown = true,
                     },
                     ArgFor::Missing => {}
@@ -5713,6 +5806,7 @@ impl<'t> Ctx<'t> {
             }
             self.collecting -= 1;
         }
+        models.complete = read && !models.unseen && !models.unknown && self.is_private(func);
         let models = Rc::new(models);
         self.caller_models.insert(key, Rc::clone(&models));
         models
@@ -5737,85 +5831,222 @@ impl<'t> Ctx<'t> {
         } else {
             return None;
         };
-        Some(Unresolved::new(reason, name.to_string()).with_candidates(others))
+        Some(Unresolved::new(reason, name.to_string()).with_candidates(others, passed.complete))
     }
 
     /// The assignments of `name` that reach a use at byte `pos` of `scope`,
-    /// at most [`MAX_CANDIDATE_READS`].
-    fn reaching_assigns(&self, name: &str, scope: usize, pos: usize) -> Vec<Assign<'t>> {
+    /// at most [`MAX_CANDIDATE_READS`], and whether that is all of them.
+    fn reaching_assigns(&self, name: &str, scope: usize, pos: usize) -> (Vec<Assign<'t>>, bool) {
         let (key, at) = self.locate(name, scope, pos);
         let Some(assigns) = self.assigns.get(&key) else {
-            return Vec::new();
+            return (Vec::new(), true);
         };
-        match self.reaching(&key, at) {
-            Reach::All => assigns.iter().take(MAX_CANDIDATE_READS).copied().collect(),
+        let reaching: Vec<Assign<'t>> = match self.reaching(&key, at) {
+            Reach::All => assigns.clone(),
             Reach::Subset(defs) => defs
                 .iter()
                 .filter_map(|def| match def {
                     DefRef::Assign(i) => assigns.get(*i).copied(),
                     _ => None,
                 })
-                .take(MAX_CANDIDATE_READS)
                 .collect(),
-        }
+        };
+        let all = reaching.len() <= MAX_CANDIDATE_READS;
+        (
+            reaching.into_iter().take(MAX_CANDIDATE_READS).collect(),
+            all,
+        )
     }
 
     /// The values `assigns` give a name, for a `reassigned` gap: each
     /// assignment resolved on its own (without collecting candidates of
-    /// its own), distinct, at most [`MAX_CANDIDATES`].
+    /// its own), a loop target's items, distinct, at most
+    /// [`MAX_CANDIDATES`]; and whether every assignment resolved, with no
+    /// caveat, into the list.
     fn assign_candidates(
         &mut self,
         assigns: &[Assign<'t>],
         origin: ValueOrigin,
         name: &str,
         depth: u32,
-    ) -> Vec<Resolved> {
+    ) -> (Vec<Resolved>, bool) {
         if self.collecting > 0 {
-            return Vec::new();
+            return (Vec::new(), false);
         }
         self.collecting += 1;
         let mut found = Vec::new();
+        let mut complete = assigns.len() <= MAX_CANDIDATE_READS;
         for assign in assigns.iter().take(MAX_CANDIDATE_READS) {
-            let Some(value) = assign.value.filter(|_| !assign.unknowable) else {
-                continue;
-            };
-            if let Ok(mut resolved) = self.resolve_value(value, assign.scope, depth + 1) {
-                if resolved.origin == ValueOrigin::Literal {
-                    resolved.origin = origin;
+            let value = match (assign.value, assign.unknowable) {
+                (Some(value), false) => value,
+                _ => {
+                    // A loop target takes each item of a literal list.
+                    let items = assign
+                        .iter
+                        .map(|iter| self.loop_items(iter, assign.scope, origin, depth));
+                    match items {
+                        Some((items, all)) => {
+                            complete &= all;
+                            for item in items {
+                                complete &= push_candidate(&mut found, item.through(name, origin));
+                            }
+                        }
+                        None => complete = false,
+                    }
+                    continue;
                 }
-                push_candidate(&mut found, resolved.through(name, origin));
+            };
+            match self.resolve_value(value, assign.scope, depth + 1) {
+                Ok(mut resolved) => {
+                    complete &= resolved.caveats.is_empty();
+                    if resolved.origin == ValueOrigin::Literal {
+                        resolved.origin = origin;
+                    }
+                    complete &= push_candidate(&mut found, resolved.through(name, origin));
+                }
+                Err(_) => complete = false,
             }
         }
         self.collecting -= 1;
-        found
+        (found, complete)
+    }
+
+    /// The items of the literal list, tuple or set a loop runs over (or of
+    /// one bound once to a name that never changes), resolved, and whether
+    /// every item resolved. Called while candidates are being collected.
+    fn loop_items(
+        &mut self,
+        iter: Node<'t>,
+        scope: usize,
+        origin: ValueOrigin,
+        depth: u32,
+    ) -> (Vec<Resolved>, bool) {
+        let list = match iter.kind() {
+            "list" | "tuple" | "set" => Some((iter, scope)),
+            "identifier" => {
+                let name = self.text(iter);
+                let (key, defs) = self.defs_at(name, scope, iter.start_byte());
+                let single = !defs.param && !defs.imported && defs.assigns == 1;
+                match defs
+                    .only_assign
+                    .filter(|_| single && !self.escaped.contains(name))
+                {
+                    Some(i) => self
+                        .assigns
+                        .get(&key)
+                        .and_then(|v| v.get(i))
+                        .filter(|a| !a.unknowable)
+                        .and_then(|a| a.value.map(|value| (value, a.scope)))
+                        .filter(|(value, _)| matches!(value.kind(), "list" | "tuple" | "set")),
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        let Some((list, list_scope)) = list else {
+            return (Vec::new(), false);
+        };
+        let mut found = Vec::new();
+        let mut complete = true;
+        for (i, item) in named_children(list).into_iter().enumerate() {
+            if i >= MAX_CANDIDATE_READS {
+                complete = false;
+                break;
+            }
+            if item.kind() == "comment" {
+                continue;
+            }
+            match self.resolve_value(item, list_scope, depth + 1) {
+                Ok(mut resolved) => {
+                    complete &= resolved.caveats.is_empty();
+                    if resolved.origin == ValueOrigin::Literal {
+                        resolved.origin = origin;
+                    }
+                    complete &= push_candidate(&mut found, resolved);
+                }
+                Err(_) => complete = false,
+            }
+        }
+        (found, complete)
+    }
+
+    /// The two sides of `a if cond else b`, each resolved on its own, and
+    /// whether both resolved.
+    fn branch_candidates(
+        &mut self,
+        expr: Node<'t>,
+        scope: usize,
+        depth: u32,
+    ) -> (Vec<Resolved>, bool) {
+        if self.collecting > 0 {
+            return (Vec::new(), false);
+        }
+        self.collecting += 1;
+        let children = named_children(expr);
+        let mut found = Vec::new();
+        let mut complete = true;
+        for side in [children.first(), children.last()].into_iter().flatten() {
+            match self.resolve_value(*side, scope, depth + 1) {
+                Ok(resolved) => {
+                    complete &= resolved.caveats.is_empty();
+                    complete &= push_candidate(&mut found, resolved);
+                }
+                Err(unresolved) => {
+                    complete &= unresolved.complete();
+                    for candidate in unresolved.candidates {
+                        complete &= push_candidate(&mut found, candidate);
+                    }
+                }
+            }
+        }
+        self.collecting -= 1;
+        (found, complete)
     }
 
     /// The values a dict literal's entries hold, for a lookup whose key is
     /// known only at run time: the first [`MAX_CANDIDATE_READS`] entries
-    /// under identifier keys (never under a secret-named or
-    /// credential-shaped key), distinct, at most [`MAX_CANDIDATES`]. Read
-    /// once per dict.
-    fn dict_candidates(&mut self, dict: &DictRef<'t>) -> Rc<[Resolved]> {
+    /// (never under a secret-named or credential-shaped key), distinct, at
+    /// most [`MAX_CANDIDATES`], and whether they are all of its values.
+    /// Read once per dict.
+    fn dict_candidates(&mut self, dict: &DictRef<'t>) -> Rc<DictCandidates> {
         let key = (dict.node.id(), dict.name.clone());
         if let Some(found) = self.dict_candidates_memo.get(&key) {
             return Rc::clone(found);
         }
         if self.collecting > 0 {
-            return Rc::from(Vec::new());
+            return Rc::new(DictCandidates {
+                values: Vec::new(),
+                complete: false,
+            });
         }
         self.collecting += 1;
         let mut found = Vec::new();
         let entries = dict_entries(dict.node, |n| self.literal(n).ok(), |n| self.text(n));
-        for (entry_key, value) in entries.into_iter().take(MAX_CANDIDATE_READS).flatten() {
-            if !is_identifier_key(&entry_key) {
+        let mut complete = entries.len() <= MAX_CANDIDATE_READS;
+        for entry in entries.into_iter().take(MAX_CANDIDATE_READS) {
+            // `**other` or a computed key: anything may be there.
+            let Some((entry_key, value)) = entry else {
+                complete = false;
+                continue;
+            };
+            // A value under a credential's key is never read.
+            if is_secret_key(&entry_key) || is_credential_value(&entry_key) {
+                complete = false;
                 continue;
             }
-            if let Ok(resolved) = self.dict_entry(dict, &entry_key, value, 0) {
-                push_candidate(&mut found, resolved);
+            match self.dict_entry(dict, &entry_key, value, 0) {
+                Ok(resolved) => {
+                    complete &= resolved.caveats.is_empty();
+                    complete &= push_candidate(&mut found, resolved);
+                }
+                Err(_) => complete = false,
             }
         }
         self.collecting -= 1;
-        let found: Rc<[Resolved]> = Rc::from(found);
+        let found = Rc::new(DictCandidates {
+            values: found,
+            complete,
+        });
         self.dict_candidates_memo.insert(key, Rc::clone(&found));
         found
     }
@@ -5833,7 +6064,15 @@ impl<'t> Ctx<'t> {
             (_, 0) => Err(Unresolved::new("unbound", String::new())),
             (Some(assign), 1) => {
                 let Some(value) = assign.value.filter(|_| !assign.unknowable) else {
-                    return Err(Unresolved::new("non_literal", String::new()));
+                    let unresolved = Unresolved::new("non_literal", String::new());
+                    // `for model in ["gpt-4o", "o1"]`: each item is a value.
+                    let Some(iter) = assign.iter.filter(|_| self.collecting == 0) else {
+                        return Err(unresolved);
+                    };
+                    self.collecting += 1;
+                    let (items, complete) = self.loop_items(iter, assign.scope, origin, depth);
+                    self.collecting -= 1;
+                    return Err(unresolved.with_candidates(items, complete));
                 };
                 let mut resolved = self.resolve_value(value, assign.scope, depth + 1)?;
                 if resolved.origin == ValueOrigin::Literal {
@@ -5888,6 +6127,7 @@ impl<'t> Ctx<'t> {
                 .map(|(_, v)| *v)
         };
         let mut candidates: Vec<Resolved> = Vec::new();
+        let mut candidates_complete = false;
         let (lookup_key, default, reason) = match rendered.as_str() {
             "os.getenv"
             | "getenv"
@@ -5929,7 +6169,9 @@ impl<'t> Ctx<'t> {
                         }
                         // A key known only at run time: the dict's values
                         // are the candidates.
-                        candidates = self.dict_candidates(&dict).to_vec();
+                        let found = self.dict_candidates(&dict);
+                        candidates = found.values.clone();
+                        candidates_complete = found.complete;
                     }
                 }
                 let reason = if self.contains_env(function) {
@@ -5956,19 +6198,23 @@ impl<'t> Ctx<'t> {
                 return None;
             }
             return Some(Err(
-                Unresolved::new(reason, shape).with_candidates(candidates)
+                Unresolved::new(reason, shape).with_candidates(candidates, candidates_complete)
             ));
         };
         Some(match self.resolve_value(default, scope, depth + 1) {
             Ok(mut resolved) => {
                 resolved.origin = ValueOrigin::EnvDefault;
+                // With the default captured, the dict's values are every
+                // other value only for a dict lookup; an environment or
+                // config lookup may return anything.
+                let complete = candidates_complete && resolved.caveats.is_empty();
                 resolved
                     .caveats
-                    .push(Unresolved::new(reason, shape).with_candidates(candidates));
+                    .push(Unresolved::new(reason, shape).with_candidates(candidates, complete));
                 Ok(resolved)
             }
             Err(unresolved) if unresolved.reason == "credential" => Err(unresolved),
-            Err(_) => Err(Unresolved::new(reason, shape).with_candidates(candidates)),
+            Err(_) => Err(Unresolved::new(reason, shape).with_candidates(candidates, false)),
         })
     }
 
@@ -6390,12 +6636,17 @@ struct Args<'t> {
 }
 
 /// Adds `resolved` to `values` unless its value is already there, keeping at
-/// most [`MAX_CANDIDATES`].
-fn push_candidate(values: &mut Vec<Resolved>, mut resolved: Resolved) {
-    if values.len() < MAX_CANDIDATES && values.iter().all(|v| v.value != resolved.value) {
-        resolved.caveats.clear();
-        values.push(resolved);
+/// most [`MAX_CANDIDATES`]; `false` when it was dropped at that limit.
+fn push_candidate(values: &mut Vec<Resolved>, mut resolved: Resolved) -> bool {
+    if values.iter().any(|v| v.value == resolved.value) {
+        return true;
     }
+    if values.len() >= MAX_CANDIDATES {
+        return false;
+    }
+    resolved.caveats.clear();
+    values.push(resolved);
+    true
 }
 
 fn captured(key: &str, resolved: Resolved, positional: bool) -> CapturedValue {
