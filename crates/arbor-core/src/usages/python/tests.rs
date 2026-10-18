@@ -2178,3 +2178,174 @@ ChatCompletion(model=os.getenv("M17", "gpt-4"))
     let typed = call(&found, "ChatCompletion");
     assert!(typed.values.is_empty(), "{:?}", typed.values);
 }
+
+// ---------------------------------------------------------------------------
+// Re-review of #276: each use sees the definitions that can reach it
+// ---------------------------------------------------------------------------
+
+/// `(line, model value or "-", gap reasons at that line)` for every call.
+fn values_and_gaps(found: &FileUsages) -> Vec<(u32, String, Vec<String>)> {
+    found
+        .calls
+        .iter()
+        .map(|c| {
+            let value = c
+                .values
+                .iter()
+                .find(|v| v.key == "model")
+                .map_or("-".to_string(), |v| v.value.clone());
+            let reasons = found
+                .gaps
+                .iter()
+                .filter(|g| g.span.map(|s| s.start_byte) == Some(c.span.start_byte))
+                .map(|g| g.reason.clone())
+                .collect();
+            (c.span.line, value, reasons)
+        })
+        .collect()
+}
+
+#[test]
+fn comprehension_targets_have_their_own_scope() {
+    // The body of a comprehension comes before its `for` clause, and the
+    // target was recorded in the enclosing scope, so these reported the
+    // outer `model` with no gap.
+    let found = usages(
+        r#"
+from openai import OpenAI
+client = OpenAI()
+model = "gpt-4o"
+results = [client.chat.completions.create(model=model, messages=[]) for model in ["gpt-3.5-turbo", "o1-mini"]]
+gen = (client.chat.completions.create(model=model, messages=[]) for model in ("o3-mini",))
+d3 = {model: client.chat.completions.create(model=model, messages=[]) for model in ["gpt-4"]}
+
+def compare(model="gpt-4o"):
+    return [client.chat.completions.create(model=model, messages=[]) for model in ["o1-mini", "gpt-3.5-turbo"]]
+
+def compare2():
+    model = "gpt-4o"
+    return [client.chat.completions.create(model=model, messages=[]) for model in ("o3-mini",)]
+
+kept = [client.chat.completions.create(model=model, messages=[]) for _ in range(2)]
+"#,
+    );
+    let rows = values_and_gaps(&found);
+    for (line, value, reasons) in &rows[..5] {
+        assert_eq!(value, "-", "line {line} reported the outer `model`");
+        assert!(!reasons.is_empty(), "line {line} has no gap");
+    }
+    // A name the comprehension does not bind is still the enclosing one.
+    assert_eq!(rows[5].1, "gpt-4o");
+    assert!(rows[5].2.is_empty(), "{:?}", rows[5]);
+}
+
+#[test]
+fn nested_functions_see_every_later_definition() {
+    // A use in a function was resolved at the end of the enclosing scope, so
+    // the last assignment won and the earlier request was missed.
+    let found = usages(
+        r#"
+from openai import OpenAI
+client = OpenAI()
+
+MODEL = "o1-mini"
+def ask(q):
+    return client.chat.completions.create(model=MODEL, messages=[q])
+print(ask("hi"))
+MODEL = "gpt-4o"
+
+def ask5():
+    return CL5.chat.completions.create(model="gpt-4o-mini", messages=[])
+CL5 = OpenAI()
+ask5()
+CL5 = OpenAI(base_url="https://openrouter.ai/api/v1")
+ask5()
+
+M = "gpt-4"
+gen = (client.chat.completions.create(model=M, messages=[]) for _ in range(2))
+M = "o3-mini"
+
+STABLE = "gpt-4.1"
+def ok():
+    return client.chat.completions.create(model=STABLE, messages=[])
+"#,
+    );
+    let rows = values_and_gaps(&found);
+    assert_eq!(rows[0].1, "-");
+    assert_eq!(rows[0].2, vec!["reassigned"]);
+    let ask5 = call(&found, "CL5.chat.completions.create");
+    assert_eq!(ask5.routing, Routing::Unknown);
+    assert_eq!(gaps(&found, GapKind::AmbiguousClient).len(), 1);
+    // A generator runs when consumed, so it is deferred too.
+    assert_eq!(rows[2].1, "-");
+    assert_eq!(rows[2].2, vec!["reassigned"]);
+    assert_eq!(rows[3].1, "gpt-4.1");
+    assert!(rows[3].2.is_empty());
+}
+
+#[test]
+fn class_bodies_resolve_where_they_run() {
+    // `c = CL7` runs when the class is created, before `CL7` is rebound.
+    let found = usages(
+        r#"
+from openai import OpenAI
+CL7 = OpenAI()
+class Bot7:
+    c = CL7
+    def go(self):
+        return self.c.chat.completions.create(model="gpt-4", messages=[])
+CL7 = OpenAI(base_url="https://gw")
+"#,
+    );
+    let go = call(&found, "self.c.chat.completions.create");
+    assert_eq!(go.routing, Routing::OpenaiDirect);
+    assert_eq!(go.client_line, Some(3));
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn a_rebinding_in_another_branch_of_a_loop_does_not_reach() {
+    // Track C h042: the definition in each branch dominates its call, so the
+    // other branch's client cannot reach it on the next iteration.
+    let found = usages(
+        r#"import anthropic
+from openai import OpenAI
+
+def run(providers):
+    for provider in providers:
+        if provider == "openai":
+            client = OpenAI()
+            client.chat.completions.create(model="gpt-4o", messages=[])
+        else:
+            client = anthropic.Anthropic()
+            client.messages.create(model="claude-3-opus-20240229", max_tokens=1, messages=[])
+    return client
+"#,
+    );
+    let routes: Vec<(u32, Routing)> = found
+        .calls
+        .iter()
+        .map(|c| (c.span.line, c.routing))
+        .collect();
+    assert_eq!(
+        routes,
+        vec![(8, Routing::OpenaiDirect), (11, Routing::AnthropicDirect)]
+    );
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+
+    // A later rebinding in an inner loop that does not re-run the
+    // dominating definition still reaches the call.
+    let found = usages(
+        r#"from openai import OpenAI, AzureOpenAI
+
+def run(batches):
+    for batch in batches:
+        client = OpenAI()
+        for item in batch:
+            client.chat.completions.create(model="gpt-4o", messages=[])
+            client = AzureOpenAI()
+"#,
+    );
+    assert_eq!(found.calls[0].routing, Routing::Unknown);
+    assert_eq!(gaps(&found, GapKind::AmbiguousClient).len(), 1);
+}

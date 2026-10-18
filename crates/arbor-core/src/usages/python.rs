@@ -16,14 +16,17 @@
 //!
 //! Names resolve the way Python scopes them, approximately: function and
 //! lambda locals, parameters and imports shadow enclosing functions, class
-//! bodies are skipped from inside methods, and `global` re-homes an
-//! assignment to the module. Within one scope a use sees its reaching
-//! definitions: the nearest definition that dominates it in straight-line
-//! code, every definition between that one and the use (in a branch), later
-//! ones in a loop around the use, and `global` assignments made by
-//! functions. A use from a nested function or lambda sees the definitions
-//! that reach the end of the binding scope. With no dominating definition,
-//! or past the search limits, every definition of the name counts.
+//! bodies are skipped from inside methods, comprehensions have their own
+//! scope, and `global` re-homes an assignment to the module. A use sees its
+//! reaching definitions: the nearest definition that dominates it in
+//! straight-line code, every definition between that one and the use (in a
+//! branch), later ones in a loop that runs the use again without passing
+//! the dominating one, and `global` assignments made by functions. Class
+//! bodies and list, set and dict comprehensions run where they are written,
+//! so their uses are placed there. A use from a function, lambda or
+//! generator sees what reaches its definition plus every later definition,
+//! since it may run after any of them. With no dominating definition, or
+//! past the search limits, every definition of the name counts.
 //!
 //! An untyped parameter used as a client resolves when every call to its
 //! function in this file passes the same tracked client. Other files may
@@ -724,6 +727,12 @@ struct Scope {
     decorated: bool,
     staticmethod: bool,
     lambda: bool,
+    /// A list, set or dict comprehension or a generator expression: its
+    /// own scope for its targets, with no name.
+    comprehension: bool,
+    /// The body runs where it is written (a class body, a list, set or dict
+    /// comprehension), not when called later.
+    immediate: bool,
 }
 
 impl Scope {
@@ -742,6 +751,8 @@ impl Scope {
             decorated: false,
             staticmethod: false,
             lambda: false,
+            comprehension: false,
+            immediate: kind == ScopeKind::Class,
         }
     }
 }
@@ -755,14 +766,11 @@ struct Place {
     /// of its block after its statement). `None` for bindings that do not
     /// dominate what follows (walrus, loop targets).
     region: Option<(usize, usize)>,
-    /// The outermost loop around the definition in its scope.
-    outer_loop: Option<(usize, usize)>,
 }
 
 impl Place {
-    /// Whether the binding certainly holds at `pos`. The end is inclusive
-    /// so that the end of a scope (where a nested function's use is
-    /// resolved) is covered.
+    /// Whether the binding certainly holds at `pos`. The end is inclusive,
+    /// so a definition holds at the end of its block.
     fn dominates(&self, pos: usize) -> bool {
         self.region
             .is_some_and(|(start, end)| start <= pos && pos <= end)
@@ -871,8 +879,36 @@ struct Frame<'t> {
     /// The statement of that block this node is part of; `None` when the
     /// node is the statement.
     stmt: Option<(usize, usize)>,
-    /// Outermost loop around the node in its scope.
-    outer_loop: Option<(usize, usize)>,
+    /// Innermost loop around the node in its scope (an index into that
+    /// scope's [`Ctx::loops`]).
+    inner_loop: Option<usize>,
+}
+
+/// A `for` or `while` statement, for loop-carried definitions.
+#[derive(Clone, Copy, Debug)]
+struct LoopRange {
+    start: usize,
+    end: usize,
+    /// The loop around it in the same scope.
+    parent: Option<usize>,
+}
+
+impl LoopRange {
+    fn contains(&self, pos: usize) -> bool {
+        self.start <= pos && pos < self.end
+    }
+}
+
+/// Where a use runs relative to the scope that binds its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UseAt {
+    /// At this byte of the binding scope: code in the scope itself, a class
+    /// body or a list, set or dict comprehension, which all run where they
+    /// are written.
+    At(usize),
+    /// Later, from a function, lambda or generator defined at this byte of
+    /// the binding scope: it may run after any later definition.
+    Deferred(usize),
 }
 
 /// A dict literal reached through names and subscripts.
@@ -962,6 +998,8 @@ struct Ctx<'t> {
     /// Names whose dict may change after its literal (`D[k] = v`, `D.update`).
     mutated: HashSet<&'t str>,
     def_index: HashMap<Key, DefIndex>,
+    /// `for`/`while` statements per scope, in source order.
+    loops: HashMap<usize, Vec<LoopRange>>,
     /// Start bytes of the expressions that read the process environment
     /// (`os.environ`, `os.getenv`, `getenv(...)`, `environ[...]`), in
     /// order, so "does this expression read the environment?" is a binary
@@ -1027,6 +1065,7 @@ impl<'t> Ctx<'t> {
             attr_uses: HashMap::new(),
             mutated: HashSet::new(),
             def_index: HashMap::new(),
+            loops: HashMap::new(),
             env_reads: Vec::new(),
             constructions: HashMap::new(),
             name_memo: HashMap::new(),
@@ -1110,7 +1149,7 @@ impl<'t> Ctx<'t> {
             field: None,
             block_end: root.end_byte(),
             stmt: None,
-            outer_loop: None,
+            inner_loop: None,
         }];
         while let Some(frame) = stack.pop() {
             let node = frame.node;
@@ -1121,10 +1160,9 @@ impl<'t> Ctx<'t> {
             let place = Place {
                 at: stmt.1,
                 region: Some((stmt.1, frame.block_end)),
-                outer_loop: frame.outer_loop,
             };
             let mut inner = scope;
-            let mut child_loop = frame.outer_loop;
+            let mut child_loop = frame.inner_loop;
             if node.is_named() {
                 match node.kind() {
                     "function_definition" => {
@@ -1139,15 +1177,25 @@ impl<'t> Ctx<'t> {
                         inner = self.enter_lambda(node, scope);
                         child_loop = None;
                     }
+                    "list_comprehension"
+                    | "set_comprehension"
+                    | "dictionary_comprehension"
+                    | "generator_expression" => {
+                        inner = self.enter_comprehension(node, scope);
+                        child_loop = None;
+                    }
                     "for_statement" | "while_statement" => {
-                        if child_loop.is_none() {
-                            child_loop = Some((node.start_byte(), node.end_byte()));
-                        }
+                        let loops = self.loops.entry(scope).or_default();
+                        loops.push(LoopRange {
+                            start: node.start_byte(),
+                            end: node.end_byte(),
+                            parent: frame.inner_loop,
+                        });
+                        child_loop = Some(loops.len() - 1);
                         if let Some(left) = node.child_by_field_name("left") {
                             let place = Place {
                                 at: left.end_byte(),
                                 region: None,
-                                outer_loop: child_loop,
                             };
                             self.record_target(left, None, None, scope, true, place);
                         }
@@ -1157,7 +1205,6 @@ impl<'t> Ctx<'t> {
                             let place = Place {
                                 at: left.end_byte(),
                                 region: None,
-                                outer_loop: frame.outer_loop,
                             };
                             self.record_target(left, None, None, scope, true, place);
                         }
@@ -1181,19 +1228,23 @@ impl<'t> Ctx<'t> {
                         let place = Place {
                             at: node.end_byte(),
                             region: Some((node.end_byte(), frame.block_end)),
-                            outer_loop: frame.outer_loop,
                         };
                         self.record_with_item(node, scope, place);
                     }
                     "named_expression" => {
                         if let Some(name) = node.child_by_field_name("name") {
                             let value = node.child_by_field_name("value");
+                            // A walrus in a comprehension binds in the
+                            // enclosing function or module (PEP 572).
+                            let mut home = scope;
+                            while self.scopes[home].comprehension {
+                                home = self.scopes[home].parent.unwrap_or(0);
+                            }
                             let place = Place {
                                 at: node.end_byte(),
                                 region: None,
-                                outer_loop: frame.outer_loop,
                             };
-                            self.record_target(name, value, None, scope, false, place);
+                            self.record_target(name, value, None, home, false, place);
                         }
                     }
                     "global_statement" => {
@@ -1255,7 +1306,7 @@ impl<'t> Ctx<'t> {
                     field,
                     block_end,
                     stmt: child_stmt,
-                    outer_loop: child_loop,
+                    inner_loop: child_loop,
                 });
             }
         }
@@ -1443,6 +1494,32 @@ impl<'t> Ctx<'t> {
             _ => self.import_home(parent, &name),
         };
         self.functions.entry((home, name)).or_default().push(id);
+        id
+    }
+
+    /// A comprehension or generator expression: its own scope for its
+    /// targets (Python 3), named after the enclosing symbol like a lambda.
+    /// List, set and dict comprehensions run where they are written; a
+    /// generator runs when consumed.
+    fn enter_comprehension(&mut self, node: Node<'t>, parent: usize) -> usize {
+        let class = match self.scopes[parent].kind {
+            ScopeKind::Class => Some(parent),
+            _ => self.scopes[parent].class,
+        };
+        let mut scope = Scope::new(
+            ScopeKind::Function,
+            Some(parent),
+            node.start_byte(),
+            node.end_byte(),
+        );
+        scope.class = class;
+        scope.symbol = self.scopes[parent].symbol.clone();
+        scope.name = "<comprehension>".to_string();
+        scope.lambda = true;
+        scope.comprehension = true;
+        scope.immediate = node.kind() != "generator_expression";
+        let id = self.scopes.len();
+        self.scopes.push(scope);
         id
     }
 
@@ -1935,7 +2012,6 @@ impl<'t> Ctx<'t> {
                     place: Place {
                         at: scope.start,
                         region: Some((scope.start, scope.end)),
-                        outer_loop: None,
                     },
                     def: DefRef::Param,
                 });
@@ -1963,16 +2039,25 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    /// The definitions of `key` that reach byte `pos` of its scope (`None`:
-    /// the end of the scope, for a use from a nested function).
-    fn reaching(&self, key: &Key, pos: Option<usize>) -> Reach {
+    /// The definitions of `key` that reach a use.
+    ///
+    /// A use [`UseAt::At`] a byte sees the nearest definition that dominates
+    /// it, every definition between that one and the use (in a branch), and
+    /// the definitions later in a loop that runs the use again without
+    /// passing the dominating one first. A [`UseAt::Deferred`] use (from a
+    /// function defined at that byte) sees what reaches the definition plus
+    /// every later definition: it may be called after any of them.
+    fn reaching(&self, key: &Key, at: UseAt) -> Reach {
         let Some(index) = self.def_index.get(key) else {
             return Reach::All;
         };
         if index.total <= 1 {
             return Reach::All;
         }
-        let pos = pos.unwrap_or(self.scopes[key.0].end);
+        let (pos, deferred) = match at {
+            UseAt::At(pos) => (pos, false),
+            UseAt::Deferred(pos) => (pos, true),
+        };
         let local = &index.local;
         let before = local.partition_point(|d| d.place.at <= pos);
         let mut nearest = None;
@@ -1991,16 +2076,18 @@ impl<'t> Ctx<'t> {
             None => 0,
         };
         let mut chosen: Vec<DefRef> = local[first..before].iter().map(|d| d.def).collect();
-        // A later definition inside a loop around the use reaches it on the
-        // next iteration.
-        if let Some(loop_end) = local
-            .get(before)
-            .and_then(|d| d.place.outer_loop)
-            .filter(|(start, end)| *start <= pos && pos < *end)
-            .map(|(_, end)| end)
-        {
+        let later_until = if deferred {
+            Some(usize::MAX)
+        } else {
+            let dominating_at = nearest.map(|i| local[i].place.at);
+            match self.reentry_loop(key.0, pos, dominating_at) {
+                Some(found) => found,
+                None => return Reach::All,
+            }
+        };
+        if let Some(until) = later_until {
             for d in &local[before..] {
-                if d.place.at > loop_end {
+                if d.place.at > until {
                     break;
                 }
                 if chosen.len() >= MAX_REACH_SCAN {
@@ -2014,6 +2101,76 @@ impl<'t> Ctx<'t> {
         }
         chosen.extend(index.foreign.iter().copied());
         Reach::Subset(chosen)
+    }
+
+    /// The end of the outermost loop of `scope` that runs byte `pos` again
+    /// without passing a dominating definition at `dominating_at` first:
+    /// definitions later in that loop reach `pos` on its next iteration.
+    /// `Some(None)` when there is no such loop, `None` past the search
+    /// limit.
+    fn reentry_loop(
+        &self,
+        scope: usize,
+        pos: usize,
+        dominating_at: Option<usize>,
+    ) -> Option<Option<usize>> {
+        let Some(loops) = self.loops.get(&scope) else {
+            return Some(None);
+        };
+        // The last loop starting before `pos`; every loop around `pos` is
+        // it or one of its ancestors, since loops nest.
+        let last = loops.partition_point(|l| l.start <= pos);
+        let mut current = last.checked_sub(1);
+        let mut found = None;
+        let mut steps = 0;
+        while let Some(i) = current {
+            steps += 1;
+            if steps > MAX_REACH_SCAN {
+                return None;
+            }
+            let range = loops[i];
+            if range.contains(pos) {
+                // This loop re-runs the dominating definition before the
+                // use, and so does every loop around it.
+                if dominating_at.is_some_and(|at| range.start < at && at <= range.end) {
+                    break;
+                }
+                found = Some(range.end);
+            }
+            current = range.parent;
+        }
+        Some(found)
+    }
+
+    /// Where a use at byte `pos` of `scope` runs, seen from `home`, the
+    /// scope that binds the name: at its position when only immediate
+    /// scopes (class bodies, comprehensions) lie between them, else deferred
+    /// from where the outermost nested scope is defined.
+    fn use_at(&self, scope: usize, home: usize, pos: usize) -> UseAt {
+        let mut s = scope;
+        let mut outer = None;
+        let mut deferred = false;
+        while s != home {
+            let current = &self.scopes[s];
+            deferred |= !current.immediate;
+            outer = Some(s);
+            match current.parent {
+                Some(parent) => s = parent,
+                None => break,
+            }
+        }
+        match outer {
+            Some(outer) if deferred => UseAt::Deferred(self.scopes[outer].start),
+            _ => UseAt::At(pos),
+        }
+    }
+
+    /// The binding scope of `name` used at byte `pos` of `scope`, and where
+    /// that use runs in it.
+    fn locate(&self, name: &str, scope: usize, pos: usize) -> (Key, UseAt) {
+        let home = self.binding_scope(name, scope);
+        let at = self.use_at(scope, home, pos);
+        ((home, name.to_string()), at)
     }
 
     /// Every definition of `key`, in a fixed order.
@@ -2032,10 +2189,8 @@ impl<'t> Ctx<'t> {
     /// and the key they belong to. Constant time when every definition
     /// reaches the use, however many there are.
     fn defs_at(&self, name: &str, scope: usize, pos: usize) -> (Key, DefKinds) {
-        let home = self.binding_scope(name, scope);
-        let key = (home, name.to_string());
-        let pos = (scope == home).then_some(pos);
-        let kinds = match self.reaching(&key, pos) {
+        let (key, at) = self.locate(name, scope, pos);
+        let kinds = match self.reaching(&key, at) {
             Reach::All => {
                 let assigns = self.assigns.get(&key).map_or(0, Vec::len);
                 DefKinds {
@@ -2270,10 +2425,8 @@ impl<'t> Ctx<'t> {
         if !self.enter_name() {
             return Val::untracked(Origin::Other);
         }
-        let home = self.binding_scope(name, scope);
-        let key = (home, name.to_string());
-        let pos = (scope == home).then_some(pos);
-        let val = match self.reaching(&key, pos) {
+        let (key, at) = self.locate(name, scope, pos);
+        let val = match self.reaching(&key, at) {
             Reach::All => self.resolve_all(key),
             Reach::Subset(defs) => {
                 let vals = self.def_values(&key, &defs);
