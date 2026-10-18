@@ -9,9 +9,13 @@ This script keeps only the public facts `arbor retirements` needs:
 - each retired or retiring model ID, its provider, status, date and the replacement the
   provider lists (or none, or several);
 - the parameter rules that can be checked from a call's keyword-argument names (for
-  example "max_tokens is rejected on gpt-6-luna"), with how each was verified;
-- provenance: the provider pages each recipe was built from, the recipe versions and
-  the SHA-256 of each recipe file.
+  example "max_tokens is rejected on gpt-6-luna"), with how each was verified and, for
+  a live check, which models and which API it called;
+- the choices a recipe leaves to each repository (`report_choice`: for example whether
+  gpt-6-luna should keep reasoning off), with every option's edits and effect. These
+  are reported as decisions, never as automatic changes;
+- provenance: the provider pages each recipe was built from, the date they were read,
+  the recipe versions and the SHA-256 of each recipe file.
 
 It writes one JSON file that `crates/arbor-core` embeds at build time.
 
@@ -21,9 +25,19 @@ It writes one JSON file that `crates/arbor-core` embeds at build time.
     python3 scripts/retirements/generate_model_retirements.py --recipes PATH/TO/recipes --check
 
 `--check` regenerates in memory and exits 1 when the committed file differs, naming the
-recipes whose version or hash changed. On every `cargo test`, the Rust test in
-`crates/arbor-core/src/retirements/mod.rs` recomputes the file's digest and checks its
-invariants, so a hand edit to the JSON fails CI.
+recipes whose version or hash changed. Recipe hashes are taken over the file with CRLF
+line endings turned into LF, so a Windows checkout hashes the same as a Linux one. On
+every `cargo test`, the Rust test in `crates/arbor-core/src/retirements/mod.rs`
+recomputes the file's digest (every key except `digest` and `generated_at`) and checks
+its invariants, so a hand edit to the JSON fails CI.
+
+Any recipe field the generator cannot translate (a new rule id, action, option, edit
+kind or condition) stops generation with an error instead of being dropped.
+
+The recipes live in Arbor's research repository, which is private, so `source` names a
+commit outsiders cannot open. Every fact the data keeps carries the provider page it
+came from (`source_urls`, `source_url`), so each one can be checked against the
+provider's own page without the recipes.
 
 Nothing here reaches the network. Requires PyYAML.
 """
@@ -95,13 +109,19 @@ PROVIDER_NAMES = {
 
 RULES = {
     # -- OpenAI, shutdown 2026-10-23 (GPT-5.6 targets) --
-    "OAI-TOOLS-CC": {"message": "Chat Completions function tools on {target} need reasoning_effort \"none\" (400 otherwise)."},
+    # report_choice rules: the message says why the call needs the decision; the
+    # options (edits, effect, status) are read from the recipe.
+    "OAI-TOOLS-CC": {"message": "Chat Completions function tools work on {target} only at reasoning_effort \"none\" (400 otherwise)."},
     "OAI-TOOLS-CC-REASONING-SOURCE": {"message": "On {target}, Chat Completions tools work only without reasoning, and this reasoning model's call relies on it: move the call to the Responses API or review it by hand."},
-    "OAI-LEGACY-FUNCTIONS": {"message": "Legacy functions/function_call work on {target} at reasoning_effort \"none\"."},
-    "OAI-REASONING-DEFAULT": {"message": "{target} reasons at medium effort by default; this model ran without a reasoning step, so calls get slower and bill reasoning tokens. reasoning_effort \"none\" may keep the old behaviour (not verified to be equivalent)."},
-    "OAI-SAMPLING": {"message": "temperature, top_p and logprobs are accepted on {target} only at reasoning_effort \"none\"."},
+    "OAI-LEGACY-FUNCTIONS": {"message": "Legacy functions/function_call work on {target} at reasoning_effort \"none\"; without it they were not tested."},
+    "OAI-REASONING-DEFAULT": {"message": "{target} reasons at medium effort by default, and this model answered without a reasoning step."},
+    "OAI-SAMPLING": {"message": "temperature, top_p and logprobs are accepted on {target} at reasoning_effort \"none\"; at its default effort a non-default temperature returns 400."},
+    "OAI-SAMPLING-RESPONSES": {"message": "Whether {target} accepts temperature, top_p or logprobs on the Responses API is not verified."},
     "OAI-SAMPLING-REASONING-SOURCE": {"message": "temperature, top_p and logprobs work on {target} only at reasoning_effort \"none\", which would turn off this reasoning model's reasoning."},
-    "OAI-MAX-TOKENS": {"message": "max_tokens is rejected on {target}: use max_completion_tokens (same value) with reasoning_effort \"none\"."},
+    "OAI-MAX-TOKENS": {
+        "message": "max_tokens is rejected on {target}: use max_completion_tokens (same value).",
+        "choice_note": "If {target} reasons, max_completion_tokens also bounds its reasoning tokens, so a small limit can be used up before any visible text.",
+    },
     "OAI-STOP": {"message": "stop is not supported on {target} (400)."},
     "OAI-LOGIT-BIAS": {"message": "logit_bias is not supported on {target} (400)."},
     "OAI-PENALTIES-N-SEED": {
@@ -120,11 +140,15 @@ RULES = {
     "OAI-CACHE": {"message": "Replace prompt_cache_retention with prompt_cache_options.ttl on {target}."},
     "OAI-SAFEGUARDS": {"message": "{target} has real-time safeguards that can refuse or pause some cyber and biology output."},
     # -- OpenAI, shutdown 2027-01-14 (gpt-6-luna target) --
-    "G6-TOOLS-CC": {"message": "Chat Completions function tools on {target} need reasoning_effort \"none\" (400 otherwise)."},
-    "G6-LEGACY-FUNCTIONS": {"message": "Legacy functions/function_call work on {target} at reasoning_effort \"none\"."},
-    "G6-REASONING-DEFAULT": {"message": "{target} reasons at medium effort by default; this model ran without a reasoning step, so calls get slower and bill reasoning tokens. reasoning_effort \"none\" may keep the old behaviour (not verified to be equivalent)."},
-    "G6-SAMPLING": {"message": "temperature, top_p and logprobs are accepted on {target} only at reasoning_effort \"none\"."},
-    "G6-MAX-TOKENS": {"message": "max_tokens is rejected on {target}: use max_completion_tokens (same value) with reasoning_effort \"none\"."},
+    "G6-TOOLS-CC": {"message": "Chat Completions function tools work on {target} only at reasoning_effort \"none\" (400 otherwise)."},
+    "G6-LEGACY-FUNCTIONS": {"message": "Legacy functions/function_call work on {target} at reasoning_effort \"none\"; without it they were not tested."},
+    "G6-REASONING-DEFAULT": {"message": "{target} reasons at medium effort by default, and this model answered without a reasoning step."},
+    "G6-SAMPLING": {"message": "temperature, top_p and logprobs are accepted on {target} at reasoning_effort \"none\"; at its default effort a non-default temperature returns 400."},
+    "G6-SAMPLING-RESPONSES": {"message": "Whether {target} accepts temperature, top_p or logprobs on the Responses API is not verified."},
+    "G6-MAX-TOKENS": {
+        "message": "max_tokens is rejected on {target}: use max_completion_tokens (same value).",
+        "choice_note": "If {target} reasons, max_completion_tokens also bounds its reasoning tokens, so a small limit can be used up before any visible text.",
+    },
     "G6-STOP-LOGIT-BIAS": {"message": "stop and logit_bias are not supported on {target} (400)."},
     "G6-PENALTIES": {"message": "presence_penalty and frequency_penalty failed on {target} in every test (server error)."},
     "G6-N-SEED": {"message": "n and seed are accepted on {target} at reasoning_effort \"none\"."},
@@ -242,9 +266,57 @@ ACTION_EFFECTS = {
     "keep": "keep",
     "disclose": "note",
     "founder_decision": "note",
+    "report_choice": "choice",
 }
 
+# Every rule action a recipe may use. A new one stops generation until it is mapped
+# here (or given an explicit effect in RULES).
+KNOWN_ACTIONS = set(ACTION_EFFECTS) | {"add_param_or_report", "constraint"}
+
+# Actions that change a call without asking. The founder's 18 Oct decision makes the
+# reasoning effort a per-repository choice, so none of these may add or name it (the
+# recipe validator's rule C1 says the same; this keeps the data honest if it slips).
+AUTOMATIC_ACTIONS = {"add_param", "add_param_or_report", "rewrite_param", "keep", "remove_param"}
+EFFORT_NAMES = ("reasoning_effort", "effort")
+
 WHEN_KEYS = {"endpoint", "request_has_any", "request_lacks", "source_family", "target", "source_ids", "client"}
+
+# How each option of a report_choice reads to people. Option ids are the recipe's; a
+# new one stops generation until it has a label here.
+OPTION_LABELS = {
+    "reasoning_none": "keep reasoning off",
+    "model_default": "let the model reason",
+}
+OPTION_KEYS = {"id", "edits", "effect", "evidence", "status"}
+EDIT_KINDS = {"add_param", "remove_param", "keep"}
+OPTION_STATUSES = {"confirmed": "confirmed", "unverified": "unverified"}
+
+# Recipe text copied into the data is shown to people; it must not carry internal
+# references (live-check ids, decisions, the memo).
+INTERNAL_WORDS = re.compile(r"\b(L-[A-Z]+-\d+|founder|decision|memo|Anandb71)\b", re.IGNORECASE)
+
+# Every live check recorded in the recipes called Chat Completions (the recipe headers
+# and live-checks/ records say so); no Responses API call was made. A live result
+# therefore vouches only for chat.completions calls to the models it lists.
+LIVE_ENDPOINTS = ["chat.completions"]
+
+# Fine-tunes: whether the base model a recipe lists for fine-tunes can itself be
+# fine-tuned, and the public sentence that says so. Each recipe's fine_tuned.reason
+# must contain `reason_has`, so a change upstream stops generation here.
+FINE_TUNED = {
+    "openai-2026-10-23": {
+        "fine_tunable": False,
+        "reason_has": "list Fine-tuning as Not supported",
+        "note": "OpenAI's GPT-5.6 model pages list fine-tuning as not supported, so the fine-tune cannot be recreated on the listed base.",
+    },
+    "openai-2027-01-14": {
+        "fine_tunable": False,
+        "reason_has": "gpt-6-luna lists Fine-tuning as Not supported",
+        # No rows: the recipe matches fine-tunes of its snapshots and lists no base.
+        "bases": "snapshots",
+        "note": "gpt-6-luna, the replacement OpenAI lists for these models, does not support fine-tuning.",
+    },
+}
 
 
 class GenerationError(Exception):
@@ -280,7 +352,9 @@ def load_recipes(recipes_dir: Path):
         path = recipes_dir / name
         if not path.is_file():
             raise GenerationError(f"missing recipe file: {path}")
-        raw = path.read_bytes()
+        # LF line endings before hashing: a checkout with core.autocrlf (Windows)
+        # holds the same recipe with CRLF, and must hash the same.
+        raw = path.read_bytes().replace(b"\r\n", b"\n")
         sha = hashlib.sha256(raw).hexdigest()
         text = raw.decode("utf-8")
         for doc in yaml.load_all(text, Loader=UniqueKeyLoader):
@@ -364,10 +438,31 @@ def human_date(iso_date: str) -> str:
 
 
 def verification(item: dict) -> tuple[str, str | None]:
+    """`unverified` whenever the recipe says so (a live result may cover only part of
+    the claim), else `live` with the date of a recorded live result, else `docs`."""
+    if item.get("status") == "unverified":
+        return "unverified", None
     live = item.get("live_result")
     if isinstance(live, dict) and live.get("date"):
         return "live", iso(live["date"])
-    return ("unverified", None) if item.get("status") == "unverified" else ("docs", None)
+    return "docs", None
+
+
+def live_models(item: dict) -> list:
+    """The models a live result called: it vouches for those only."""
+    live = item.get("live_result")
+    if not isinstance(live, dict):
+        return []
+    models = live.get("models")
+    if models is None:
+        raise GenerationError(f"{item.get('id')}: live_result without models")
+    return [str(m) for m in as_list(models)]
+
+
+def docs_backed(item: dict) -> bool:
+    """Whether the recipe cites a page for the rule, so it stands on the docs where the
+    live check did not reach."""
+    return bool(item.get("source_url") or item.get("evidence") or item.get("evidence_quotes"))
 
 
 def new_entry(model, table, recipe, status, date, replacement, replacement_text, action,
@@ -418,18 +513,21 @@ def openai_dated(recipe: dict) -> tuple[list, list]:
         status = "retiring"
         live = value.get("live_result") or {}
         outcome = str(live.get("outcome", ""))
+        checked = iso(live.get("date"))
+        if (value.get("basis") == "models_api" or "404" in outcome) and not checked:
+            raise GenerationError(f"{model}: a live finding without a live_result date")
         if value.get("basis") == "models_api":
             notes.append(
                 f"{model} is an alias: OpenAI's deprecations page does not list it, but its models API "
-                f"gives it shutdown date {human_date(date)} (checked {human_date(verified_on)})."
+                f"gives it shutdown date {human_date(date)} (checked {human_date(checked)})."
             )
         elif value.get("kind") == "listed_variant" and "404" in outcome:
             status = "shut_down"
-            notes.append(f"Not a callable model ID: the API answers 404 (checked {human_date(verified_on)}).")
+            notes.append(f"Not a callable model ID: the API answers 404 (checked {human_date(checked)}).")
         elif "404" in outcome:
             status = "shut_down"
             notes.append(
-                f"OpenAI lists {human_date(date)}, but the API already answers 404 (checked {human_date(verified_on)})."
+                f"OpenAI lists {human_date(date)}, but the API already answers 404 (checked {human_date(checked)})."
             )
         text = value.get("listed_replacement_text")
         replacement = value.get("to")
@@ -438,19 +536,61 @@ def openai_dated(recipe: dict) -> tuple[list, list]:
             action_of(value), rid, value.get("source_family"), value.get("kind"),
             verified, verified_on, notes,
         ))
-    fine = recipe.get("fine_tuned") or {}
-    for label, base_replacement in (fine.get("rows") or {}).items():
+    fine_tunes = fine_tuned(recipe, date)
+    return entries, fine_tunes
+
+
+def fine_tuned(recipe: dict, date: str) -> list:
+    """Fine-tunes the recipe reports: the bases its `rows` list (with the base OpenAI
+    lists for them), or, for a recipe without rows, its snapshots. Whether the listed
+    base can be fine-tuned comes from FINE_TUNED, checked against the recipe's reason."""
+    rid = recipe["id"]
+    fine = recipe.get("fine_tuned")
+    if not fine:
+        return []
+    spec = FINE_TUNED.get(rid)
+    if spec is None:
+        raise GenerationError(f"{rid}: fine_tuned has no entry in FINE_TUNED")
+    reason = " ".join(str(fine.get("reason", "")).split())
+    if spec["reason_has"] not in reason:
+        raise GenerationError(
+            f"{rid}: fine_tuned.reason no longer says {spec['reason_has']!r}; update FINE_TUNED"
+        )
+    if fine.get("action") != "report_only":
+        raise GenerationError(f"{rid}: fine_tuned.action {fine.get('action')!r} is not report_only")
+    rows = fine.get("rows") or {}
+    if rows and spec.get("bases"):
+        raise GenerationError(f"{rid}: fine_tuned has rows now; drop `bases` from FINE_TUNED")
+    if not rows and spec.get("bases") != "snapshots":
+        raise GenerationError(f"{rid}: fine_tuned lists no rows")
+    pairs = []
+    for label, base_replacement in rows.items():
         if not label.startswith("ft-"):
             raise GenerationError(f"{rid}: fine-tune label {label!r} does not start with ft-")
-        fine_tunes.append({
-            "base": label[len("ft-"):],
+        pairs.append((label[len("ft-"):], base_replacement))
+    if not rows:
+        pairs = [
+            (model, None)
+            for model, value in recipe["value_map"].items()
+            if value.get("kind") == "snapshot"
+        ]
+        if not pairs:
+            raise GenerationError(f"{rid}: fine_tuned without rows and without snapshots")
+    if INTERNAL_WORDS.search(spec["note"]):
+        raise GenerationError(f"{rid}: FINE_TUNED note has internal wording")
+    return [
+        {
+            "base": base,
             "table": "openai",
             "recipe": rid,
             "status": "retiring",
             "date": date,
-            "replacement_base": base_replacement,
-        })
-    return entries, fine_tunes
+            "replacement_base": replacement,
+            "fine_tunable": spec["fine_tunable"],
+            "note": spec["note"],
+        }
+        for base, replacement in pairs
+    ]
 
 
 def openai_upcoming(recipe: dict) -> list:
@@ -607,20 +747,155 @@ def as_list(value) -> list:
     return list(value) if isinstance(value, (list, tuple)) else [value]
 
 
+# Endpoint names a recipe uses as keys of a per-endpoint parameter.
+KNOWN_ENDPOINTS = {"chat.completions", "responses", "completions_legacy", "assistants"}
+
+# Rule keys that only document the rule (evidence, history); the data does not need them.
+RULE_INFO_KEYS = {
+    "id", "action", "status", "when", "evidence", "summary", "live_check", "source_url",
+    "live_result", "note", "founder_decision", "sdk_compat", "evidence_quotes",
+    "consequence_if_not_chosen", "proposed_action", "reason", "disclose",
+}
+# Rule keys this generator translates.
+RULE_HANDLED_KEYS = {
+    "param", "keep_when", "otherwise", "if_param_present_and_not_none", "choice", "options",
+    "resolved", "default", "see_choice", "choice_note", "requires",
+}
+# Rule keys that change what the rule does in a way keyword names cannot show: the
+# RULES entry must say how it is translated (`why`, or an `else_message` for the
+# endpoint the change cannot be made on).
+RULE_OVERRIDE_KEYS = {"only_if", "caveat", "merge", "non_responses_endpoint"}
+
+
 def add_specs(param, endpoints) -> list:
-    """Normalises a recipe `param` into [{endpoint, name, value}]."""
-    if not isinstance(param, dict):
+    """Normalises a recipe `param` into [{endpoint, name, value}]: `{name, value}`,
+    `{param_name: value}`, or `{endpoint: {param_name: value}}`."""
+    if not isinstance(param, dict) or not param:
         raise GenerationError(f"unexpected param {param!r}")
     if "name" in param:
+        if set(param) != {"name", "value"}:
+            raise GenerationError(f"unexpected param {param!r}")
         targets = endpoints or ["*"]
         return [{"endpoint": e, "name": param["name"], "value": param["value"]} for e in targets]
-    specs = []
-    for endpoint, inner in param.items():
-        if not isinstance(inner, dict) or len(inner) != 1:
-            raise GenerationError(f"unexpected param for {endpoint}: {inner!r}")
-        (name, value), = inner.items()
-        specs.append({"endpoint": endpoint, "name": name, "value": value})
-    return specs
+    keys = set(param)
+    if keys <= KNOWN_ENDPOINTS:
+        specs = []
+        for endpoint, inner in param.items():
+            if not isinstance(inner, dict) or len(inner) != 1:
+                raise GenerationError(f"unexpected param for {endpoint}: {inner!r}")
+            (name, value), = inner.items()
+            specs.append({"endpoint": endpoint, "name": name, "value": value})
+        return specs
+    if keys & KNOWN_ENDPOINTS:
+        raise GenerationError(f"param {param!r} mixes endpoints and parameter names")
+    return [
+        {"endpoint": e, "name": name, "value": value}
+        for name, value in param.items()
+        for e in (endpoints or ["*"])
+    ]
+
+
+def keyword_names(rid: str, what: str, names) -> list:
+    names = [str(n) for n in as_list(names)]
+    bad = [n for n in names if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", n)]
+    if bad or not names:
+        raise GenerationError(f"{rid}: {what} {names} are not keyword names")
+    return names
+
+
+def public_text(rid: str, text) -> str:
+    """Recipe text shown to people as it is: one line, no internal references."""
+    if not isinstance(text, str) or not text.strip():
+        raise GenerationError(f"{rid}: expected text, got {text!r}")
+    text = " ".join(text.split())
+    if INTERNAL_WORDS.search(text):
+        raise GenerationError(f"{rid}: text shown to people has an internal reference: {text!r}")
+    return text
+
+
+def translate_options(rule: dict, endpoints: list) -> list:
+    """The options of a report_choice rule, as edits the engine can show."""
+    rid = rule["id"]
+    options = rule.get("options")
+    if not isinstance(options, list) or len(options) < 2:
+        raise GenerationError(f"{rid}: report_choice needs at least two options")
+    out = []
+    for option in options:
+        unknown = set(option) - OPTION_KEYS
+        missing = OPTION_KEYS - set(option)
+        if unknown or missing:
+            raise GenerationError(
+                f"{rid}: option {option.get('id')!r} has {sorted(unknown)} / lacks {sorted(missing)}"
+            )
+        oid = option["id"]
+        if oid not in OPTION_LABELS:
+            raise GenerationError(f"{rid}: option {oid!r} has no label in OPTION_LABELS")
+        if option["status"] not in OPTION_STATUSES:
+            raise GenerationError(f"{rid}: option {oid} has status {option['status']!r}")
+        add, remove, keep = [], [], []
+        for edit in option["edits"] or []:
+            if not isinstance(edit, dict) or len(edit) != 1:
+                raise GenerationError(f"{rid}: option {oid}: an edit is one kind, not {edit!r}")
+            (kind, value), = edit.items()
+            if kind not in EDIT_KINDS:
+                raise GenerationError(f"{rid}: option {oid}: unknown edit {kind!r}")
+            if kind == "add_param":
+                add += add_specs(value, endpoints)
+            elif kind == "remove_param":
+                remove += keyword_names(rid, f"option {oid} remove_param", value)
+            else:
+                keep += keyword_names(rid, f"option {oid} keep", value)
+        out.append({
+            "id": oid,
+            "label": OPTION_LABELS[oid],
+            "add": add,
+            "remove": remove,
+            "keep": keep,
+            "effect": public_text(rid, option["effect"]),
+            "status": OPTION_STATUSES[option["status"]],
+        })
+    return out
+
+
+def check_rule_keys(rule: dict, specs: list) -> None:
+    rid = rule["id"]
+    unknown = set(rule) - RULE_INFO_KEYS - RULE_HANDLED_KEYS - RULE_OVERRIDE_KEYS
+    if unknown:
+        raise GenerationError(f"{rid}: rule keys {sorted(unknown)} are not translated; map them in the generator")
+    override = set(rule) & RULE_OVERRIDE_KEYS
+    if override and not any(item.get("why") or item.get("else_message") for item in specs):
+        raise GenerationError(f"{rid}: {sorted(override)} change the rule; say how in RULES (why or else_message)")
+    action = rule.get("action")
+    if action not in KNOWN_ACTIONS:
+        raise GenerationError(f"{rid}: unknown action {action!r}")
+    for key in ("if_param_present_and_not_none", "otherwise"):
+        if key in rule and rule[key] != "report_only":
+            raise GenerationError(f"{rid}: {key}: {rule[key]!r} is not translated")
+    keep_when = rule.get("keep_when") or {}
+    if set(keep_when) - {"target", "effective_reasoning_effort"}:
+        raise GenerationError(f"{rid}: keep_when {sorted(keep_when)} is not translated")
+    # The reasoning effort is a per-repository choice: no automatic action may set it
+    # (the recipe validator's rule C1; repeated here so the data cannot drift).
+    if action in AUTOMATIC_ACTIONS:
+        named = json.dumps([rule.get("param"), rule.get("requires")], default=str)
+        if any(f'"{name}"' in named for name in EFFORT_NAMES):
+            raise GenerationError(
+                f"{rid}: automatic action {action} names the reasoning effort; it must be a report_choice"
+            )
+    if action == "report_choice":
+        if not rule.get("choice"):
+            raise GenerationError(f"{rid}: report_choice without a choice")
+        if rule["choice"] == rid:
+            resolved = rule.get("resolved") or {}
+            if resolved.get("decision") != "per_repo_choice" or rule.get("default") != "report_only":
+                raise GenerationError(f"{rid}: a choice anchor must be resolved per repo with default report_only")
+    elif any(k in rule for k in ("choice", "options", "resolved", "default")):
+        raise GenerationError(f"{rid}: choice fields on a {action} rule")
+    if "see_choice" in rule:
+        if not any(item.get("choice_note") for item in specs):
+            raise GenerationError(f"{rid}: see_choice needs a choice_note in RULES")
+    elif any(item.get("choice_note") for item in specs):
+        raise GenerationError(f"{rid}: RULES has a choice_note but the recipe names no choice")
 
 
 def translate_rule(rule: dict, rule_set: str) -> tuple[list, list]:
@@ -636,11 +911,12 @@ def translate_rule(rule: dict, rule_set: str) -> tuple[list, list]:
     when = rule.get("when") or {}
     unknown = set(when) - WHEN_KEYS
     specs = spec if isinstance(spec, list) else [spec]
+    check_rule_keys(rule, specs)
     action = rule.get("action")
     verified, verified_on = verification(rule)
     out = []
     for item in specs:
-        overrides = {k for k in item if k not in ("message", "else_message", "suffix", "why")}
+        overrides = {k for k in item if k not in ("message", "else_message", "suffix", "why", "choice_note")}
         if unknown and not item.get("why"):
             raise GenerationError(f"{rid}: condition {sorted(unknown)} is not visible from keyword names; give a translation with a reason")
         if overrides and not item.get("why"):
@@ -649,6 +925,8 @@ def translate_rule(rule: dict, rule_set: str) -> tuple[list, list]:
         if effect is None:
             raise GenerationError(f"{rid}: action {action!r} needs an explicit effect")
         endpoints = [e for e in as_list(when.get("endpoint"))]
+        item_verified = item.get("verified", verified)
+        live = item_verified == "live"
         engine = {
             "id": rid + ("/" + item["suffix"] if item.get("suffix") else ""),
             "rule_set": rule_set,
@@ -665,10 +943,18 @@ def translate_rule(rule: dict, rule_set: str) -> tuple[list, list]:
             "rename": None,
             "keep_targets": [],
             "keep_needs_effort_none": False,
+            "choice": None,
+            "options": [],
+            "see_choice": None,
+            "choice_note": None,
             "message": item["message"],
             "else_message": item.get("else_message"),
-            "verified": item.get("verified", verified),
-            "verified_on": verified_on if item.get("verified", verified) == "live" else None,
+            "verified": item_verified,
+            "verified_on": verified_on if live else None,
+            # A live result vouches for the models it called, on the API it called.
+            "live_models": live_models(rule) if live else [],
+            "live_endpoints": list(LIVE_ENDPOINTS) if live else [],
+            "otherwise_verified": ("docs" if docs_backed(rule) else "unverified") if live else None,
             "source_url": rule.get("source_url"),
         }
         if effect == "add" and "add" not in item:
@@ -686,6 +972,12 @@ def translate_rule(rule: dict, rule_set: str) -> tuple[list, list]:
             keep_when = rule.get("keep_when") or {}
             engine["keep_targets"] = as_list(keep_when.get("target"))
             engine["keep_needs_effort_none"] = keep_when.get("effective_reasoning_effort") == "none"
+        if effect == "choice":
+            engine["choice"] = rule["choice"]
+            engine["options"] = translate_options(rule, endpoints)
+        if rule.get("see_choice"):
+            engine["see_choice"] = rule["see_choice"]
+            engine["choice_note"] = item.get("choice_note")
         for key in ("endpoints", "targets", "any_kwargs", "all_kwargs", "lacks_kwargs", "add"):
             if key in item:
                 engine[key] = copy.deepcopy(item[key])
@@ -699,6 +991,28 @@ def translate_rule(rule: dict, rule_set: str) -> tuple[list, list]:
             raise GenerationError(f"{rid}: {effect} rule without a parameter")
         out.append(engine)
     return out, []
+
+
+def check_choices(rules: list) -> None:
+    """Every report_choice rule names an anchor in its own recipe and offers the
+    anchor's options in the same order; every see_choice names an anchor."""
+    anchors = {
+        (r["rule_set"], r["id"]): r
+        for r in rules
+        if r.get("choice") and r["choice"] == r["id"]
+    }
+    for rule in rules:
+        for key in ("choice", "see_choice"):
+            name = rule.get(key)
+            if not name:
+                continue
+            anchor = anchors.get((rule["rule_set"], name))
+            if anchor is None:
+                raise GenerationError(f"{rule['id']}: {key} {name} is not a choice in {rule['rule_set']}")
+            if key == "choice":
+                ids = [o["id"] for o in rule["options"]]
+                if ids != [o["id"] for o in anchor["options"]]:
+                    raise GenerationError(f"{rule['id']}: options {ids} differ from {name}'s")
 
 
 # ---------------------------------------------------------------------------
@@ -782,10 +1096,13 @@ def build(recipes_dir: Path, source: str, generated_at: str) -> dict:
         if entry["table"] == "gemini_api" and (entry["replacement"] or "").startswith("gemini-2.5"):
             entry["notes"].append("Google limits gemini-2.5 models to API keys that used them before.")
 
+    check_choices(rules)
     validate(entries, fine_tunes, rules)
     data = {
         "schema": SCHEMA,
-        "data_as_of": max(r["retrieved_on"] for r in recipes),
+        # The oldest date any provider page was read: the data is at least this
+        # fresh. Each recipe keeps its own `retrieved_on`.
+        "data_as_of": min(r["retrieved_on"] for r in recipes),
         "generated_at": generated_at,
         "generator": GENERATOR,
         "source": source,
@@ -793,7 +1110,7 @@ def build(recipes_dir: Path, source: str, generated_at: str) -> dict:
         "recipes": recipes,
         "entries": [compact(e) for e in entries],
         "fine_tunes": [compact(f) for f in fine_tunes],
-        "rules": [compact(r) for r in rules],
+        "rules": [compact_rule(r) for r in rules],
         "skipped_rules": skipped,
     }
     data["digest"] = digest(data)
@@ -803,6 +1120,13 @@ def build(recipes_dir: Path, source: str, generated_at: str) -> dict:
 def compact(item: dict) -> dict:
     """Drops null, empty and false fields: the engine reads them as their defaults."""
     return {k: v for k, v in item.items() if v is not None and v != [] and v is not False}
+
+
+def compact_rule(rule: dict) -> dict:
+    rule = compact(rule)
+    if "options" in rule:
+        rule["options"] = [compact(o) for o in rule["options"]]
+    return rule
 
 
 def validate(entries, fine_tunes, rules) -> None:
@@ -849,12 +1173,18 @@ def check_plain(value) -> None:
     raise GenerationError(f"unsupported value {value!r}")
 
 
+# Keys the digest leaves out: the digest itself, and the day the file was written
+# (`--check` keeps it from the existing file).
+UNDIGESTED = ("digest", "generated_at")
+
+
 def digest(data: dict) -> str:
-    """FNV-1a 64 over the canonical JSON (sorted keys, no spaces) of the checked sections.
+    """FNV-1a 64 over the canonical JSON (sorted keys, no spaces) of every key except
+    UNDIGESTED: entries, rules, provenance, recipe hashes, dates and skipped rules.
 
     The Rust test computes the same value, so editing the JSON by hand fails CI.
     """
-    body = {key: data[key] for key in ("entries", "fine_tunes", "rules")}
+    body = {key: value for key, value in data.items() if key not in UNDIGESTED}
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     h = 0xCBF29CE484222325
     for byte in canonical.encode("utf-8"):
