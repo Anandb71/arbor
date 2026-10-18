@@ -36,9 +36,11 @@
 //!
 //! No credential value is ever captured. A value is refused when any name it
 //! flows through matches [`is_secret_key`] (the keyword, a constant, a
-//! parameter, a `self.attr`, a dict key or an environment variable name),
-//! when the value itself is credential-shaped ([`is_credential_value`]:
-//! `sk-`, `sk-ant-`, `AIza`, `ghp_`, `xox...`, long random tokens), and dict
+//! parameter, a `self.attr`, any name in an attribute chain such as
+//! `ApiKeys.openai`, a dict key or an environment variable name), when the
+//! value itself is credential-shaped ([`is_credential_value`]: `sk-`,
+//! `sk-ant-`, `AIza`, `ghp_`, `xox...`, URLs with user information, long
+//! random tokens), and dict
 //! key paths are built only from identifier-shaped keys
 //! ([`is_identifier_key`]). A refused value at a request is an
 //! `unresolved_model` gap with reason `credential`; the gap names the
@@ -487,13 +489,25 @@ pub fn is_python_shebang(head: &[u8]) -> bool {
 /// name only.
 pub const VALUE_KEYS: &[&str] = &["model", "engine", "deployment_id", "model_name"];
 
+/// Name fragments that mark a credential: `api_key`, `auth_token`,
+/// `client_secret`, `PASSWD`, `db_pwd`, `CREDENTIALS`, `private_pem`...
+const SECRET_NEEDLES: &[&str] = &[
+    "key",
+    "token",
+    "secret",
+    "passw",
+    "passphrase",
+    "pwd",
+    "auth",
+    "cred",
+    "private",
+];
+
 /// Whether `key` may hold a credential. Such a value is never captured,
 /// whatever else is configured.
 pub fn is_secret_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
-    ["key", "token", "secret", "password", "auth"]
-        .iter()
-        .any(|needle| lower.contains(needle))
+    SECRET_NEEDLES.iter().any(|needle| lower.contains(needle))
 }
 
 /// Whether a value for `key` may be captured.
@@ -548,13 +562,18 @@ const CREDENTIAL_PREFIXES: &[&str] = &[
 ];
 
 /// Whether a string looks like a credential rather than a model ID: a known
-/// key or token prefix, an AWS key ID, a JWT, or a long random run of alphanumerics (20 or
-/// more mixing upper case, lower case and digits, or 32 or more mixing
-/// letters and digits, which covers hex keys). Model IDs are short words
-/// joined by `-`, `.`, `:`, `/` or `@`, so they do not match.
+/// key or token prefix, an AWS key ID, a JWT, a URL with user information
+/// (`postgres://admin:pw@db/prod`, `https://<token>@host`), or a long
+/// random run of alphanumerics (20 or more mixing upper case, lower case
+/// and digits, or 32 or more mixing letters and digits, which covers hex
+/// keys). Model IDs are short words joined by `-`, `.`, `:`, `/` or `@`,
+/// so they do not match.
 pub fn is_credential_value(value: &str) -> bool {
     let value = value.trim();
     if CREDENTIAL_PREFIXES.iter().any(|p| value.starts_with(p)) {
+        return true;
+    }
+    if has_url_userinfo(value) {
         return true;
     }
     // An AWS access key ID.
@@ -579,6 +598,16 @@ pub fn is_credential_value(value: &str) -> bool {
             (run.len() >= 20 && upper && lower && digit)
                 || (run.len() >= 32 && (upper || lower) && digit)
         })
+}
+
+/// Whether `value` holds a URL whose authority carries user information
+/// (`scheme://user:password@host`, `scheme://token@host`).
+fn has_url_userinfo(value: &str) -> bool {
+    value.match_indices("://").any(|(at, sep)| {
+        let rest = &value[at + sep.len()..];
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        authority.contains('@')
+    })
 }
 
 /// Whether a resolved string may be reported as a value: not
@@ -701,6 +730,13 @@ mod tests {
             "password",
             "authorization",
             "azure_ad_token_provider",
+            "PASSWD",
+            "db_pwd",
+            "credential",
+            "CREDENTIALS",
+            "gcp_cred",
+            "private_pem",
+            "passphrase",
         ] {
             assert!(is_secret_key(key), "{key} must be treated as secret");
             assert!(!is_value_key(key));
@@ -723,6 +759,9 @@ mod tests {
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig",
             "Zx8aB2cD4eF6gH8iJ0kL2mN4",
             "0123456789abcdef0123456789abcdef",
+            "postgres://admin:hunter2@db/prod",
+            "https://user:pw@gateway.example/v1",
+            "https://tokenvalue@github.com/org/repo",
         ] {
             assert!(is_credential_value(secret), "{secret} must be refused");
             assert!(!is_capturable_value(secret));
@@ -738,6 +777,8 @@ mod tests {
             "projects/123456789012/locations/us-central1/endpoints/1234567890123456789",
             "text-embedding-3-small",
             "o3-mini",
+            "https://openrouter.ai/api/v1",
+            "anthropic/claude-3-opus@latest",
         ] {
             assert!(!is_credential_value(model), "{model} is a model ID");
             assert!(is_capturable_value(model));

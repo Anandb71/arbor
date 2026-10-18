@@ -2531,3 +2531,45 @@ client.chat.completions.create(model=D3.get("sk-proj-tokenFAKEFAKE0000fakekeyXYZ
     assert_eq!(refused.reason, "credential");
     assert!(refused.detail.contains("D3.get(...)"), "{}", refused.detail);
 }
+
+#[test]
+fn wider_secret_names_and_urls_with_credentials_are_refused() {
+    // Each of these printed its value: the needles missed `passwd`, `pwd`,
+    // `cred` and `private`, a class name in `ApiKeys.openai` was not
+    // checked, and a URL with a password was not credential-shaped.
+    let found = usages(
+        r#"
+from openai import OpenAI
+client = OpenAI()
+class ApiKeys:
+    openai = "hunter2-FLOWN"
+client.chat.completions.create(model=ApiKeys.openai, messages=[])
+PASSWD = "hunter2-FLOWO"
+client.chat.completions.create(model=PASSWD, messages=[])
+CREDENTIALS = "hunter2-FLOWP"
+client.chat.completions.create(model=CREDENTIALS, messages=[])
+DATABASE_URL = "postgres://admin:hunter2FLOWQ@db/prod"
+client.chat.completions.create(model=DATABASE_URL, messages=[])
+db_pwd = "hunter2-FLOWR"
+client.chat.completions.create(model=db_pwd, messages=[])
+private_model = "hunter2-FLOWS"
+client.chat.completions.create(model=private_model, messages=[])
+GATEWAY = "https://hunter2FLOWT@gw.example/v1"
+client.chat.completions.create(model=GATEWAY, messages=[])
+P19 = {"extra_body": {"credentials": {"model": "hunter2-D19"}}}
+client.chat.completions.create(model="gpt-4", messages=[], **P19)
+client.chat.completions.create(model="gpt-4", messages=[], extra_body={"cred": {"model": "hunter2-D20"}})
+"#,
+    );
+    let json = serde_json::to_string(&found).unwrap();
+    assert!(!json.contains("hunter2"), "{json}");
+    let refused = gaps(&found, GapKind::UnresolvedModel)
+        .iter()
+        .filter(|g| g.reason == "credential")
+        .count();
+    assert_eq!(refused, 7, "{json}");
+    // The safe values next to them are still captured.
+    let last = found.calls.last().unwrap();
+    let keys: Vec<&str> = last.values.iter().map(|v| v.key.as_str()).collect();
+    assert_eq!(keys, vec!["model"]);
+}

@@ -4214,7 +4214,8 @@ impl<'t> Ctx<'t> {
                     expr.child_by_field_name("attribute"),
                 ) {
                     let attr = self.text(attr).to_string();
-                    if is_secret_key(&attr) {
+                    // `self.secret`, `ApiKeys.openai`, `cfg.credentials.model`.
+                    if is_secret_key(&attr) || self.chain_has_secret_name(object) {
                         return Err(Unresolved::new("credential", rendered));
                     }
                     if let Some(class) = self.class_receiver(object, scope) {
@@ -4279,6 +4280,29 @@ impl<'t> Ctx<'t> {
             }
             _ => Err(Unresolved::new("non_literal", self.render(expr))),
         }
+    }
+
+    /// Whether a name written in the attribute chain `node` looks like a
+    /// credential's (`ApiKeys` in `ApiKeys.openai`, `keys` in
+    /// `cfg.keys.openai`). `self` and `cls` are not names of their own.
+    fn chain_has_secret_name(&self, node: Node<'t>) -> bool {
+        let mut node = node;
+        for _ in 0..MAX_DEPTH {
+            match node.kind() {
+                "identifier" => return is_secret_key(self.text(node)),
+                "attribute" => {
+                    let secret = node
+                        .child_by_field_name("attribute")
+                        .is_some_and(|a| is_secret_key(self.text(a)));
+                    match node.child_by_field_name("object") {
+                        Some(object) if !secret => node = object,
+                        _ => return secret,
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
     }
 
     fn resolve_constant(
