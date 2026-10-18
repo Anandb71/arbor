@@ -2749,3 +2749,100 @@ ask5("z", "gpt-4.1")
     // Each listed value points at the caller's literal.
     assert_eq!(overridden.values[1].span.line, 7);
 }
+
+#[test]
+fn a_base_url_assigned_after_construction_keeps_a_gap() {
+    // `client.base_url = ...` after `OpenAI()` was ignored: the calls were
+    // reported as `openai_direct` with no gap.
+    let found = usages(
+        r#"from openai import OpenAI
+from anthropic import Anthropic
+CL8 = OpenAI()
+CL8.base_url = "https://openrouter.ai/api/v1"
+CL8.chat.completions.create(model="gpt-4", messages=[])
+alias = CL8
+alias.chat.completions.create(model="gpt-4", messages=[])
+other = OpenAI()
+other.chat.completions.create(model="gpt-4", messages=[])
+class Bot:
+    def __init__(self):
+        self.client = Anthropic()
+        self.client.base_url = "https://gw.example"
+    def go(self):
+        return self.client.messages.create(model="claude-3-opus-20240229", max_tokens=1, messages=[])
+"#,
+    );
+    let gap = || vec!["ambiguous_client/base_url_assigned".to_string()];
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (5, Routing::Unknown, gap()),
+            (7, Routing::Unknown, gap()),
+            (9, Routing::OpenaiDirect, vec![]),
+            (15, Routing::Unknown, gap()),
+        ]
+    );
+}
+
+#[test]
+fn an_endpoint_set_in_the_environment_keeps_a_gap() {
+    // `os.environ["OPENAI_BASE_URL"] = ...` before `OpenAI()` was ignored.
+    let found = usages(
+        r#"import os
+import openai
+from openai import OpenAI
+os.environ["OPENAI_BASE_URL"] = "http://localhost:11434/v1"
+CL9 = OpenAI()
+CL9.chat.completions.create(model="gpt-4", messages=[])
+own = OpenAI(base_url="https://gw.example")
+own.chat.completions.create(model="gpt-4", messages=[])
+openai.chat.completions.create(model="gpt-4", messages=[])
+"#,
+    );
+    let gap = || vec!["ambiguous_client/endpoint_env".to_string()];
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (6, Routing::Unknown, gap()),
+            (8, Routing::CustomBaseUrl, vec![]),
+            (9, Routing::Unknown, gap()),
+        ]
+    );
+    assert_eq!(routing_of(&found, "CL9"), Routing::Unknown);
+
+    let found = usages(
+        r#"import os
+from anthropic import Anthropic
+os.environ.setdefault("ANTHROPIC_BASE_URL", "https://gw.example")
+a = Anthropic()
+a.messages.create(model="claude-3-opus-20240229", max_tokens=1, messages=[])
+"#,
+    );
+    assert_eq!(routes_and_gaps(&found), vec![(5, Routing::Unknown, gap())]);
+    for write in [
+        "os.environ.update({\"ANTHROPIC_BASE_URL\": \"https://gw\"})",
+        "os.environ.update(ANTHROPIC_BASE_URL=\"https://gw\")",
+        "os.putenv(\"ANTHROPIC_BASE_URL\", \"https://gw\")",
+    ] {
+        let found = usages(&format!(
+            "import os
+from anthropic import Anthropic
+{write}
+Anthropic().messages.create(model=\"claude-3-opus-20240229\", max_tokens=1, messages=[])
+"
+        ));
+        assert_eq!(routes_and_gaps(&found), vec![(4, Routing::Unknown, gap())]);
+    }
+    // Another variable, or none, changes nothing.
+    let found = usages(
+        "import os
+from anthropic import Anthropic
+os.environ[\"ANTHROPIC_LOG\"] = \"debug\"
+Anthropic().messages.create(model=\"claude-3-opus-20240229\", max_tokens=1, messages=[])
+",
+    );
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![(4, Routing::AnthropicDirect, vec![])]
+    );
+}

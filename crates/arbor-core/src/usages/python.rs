@@ -460,6 +460,8 @@ struct Client {
     routing: Routing,
     /// Line of the same-file construction, when there is exactly one.
     line: Option<u32>,
+    /// The construction call (its node id), when there is exactly one.
+    site: Option<usize>,
     /// Assigned more than one kind of client, or a client and something else.
     ambiguous: bool,
     /// Known only from a type annotation, not from a construction.
@@ -475,7 +477,26 @@ enum ClientCaveat {
     /// Every in-file caller of a function passes this client for
     /// parameter `param`, but other modules may call it with another.
     InFileCallers { param: String },
+    /// `client.base_url = ...` after the client is built.
+    BaseUrlAssigned,
+    /// The file sets an environment variable the SDK reads its endpoint
+    /// from (`os.environ["OPENAI_BASE_URL"] = ...`).
+    EndpointEnv { var: &'static str },
 }
+
+/// Environment variables an SDK reads its endpoint from when the
+/// constructor is not given one.
+const ENDPOINT_ENV: &[(Pkg, &str)] = &[
+    (Pkg::Openai, "OPENAI_BASE_URL"),
+    (Pkg::Anthropic, "ANTHROPIC_BASE_URL"),
+];
+
+/// Environment variables the module-level OpenAI API (v0 and the v1 module
+/// client) reads its endpoint or API type from.
+const OPENAI_MODULE_ENV: &[&str] = &["OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_TYPE"];
+
+/// Attributes that re-route a built client when assigned.
+const BASE_URL_ATTRS: &[&str] = &["base_url", "api_base", "_base_url"];
 
 /// Where an untracked value came from, for gap details.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1159,6 +1180,16 @@ struct Ctx<'t> {
     /// The file is a script (no extension, or `__main__.py`): other modules
     /// do not import it, so its in-file callers are all the callers.
     script: bool,
+    /// Environment variables the file sets by name
+    /// (`os.environ["OPENAI_BASE_URL"] = ...`, `os.environ.setdefault(...)`,
+    /// `os.environ.update(...)`, `os.putenv(...)`).
+    env_writes: HashSet<String>,
+    /// Construction calls whose client has `base_url` assigned later, and
+    /// packages with such a client that could not be singled out.
+    rerouted: HashSet<usize>,
+    rerouted_pkgs: HashSet<Pkg>,
+    /// Why the module-level OpenAI API's routing may not hold.
+    openai_caveat: Option<ClientCaveat>,
     out: FileUsages,
 }
 
@@ -1223,6 +1254,10 @@ impl<'t> Ctx<'t> {
             next_id: 0,
             openai_routing: Routing::OpenaiDirect,
             script: is_script_path(file),
+            env_writes: HashSet::new(),
+            rerouted: HashSet::new(),
+            rerouted_pkgs: HashSet::new(),
+            openai_caveat: None,
             out: FileUsages::new(file, "python"),
         }
     }
@@ -1409,6 +1444,7 @@ impl<'t> Ctx<'t> {
                         }
                         self.note_dict_mutation(node);
                         self.note_env_read(node);
+                        self.note_env_write(node);
                         if is_get_call(node, |n| self.text(n)) {
                             self.note_dict_part(node, &frame, scope);
                         }
@@ -1530,6 +1566,59 @@ impl<'t> Ctx<'t> {
         if reads {
             self.env_reads.push(node.start_byte());
         }
+    }
+
+    /// Records the names of environment variables set by `node`: an
+    /// assignment target `os.environ["NAME"]`, or a call to
+    /// `os.environ.setdefault("NAME", ...)`, `os.environ.update(...)` or
+    /// `os.putenv("NAME", ...)`. Only names written as literals are seen.
+    fn note_env_write(&mut self, node: Node<'t>) {
+        let environ =
+            |n: Node<'t>| matches!(self.render_links(n, 4).as_str(), "os.environ" | "environ");
+        let mut names: Vec<String> = Vec::new();
+        match node.kind() {
+            "subscript" => {
+                if node.child_by_field_name("value").is_some_and(environ) {
+                    if let Some(name) = single_subscript(node).and_then(|k| self.literal(k).ok()) {
+                        names.push(name);
+                    }
+                }
+            }
+            "call" => {
+                let Some(function) = node.child_by_field_name("function") else {
+                    return;
+                };
+                let (positional, keywords) = call_arguments(node, |n| self.text(n));
+                let callee = self.render_links(function, 4);
+                let method = function
+                    .child_by_field_name("attribute")
+                    .map(|a| self.text(a))
+                    .unwrap_or_default();
+                let on_environ = function.child_by_field_name("object").is_some_and(environ);
+                if matches!(callee.as_str(), "os.putenv" | "putenv")
+                    || (on_environ && method == "setdefault")
+                {
+                    if let Some(name) = positional.first().and_then(|k| self.literal(*k).ok()) {
+                        names.push(name);
+                    }
+                } else if on_environ && method == "update" {
+                    names.extend(keywords.iter().map(|(k, _)| k.clone()));
+                    for arg in positional {
+                        if arg.kind() == "dictionary" {
+                            for (key, _) in
+                                dict_entries(arg, |n| self.literal(n).ok(), |n| self.text(n))
+                                    .into_iter()
+                                    .flatten()
+                            {
+                                names.push(key);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.env_writes.extend(names);
     }
 
     /// `D[k] = v`, `del D[k]`, `D["a"]["b"] = v`, `H.d["k"] = v`: the
@@ -2140,7 +2229,10 @@ impl<'t> Ctx<'t> {
                     scope,
                 });
             }
-            "subscript" => self.note_mutated_root(target),
+            "subscript" => {
+                self.note_env_write(target);
+                self.note_mutated_root(target)
+            }
             "pattern_list"
             | "tuple_pattern"
             | "list_pattern"
@@ -3256,6 +3348,7 @@ impl<'t> Ctx<'t> {
                             pkg: class.pkg,
                             routing: class.typed_routing(),
                             line: None,
+                            site: None,
                             ambiguous: false,
                             typed: true,
                             caveat: None,
@@ -3480,20 +3573,27 @@ impl<'t> Ctx<'t> {
 
     /// The client built by `call`, recorded once.
     fn construction(&mut self, call: Node<'t>, class: ClientClass) -> Client {
+        let site = Some(call.id());
         if let Some(&index) = self.constructions.get(&call.id()) {
             let built = &self.out.clients[index];
+            let kwargs = built.kwargs.clone();
             return Client {
                 pkg: class.pkg,
                 routing: built.routing,
                 line: Some(built.span.line),
+                site,
                 ambiguous: false,
                 typed: false,
-                caveat: None,
+                caveat: self.endpoint_env(class, &kwargs),
             };
         }
         let scope = self.call_scope.get(&call.id()).copied().unwrap_or(0);
         let args = self.arguments(call);
-        let routing = class.routing(&args.kwargs, args.splat);
+        let mut routing = class.routing(&args.kwargs, args.splat);
+        let caveat = self.endpoint_env(class, &args.kwargs);
+        if caveat.is_some() {
+            routing = Routing::Unknown;
+        }
         let (binding, binding_scope) = self.binding_target(call, scope);
         let chain = call
             .child_by_field_name("function")
@@ -3521,10 +3621,30 @@ impl<'t> Ctx<'t> {
             pkg: class.pkg,
             routing,
             line: Some(span.line),
+            site,
             ambiguous: false,
             typed: false,
-            caveat: None,
+            caveat,
         }
+    }
+
+    /// The endpoint variable this file sets for a client built by `class`
+    /// with keyword arguments `kwargs`, when the constructor does not name
+    /// its own endpoint: the SDK reads the variable instead.
+    fn endpoint_env(&self, class: ClientClass, kwargs: &[String]) -> Option<ClientCaveat> {
+        let own = match class.family {
+            Family::OpenaiDirect | Family::AnthropicDirect => {
+                kwargs.iter().any(|k| is_base_url_key(k))
+            }
+            _ => return None,
+        };
+        if own {
+            return None;
+        }
+        ENDPOINT_ENV
+            .iter()
+            .find(|(pkg, var)| *pkg == class.pkg && self.env_writes.contains(*var))
+            .map(|(_, var)| ClientCaveat::EndpointEnv { var })
     }
 
     /// The name a constructed client is assigned to, and how it is held.
@@ -3588,6 +3708,16 @@ impl<'t> Ctx<'t> {
 
     fn analyze(&mut self) {
         self.openai_routing = self.module_openai_routing();
+        if let Some(var) = OPENAI_MODULE_ENV
+            .iter()
+            .find(|var| self.env_writes.contains(**var))
+        {
+            if self.openai_routing == Routing::OpenaiDirect {
+                self.openai_routing = Routing::Unknown;
+            }
+            self.openai_caveat = Some(ClientCaveat::EndpointEnv { var });
+        }
+        self.note_rerouted_clients();
         for (call, scope) in self.calls.clone() {
             self.analyze_call(call, scope);
         }
@@ -3631,6 +3761,60 @@ impl<'t> Ctx<'t> {
             Routing::CustomBaseUrl
         } else {
             Routing::OpenaiDirect
+        }
+    }
+
+    /// Clients given a new `base_url` after they are built
+    /// (`client.base_url = "https://openrouter.ai/api/v1"`).
+    fn note_rerouted_clients(&mut self) {
+        for assign in self.config_assigns.clone() {
+            if !BASE_URL_ATTRS.contains(&self.text(assign.attr)) {
+                continue;
+            }
+            if let Val::Client { client, path } = self.eval(assign.object, assign.scope, 0) {
+                if !path.is_empty() {
+                    continue;
+                }
+                match client.site {
+                    Some(site) => {
+                        self.rerouted.insert(site);
+                    }
+                    None => {
+                        self.rerouted_pkgs.insert(client.pkg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `client` with its routing unknown when a `base_url` is assigned to it
+    /// after it is built.
+    fn reroute(&self, mut client: Client) -> Client {
+        let assigned = client
+            .site
+            .is_some_and(|site| self.rerouted.contains(&site))
+            || (self.rerouted_pkgs.contains(&client.pkg)
+                && matches!(
+                    client.routing,
+                    Routing::OpenaiDirect | Routing::AnthropicDirect
+                ));
+        if assigned && !client.ambiguous {
+            if matches!(
+                client.routing,
+                Routing::OpenaiDirect | Routing::AnthropicDirect
+            ) {
+                client.routing = Routing::Unknown;
+            }
+            client.caveat = Some(ClientCaveat::BaseUrlAssigned);
+        }
+        client
+    }
+
+    /// Why the module-level API of `pkg` may not route as reported.
+    fn module_caveat(&self, pkg: Pkg) -> Option<ClientCaveat> {
+        match pkg {
+            Pkg::Openai => self.openai_caveat.clone(),
+            _ => None,
         }
     }
 
@@ -3683,7 +3867,7 @@ impl<'t> Ctx<'t> {
                     routing: self.module_routing(pkg),
                     client_line: None,
                     ambiguous: false,
-                    caveat: None,
+                    caveat: self.module_caveat(pkg),
                 };
                 self.record_call(call, function, scope, target);
             }
@@ -3695,11 +3879,12 @@ impl<'t> Ctx<'t> {
                     routing: self.module_routing(pkg),
                     client_line: None,
                     ambiguous: false,
-                    caveat: None,
+                    caveat: self.module_caveat(pkg),
                 };
                 self.record_call(call, function, scope, target);
             }
             Val::Client { client, path } if !path.is_empty() => {
+                let client = self.reroute(client);
                 let target = CallTarget {
                     pkg: client.pkg,
                     member: path.join("."),
@@ -3862,6 +4047,18 @@ impl<'t> Ctx<'t> {
                     "in_file_callers",
                     format!(
                         "the receiver of `{chain}` is parameter `{param}`: every caller in this file passes the same client, but other modules may call the function with another one"
+                    ),
+                ),
+                ClientCaveat::BaseUrlAssigned => (
+                    "base_url_assigned",
+                    format!(
+                        "the client behind `{chain}` is given a `base_url` after it is built, so its requests may go to another endpoint"
+                    ),
+                ),
+                ClientCaveat::EndpointEnv { var } => (
+                    "endpoint_env",
+                    format!(
+                        "this file sets `{var}`, which the SDK reads its endpoint from, so `{chain}` may send its requests elsewhere"
                     ),
                 ),
             };
@@ -5621,6 +5818,7 @@ fn combine(vals: Vec<Val>) -> Val {
         let same_routing = constructed.iter().all(|c| c.routing == first.routing);
         let same_pkg = constructed.iter().all(|c| c.pkg == first.pkg);
         let same_line = constructed.iter().all(|c| c.line == first.line);
+        let same_site = constructed.iter().all(|c| c.site == first.site);
         let ambiguous =
             others > 0 || !same_routing || !same_pkg || constructed.iter().any(|c| c.ambiguous);
         return Val::Client {
@@ -5632,6 +5830,7 @@ fn combine(vals: Vec<Val>) -> Val {
                     first.routing
                 },
                 line: if same_line { first.line } else { None },
+                site: if same_site { first.site } else { None },
                 ambiguous,
                 typed: false,
                 caveat: constructed.iter().find_map(|c| c.caveat.clone()),

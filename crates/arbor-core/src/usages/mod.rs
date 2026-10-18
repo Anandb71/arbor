@@ -130,7 +130,10 @@ pub enum Routing {
     GoogleGenerativeaiLegacy,
     /// Not decided by this version: `**kwargs` passed to a direct
     /// constructor, a client typed only by annotation, a binding assigned
-    /// more than one kind of client, a non-literal or non-Azure
+    /// more than one kind of client, a direct client given a `base_url`
+    /// after it is built or built in a file that sets `OPENAI_BASE_URL` /
+    /// `ANTHROPIC_BASE_URL` (both with an `ambiguous_client` gap at each
+    /// call), a non-literal or non-Azure
     /// `openai.api_type`, or a hosted-platform client this list does not name
     /// (`BedrockOpenAI`, `OpenAI(provider=...)`, `AnthropicAWS`,
     /// `AnthropicFoundry`, `AnthropicGoogleCloud` and their async variants).
@@ -380,7 +383,9 @@ pub enum GapKind {
     /// A binding assigned more than one kind of client, so routing depends on
     /// a runtime branch (`multiple_assignments`), or a client known from
     /// only some of the places it can come from: the in-file callers of a
-    /// function other modules may also call (`in_file_callers`).
+    /// function other modules may also call (`in_file_callers`), a client
+    /// whose `base_url` is assigned after it is built (`base_url_assigned`),
+    /// or a file that sets the SDK's endpoint variable (`endpoint_env`).
     AmbiguousClient,
     /// `getattr` on a tracked binding, or an SDK method stored or passed as a
     /// value; calls through it are not tracked.
