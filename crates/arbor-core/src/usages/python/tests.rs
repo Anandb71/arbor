@@ -514,7 +514,14 @@ def param(model="o1-mini"):
         (param.value.as_str(), param.origin, param.name.as_deref()),
         ("o1-mini", ValueOrigin::ParameterDefault, Some("model"))
     );
-    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+    // Policy round (P1): other modules may call a public function with
+    // another model, so its default keeps a `parameter_default` gap.
+    let reasons: Vec<(Option<&str>, &str)> = found
+        .gaps
+        .iter()
+        .map(|g| (g.symbol.as_deref(), g.reason.as_str()))
+        .collect();
+    assert_eq!(reasons, vec![(Some("param"), "parameter_default")]);
 }
 
 #[test]
@@ -1802,26 +1809,39 @@ from openai import OpenAI
 GPT_MODEL = "gpt-3.5-turbo"
 client = OpenAI()
 
+def _ask(q, model: str = GPT_MODEL):
+    return client.chat.completions.create(model=model, messages=[q])
+
 def ask(q, model: str = GPT_MODEL):
     return client.chat.completions.create(model=model, messages=[q])
 "#,
     );
-    let model = &call(&found, "client.chat.completions.create").values[0];
-    assert_eq!(
-        (
-            model.value.as_str(),
-            model.origin,
-            model.name.as_deref(),
-            model.span.line
-        ),
-        (
-            "gpt-3.5-turbo",
-            ValueOrigin::ParameterDefault,
-            Some("model"),
-            4
-        )
-    );
-    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+    for c in &found.calls {
+        let model = &c.values[0];
+        assert_eq!(
+            (
+                model.value.as_str(),
+                model.origin,
+                model.name.as_deref(),
+                model.span.line
+            ),
+            (
+                "gpt-3.5-turbo",
+                ValueOrigin::ParameterDefault,
+                Some("model"),
+                4
+            )
+        );
+    }
+    // Policy round (P1): the private function's default is the supported
+    // grammar; the public one's keeps a `parameter_default` gap, since
+    // other modules may pass another model.
+    let reasons: Vec<(Option<&str>, &str)> = found
+        .gaps
+        .iter()
+        .map(|g| (g.symbol.as_deref(), g.reason.as_str()))
+        .collect();
+    assert_eq!(reasons, vec![(Some("ask"), "parameter_default")]);
 }
 
 #[test]
@@ -2727,8 +2747,14 @@ ask5("z", "gpt-4.1")
                     s(&["gpt-3.5-turbo", "o1-mini"])
                 )]
             ),
-            // Callers pass the default or nothing: no gap.
-            (10, "gpt-3.5-turbo".to_string(), vec![]),
+            // Callers pass the default or nothing, but the function is
+            // public: other modules may pass another model (policy round,
+            // P1).
+            (
+                10,
+                "gpt-3.5-turbo".to_string(),
+                vec![("parameter_default".to_string(), vec![])]
+            ),
             (
                 13,
                 "gpt-4o".to_string(),
@@ -3280,8 +3306,13 @@ ask12("x")
             (26, "gpt-4".to_string(), unseen()),
             // Private and called only directly: the default holds.
             (29, "gpt-4".to_string(), vec![]),
-            // Public, called here only without the argument.
-            (32, "gpt-4o".to_string(), vec![]),
+            // Public, called here only without the argument: other modules
+            // may pass another model (policy round, P1).
+            (
+                32,
+                "gpt-4o".to_string(),
+                vec!["parameter_default".to_string()]
+            ),
         ]
     );
     // The values the visible calls pass are listed with the gap.
@@ -3318,9 +3349,12 @@ class Bot:
         return client.chat.completions.create(model=model, messages=[q])
     def plain(self, q, model="gpt-4o"):
         return client.chat.completions.create(model=model, messages=[q])
+    def _quiet(self, q, model="gpt-4o"):
+        return client.chat.completions.create(model=model, messages=[q])
 bot = Bot()
 bot.ask("hi", model="o1-mini")
 bot.plain("hi")
+bot._quiet("hi")
 "#,
     );
     assert_eq!(
@@ -3331,7 +3365,14 @@ bot.plain("hi")
                 "gpt-4o".to_string(),
                 vec!["parameter_overridden".to_string()]
             ),
-            (7, "gpt-4o".to_string(), vec![]),
+            // Public: other modules may pass another model (policy round,
+            // P1); the private method's calls are all here.
+            (
+                7,
+                "gpt-4o".to_string(),
+                vec!["parameter_default".to_string()]
+            ),
+            (9, "gpt-4o".to_string(), vec![]),
         ]
     );
 }
@@ -3362,6 +3403,12 @@ class Quiet:
     def run(self):
         return client.chat.completions.create(model=self.model, messages=[])
 q: Quiet = Quiet()
+class _Hidden:
+    def __init__(self, model="gpt-4o"):
+        self.model = model
+    def run(self):
+        return client.chat.completions.create(model=self.model, messages=[])
+_Hidden()
 "#,
     );
     assert_eq!(
@@ -3377,8 +3424,16 @@ q: Quiet = Quiet()
                 "gpt-4".to_string(),
                 vec!["multiple_assignments".to_string()]
             ),
-            // Built here without the argument (an annotation is not a use).
-            (19, "gpt-4o".to_string(), vec![]),
+            // Built here without the argument (an annotation is not a use),
+            // but other modules may build a public class with another model
+            // (policy round, P1); a private class's constructor calls are
+            // all here.
+            (
+                19,
+                "gpt-4o".to_string(),
+                vec!["parameter_default".to_string()]
+            ),
+            (25, "gpt-4o".to_string(), vec![]),
         ]
     );
     assert_eq!(found.calls[1].routing, Routing::Unknown);

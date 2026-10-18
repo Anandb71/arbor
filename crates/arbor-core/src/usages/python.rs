@@ -776,6 +776,9 @@ impl Unresolved {
             "credential" => {
                 "credential-shaped (a secret-like name or value), so it is never captured"
             }
+            "parameter_default" => {
+                "a parameter of a function other modules may call with another value"
+            }
             _ => "not a string literal",
         }
     }
@@ -4094,6 +4097,12 @@ impl<'t> Ctx<'t> {
         if self.scopes[parent].kind == ScopeKind::Function {
             return true;
         }
+        // A constructor is called wherever its class is: as private as the
+        // class.
+        if self.scopes[parent].kind == ScopeKind::Class && scope.name == "__init__" && !scope.lambda
+        {
+            return self.is_private(parent);
+        }
         let name = match &scope.bound_name {
             Some(name) if scope.lambda => name.as_str(),
             _ => scope.name.as_str(),
@@ -5488,6 +5497,12 @@ impl<'t> Ctx<'t> {
                     );
                 }
             }
+            Some(origin) if unresolved.reason == "parameter_default" => {
+                detail.push_str(&format!(
+                    "; its default is captured with origin `{}`",
+                    origin.as_str()
+                ));
+            }
             Some(_) => {
                 detail.push_str("; its literal fallback is captured with origin `env_default`");
                 if !values.is_empty() {
@@ -6088,9 +6103,15 @@ impl<'t> Ctx<'t> {
                         .map(|caveat| caveat.via(name))
                         .collect();
                     // In-file callers that pass another value make the
-                    // default one of several.
+                    // default one of several; a function other modules may
+                    // call (not private, not in a script) may be passed
+                    // anything.
                     if let Some(caveat) = self.overridden(home, name, &resolved.value) {
                         resolved.caveats.push(caveat);
+                    } else if !self.is_private(home) {
+                        resolved
+                            .caveats
+                            .push(Unresolved::new("parameter_default", name.to_string()));
                     }
                     Ok(resolved)
                 }
