@@ -3,12 +3,16 @@
 //! For every model value [`crate::usages`] captured at an SDK call, [`check`]
 //! decides which provider schedule applies from the client's routing, looks
 //! the value up (exactly; never a substring or a case-folded match), and
-//! applies the parameter rules for the listed replacement to the call's
+//! applies the parameter rules for the replacement to the call's
 //! keyword-argument names. The result says, per call site:
 //!
 //! - when the model stops working (already retired, or N days left);
-//! - what the provider lists as the replacement;
-//! - which other arguments must change with it, and what needs a person;
+//! - what the provider lists as the replacement and, when that model is
+//!   itself retired or retiring, the first replacement down the chain that
+//!   still works (`gpt-6-luna` via `gpt-4o`);
+//! - which other arguments must change with it, which choices the
+//!   repository has to make first (the replacement's reasoning effort), and
+//!   what needs a person;
 //! - how sure the match is: a literal or constant ([`Confidence::Confirmed`]),
 //!   an environment or parameter default the deployed value may override
 //!   ([`Confidence::ConfirmFirst`]), or a call whose client Arbor could not
@@ -16,10 +20,17 @@
 //! - whether the call reaches the provider directly. A provider's dates do
 //!   not necessarily apply through Azure, a proxy or another cloud, so those
 //!   calls are kept apart in [`RetirementReport::routed`].
+//!
+//! Only SDK calls that send a request, bind a model for later requests
+//! (`genai.GenerativeModel(...)`) or set a model in a request parameter
+//! object (a tool config) are checked. Response and type objects built in
+//! code (`ChatCompletion(...)`, `Message(...)`, `.model_validate(...)`) send
+//! nothing; they are counted in [`Summary::response_objects`] and skipped.
 
+use super::base_url::{BaseUrl, ClientBaseUrl};
 use super::{
-    Action, DateKind, EntryStatus, ParamRule, RecipeInfo, RetirementData, Retirements, RuleEffect,
-    Table, Verified,
+    Action, DateKind, EntryStatus, OptionStatus, ParamRule, RecipeInfo, RetirementData,
+    Retirements, RuleEffect, Table, Verified,
 };
 use super::{Date, ModelEntry};
 use crate::usages::{
@@ -43,6 +54,12 @@ pub struct CheckOptions {
     /// List calls that go through Azure, a proxy or another cloud, and let
     /// them count toward the exit code.
     pub include_routed: bool,
+    /// Also count toward the exit code the calls that are not confirmed:
+    /// a confirm-first value (an environment fallback, a parameter default,
+    /// one of several possible values), an unresolved client, or a client
+    /// whose routing is unknown. By default only confirmed values at direct
+    /// calls fail the check.
+    pub count_unconfirmed: bool,
 }
 
 /// The usage scan to check.
@@ -51,17 +68,22 @@ pub struct ScanInput<'a> {
     pub calls: &'a [SdkCall],
     pub gaps: &'a [UsageGap],
     pub clients: &'a [ClientConstruction],
+    /// How each custom `base_url` reads ([`super::read_base_urls`]). Empty
+    /// when the sources were not read: those clients stay routed.
+    pub base_urls: &'a [ClientBaseUrl],
 }
 
 /// Where a model stands today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
-    /// Shut down: calls fail (or the provider says they will).
+    /// Shut down: calls fail (or the provider says they will). A hard
+    /// shutdown date counts as retired from that day on, in UTC.
     Retired,
-    /// Shuts down on `date`, `days_left` from today.
+    /// Shuts down on `date`, `days_left` (at least 1) from today.
     Retiring,
-    /// Probably shut down, not confirmed for this exact ID.
+    /// Probably shut down, not confirmed for this exact ID; or an "earliest"
+    /// date that has been reached.
     Unconfirmed,
     /// Deprecated, no shutdown date yet.
     Deprecated,
@@ -87,13 +109,15 @@ pub enum MatchKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingClass {
-    /// A direct client (`OpenAI()`, `Anthropic()`, `genai.Client()`).
+    /// A direct client (`OpenAI()`, `Anthropic()`, `genai.Client()`), or one
+    /// whose `base_url` is the provider's own host ([`BaseUrl`]).
     Direct,
-    /// Azure, a custom `base_url`, Bedrock or Vertex for Claude: the
+    /// Azure, another host in `base_url`, Bedrock or Vertex for Claude: the
     /// provider's dates may not apply.
     Routed,
     /// Arbor could not tell (a client from a factory, `**kwargs` passed to
-    /// the constructor, a client assigned two ways).
+    /// the constructor, a client assigned two ways, a `base_url` read from
+    /// the environment or from code Arbor cannot read).
     Unknown,
 }
 
@@ -103,7 +127,8 @@ pub enum RoutingClass {
 pub enum Confidence {
     /// A literal or a same-file constant.
     Confirmed,
-    /// An environment/config fallback or a parameter default: the deployed
+    /// An environment/config fallback, a parameter default, or one of the
+    /// values a lookup, a branch or an in-file caller may give: the deployed
     /// or passed value may differ, so confirm before acting.
     ConfirmFirst,
     /// An SDK-shaped call whose client Arbor could not resolve (a typed
@@ -118,10 +143,30 @@ pub enum FixKind {
     /// Swap the model for the listed replacement and make the listed
     /// argument changes; nothing needs judgement.
     Swap,
-    /// Something needs a person: see `review`.
+    /// Like `Swap`, once the repository has made the choices in `decisions`
+    /// (Arbor never makes them).
+    Decide,
+    /// Something needs a person: see `review`, the confidence, the routing
+    /// or the replacement chain.
     Manual,
     /// Nothing fails (the provider routes the ID to a newer model).
     None,
+}
+
+/// What the call is, as far as retirements go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallKind {
+    /// Sends a request (`client.chat.completions.create`).
+    Request,
+    /// Builds a model object later requests use
+    /// (`genai.GenerativeModel("gemini-pro")`), or hands the model to
+    /// another SDK helper.
+    ModelBinding,
+    /// A request-side parameter object, such as a tool config
+    /// (`tool_param.ImageGeneration(model=...)`): its model is sent with a
+    /// request built elsewhere.
+    RequestParam,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -146,6 +191,8 @@ pub struct Change {
     /// The call's arguments that make it necessary.
     pub because: Vec<String>,
     pub rules: Vec<String>,
+    /// For this call: `live` only when the live check called this
+    /// replacement on this API.
     pub verified: Verified,
 }
 
@@ -160,12 +207,65 @@ pub struct ReviewItem {
     pub verified: Option<Verified>,
 }
 
-/// The replacement is itself retiring or retired.
+/// One model in a replacement chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ChainInfo {
+pub struct ChainStep {
     pub model: String,
-    pub status: State,
+    /// Where it stands today; `None` when the data lists no retirement for
+    /// it, so it is the replacement to move to.
+    pub status: Option<State>,
     pub date: Option<Date>,
+    pub date_kind: Option<DateKind>,
+    /// What the provider lists for it when it lists several models or none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replacement_text: Option<String>,
+}
+
+/// A parameter and its value.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ParamValue {
+    pub name: String,
+    pub value: serde_json::Value,
+}
+
+/// What an option does for this call, per rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OptionEffect {
+    pub rule: String,
+    pub text: String,
+    pub status: OptionStatus,
+}
+
+/// One way to settle a [`Decision`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DecisionOption {
+    /// `reasoning_none`, `model_default`.
+    pub id: String,
+    /// `keep reasoning off`, `let the model reason`.
+    pub label: String,
+    /// Parameters to add.
+    pub add: Vec<ParamValue>,
+    /// The call's parameters to remove.
+    pub remove: Vec<String>,
+    /// The call's parameters to keep.
+    pub keep: Vec<String>,
+    pub effects: Vec<OptionEffect>,
+}
+
+/// A choice the repository makes once (the recipe's `report_choice`). Arbor
+/// shows every option and applies none.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Decision {
+    /// The choice (`G6-REASONING-DEFAULT`): the same id across calls.
+    pub choice: String,
+    /// Why this call needs it, one sentence per rule.
+    pub reasons: Vec<String>,
+    /// The call's arguments that bring it up (`tools`, `temperature`).
+    pub because: Vec<String>,
+    pub rules: Vec<String>,
+    pub options: Vec<DecisionOption>,
+    /// How the call's automatic changes depend on the choice.
+    pub notes: Vec<String>,
 }
 
 /// One affected call site.
@@ -178,6 +278,7 @@ pub struct Finding {
     pub symbol: Option<String>,
     /// The callee as written (`client.chat.completions.create`).
     pub chain: Option<String>,
+    pub call_kind: CallKind,
     pub provider: Table,
     /// The value as written.
     pub model: String,
@@ -191,19 +292,31 @@ pub struct Finding {
     pub listed_status: EntryStatus,
     pub date: Option<Date>,
     pub date_kind: DateKind,
-    /// Days from today to `date`; negative once it has passed.
+    /// Days from today to `date`; zero or negative once it has come.
     pub days_left: Option<i64>,
+    /// The replacement the provider lists for this model.
     pub replacement: Option<String>,
+    /// The provider's replacement text when it lists several models, none,
+    /// or (for a fine-tune) says why none fits.
     pub replacement_text: Option<String>,
-    pub replacement_status: Option<ChainInfo>,
+    /// The first replacement that still works: `replacement`, or, when that
+    /// is itself retired or retiring, the one listed for it in turn.
+    pub live_replacement: Option<String>,
+    /// Every model from `replacement` to `live_replacement` (or to the dead
+    /// end), with where each stands.
+    pub replacement_chain: Vec<ChainStep>,
     pub fix: FixKind,
     pub changes: Vec<Change>,
+    /// Choices the repository makes before the swap; never applied by Arbor.
+    pub decisions: Vec<Decision>,
     pub review: Vec<ReviewItem>,
     pub notes: Vec<String>,
     /// The client's routing (`openai_direct`, `azure_openai`...), or
     /// `unresolved_client` for a gap.
     pub routing: String,
     pub routing_class: RoutingClass,
+    /// For a client given a `base_url`: how its value reads.
+    pub base_url: Option<BaseUrl>,
     /// `chat.completions`, `responses`, `messages`...
     pub endpoint: Option<&'static str>,
     pub confidence: Confidence,
@@ -220,8 +333,12 @@ pub struct Finding {
     pub candidate: bool,
     /// Arguments were spread into the call with `**`.
     pub splat: bool,
-    /// Counts toward the exit code under the current options.
+    /// The model is retired, or retires within `--fail-within` days.
     pub in_window: bool,
+    /// Counts toward the exit code: in the window, and confirmed and direct
+    /// unless the options count more ([`CheckOptions::count_unconfirmed`],
+    /// [`CheckOptions::include_routed`]).
+    pub fails: bool,
     pub recipe: String,
     pub recipe_version: String,
     pub verified: Verified,
@@ -246,12 +363,24 @@ pub struct RecipeRef {
     pub id: String,
     pub version: String,
     pub provider: String,
+    /// The day its provider pages were read.
+    pub retrieved_on: String,
+}
+
+/// When one provider's pages were read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderDate {
+    pub provider: String,
+    /// The oldest read of that provider's pages.
+    pub as_of: Date,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DataInfo {
-    /// The newest date the provider pages were read.
+    /// The oldest date any provider page was read.
     pub as_of: Date,
+    /// Per provider, in the order the report lists them.
+    pub providers: Vec<ProviderDate>,
     pub source: String,
     pub recipes: Vec<RecipeRef>,
 }
@@ -260,6 +389,7 @@ pub struct DataInfo {
 pub struct ReportOptions {
     pub fail_within_days: Option<i64>,
     pub include_routed: bool,
+    pub count_unconfirmed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -281,9 +411,15 @@ pub struct Summary {
     pub retiring: usize,
     /// Unconfirmed, deprecated without a date, or auto-routed.
     pub other: usize,
-    /// Calls that count toward the exit code.
+    /// Listed calls whose model is retired or inside the window.
     pub in_window: usize,
+    /// Of those, the calls that count toward the exit code.
+    pub failing: usize,
+    /// Of those, the calls that do not count: unconfirmed values, unresolved
+    /// clients or unknown routing (see [`CheckOptions::count_unconfirmed`]).
+    pub uncounted: usize,
     pub swap: usize,
+    pub decide: usize,
     pub manual: usize,
     pub by_provider: BTreeMap<String, usize>,
     /// The soonest date among retiring calls.
@@ -295,6 +431,9 @@ pub struct Summary {
     pub unreadable_calls: usize,
     /// Requests that pass no model, so the SDK's or server's default applies.
     pub no_model_calls: usize,
+    /// SDK response or type objects built in code with a model value
+    /// (`ChatCompletion(...)`, `.model_validate(...)`): no request, skipped.
+    pub response_objects: usize,
 }
 
 /// The result of [`check`].
@@ -322,14 +461,19 @@ pub struct RetirementReport {
 pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -> RetirementReport {
     let mut direct = Vec::new();
     let mut routed = Vec::new();
+    let mut response_objects = 0;
 
     for call in input.calls {
-        let class = call_routing(call, input.clients);
+        let Some(kind) = call_kind(call) else {
+            response_objects += usize::from(!call.values.is_empty());
+            continue;
+        };
+        let class = call_routing(call, input.clients, input.base_urls);
         for value in &call.values {
             let Some(finding) = finding_for(
                 data,
                 options,
-                Site::Call(call),
+                Site::Call(call, kind),
                 &class,
                 value,
                 confidence_of(value.origin),
@@ -357,11 +501,16 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
             })
             .flatten();
         let (site, class, confidence) = match call {
-            Some(call) => (
-                Site::Call(call),
-                call_routing(call, input.clients),
-                Confidence::ConfirmFirst,
-            ),
+            Some(call) => {
+                let Some(kind) = call_kind(call) else {
+                    continue;
+                };
+                (
+                    Site::Call(call, kind),
+                    call_routing(call, input.clients, input.base_urls),
+                    Confidence::ConfirmFirst,
+                )
+            }
             None => (
                 Site::Gap(gap),
                 CallRouting {
@@ -369,6 +518,7 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
                     routing: "unresolved_client".to_string(),
                     sdk: gap.sdk,
                     table: None,
+                    base_url: None,
                 },
                 if gap.kind == GapKind::UnresolvedModel {
                     Confidence::ConfirmFirst
@@ -406,7 +556,8 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
 
     let mut summary = summarize(&direct, &routed, routed_calls, unreadable.len());
     summary.no_model_calls = no_model_calls;
-    let exit_code = i32::from(direct.iter().chain(&routed).any(|f| f.in_window));
+    summary.response_objects = response_objects;
+    let exit_code = i32::from(summary.failing > 0);
 
     RetirementReport {
         version: REPORT_VERSION,
@@ -420,6 +571,7 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
         options: ReportOptions {
             fail_within_days: options.fail_within,
             include_routed: options.include_routed,
+            count_unconfirmed: options.count_unconfirmed,
         },
         summary,
         findings: direct,
@@ -430,8 +582,29 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
 }
 
 fn data_info(data: &RetirementData, as_of: Date) -> DataInfo {
+    let mut providers: Vec<(Table, ProviderDate)> = Vec::new();
+    for recipe in &data.recipes {
+        let Some(date) = Date::parse(&recipe.retrieved_on) else {
+            continue;
+        };
+        match providers
+            .iter_mut()
+            .find(|(_, p)| p.provider == recipe.provider)
+        {
+            Some((_, existing)) => existing.as_of = existing.as_of.min(date),
+            None => providers.push((
+                recipe.table,
+                ProviderDate {
+                    provider: recipe.provider.clone(),
+                    as_of: date,
+                },
+            )),
+        }
+    }
+    providers.sort_by_key(|(table, _)| *table);
     DataInfo {
         as_of,
+        providers: providers.into_iter().map(|(_, p)| p).collect(),
         source: data.source.clone(),
         recipes: data
             .recipes
@@ -440,6 +613,7 @@ fn data_info(data: &RetirementData, as_of: Date) -> DataInfo {
                 id: r.id.clone(),
                 version: r.version.clone(),
                 provider: r.provider.clone(),
+                retrieved_on: r.retrieved_on.clone(),
             })
             .collect(),
     }
@@ -456,6 +630,53 @@ fn confidence_of(origin: ValueOrigin) -> Confidence {
 }
 
 // ---------------------------------------------------------------------------
+// What a call is
+// ---------------------------------------------------------------------------
+
+/// Pydantic constructors on SDK types: they build an object from data and
+/// send nothing (`ChatCompletion.model_validate(...)`).
+const OBJECT_BUILDERS: &[&str] = &[
+    "model_validate",
+    "model_validate_json",
+    "model_validate_strings",
+    "model_construct",
+    "construct",
+    "parse_obj",
+    "parse_raw",
+    "parse_file",
+    "from_orm",
+    "model_copy",
+];
+
+/// Request-side type names: parameter TypedDicts and configs
+/// (`ChatCompletionToolParam`, `GenerateContentConfig`).
+const REQUEST_TYPE_SUFFIXES: &[&str] = &["Param", "Params", "Parameters", "Config"];
+
+/// The kind of call, or `None` for a response or type object built in code,
+/// which sends no request. [`SdkCall::member`] keeps the module path of an
+/// imported type (`types.chat.ChatCompletion`), which tells them apart.
+fn call_kind(call: &SdkCall) -> Option<CallKind> {
+    if call.request {
+        return Some(CallKind::Request);
+    }
+    let segments: Vec<&str> = call.member.split('.').collect();
+    let last = segments.last().copied().unwrap_or_default();
+    if OBJECT_BUILDERS.contains(&last) {
+        return None;
+    }
+    if segments.first() == Some(&"types") {
+        // `openai.types.responses.tool_param.ImageGeneration`: a request
+        // parameter module; `openai.types.chat.ChatCompletion`: a response.
+        let request_module = segments[..segments.len() - 1]
+            .iter()
+            .any(|s| s.ends_with("_param") || s.ends_with("_params"));
+        let request_type = REQUEST_TYPE_SUFFIXES.iter().any(|s| last.ends_with(s));
+        return (request_module || request_type).then_some(CallKind::RequestParam);
+    }
+    Some(CallKind::ModelBinding)
+}
+
+// ---------------------------------------------------------------------------
 // Routing
 // ---------------------------------------------------------------------------
 
@@ -465,9 +686,23 @@ struct CallRouting {
     sdk: Option<Sdk>,
     /// The schedule a direct client follows.
     table: Option<Table>,
+    base_url: Option<BaseUrl>,
 }
 
-fn call_routing(call: &SdkCall, clients: &[ClientConstruction]) -> CallRouting {
+fn call_routing(
+    call: &SdkCall,
+    clients: &[ClientConstruction],
+    base_urls: &[ClientBaseUrl],
+) -> CallRouting {
+    let base_url = (call.routing == Routing::CustomBaseUrl)
+        .then(|| {
+            let line = call.client_line?;
+            base_urls
+                .iter()
+                .find(|b| b.file == call.file && b.line == line)
+                .map(|b| b.base_url)
+        })
+        .flatten();
     let (class, table) = match call.routing {
         Routing::OpenaiDirect => (RoutingClass::Direct, Some(Table::Openai)),
         Routing::AnthropicDirect => (RoutingClass::Direct, Some(Table::Anthropic)),
@@ -477,10 +712,18 @@ fn call_routing(call: &SdkCall, clients: &[ClientConstruction]) -> CallRouting {
         Routing::GoogleGenai | Routing::GoogleGenerativeaiLegacy => {
             (RoutingClass::Direct, Some(Table::GeminiApi))
         }
-        Routing::AzureOpenai
-        | Routing::CustomBaseUrl
-        | Routing::AnthropicBedrock
-        | Routing::AnthropicVertex => (RoutingClass::Routed, None),
+        Routing::CustomBaseUrl => match base_url {
+            // The provider's own host, or the SDK's default: a direct call.
+            Some(BaseUrl::ProviderHost | BaseUrl::EnvProviderDefault) => {
+                (RoutingClass::Direct, Some(sdk_table(call.sdk)))
+            }
+            // Set by the deployment, or not readable: listed, not hidden.
+            Some(BaseUrl::EnvOnly | BaseUrl::Unreadable) => (RoutingClass::Unknown, None),
+            Some(BaseUrl::OtherHost) | None => (RoutingClass::Routed, None),
+        },
+        Routing::AzureOpenai | Routing::AnthropicBedrock | Routing::AnthropicVertex => {
+            (RoutingClass::Routed, None)
+        }
         Routing::Unknown => (RoutingClass::Unknown, None),
     };
     CallRouting {
@@ -488,6 +731,7 @@ fn call_routing(call: &SdkCall, clients: &[ClientConstruction]) -> CallRouting {
         routing: call.routing.as_str().to_string(),
         sdk: Some(call.sdk),
         table,
+        base_url,
     }
 }
 
@@ -537,6 +781,8 @@ struct Hit<'d> {
     entry: Option<&'d ModelEntry>,
     verified: Verified,
     notes: Vec<String>,
+    /// For a fine-tune: what to tell people about moving it.
+    fine_tune_advice: Option<String>,
 }
 
 fn entry_hit<'d>(data: &'d Retirements, entry: &'d ModelEntry, kind: MatchKind) -> Option<Hit<'d>> {
@@ -555,6 +801,7 @@ fn entry_hit<'d>(data: &'d Retirements, entry: &'d ModelEntry, kind: MatchKind) 
         entry: Some(entry),
         verified: entry.verified,
         notes: entry.notes.clone(),
+        fine_tune_advice: None,
     })
 }
 
@@ -580,44 +827,71 @@ fn lookup<'d>(data: &'d Retirements, table: Table, value: &str) -> Option<Hit<'d
     }
     if table == Table::Openai {
         let base = value.strip_prefix("ft:")?.split(':').next()?;
-        if let Some(fine) = data.fine_tune(table, base) {
-            let recipe = data.recipe(&fine.recipe)?;
-            return Some(Hit {
-                matched: base.to_string(),
-                match_kind: MatchKind::FineTuned,
-                table,
-                recipe,
-                status: fine.status,
-                date: Date::parse(&fine.date),
-                replacement: None,
-                replacement_text: fine
-                    .replacement_base
-                    .as_ref()
-                    .map(|b| format!("retrain on {b} (the base model OpenAI lists)")),
-                action: Action::ReportOnly,
-                rule_set: None,
-                entry: None,
-                verified: Verified::Docs,
-                notes: vec![format!(
-                    "OpenAI retires fine-tunes of {base} with their base model's schedule."
-                )],
-            });
-        }
-        let entry = data.entry(table, base)?;
-        let mut hit = entry_hit(data, entry, MatchKind::FineTuned)?;
-        hit.replacement_text = entry
-            .replacement
-            .as_ref()
-            .map(|b| format!("retrain on {b} (the replacement OpenAI lists for {base})"));
-        hit.replacement = None;
-        hit.action = Action::ReportOnly;
-        hit.rule_set = None;
-        hit.notes = vec![format!(
-            "Fine-tuned models follow the schedule of their base model, {base}."
-        )];
-        return Some(hit);
+        return fine_tune_hit(data, table, base);
     }
     None
+}
+
+/// A fine-tune of `base`. Advice to retrain names a base model only when the
+/// data lists one for these fine-tunes and it can itself be fine-tuned;
+/// otherwise the report says no fine-tunable replacement is listed.
+fn fine_tune_hit<'d>(data: &'d Retirements, table: Table, base: &str) -> Option<Hit<'d>> {
+    const NONE_LISTED: &str = "no fine-tunable replacement is listed";
+    if let Some(fine) = data.fine_tune(table, base) {
+        let recipe = data.recipe(&fine.recipe)?;
+        let advice = match (&fine.replacement_base, fine.fine_tunable) {
+            (Some(listed), true) => format!(
+                "Fine-tuned model: retrain it on {listed}, the base model OpenAI lists for fine-tunes of {base}."
+            ),
+            (Some(listed), false) => format!(
+                "Fine-tuned model: OpenAI lists {listed} for fine-tunes of {base}, so {NONE_LISTED}. {}",
+                fine.note.as_deref().unwrap_or_default()
+            ),
+            (None, _) => format!(
+                "Fine-tuned model: {} for fine-tunes of {base}. {}",
+                capitalize(NONE_LISTED),
+                fine.note.as_deref().unwrap_or_default()
+            ),
+        };
+        let retrain = fine
+            .replacement_base
+            .as_ref()
+            .filter(|_| fine.fine_tunable)
+            .map(|b| format!("retrain on {b}"));
+        return Some(Hit {
+            matched: base.to_string(),
+            match_kind: MatchKind::FineTuned,
+            table,
+            recipe,
+            status: fine.status,
+            date: Date::parse(&fine.date),
+            replacement: None,
+            replacement_text: Some(retrain.unwrap_or_else(|| NONE_LISTED.to_string())),
+            action: Action::ReportOnly,
+            rule_set: None,
+            entry: None,
+            verified: Verified::Docs,
+            notes: vec![format!(
+                "OpenAI retires fine-tunes of {base} with their base model's schedule."
+            )],
+            fine_tune_advice: Some(advice.trim_end().to_string()),
+        });
+    }
+    // A base the data lists as a model but not for fine-tunes: its listed
+    // replacement is a base model, which may not be fine-tunable.
+    let entry = data.entry(table, base)?;
+    let mut hit = entry_hit(data, entry, MatchKind::FineTuned)?;
+    hit.replacement = None;
+    hit.replacement_text = Some(NONE_LISTED.to_string());
+    hit.action = Action::ReportOnly;
+    hit.rule_set = None;
+    hit.notes = vec![format!(
+        "Fine-tuned models follow the schedule of their base model, {base}."
+    )];
+    hit.fine_tune_advice = Some(format!(
+        "Fine-tuned model: OpenAI lists no replacement for fine-tunes of {base}, so {NONE_LISTED}."
+    ));
+    Some(hit)
 }
 
 /// Resolves a value for a call, deciding which schedule applies.
@@ -655,12 +929,161 @@ fn resolve<'d>(
 }
 
 // ---------------------------------------------------------------------------
+// Replacement chains
+// ---------------------------------------------------------------------------
+
+struct Chain<'d> {
+    steps: Vec<ChainStep>,
+    /// The first model down the chain that still works.
+    live: Option<String>,
+    /// The entry whose listed replacement is `live`, when that is not the
+    /// model's own listing: its rule set describes the move.
+    last_hop: Option<&'d ModelEntry>,
+}
+
+impl Chain<'_> {
+    /// The listed replacement is itself retired, retiring or deprecated.
+    fn chained(&self) -> bool {
+        self.steps.first().is_some_and(|s| s.status.is_some())
+    }
+}
+
+/// Follows `first` (a listed replacement) through the data on `table` to the
+/// first model that is not retired, retiring or unconfirmed. A deprecated or
+/// auto-routed model with a replacement of its own is followed too; without
+/// one it still works, so the chain ends there.
+fn follow_chain<'d>(data: &'d Retirements, table: Table, first: &str, today: Date) -> Chain<'d> {
+    let mut steps = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = first.to_string();
+    let mut last_hop = None;
+    loop {
+        if !seen.insert(current.clone()) || steps.len() >= 8 {
+            return Chain {
+                steps,
+                live: None,
+                last_hop,
+            };
+        }
+        let Some(entry) = data.entry(table, &current) else {
+            steps.push(ChainStep {
+                model: current.clone(),
+                status: None,
+                date: None,
+                date_kind: None,
+                replacement_text: None,
+            });
+            return Chain {
+                steps,
+                live: Some(current),
+                last_hop,
+            };
+        };
+        let date = entry.date.as_deref().and_then(Date::parse);
+        let kind = data
+            .recipe(&entry.recipe)
+            .map(|r| r.date_kind)
+            .unwrap_or(DateKind::Hard);
+        let state = effective_state(entry.status, date, kind, today);
+        steps.push(ChainStep {
+            model: entry.model.clone(),
+            status: Some(state),
+            date,
+            date_kind: Some(kind),
+            replacement_text: entry.replacement_text.clone(),
+        });
+        match &entry.replacement {
+            Some(next) => {
+                last_hop = Some(entry);
+                current = next.clone();
+            }
+            None => {
+                let works = matches!(state, State::Deprecated | State::AutoRouted);
+                return Chain {
+                    steps,
+                    live: works.then(|| entry.model.clone()),
+                    last_hop,
+                };
+            }
+        }
+    }
+}
+
+/// `shuts down on 14 Jan 2027 (88 days)`.
+fn step_phrase(step: &ChainStep, today: Date) -> String {
+    match (step.status, step.date) {
+        (Some(State::Retired), Some(d)) if d <= today => format!("shut down on {}", d.human()),
+        (Some(State::Retired), _) => "is already shut down".to_string(),
+        (Some(State::Retiring), Some(d)) => {
+            let left = days_phrase(today.days_until(d));
+            match step.date_kind {
+                Some(DateKind::Earliest) => format!("retires on or after {} ({left})", d.human()),
+                _ => format!("shuts down on {} ({left})", d.human()),
+            }
+        }
+        (Some(State::Retiring), None) => "is retiring".to_string(),
+        (Some(State::Unconfirmed), _) => "may already be retired".to_string(),
+        (Some(State::Deprecated), _) => "is deprecated".to_string(),
+        (Some(State::AutoRouted), _) => "is routed to a newer model".to_string(),
+        (None, _) => "is current".to_string(),
+    }
+}
+
+fn days_phrase(days: i64) -> String {
+    match days {
+        0 => "today".to_string(),
+        1 => "1 day".to_string(),
+        n => format!("{n} days"),
+    }
+}
+
+/// Why a chained replacement needs a person.
+fn chain_message(provider: &str, chain: &Chain<'_>, today: Date) -> String {
+    let dead: Vec<&ChainStep> = chain
+        .steps
+        .iter()
+        .take_while(|s| s.status.is_some() && Some(&s.model) != chain.live.as_ref())
+        .collect();
+    let mut text = String::new();
+    for (index, step) in dead.iter().enumerate() {
+        if index == 0 {
+            text.push_str(&format!(
+                "{provider} lists {} as the replacement, and it {}",
+                step.model,
+                step_phrase(step, today)
+            ));
+        } else {
+            text.push_str(&format!(
+                "; {provider} lists {} for it, and it {}",
+                step.model,
+                step_phrase(step, today)
+            ));
+        }
+    }
+    let last = dead.last().map(|s| s.model.as_str()).unwrap_or_default();
+    match &chain.live {
+        Some(live) => text.push_str(&format!(
+            ". {live} is the replacement {provider} lists for {last}; the changes shown are for {live}."
+        )),
+        None => match dead.last().and_then(|s| s.replacement_text.as_deref()) {
+            Some(listed) => text.push_str(&format!(
+                ". For {last}, {provider} lists {listed}: pick one by hand."
+            )),
+            None => text.push_str(&format!(
+                ". {provider} lists no replacement for {last}: pick one by hand."
+            )),
+        },
+    }
+    text
+}
+
+// ---------------------------------------------------------------------------
 // Findings
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 enum Site<'a> {
-    Call(&'a SdkCall),
+    Call(&'a SdkCall, CallKind),
     Gap(&'a UsageGap),
 }
 
@@ -678,16 +1101,19 @@ fn finding_for(
     let status = effective_state(hit.status, hit.date, date_kind, today);
     let days_left = hit.date.map(|d| today.days_until(d));
 
-    let (file, span, symbol, chain, kwargs, splat, gap_reason, endpoint) = match site {
-        Site::Call(call) => (
+    let (file, span, symbol, chain, kwargs, splat, endpoint, call_kind) = match site {
+        Site::Call(call, kind) => (
             call.file.clone(),
             Some(call.span),
             call.symbol.clone(),
             Some(call.chain.clone()),
             call.kwargs.clone(),
             call.splat,
-            None,
-            endpoint_of(&call.chain, &call.member),
+            // A parameter object's arguments are not the request's.
+            (kind != CallKind::RequestParam)
+                .then(|| endpoint_of(&call.chain, &call.member))
+                .flatten(),
+            kind,
         ),
         Site::Gap(gap) => {
             let chain = gap.chain.clone().unwrap_or_default();
@@ -698,62 +1124,103 @@ fn finding_for(
                 gap.chain.clone(),
                 Vec::new(),
                 false,
-                Some(gap.reason.clone()),
                 endpoint_of(&chain, &chain),
+                CallKind::Request,
             )
         }
     };
+    let gap_reason = match site {
+        Site::Gap(gap) => Some(gap.reason.clone()),
+        Site::Call(..) => None,
+    };
     let span = span.unwrap_or(value.span);
 
-    let mut changes = Vec::new();
-    let mut review = Vec::new();
-    let mut notes = hit.notes.clone();
-    if let (Some(rule_set), Some(target)) = (hit.rule_set, hit.replacement.as_deref()) {
-        let context = RuleContext {
-            target,
-            source_model: &hit.matched,
-            source_family: hit.entry.and_then(|e| e.source_family.as_deref()),
-            endpoint,
-            routing: &routing.routing,
-            kwargs: &kwargs,
-        };
-        apply_rules(
-            data.rules(rule_set),
-            &context,
-            &mut changes,
-            &mut review,
-            &mut notes,
-        );
+    // The listed replacement, followed to the first one that still works.
+    let replacement_chain = hit
+        .replacement
+        .as_deref()
+        .map(|r| follow_chain(data, hit.table, r, today));
+    let chained = replacement_chain.as_ref().is_some_and(Chain::chained);
+    let live = replacement_chain.as_ref().and_then(|c| c.live.clone());
+
+    // The rules that describe the move: the model's own rule set, or, for a
+    // chained replacement, the rule set of the last hop.
+    let source = match (&replacement_chain, live.as_deref()) {
+        (Some(c), Some(target)) if !c.chained() => hit.rule_set.map(|set| {
+            (
+                set,
+                target,
+                hit.matched.as_str(),
+                hit.entry.and_then(|e| e.source_family.as_deref()),
+            )
+        }),
+        (Some(c), Some(target)) => c.last_hop.and_then(|hop| {
+            hop.rule_set.as_deref().map(|set| {
+                (
+                    set,
+                    target,
+                    hop.model.as_str(),
+                    hop.source_family
+                        .as_deref()
+                        .or(hit.entry.and_then(|e| e.source_family.as_deref())),
+                )
+            })
+        }),
+        _ => None,
+    };
+    let mut outcome = Outcome::default();
+    if call_kind != CallKind::RequestParam {
+        if let Some((rule_set, target, source_model, source_family)) = source {
+            let context = RuleContext {
+                target,
+                source_model,
+                source_family,
+                endpoint,
+                routing: &routing.routing,
+                kwargs: &kwargs,
+            };
+            outcome = apply_rules(data.rules(rule_set), &context);
+        }
     }
 
-    let replacement_status = hit.replacement.as_ref().and_then(|r| {
-        let next = data.entry(hit.table, r)?;
-        let next_date = next.date.as_deref().and_then(Date::parse);
-        let next_kind = data
-            .recipe(&next.recipe)
-            .map(|r| r.date_kind)
-            .unwrap_or(DateKind::Hard);
-        let state = effective_state(next.status, next_date, next_kind, today);
-        matches!(state, State::Retired | State::Retiring | State::Unconfirmed).then(|| ChainInfo {
-            model: r.clone(),
-            status: state,
-            date: next_date,
-        })
-    });
-
-    let mut reasons = model_reasons(&hit, status, splat);
-    reasons.append(&mut review);
+    let mut reasons = model_reasons(&hit, status, splat, source.is_some(), chained);
+    if let Some(chain) = replacement_chain.as_ref().filter(|c| c.chained()) {
+        reasons.push(ReviewItem {
+            rule: None,
+            message: chain_message(hit.table.provider(), chain, today),
+            because: Vec::new(),
+            verified: None,
+        });
+    }
+    if call_kind == CallKind::RequestParam {
+        reasons.push(ReviewItem {
+            rule: None,
+            message: "The model is set in a request parameter object, not at the request: check the request that sends it."
+                .to_string(),
+            because: Vec::new(),
+            verified: None,
+        });
+    }
+    reasons.append(&mut outcome.review);
     let review = dedupe_review(reasons);
+    let mut notes = hit.notes.clone();
+    notes.append(&mut outcome.notes);
+
+    let manual = !review.is_empty()
+        || chained
+        || live.is_none()
+        || confidence != Confidence::Confirmed
+        || class != RoutingClass::Direct
+        || hit.action != Action::Rewrite
+        || hit.match_kind != MatchKind::Exact;
     let fix = if status == State::AutoRouted {
         FixKind::None
-    } else if review.is_empty()
-        && hit.action == Action::Rewrite
-        && hit.replacement.is_some()
-        && hit.match_kind == MatchKind::Exact
-    {
-        FixKind::Swap
-    } else {
+    } else if manual {
         FixKind::Manual
+    } else if !outcome.decisions.is_empty() {
+        FixKind::Decide
+    } else {
+        FixKind::Swap
     };
 
     let in_window = match status {
@@ -764,6 +1231,12 @@ fn finding_for(
         },
         _ => false,
     };
+    let counted = (confidence == Confidence::Confirmed || options.count_unconfirmed)
+        && match class {
+            RoutingClass::Direct => true,
+            RoutingClass::Routed => options.include_routed,
+            RoutingClass::Unknown => options.count_unconfirmed,
+        };
 
     Some(Finding {
         file,
@@ -772,6 +1245,7 @@ fn finding_for(
         end_line: span.end_line,
         symbol,
         chain,
+        call_kind,
         provider: hit.table,
         model: value.value.clone(),
         matched: hit.matched.clone(),
@@ -784,13 +1258,16 @@ fn finding_for(
         days_left,
         replacement: hit.replacement.clone(),
         replacement_text: hit.replacement_text.clone(),
-        replacement_status,
+        live_replacement: live,
+        replacement_chain: replacement_chain.map(|c| c.steps).unwrap_or_default(),
         fix,
-        changes,
+        changes: outcome.changes,
+        decisions: outcome.decisions,
         review,
         notes: dedupe(notes),
         routing: routing.routing.clone(),
         routing_class: class,
+        base_url: routing.base_url,
         endpoint,
         confidence,
         origin: (confidence != Confidence::Gap).then_some(value.origin),
@@ -800,6 +1277,7 @@ fn finding_for(
         candidate: false,
         splat,
         in_window,
+        fails: in_window && counted,
         recipe: hit.recipe.id.clone(),
         recipe_version: hit.recipe.version.clone(),
         verified: hit.verified,
@@ -807,13 +1285,14 @@ fn finding_for(
     })
 }
 
-/// The state on `today`: a hard date that has passed means retired; a
-/// passed "earliest" date is only a possibility.
+/// The state on `today`. A hard date counts as retired from that day on (the
+/// provider may switch the model off at any time that day); a reached
+/// "earliest" date is only a possibility.
 fn effective_state(status: EntryStatus, date: Option<Date>, kind: DateKind, today: Date) -> State {
     match status {
         EntryStatus::ShutDown => State::Retired,
         EntryStatus::Retiring => match date {
-            Some(date) if date < today => match kind {
+            Some(date) if date <= today => match kind {
                 DateKind::Hard => State::Retired,
                 DateKind::Earliest => State::Unconfirmed,
             },
@@ -860,7 +1339,13 @@ fn endpoint_of(chain: &str, member: &str) -> Option<&'static str> {
 }
 
 /// Why the model itself needs a person, before any parameter rule.
-fn model_reasons(hit: &Hit<'_>, status: State, splat: bool) -> Vec<ReviewItem> {
+fn model_reasons(
+    hit: &Hit<'_>,
+    status: State,
+    splat: bool,
+    rules_known: bool,
+    chained: bool,
+) -> Vec<ReviewItem> {
     if status == State::AutoRouted {
         return Vec::new();
     }
@@ -870,7 +1355,9 @@ fn model_reasons(hit: &Hit<'_>, status: State, splat: bool) -> Vec<ReviewItem> {
     let category = hit.entry.map(|e| e.category.as_str()).unwrap_or("text");
     let mut messages = Vec::new();
     if fine_tuned {
-        messages.push("Fine-tuned model: retrain it on a supported base model.".to_string());
+        messages.push(hit.fine_tune_advice.clone().unwrap_or_else(|| {
+            "Fine-tuned model: retrain it on a base model that supports fine-tuning.".to_string()
+        }));
     } else if hit.replacement.is_none() {
         messages.push(match &hit.replacement_text {
             Some(text) => format!("{provider} lists more than one way forward: {text}."),
@@ -885,7 +1372,9 @@ fn model_reasons(hit: &Hit<'_>, status: State, splat: bool) -> Vec<ReviewItem> {
             "{} model: Arbor checks chat and text parameters only, so review this call by hand.",
             capitalize(&category.replace('_', " "))
         ));
-    } else if hit.rule_set.is_none() {
+    } else if chained {
+        // The chain's own message says what to check.
+    } else if !rules_known {
         messages.push(format!(
             "The parameters {} needs have not been checked yet.",
             hit.replacement.as_deref().unwrap_or("the replacement")
@@ -976,18 +1465,54 @@ impl RuleContext<'_> {
     fn message(&self, text: &str) -> String {
         text.replace("{target}", self.target)
     }
+
+    /// Sorts argument names into the order the call passes them.
+    fn order(&self, names: &mut [String]) {
+        names.sort_by_key(|name| self.kwargs.iter().position(|k| k == name));
+    }
+
+    fn endpoint_matches(&self, endpoint: &str) -> bool {
+        endpoint == "*" || Some(endpoint) == self.endpoint
+    }
+
+    /// The label for this call: a live check vouches only for the models
+    /// and the API it called.
+    fn verified(&self, rule: &ParamRule) -> Verified {
+        if rule.verified != Verified::Live {
+            return rule.verified;
+        }
+        let model =
+            rule.live_models.is_empty() || rule.live_models.iter().any(|m| m == self.target);
+        let endpoint = rule.live_endpoints.is_empty()
+            || self
+                .endpoint
+                .is_some_and(|e| rule.live_endpoints.iter().any(|x| x == e));
+        if model && endpoint {
+            Verified::Live
+        } else {
+            rule.otherwise_verified.unwrap_or(Verified::Docs)
+        }
+    }
+}
+
+#[derive(Default)]
+struct Outcome {
+    changes: Vec<Change>,
+    review: Vec<ReviewItem>,
+    notes: Vec<String>,
+    decisions: Vec<Decision>,
 }
 
 fn apply_rules<'r>(
     rules: impl Iterator<Item = &'r ParamRule>,
     context: &RuleContext<'_>,
-    changes: &mut Vec<Change>,
-    review: &mut Vec<ReviewItem>,
-    notes: &mut Vec<String>,
-) {
+) -> Outcome {
     let rules: Vec<&ParamRule> = rules.collect();
+    let mut out = Outcome::default();
     let changes_args =
         |rule: &&&ParamRule| matches!(rule.effect, RuleEffect::Add | RuleEffect::Rename);
+    // Notes from automatic changes that depend on a choice.
+    let mut choice_notes: Vec<(String, String)> = Vec::new();
 
     // First the argument changes, so the other rules see what the swap adds.
     for rule in rules.iter().filter(changes_args) {
@@ -997,7 +1522,7 @@ fn apply_rules<'r>(
         let because = context.because(rule);
         if let Some(rename) = rule.rename.as_ref().filter(|r| context.has(&r.from)) {
             merge_change(
-                changes,
+                &mut out.changes,
                 Change {
                     kind: ChangeKind::Rename,
                     param: rename.from.clone(),
@@ -1005,65 +1530,209 @@ fn apply_rules<'r>(
                     value: None,
                     because: vec![rename.from.clone()],
                     rules: vec![rule.id.clone()],
-                    verified: rule.verified,
+                    verified: context.verified(rule),
                 },
             );
         }
-        apply_adds(rule, context, &because, changes, review);
+        apply_adds(rule, context, &because, &mut out.changes, &mut out.review);
+        if let (Some(choice), Some(note)) = (&rule.see_choice, &rule.choice_note) {
+            choice_notes.push((choice.clone(), context.message(note)));
+        }
     }
     // Renames read first: they are edits to arguments already in the call.
-    changes.sort_by_key(|c| c.kind != ChangeKind::Rename);
-    let added: Vec<String> = changes
+    out.changes.sort_by_key(|c| c.kind != ChangeKind::Rename);
+    let added: Vec<String> = out
+        .changes
         .iter()
         .filter(|c| c.kind == ChangeKind::Add)
         .map(|c| c.param.clone())
         .collect();
 
+    // Choices the repository makes: shown with every option, applied never.
+    for rule in rules.iter().filter(|r| r.effect == RuleEffect::Choice) {
+        if !context.applies(rule, &added) {
+            continue;
+        }
+        add_choice(rule, context, &mut out);
+    }
+
     let mut keeps = Vec::new();
-    for rule in rules.iter().filter(|r| !changes_args(r)) {
+    for rule in rules.iter().filter(|r| {
+        !matches!(
+            r.effect,
+            RuleEffect::Add | RuleEffect::Rename | RuleEffect::Choice
+        )
+    }) {
         if !context.applies(rule, &added) {
             continue;
         }
         let because = context.because(rule);
         match rule.effect {
-            RuleEffect::Review => review.push(ReviewItem {
+            RuleEffect::Review => out.review.push(ReviewItem {
                 rule: Some(rule.id.clone()),
                 message: context.message(&rule.message),
                 because,
-                verified: Some(rule.verified),
+                verified: Some(context.verified(rule)),
             }),
             RuleEffect::Keep => keeps.push((*rule, because)),
-            RuleEffect::Note => notes.push(context.message(&rule.message)),
-            RuleEffect::Add | RuleEffect::Rename => {}
+            RuleEffect::Note => out.notes.push(context.message(&rule.message)),
+            RuleEffect::Add | RuleEffect::Rename | RuleEffect::Choice => {}
         }
     }
-    // Keep rules depend on the reasoning effort the adds settled on.
+    // Keep rules depend on the reasoning effort the call runs at.
     for (rule, because) in keeps {
         let on_target =
             rule.keep_targets.is_empty() || rule.keep_targets.iter().any(|t| t == context.target);
+        let verb = if because.len() == 1 { "was" } else { "were" };
         if !on_target {
             let text = rule.else_message.as_deref().unwrap_or(&rule.message);
-            review.push(ReviewItem {
+            out.review.push(ReviewItem {
                 rule: Some(rule.id.clone()),
                 message: context.message(text),
                 because,
-                verified: Some(rule.verified),
+                verified: Some(context.verified(rule)),
             });
-        } else if rule.keep_needs_effort_none && !effort_none(changes) {
-            review.push(ReviewItem {
-                rule: Some(rule.id.clone()),
-                message: format!(
-                    "{} {} accepted on {} only at reasoning effort \"none\"; check the effort this call runs at.",
+        } else if rule.keep_needs_effort_none && !effort_none(&out.changes) {
+            if let Some(decision) = out.decisions.first_mut() {
+                decision.notes.push(format!(
+                    "{} {verb} accepted on {} at reasoning_effort \"none\" ({}); with the model reasoning, untested.",
                     because.join(", "),
-                    if because.len() == 1 { "is" } else { "are" },
-                    context.target
-                ),
-                because,
-                verified: Some(rule.verified),
-            });
+                    context.target,
+                    decision
+                        .options
+                        .iter()
+                        .find(|o| o.add.iter().any(|a| a.name.contains("reasoning")))
+                        .map(|o| o.label.as_str())
+                        .unwrap_or("reasoning off")
+                ));
+            } else {
+                out.review.push(ReviewItem {
+                    rule: Some(rule.id.clone()),
+                    message: format!(
+                        "{} {verb} checked on {} only at reasoning effort \"none\"; check the effort this call runs at.",
+                        because.join(", "),
+                        context.target
+                    ),
+                    because,
+                    verified: Some(context.verified(rule)),
+                });
+            }
         } else {
-            notes.push(context.message(&rule.message));
+            out.notes.push(context.message(&rule.message));
         }
+    }
+    for (choice, note) in choice_notes {
+        match out.decisions.iter_mut().find(|d| d.choice == choice) {
+            Some(decision) => push_unique(&mut decision.notes, note),
+            None => out.notes.push(note),
+        }
+    }
+    out
+}
+
+/// Adds a choice rule's options to the call's decision for that choice. A
+/// call that already sets a parameter an option adds has made the choice in
+/// code; its value is not visible, so it is a check instead.
+fn add_choice(rule: &ParamRule, context: &RuleContext<'_>, out: &mut Outcome) {
+    let Some(choice) = rule.choice.clone() else {
+        return;
+    };
+    let because = context.because(rule);
+    let preset = rule
+        .options
+        .iter()
+        .flat_map(|o| &o.add)
+        .filter(|a| context.endpoint_matches(&a.endpoint))
+        .find(|a| context.has(&a.name));
+    if let Some(add) = preset {
+        out.review.push(ReviewItem {
+            rule: Some(rule.id.clone()),
+            message: format!(
+                "{} This call already sets {}; check that it is {}.",
+                context.message(&rule.message),
+                add.name,
+                python_literal(&add.value)
+            ),
+            because,
+            verified: Some(context.verified(rule)),
+        });
+        return;
+    }
+    let index = match out.decisions.iter().position(|d| d.choice == choice) {
+        Some(index) => index,
+        None => {
+            out.decisions.push(Decision {
+                choice,
+                reasons: Vec::new(),
+                because: Vec::new(),
+                rules: Vec::new(),
+                options: rule
+                    .options
+                    .iter()
+                    .map(|o| DecisionOption {
+                        id: o.id.clone(),
+                        label: o.label.clone(),
+                        add: Vec::new(),
+                        remove: Vec::new(),
+                        keep: Vec::new(),
+                        effects: Vec::new(),
+                    })
+                    .collect(),
+                notes: Vec::new(),
+            });
+            out.decisions.len() - 1
+        }
+    };
+    let decision = &mut out.decisions[index];
+    push_unique(&mut decision.reasons, context.message(&rule.message));
+    for name in because {
+        push_unique(&mut decision.because, name);
+    }
+    push_unique(&mut decision.rules, rule.id.clone());
+    for option in &rule.options {
+        let Some(target) = decision.options.iter_mut().find(|o| o.id == option.id) else {
+            continue;
+        };
+        for add in option
+            .add
+            .iter()
+            .filter(|a| context.endpoint_matches(&a.endpoint))
+        {
+            if !target
+                .add
+                .iter()
+                .any(|p| p.name == add.name && p.value == add.value)
+            {
+                target.add.push(ParamValue {
+                    name: add.name.clone(),
+                    value: add.value.clone(),
+                });
+            }
+        }
+        for name in option.remove.iter().filter(|n| context.has(n)) {
+            push_unique(&mut target.remove, name.clone());
+        }
+        for name in option.keep.iter().filter(|n| context.has(n)) {
+            push_unique(&mut target.keep, name.clone());
+        }
+        let text = context.message(&option.effect);
+        if !target.effects.iter().any(|e| e.text == text) {
+            target.effects.push(OptionEffect {
+                rule: rule.id.clone(),
+                text,
+                status: option.status,
+            });
+        }
+        // The call's own argument order reads best.
+        context.order(&mut target.remove);
+        context.order(&mut target.keep);
+    }
+    context.order(&mut decision.because);
+}
+
+fn push_unique(list: &mut Vec<String>, item: String) {
+    if !list.contains(&item) {
+        list.push(item);
     }
 }
 
@@ -1080,7 +1749,7 @@ fn apply_adds(
     let spec = rule
         .add
         .iter()
-        .find(|a| a.endpoint == "*" || Some(a.endpoint.as_str()) == context.endpoint);
+        .find(|a| context.endpoint_matches(&a.endpoint));
     let Some(spec) = spec else {
         let text = rule.else_message.clone().unwrap_or_else(|| {
             format!(
@@ -1092,7 +1761,7 @@ fn apply_adds(
             rule: Some(rule.id.clone()),
             message: context.message(&text),
             because: because.to_vec(),
-            verified: Some(rule.verified),
+            verified: Some(context.verified(rule)),
         });
         return;
     };
@@ -1107,7 +1776,7 @@ fn apply_adds(
                 python_literal(&spec.value)
             ),
             because: because.to_vec(),
-            verified: Some(rule.verified),
+            verified: Some(context.verified(rule)),
         });
         return;
     }
@@ -1120,9 +1789,17 @@ fn apply_adds(
             value: Some(spec.value.clone()),
             because: because.to_vec(),
             rules: vec![rule.id.clone()],
-            verified: rule.verified,
+            verified: context.verified(rule),
         },
     );
+}
+
+fn verified_rank(verified: Verified) -> u8 {
+    match verified {
+        Verified::Live => 2,
+        Verified::Docs => 1,
+        Verified::Unverified => 0,
+    }
 }
 
 /// Adds `change`, or folds it into an equal change already listed.
@@ -1143,8 +1820,8 @@ fn merge_change(changes: &mut Vec<Change>, change: Change) {
                 existing.rules.push(rule);
             }
         }
-        if change.verified == Verified::Live {
-            existing.verified = Verified::Live;
+        if verified_rank(change.verified) > verified_rank(existing.verified) {
+            existing.verified = change.verified;
         }
         return;
     }
@@ -1320,6 +1997,7 @@ fn summarize(
         }
         match finding.fix {
             FixKind::Swap => summary.swap += 1,
+            FixKind::Decide => summary.decide += 1,
             FixKind::Manual => summary.manual += 1,
             FixKind::None => {}
         }
@@ -1328,11 +2006,14 @@ fn summarize(
             .entry(finding.provider.as_str().to_string())
             .or_default() += 1;
     }
-    summary.in_window = findings
-        .iter()
-        .chain(routed)
-        .filter(|f| f.in_window)
-        .count();
+    for finding in findings.iter().chain(routed).filter(|f| f.in_window) {
+        summary.in_window += 1;
+        if finding.fails {
+            summary.failing += 1;
+        } else {
+            summary.uncounted += 1;
+        }
+    }
     let next = findings
         .iter()
         .filter(|f| f.status == State::Retiring)
@@ -1422,11 +2103,23 @@ mod tests {
         )
     }
 
+    /// An object built from an imported SDK type: `member` keeps the module
+    /// path, as the usage scan reports it.
+    fn object(sdk: Sdk, chain: &str, member: &str, model: &str, line: u32) -> SdkCall {
+        let mut object = call(sdk, Routing::OpenaiDirect, chain, model, &[], line);
+        object.member = member.into();
+        object.request = false;
+        object.receiver = Receiver::Symbol;
+        object.client_line = None;
+        object
+    }
+
     fn options(today: &str) -> CheckOptions {
         CheckOptions {
             today: Date::parse(today).unwrap(),
             fail_within: None,
             include_routed: false,
+            count_unconfirmed: false,
         }
     }
 
@@ -1435,6 +2128,7 @@ mod tests {
             calls,
             gaps,
             clients: &[],
+            base_urls: &[],
         };
         check(input, bundled().unwrap(), opts)
     }
@@ -1449,6 +2143,14 @@ mod tests {
         finding.changes.iter().find(|c| c.param == param).cloned()
     }
 
+    fn option<'a>(finding: &'a Finding, id: &str) -> &'a DecisionOption {
+        finding.decisions[0]
+            .options
+            .iter()
+            .find(|o| o.id == id)
+            .unwrap_or_else(|| panic!("no option {id}: {:#?}", finding.decisions))
+    }
+
     #[test]
     fn retiring_model_counts_days_from_a_fixed_clock() {
         let finding = one(&[openai("gpt-4o", &["messages"])]);
@@ -1456,25 +2158,32 @@ mod tests {
         assert_eq!(finding.date.unwrap().iso(), "2027-01-14");
         assert_eq!(finding.days_left, Some(88));
         assert_eq!(finding.replacement.as_deref(), Some("gpt-6-luna"));
+        assert_eq!(finding.live_replacement.as_deref(), Some("gpt-6-luna"));
         assert_eq!(finding.routing_class, RoutingClass::Direct);
         assert_eq!(finding.confidence, Confidence::Confirmed);
-        assert_eq!(finding.fix, FixKind::Swap);
+        assert_eq!(finding.call_kind, CallKind::Request);
         assert_eq!(finding.endpoint, Some("chat.completions"));
         assert!(!finding.in_window, "retiring is not failing by default");
         assert!(finding.notes.iter().any(|n| n.contains("efficient tier")));
 
-        // The same call once the date has passed.
+        // The day after the date the call is retired.
         let report = run(&[openai("gpt-4o", &[])], &[], &options("2027-01-15"));
         let later = &report.findings[0];
         assert_eq!(later.status, State::Retired);
         assert_eq!(later.days_left, Some(-1));
-        assert!(later.in_window);
+        assert!(later.in_window && later.fails);
         assert_eq!(report.exit_code, 1);
 
-        // On the day itself it is still retiring, with 0 days left.
+        // The shutdown day itself counts as retired: the provider may turn
+        // the model off at any time that day (UTC).
         let report = run(&[openai("gpt-4o", &[])], &[], &options("2027-01-14"));
-        assert_eq!(report.findings[0].status, State::Retiring);
+        assert_eq!(report.findings[0].status, State::Retired);
         assert_eq!(report.findings[0].days_left, Some(0));
+        assert_eq!(report.exit_code, 1);
+        let report = run(&[openai("gpt-4o", &[])], &[], &options("2027-01-13"));
+        assert_eq!(report.findings[0].status, State::Retiring);
+        assert_eq!(report.findings[0].days_left, Some(1));
+        assert_eq!(report.exit_code, 0);
     }
 
     #[test]
@@ -1488,6 +2197,7 @@ mod tests {
         let report = run(&calls, &[], &opts);
         assert_eq!(report.exit_code, 1);
         assert_eq!(report.summary.in_window, 1);
+        assert_eq!(report.summary.failing, 1);
     }
 
     #[test]
@@ -1506,7 +2216,7 @@ mod tests {
         assert_eq!(finding.provider, Table::Anthropic);
         assert_eq!(finding.date.unwrap().iso(), "2025-10-28");
         assert_eq!(finding.replacement.as_deref(), Some("claude-sonnet-5-5"));
-        assert!(finding.in_window);
+        assert!(finding.in_window && finding.fails);
         assert_eq!(report.exit_code, 1);
         assert_eq!(report.summary.retired, 1);
         // Sonnet 5.5 thinks by default: without tools, between_tools is added.
@@ -1518,35 +2228,65 @@ mod tests {
     }
 
     #[test]
-    fn co_changes_follow_the_call_arguments() {
+    fn the_reasoning_effort_is_a_decision_never_a_change() {
         let finding = one(&[openai(
             "gpt-4o-mini",
             &["messages", "max_tokens", "temperature", "tools"],
         )]);
+        // The rename stays automatic, verified live on gpt-6-luna.
         let rename = change(&finding, "max_tokens").expect("rename");
         assert_eq!(rename.kind, ChangeKind::Rename);
         assert_eq!(rename.to.as_deref(), Some("max_completion_tokens"));
         assert_eq!(rename.verified, Verified::Live);
-        let effort = change(&finding, "reasoning_effort").expect("effort none");
-        assert_eq!(effort.value, Some(serde_json::json!("none")));
-        // One change, every reason that needs it.
-        for reason in ["max_tokens", "temperature", "tools"] {
-            assert!(
-                effort.because.iter().any(|b| b == reason),
-                "{reason}: {effort:?}"
-            );
+        // Nothing adds reasoning_effort or removes a parameter on its own.
+        assert_eq!(finding.changes.len(), 1, "{:#?}", finding.changes);
+        assert_eq!(finding.fix, FixKind::Decide);
+
+        // One decision for the call, with both options.
+        assert_eq!(finding.decisions.len(), 1);
+        let decision = &finding.decisions[0];
+        assert_eq!(decision.choice, "G6-REASONING-DEFAULT");
+        for rule in ["G6-REASONING-DEFAULT", "G6-SAMPLING", "G6-TOOLS-CC"] {
+            assert!(decision.rules.iter().any(|r| r == rule), "{rule}");
         }
-        assert_eq!(
-            finding
-                .changes
-                .iter()
-                .filter(|c| c.param == "reasoning_effort")
-                .count(),
-            1
-        );
-        assert_eq!(finding.fix, FixKind::Swap);
-        // With effort none set, the reasoning-default note does not apply.
-        assert!(!finding.notes.iter().any(|n| n.contains("medium effort")));
+        assert_eq!(decision.because, ["temperature", "tools"]);
+        let off = option(&finding, "reasoning_none");
+        assert_eq!(off.label, "keep reasoning off");
+        assert_eq!(off.add.len(), 1);
+        assert_eq!(off.add[0].name, "reasoning_effort");
+        assert_eq!(off.add[0].value, serde_json::json!("none"));
+        assert_eq!(off.keep, ["temperature", "tools"]);
+        let reason = option(&finding, "model_default");
+        assert!(reason.add.is_empty());
+        assert_eq!(reason.remove, ["temperature", "tools"]);
+        assert!(reason
+            .effects
+            .iter()
+            .any(|e| e.text.contains("tool calls stop")));
+        // max_tokens's note joins the decision: the budget covers reasoning.
+        assert!(decision
+            .notes
+            .iter()
+            .any(|n| n.contains("max_completion_tokens also bounds its reasoning")));
+        // The anchor's effect for "none" is not verified to match the old model.
+        assert!(off
+            .effects
+            .iter()
+            .any(|e| e.rule == "G6-REASONING-DEFAULT" && e.status == OptionStatus::Unverified));
+    }
+
+    #[test]
+    fn a_plain_call_is_a_decision_and_nothing_else() {
+        let finding = one(&[openai("gpt-4o", &["messages"])]);
+        assert!(finding.changes.is_empty());
+        assert!(finding.review.is_empty());
+        assert_eq!(finding.fix, FixKind::Decide);
+        let off = option(&finding, "reasoning_none");
+        assert_eq!(off.add[0].name, "reasoning_effort");
+        assert!(option(&finding, "model_default").remove.is_empty());
+        let report = run(&[openai("gpt-4o", &[])], &[], &options("2026-10-18"));
+        assert_eq!(report.summary.decide, 1);
+        assert_eq!(report.summary.swap, 0);
     }
 
     #[test]
@@ -1557,24 +2297,31 @@ mod tests {
             .review
             .iter()
             .any(|r| r.rule.as_deref() == Some("G6-STOP-LOGIT-BIAS")
-                && r.message.contains("gpt-6-luna")));
+                && r.message.contains("gpt-6-luna")
+                && r.verified == Some(Verified::Live)));
 
-        // Penalties failed live on gpt-6-luna; n and seed need effort none.
+        // Penalties failed live on gpt-6-luna.
         let finding = one(&[openai("gpt-4o", &["presence_penalty", "seed"])]);
         assert!(finding
             .review
             .iter()
             .any(|r| r.rule.as_deref() == Some("G6-PENALTIES")));
+        // seed was checked only at reasoning_effort "none": part of the decision.
+        assert!(
+            finding.decisions[0]
+                .notes
+                .iter()
+                .any(|n| n
+                    .starts_with("seed was accepted on gpt-6-luna at reasoning_effort \"none\""))
+        );
+
+        // A call that sets its own reasoning effort has no decision; seed is a check.
+        let finding = one(&[openai("gpt-4o", &["seed", "reasoning_effort"])]);
+        assert!(finding.decisions.is_empty());
         assert!(finding
             .review
             .iter()
             .any(|r| r.rule.as_deref() == Some("G6-N-SEED")));
-        let finding = one(&[openai("gpt-4o", &["seed", "temperature"])]);
-        assert!(!finding
-            .review
-            .iter()
-            .any(|r| r.rule.as_deref() == Some("G6-N-SEED")));
-        assert!(finding.notes.iter().any(|n| n.contains("n and seed")));
     }
 
     #[test]
@@ -1585,9 +2332,11 @@ mod tests {
             .review
             .iter()
             .any(|r| r.rule.as_deref() == Some("OAI-SAMPLING-REASONING-SOURCE")));
+        assert!(finding.decisions.is_empty());
         assert!(change(&finding, "reasoning_effort").is_none());
 
-        // The Responses API takes reasoning={"effort": "none"}.
+        // The Responses API: the decision offers reasoning={"effort": "none"},
+        // and sampling there is not verified.
         let responses = call(
             Sdk::Openai,
             Routing::OpenaiDirect,
@@ -1597,16 +2346,26 @@ mod tests {
             12,
         );
         let finding = one(&[responses]);
-        let reasoning = change(&finding, "reasoning").expect("reasoning added");
-        assert_eq!(reasoning.value, Some(serde_json::json!({"effort": "none"})));
+        assert!(finding.changes.is_empty());
+        let off = option(&finding, "reasoning_none");
+        assert_eq!(off.add[0].name, "reasoning");
+        assert_eq!(off.add[0].value, serde_json::json!({"effort": "none"}));
+        assert!(finding
+            .review
+            .iter()
+            .any(|r| r.rule.as_deref() == Some("OAI-SAMPLING-RESPONSES")
+                && r.verified == Some(Verified::Unverified)));
 
         // A reasoning_effort the call already sets cannot be read: check it.
         let finding = one(&[openai("gpt-4", &["tools", "reasoning_effort"])]);
+        assert!(finding.decisions.is_empty());
         assert!(change(&finding, "reasoning_effort").is_none());
         assert!(finding
             .review
             .iter()
-            .any(|r| r.message.contains("already sets reasoning_effort")));
+            .any(|r| r.rule.as_deref() == Some("OAI-TOOLS-CC")
+                && r.message
+                    .contains("already sets reasoning_effort; check that it is \"none\"")));
 
         // The legacy Completions endpoint is not supported on the target.
         let legacy = call(
@@ -1623,6 +2382,237 @@ mod tests {
             .review
             .iter()
             .any(|r| r.rule.as_deref() == Some("OAI-LEGACY-COMPLETIONS-ENDPOINT")));
+    }
+
+    #[test]
+    fn live_labels_hold_only_for_the_models_and_api_called() {
+        // OAI-TOOLS-CC was called live on gpt-5.6-terra (gpt-3.5-turbo's
+        // replacement), not on gpt-5.6-sol (gpt-4's).
+        let label = |model: &str| {
+            let finding = one(&[openai(model, &["tools", "reasoning_effort"])]);
+            finding
+                .review
+                .iter()
+                .find(|r| r.rule.as_deref() == Some("OAI-TOOLS-CC"))
+                .and_then(|r| r.verified)
+                .unwrap()
+        };
+        assert_eq!(label("gpt-3.5-turbo"), Verified::Live);
+        assert_eq!(label("gpt-4"), Verified::Docs);
+
+        // The max_tokens rename: live on terra, documented on sol.
+        let rename = |model: &str| change(&one(&[openai(model, &["max_tokens"])]), "max_tokens");
+        assert_eq!(rename("gpt-3.5-turbo").unwrap().verified, Verified::Live);
+        assert_eq!(
+            rename("gpt-4o-2024-05-13").unwrap().verified,
+            Verified::Docs
+        );
+
+        // stop on gpt-6-luna was called on Chat Completions only.
+        let assistants = call(
+            Sdk::Openai,
+            Routing::OpenaiDirect,
+            "client.beta.assistants.create",
+            "gpt-4o",
+            &["stop"],
+            16,
+        );
+        let finding = one(&[assistants]);
+        let stop = finding
+            .review
+            .iter()
+            .find(|r| r.rule.as_deref() == Some("G6-STOP-LOGIT-BIAS"))
+            .unwrap();
+        assert_eq!(stop.verified, Some(Verified::Unverified));
+    }
+
+    #[test]
+    fn response_and_type_objects_are_not_requests() {
+        // The reviewer's file: two functions that build objects and call no API.
+        let calls = [
+            object(
+                Sdk::Openai,
+                "ChatCompletion",
+                "types.chat.ChatCompletion",
+                "gpt-3.5-turbo-0613",
+                5,
+            ),
+            object(
+                Sdk::Anthropic,
+                "Message",
+                "types.Message",
+                "claude-3-5-sonnet-20241022",
+                9,
+            ),
+        ];
+        let report = run(&calls, &[], &options("2026-10-18"));
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        assert_eq!(report.exit_code, 0);
+        assert_eq!(report.summary.response_objects, 2);
+
+        // Pydantic constructors and module-qualified types are objects too.
+        for (chain, member) in [
+            (
+                "ChatCompletion.model_validate",
+                "types.chat.ChatCompletion.model_validate",
+            ),
+            (
+                "ChatCompletion.construct",
+                "types.chat.ChatCompletion.construct",
+            ),
+            (
+                "openai.types.chat.ChatCompletion",
+                "types.chat.ChatCompletion",
+            ),
+            ("Choice", "types.chat.chat_completion.Choice"),
+        ] {
+            let report = run(
+                &[object(Sdk::Openai, chain, member, "gpt-3.5-turbo-0613", 5)],
+                &[],
+                &options("2026-10-18"),
+            );
+            assert!(report.findings.is_empty(), "{chain}");
+        }
+
+        // A tool config is a request parameter: its model is used.
+        let tool = object(
+            Sdk::Openai,
+            "ImageGeneration",
+            "types.responses.tool_param.ImageGeneration",
+            "dall-e-2",
+            7,
+        );
+        let finding = one(&[tool]);
+        assert_eq!(finding.call_kind, CallKind::RequestParam);
+        assert_eq!(finding.endpoint, None);
+        assert_eq!(finding.fix, FixKind::Manual);
+        assert!(finding
+            .review
+            .iter()
+            .any(|r| r.message.contains("request parameter object")));
+
+        // `genai.GenerativeModel("gemini-1.5-pro")` binds the model.
+        let mut binding = call(
+            Sdk::Google,
+            Routing::GoogleGenerativeaiLegacy,
+            "genai.GenerativeModel",
+            "gemini-2.0-flash",
+            &[],
+            8,
+        );
+        binding.request = false;
+        binding.member = "GenerativeModel".into();
+        let finding = one(&[binding]);
+        assert_eq!(finding.call_kind, CallKind::ModelBinding);
+        assert_eq!(finding.endpoint, Some("generate_content"));
+        assert_eq!(finding.status, State::Retired);
+    }
+
+    #[test]
+    fn replacement_chains_end_at_a_model_that_still_works() {
+        // gpt-4-vision-preview → gpt-4o (shuts down 14 Jan 2027) → gpt-6-luna.
+        let finding = one(&[openai("gpt-4-vision-preview", &["max_tokens"])]);
+        assert_eq!(finding.replacement.as_deref(), Some("gpt-4o"));
+        assert_eq!(finding.live_replacement.as_deref(), Some("gpt-6-luna"));
+        let steps: Vec<(&str, Option<State>)> = finding
+            .replacement_chain
+            .iter()
+            .map(|s| (s.model.as_str(), s.status))
+            .collect();
+        assert_eq!(
+            steps,
+            [("gpt-4o", Some(State::Retiring)), ("gpt-6-luna", None)]
+        );
+        assert_eq!(finding.fix, FixKind::Manual);
+        assert!(finding.review.iter().any(|r| r.message
+            == "OpenAI lists gpt-4o as the replacement, and it shuts down on 14 Jan 2027 (88 days). \
+                gpt-6-luna is the replacement OpenAI lists for gpt-4o; the changes shown are for gpt-6-luna."));
+        // The changes are for the model at the end of the chain.
+        assert_eq!(
+            change(&finding, "max_tokens").unwrap().to.as_deref(),
+            Some("max_completion_tokens")
+        );
+
+        // An already shut-down replacement: text-davinci-003 → gpt-3.5-turbo-instruct.
+        let finding = one(&[openai("text-davinci-003", &[])]);
+        assert_eq!(
+            finding.replacement.as_deref(),
+            Some("gpt-3.5-turbo-instruct")
+        );
+        assert_eq!(finding.live_replacement.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(finding.replacement_chain[0].status, Some(State::Retired));
+
+        // A dead end: Vertex text-bison → gemini-2.5-flash-lite, which retires
+        // too and has several replacements.
+        let bison = call(
+            Sdk::Google,
+            Routing::GoogleGenai,
+            "client.models.generate_content",
+            "text-bison",
+            &["contents"],
+            30,
+        );
+        let vertex = ClientConstruction {
+            sdk: Sdk::Google,
+            package: "google.genai".into(),
+            constructor: "google.genai.Client".into(),
+            chain: "genai.Client".into(),
+            binding: Some("client".into()),
+            scope: crate::usages::ClientScope::Module,
+            routing: Routing::GoogleGenai,
+            is_async: false,
+            kwargs: vec!["vertexai".into()],
+            splat: false,
+            file: "app.py".into(),
+            span: span(1),
+            symbol: None,
+        };
+        let input = ScanInput {
+            calls: std::slice::from_ref(&bison),
+            gaps: &[],
+            clients: std::slice::from_ref(&vertex),
+            base_urls: &[],
+        };
+        let report = check(input, bundled().unwrap(), &options("2026-10-18"));
+        let finding = &report.findings[0];
+        assert_eq!(
+            finding.replacement.as_deref(),
+            Some("gemini-2.5-flash-lite")
+        );
+        assert_eq!(finding.live_replacement, None);
+        assert_eq!(finding.fix, FixKind::Manual);
+        assert!(finding
+            .review
+            .iter()
+            .any(|r| r.message.contains("pick one by hand")));
+    }
+
+    #[test]
+    fn fine_tunes_never_get_a_base_that_cannot_be_fine_tuned() {
+        // gpt-6-luna does not support fine-tuning: no retrain advice.
+        let finding = one(&[openai("ft:gpt-4o-mini-2024-07-18:acme::abc123", &[])]);
+        assert_eq!(finding.match_kind, MatchKind::FineTuned);
+        assert_eq!(finding.matched, "gpt-4o-mini-2024-07-18");
+        assert_eq!(finding.replacement, None);
+        assert_eq!(
+            finding.replacement_text.as_deref(),
+            Some("no fine-tunable replacement is listed")
+        );
+        assert_eq!(finding.fix, FixKind::Manual);
+        let advice = &finding.review[0].message;
+        assert!(advice.starts_with("Fine-tuned model:"), "{advice}");
+        assert!(advice.contains("does not support fine-tuning"), "{advice}");
+        assert!(!advice.contains("retrain on gpt-6-luna"), "{advice}");
+
+        // A listed base that cannot be fine-tuned is named, not recommended.
+        let finding = one(&[openai("ft:gpt-3.5-turbo:acme::abc123", &[])]);
+        assert_eq!(
+            finding.replacement_text.as_deref(),
+            Some("no fine-tunable replacement is listed")
+        );
+        assert!(finding.review[0]
+            .message
+            .contains("OpenAI lists gpt-5.6-terra for fine-tunes of gpt-3.5-turbo"));
     }
 
     #[test]
@@ -1669,13 +2659,93 @@ mod tests {
     }
 
     #[test]
-    fn env_defaults_and_gaps_carry_their_confidence() {
-        let mut env = openai("gpt-4.1", &[]);
+    fn a_base_url_on_the_provider_host_is_direct() {
+        let model = "gpt-3.5-turbo-0613";
+        let at = |line: u32| {
+            let mut c = call(
+                Sdk::Openai,
+                Routing::CustomBaseUrl,
+                "client.chat.completions.create",
+                model,
+                &[],
+                line,
+            );
+            c.client_line = Some(line - 20);
+            c
+        };
+        let calls = [at(21), at(22), at(23), at(24), at(25)];
+        let base_urls: Vec<ClientBaseUrl> = [
+            BaseUrl::ProviderHost,
+            BaseUrl::EnvProviderDefault,
+            BaseUrl::EnvOnly,
+            BaseUrl::Unreadable,
+            BaseUrl::OtherHost,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, base_url)| ClientBaseUrl {
+            file: "app.py".into(),
+            line: i as u32 + 1,
+            base_url,
+        })
+        .collect();
+        let input = ScanInput {
+            calls: &calls,
+            gaps: &[],
+            clients: &[],
+            base_urls: &base_urls,
+        };
+        let report = check(input, bundled().unwrap(), &options("2026-10-18"));
+        let class = |line: u32| {
+            report
+                .findings
+                .iter()
+                .find(|f| f.line == line)
+                .map(|f| (f.routing_class, f.fails))
+        };
+        assert_eq!(class(21), Some((RoutingClass::Direct, true)));
+        assert_eq!(class(22), Some((RoutingClass::Direct, true)));
+        // Listed with routing unknown, and not counted by default.
+        assert_eq!(class(23), Some((RoutingClass::Unknown, false)));
+        assert_eq!(class(24), Some((RoutingClass::Unknown, false)));
+        assert_eq!(class(25), None, "another host stays routed");
+        assert_eq!(report.summary.routed_calls, 1);
+        assert_eq!(report.summary.uncounted, 2);
+        assert_eq!(report.findings[0].base_url, Some(BaseUrl::ProviderHost));
+
+        let mut opts = options("2026-10-18");
+        opts.count_unconfirmed = true;
+        let input = ScanInput {
+            calls: &calls,
+            gaps: &[],
+            clients: &[],
+            base_urls: &base_urls,
+        };
+        let report = check(input, bundled().unwrap(), &opts);
+        assert_eq!(report.summary.failing, 4);
+    }
+
+    #[test]
+    fn unconfirmed_values_are_listed_but_count_only_when_asked() {
+        let mut env = openai("gpt-3.5-turbo-0613", &[]);
         env.values[0].origin = ValueOrigin::EnvDefault;
         env.values[0].name = Some("os.getenv(\"MODEL\")".into());
-        let finding = one(&[env]);
+        let report = run(std::slice::from_ref(&env), &[], &options("2026-10-18"));
+        let finding = &report.findings[0];
         assert_eq!(finding.confidence, Confidence::ConfirmFirst);
         assert_eq!(finding.origin, Some(ValueOrigin::EnvDefault));
+        assert_eq!(
+            finding.fix,
+            FixKind::Manual,
+            "confirm-first is never a swap"
+        );
+        assert!(finding.in_window && !finding.fails);
+        assert_eq!(report.exit_code, 0);
+        assert_eq!(report.summary.uncounted, 1);
+
+        let mut opts = options("2026-10-18");
+        opts.count_unconfirmed = true;
+        assert_eq!(run(&[env], &[], &opts).exit_code, 1);
 
         let gap = UsageGap {
             kind: GapKind::UnknownClientFactory,
@@ -1688,6 +2758,7 @@ mod tests {
             reason: "factory_call".into(),
             detail: String::new(),
             values: vec![value("gpt-4o-2024-08-06", ValueOrigin::Literal, 40)],
+            values_complete: false,
         };
         let report = run(&[], &[gap], &options("2026-10-18"));
         let finding = &report.findings[0];
@@ -1696,6 +2767,7 @@ mod tests {
         assert_eq!(finding.gap_reason.as_deref(), Some("factory_call"));
         assert_eq!(finding.origin, None);
         assert_eq!(finding.replacement.as_deref(), Some("gpt-6-luna"));
+        assert_eq!(finding.fix, FixKind::Manual, "a gap is never a swap");
     }
 
     #[test]
@@ -1713,6 +2785,7 @@ mod tests {
             reason: "env_var".into(),
             detail: String::new(),
             values: Vec::new(),
+            values_complete: false,
         };
         // Line 10 has a captured fallback; line 50 has nothing.
         let report = run(&[env], &[gap(10), gap(50), gap(50)], &options("2026-10-18"));
@@ -1744,14 +2817,7 @@ mod tests {
     }
 
     #[test]
-    fn fine_tunes_and_resource_prefixes() {
-        let finding = one(&[openai("ft:gpt-4o-2024-08-06:acme::abc123", &[])]);
-        assert_eq!(finding.match_kind, MatchKind::FineTuned);
-        assert_eq!(finding.matched, "gpt-4o-2024-08-06");
-        assert_eq!(finding.replacement, None);
-        assert_eq!(finding.fix, FixKind::Manual);
-        assert!(finding.review[0].message.starts_with("Fine-tuned model"));
-
+    fn resource_prefixes_are_matched_and_never_swapped() {
         let gemini = call(
             Sdk::Google,
             Routing::GoogleGenai,
@@ -1803,6 +2869,7 @@ mod tests {
             calls: std::slice::from_ref(&gemini),
             gaps: &[],
             clients: std::slice::from_ref(&vertex),
+            base_urls: &[],
         };
         let report = check(input, bundled().unwrap(), &options("2026-10-18"));
         let finding = &report.findings[0];
@@ -1810,10 +2877,21 @@ mod tests {
         assert_eq!(finding.date.unwrap().iso(), "2026-10-20");
         assert_eq!(finding.date_kind, DateKind::Earliest);
         assert_eq!(finding.days_left, Some(2));
+
+        // From the "earliest" date on, Google may have shut it down.
+        let input = ScanInput {
+            calls: std::slice::from_ref(&gemini),
+            gaps: &[],
+            clients: std::slice::from_ref(&vertex),
+            base_urls: &[],
+        };
+        let report = check(input, bundled().unwrap(), &options("2026-10-20"));
+        assert_eq!(report.findings[0].status, State::Unconfirmed);
+        assert_eq!(report.exit_code, 0);
     }
 
     #[test]
-    fn chains_and_summary() {
+    fn summary_and_provider_dates() {
         let calls = [
             openai("gpt-4-0314", &[]),
             openai("gpt-4o", &[]),
@@ -1839,8 +2917,19 @@ mod tests {
             State::Retired,
             "retired sorts first"
         );
-        let past = &report.findings[0];
-        assert_eq!(past.fix, FixKind::Manual);
+        assert_eq!(report.findings[0].fix, FixKind::Manual);
+
+        // Each provider's pages carry their own date; as_of is the oldest.
+        let dates: Vec<(&str, String)> = report
+            .data
+            .providers
+            .iter()
+            .map(|p| (p.provider.as_str(), p.as_of.iso()))
+            .collect();
+        assert_eq!(dates[0], ("OpenAI", "2026-10-18".to_string()));
+        assert_eq!(dates[1], ("Anthropic", "2026-10-16".to_string()));
+        assert_eq!(report.data.as_of.iso(), "2026-10-16");
+
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["version"], 1);
         assert_eq!(json["findings"][1]["status"], "retiring");
@@ -1867,6 +2956,7 @@ mod tests {
                 value("gpt-4o-mini", ValueOrigin::Literal, 3),
                 value("gpt-6-luna", ValueOrigin::Literal, 3),
             ],
+            values_complete: true,
         };
         let missing = UsageGap {
             kind: GapKind::UnresolvedModel,
@@ -1888,8 +2978,11 @@ mod tests {
             "the call's own routing"
         );
         assert_eq!(finding.gap_reason.as_deref(), Some("dict_lookup"));
-        // The call's arguments still drive the co-changes.
-        assert!(change(finding, "reasoning_effort").is_some());
+        // The call's arguments still drive the decision.
+        assert!(finding.decisions[0]
+            .because
+            .iter()
+            .any(|b| b == "temperature"));
         // Neither gap is an unreadable model: one lists its values, the
         // other passes no model at all.
         assert_eq!(report.summary.unreadable_calls, 0);

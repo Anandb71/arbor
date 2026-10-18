@@ -9,15 +9,20 @@
 //!
 //! Output modes: people (default), `--json` (always one valid JSON object on
 //! stdout, errors included), `--markdown` (a GitHub job summary) and
-//! `--annotations` (GitHub workflow commands, one warning per call).
+//! `--annotations` (GitHub workflow commands, one warning per call up to
+//! GitHub's per-step limit). `--markdown-out <file>` also writes the
+//! Markdown report from the same scan, so CI scans once.
 //!
-//! Exit codes: 0 when nothing counts as failing, 1 when a call uses a model
-//! that is already retired (or, with `--fail-within N`, retires within N
-//! days), 2 when the check could not run.
+//! Exit codes: 0 when nothing counts as failing, 1 when a confirmed call
+//! uses a model that is already retired (or, with `--fail-within N`, retires
+//! within N days), 2 when the check could not run. Unconfirmed calls count
+//! only with `--count-unconfirmed`, routed ones only with
+//! `--include-routed`.
 
 use arbor_core::retirements::{
-    bundled, check, python_literal, Change, ChangeKind, CheckOptions, Confidence, Date, DateKind,
-    Finding, MatchKind, RetirementReport, RoutingClass, ScanInput, State, REPORT_VERSION,
+    bundled, check, python_literal, read_base_urls, Change, ChangeKind, CheckOptions, Confidence,
+    Date, DateKind, Decision, Finding, MatchKind, OptionStatus, RetirementReport, RoutingClass,
+    ScanInput, State, REPORT_VERSION,
 };
 use arbor_core::usages::{is_unsafe_char, ValueOrigin};
 use arbor_watcher::usages::{scan_usages, UsageScanOptions};
@@ -32,14 +37,22 @@ pub const FIX_PRS_URL: &str = "https://getarbor.dev/retirements";
 /// Data older than this gets a reminder to update Arbor.
 const STALE_AFTER_DAYS: i64 = 90;
 
+/// GitHub shows at most this many warning annotations per step.
+pub const GITHUB_WARNING_LIMIT: usize = 10;
+
 #[derive(Debug, Clone, Default)]
 pub struct Args {
     pub path: String,
     pub json: bool,
     pub markdown: bool,
     pub annotations: bool,
+    /// Also write the Markdown report to this file.
+    pub markdown_out: Option<String>,
+    /// The most warning annotations to print; a notice says how many more.
+    pub max_annotations: Option<usize>,
     pub fail_within: Option<i64>,
     pub include_routed: bool,
+    pub count_unconfirmed: bool,
     pub quiet: bool,
     /// `YYYY-MM-DD` to count days from instead of the system clock.
     pub today: Option<String>,
@@ -49,6 +62,11 @@ pub struct Args {
 pub fn run(args: &Args) -> i32 {
     let code = match build_report(args) {
         Ok(report) => {
+            if let Some(path) = &args.markdown_out {
+                if let Err(error) = std::fs::write(path, markdown(&report)) {
+                    return fail(args, &format!("cannot write {path}: {error}"));
+                }
+            }
             if args.json {
                 match serde_json::to_string_pretty(&report) {
                     Ok(text) => println!("{text}"),
@@ -57,7 +75,8 @@ pub fn run(args: &Args) -> i32 {
             } else if args.markdown {
                 print!("{}", markdown(&report));
             } else if args.annotations {
-                print!("{}", annotations(&report));
+                let limit = args.max_annotations.unwrap_or(GITHUB_WARNING_LIMIT);
+                print!("{}", annotations(&report, limit));
             } else {
                 print_human(&report, args.quiet, show_offer(args.quiet));
             }
@@ -124,15 +143,19 @@ fn build_report(args: &Args) -> Result<RetirementReport, String> {
         },
     )
     .map_err(|error| format!("cannot scan {}: {}", path.display(), error))?;
+    // Reported paths start with the path as given, so they open from here.
+    let base_urls = read_base_urls(&scan.clients, |file| std::fs::read_to_string(file).ok());
     let options = CheckOptions {
         today,
         fail_within: args.fail_within,
         include_routed: args.include_routed,
+        count_unconfirmed: args.count_unconfirmed,
     };
     let input = ScanInput {
         calls: &scan.usages,
         gaps: &scan.gaps,
         clients: &scan.clients,
+        base_urls: &base_urls,
     };
     let mut report = check(input, data, &options);
     report.root = scan.root;
@@ -181,6 +204,15 @@ fn calls(n: usize) -> String {
     }
 }
 
+/// `uses` for one, `use` for several.
+fn verb(n: usize, one: &'static str, many: &'static str) -> &'static str {
+    if n == 1 {
+        one
+    } else {
+        many
+    }
+}
+
 fn days(n: i64) -> String {
     match n {
         0 => "today".to_string(),
@@ -213,6 +245,9 @@ fn groups(findings: &[Finding]) -> Vec<&[Finding]> {
 fn status_phrase(finding: &Finding, today: Date) -> String {
     let provider = finding.provider.provider();
     match (finding.status, finding.date) {
+        (State::Retired, Some(d)) if d == today => {
+            format!("{provider} shuts down today ({})", d.human())
+        }
         (State::Retired, Some(d)) if d > today => {
             format!(
                 "{provider} has already shut down (listed for {})",
@@ -264,22 +299,23 @@ fn headline(group: &[Finding], today: Date) -> String {
     format!("{subject}{link} {}", status_phrase(first, today))
 }
 
-/// `max_tokens → max_completion_tokens, add reasoning_effort="none" (for tools)`.
+fn tick(text: &str, code: bool) -> String {
+    if code {
+        format!("`{text}`")
+    } else {
+        text.to_string()
+    }
+}
+
+/// `max_tokens → max_completion_tokens, add thinking={"type": "between_tools"} (for messages)`.
 fn describe_changes(changes: &[Change], code: bool) -> String {
-    let tick = |s: &str| {
-        if code {
-            format!("`{s}`")
-        } else {
-            s.to_string()
-        }
-    };
     changes
         .iter()
         .map(|change| match change.kind {
             ChangeKind::Rename => format!(
                 "{} → {}",
-                tick(&change.param),
-                tick(change.to.as_deref().unwrap_or_default())
+                tick(&change.param, code),
+                tick(change.to.as_deref().unwrap_or_default(), code)
             ),
             ChangeKind::Add => {
                 let value = change
@@ -292,14 +328,50 @@ fn describe_changes(changes: &[Change], code: bool) -> String {
                 } else {
                     format!(" (for {})", change.because.join(", "))
                 };
-                format!("add {}{reason}", tick(&format!("{}={value}", change.param)))
+                format!(
+                    "add {}{reason}",
+                    tick(&format!("{}={value}", change.param), code)
+                )
             }
         })
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-/// What to keep in mind about how the value was found.
+/// `keep reasoning off (add reasoning_effort="none"; keep tools) or let the
+/// model reason (remove tools)`.
+fn describe_decision(decision: &Decision, code: bool) -> String {
+    decision
+        .options
+        .iter()
+        .map(|option| {
+            let mut edits = Vec::new();
+            for add in &option.add {
+                edits.push(format!(
+                    "add {}",
+                    tick(
+                        &format!("{}={}", add.name, python_literal(&add.value)),
+                        code
+                    )
+                ));
+            }
+            if !option.keep.is_empty() {
+                edits.push(format!("keep {}", option.keep.join(", ")));
+            }
+            if !option.remove.is_empty() {
+                edits.push(format!("remove {}", option.remove.join(", ")));
+            }
+            if edits.is_empty() {
+                edits.push("no change".to_string());
+            }
+            format!("{} ({})", option.label, edits.join("; "))
+        })
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
+/// What to keep in mind about how the value was found or where the call
+/// goes.
 fn caveat(finding: &Finding) -> Option<String> {
     let provider = finding.provider.provider();
     let text = match (finding.confidence, finding.origin) {
@@ -318,6 +390,9 @@ fn caveat(finding: &Finding) -> Option<String> {
         _ if finding.routing_class == RoutingClass::Routed => {
             format!("via {}: {provider}'s dates may not apply", finding.routing)
         }
+        _ if finding.routing_class == RoutingClass::Unknown && finding.base_url.is_some() => {
+            format!("base_url set from the environment or code Arbor cannot read: confirm this call reaches {provider} directly")
+        }
         _ if finding.routing_class == RoutingClass::Unknown => {
             format!("routing unknown: confirm this call reaches {provider} directly")
         }
@@ -326,19 +401,48 @@ fn caveat(finding: &Finding) -> Option<String> {
     Some(text)
 }
 
-fn chain_note(finding: &Finding, today: Date) -> Option<String> {
-    let chain = finding.replacement_status.as_ref()?;
-    let text = match (chain.status, chain.date) {
-        (State::Retired, _) => format!("{} itself is already shut down.", chain.model),
-        (State::Retiring, Some(d)) => format!(
-            "{} itself shuts down on {} ({}).",
-            chain.model,
-            d.human(),
-            days(today.days_until(d))
-        ),
-        _ => format!("{} itself may be retiring.", chain.model),
-    };
-    Some(text)
+/// Where to move: `gpt-6-luna`, `gpt-6-luna (via gpt-4o)`, or why there is
+/// no single model.
+fn target_text(finding: &Finding) -> (String, bool) {
+    let chained = finding
+        .replacement_chain
+        .first()
+        .is_some_and(|step| step.status.is_some());
+    if finding.match_kind == MatchKind::FineTuned {
+        let text = finding
+            .replacement_text
+            .clone()
+            .unwrap_or_else(|| "no fine-tunable replacement is listed".to_string());
+        return (text, false);
+    }
+    match (&finding.replacement, &finding.live_replacement) {
+        (Some(_), Some(live)) if !chained => (live.clone(), true),
+        (Some(_), Some(live)) => {
+            let via: Vec<&str> = finding
+                .replacement_chain
+                .iter()
+                .filter(|s| s.status.is_some() && &s.model != live)
+                .map(|s| s.model.as_str())
+                .collect();
+            (format!("{live} (via {})", via.join(", ")), true)
+        }
+        (Some(listed), None) => {
+            let state = finding.replacement_chain.first().and_then(|s| s.status);
+            let how = if state == Some(State::Retired) {
+                "is shut down too"
+            } else {
+                "retires too"
+            };
+            (
+                format!("no current replacement (the listed {listed} {how})"),
+                false,
+            )
+        }
+        (None, _) if finding.replacement_text.is_some() => {
+            ("several listed (see check)".to_string(), false)
+        }
+        (None, _) => ("none listed".to_string(), false),
+    }
 }
 
 fn model_text(finding: &Finding) -> String {
@@ -359,12 +463,20 @@ fn model_text(finding: &Finding) -> String {
     text
 }
 
-fn summary_lines(report: &RetirementReport) -> Vec<String> {
+/// `already retired`, `retired or retiring within 90 days`.
+fn window_phrase(fail_within: Option<i64>) -> String {
+    match fail_within {
+        None | Some(0) => "already retired".to_string(),
+        Some(n) => format!("retired or retiring within {}", days(n)),
+    }
+}
+
+fn summary_lines(report: &RetirementReport, markdown: bool) -> Vec<String> {
     let s = &report.summary;
     let mut lines = Vec::new();
     if s.affected_calls == 0 {
         lines.push(format!(
-            "No calls to retired or retiring models in {} Python file{}.",
+            "No direct openai/anthropic/google SDK calls to retired or retiring models in {} Python file{}. Calls through LangChain, LiteLLM or other wrappers are not checked yet.",
             s.files_scanned,
             if s.files_scanned == 1 { "" } else { "s" }
         ));
@@ -385,10 +497,11 @@ fn summary_lines(report: &RetirementReport) -> Vec<String> {
             parts.push(format!("{} to keep an eye on", s.other));
         }
         lines.push(format!(
-            "{} in {} file{} use retired or retiring models: {}.",
+            "{} in {} file{} {} retired or retiring models: {}.",
             calls(s.affected_calls),
             s.affected_files,
             if s.affected_files == 1 { "" } else { "s" },
+            verb(s.affected_calls, "uses", "use"),
             parts.join(", ")
         ));
         let mut fixes = Vec::new();
@@ -398,11 +511,17 @@ fn summary_lines(report: &RetirementReport) -> Vec<String> {
                 s.swap
             ));
         }
+        if s.decide > 0 {
+            fixes.push(format!(
+                "{} can move once this repo makes the choice shown under decide",
+                s.decide
+            ));
+        }
         if s.manual > 0 {
             fixes.push(format!(
-                "{} need{} a manual check",
+                "{} {} a manual check",
                 s.manual,
-                if s.manual == 1 { "s" } else { "" }
+                verb(s.manual, "needs", "need")
             ));
         }
         if !fixes.is_empty() {
@@ -410,14 +529,20 @@ fn summary_lines(report: &RetirementReport) -> Vec<String> {
         }
     }
     if report.exit_code == 1 {
-        let window = match report.options.fail_within_days {
-            Some(n) => format!("retired or retiring within {}", days(n)),
-            None => "already retired".to_string(),
-        };
         lines.push(format!(
-            "Failing (exit 1): {} {} a model that is {window}.",
-            calls(s.in_window),
-            if s.in_window == 1 { "uses" } else { "use" }
+            "Failing (exit 1): {} {} a model that is {}.",
+            calls(s.failing),
+            verb(s.failing, "uses", "use"),
+            window_phrase(report.options.fail_within_days)
+        ));
+    }
+    if s.uncounted > 0 {
+        let flag = tick("--count-unconfirmed", markdown);
+        lines.push(format!(
+            "Not counted toward the exit code: {} to a model that is {}, because the value, the client or the routing is unconfirmed. Add {flag} to count {}.",
+            calls(s.uncounted),
+            window_phrase(report.options.fail_within_days),
+            verb(s.uncounted, "it", "them")
         ));
     }
     lines
@@ -427,49 +552,72 @@ fn not_checked_lines(report: &RetirementReport, markdown: bool) -> Vec<String> {
     let s = &report.summary;
     let mut lines = Vec::new();
     if s.unreadable_calls > 0 {
-        let cmd = if markdown {
-            "`arbor usages`"
-        } else {
-            "arbor usages"
-        };
         lines.push(format!(
-            "Not checked: {} {} the model from somewhere Arbor cannot read (an environment variable, a function argument, another module); {cmd} lists {}.",
+            "Not checked: {} {} the model from somewhere Arbor cannot read (an environment variable, a function argument, another module); {} lists {}.",
             calls(s.unreadable_calls),
-            if s.unreadable_calls == 1 { "takes" } else { "take" },
-            if s.unreadable_calls == 1 { "it" } else { "them" }
+            verb(s.unreadable_calls, "takes", "take"),
+            tick("arbor usages", markdown),
+            verb(s.unreadable_calls, "it", "them")
         ));
     }
     if s.no_model_calls > 0 {
         lines.push(format!(
             "Not checked: {} {} no model, so the SDK's or the server's default applies.",
             calls(s.no_model_calls),
-            if s.no_model_calls == 1 {
-                "passes"
-            } else {
-                "pass"
-            }
+            verb(s.no_model_calls, "passes", "pass")
         ));
     }
     if s.routed_calls > 0 && !report.options.include_routed {
-        let flag = if markdown {
-            "`--include-routed`"
-        } else {
-            "--include-routed"
-        };
         lines.push(format!(
-            "Not listed: {} {} these models through Azure, a custom base_url or another cloud, where the provider's dates may not apply. Add {flag} to list {}.",
+            "Not listed: {} {} these models through Azure, another host in base_url or another cloud, where the provider's dates may not apply. Add {} to list {}.",
             calls(s.routed_calls),
-            if s.routed_calls == 1 { "reaches" } else { "reach" },
-            if s.routed_calls == 1 { "it" } else { "them" }
+            verb(s.routed_calls, "reaches", "reach"),
+            tick("--include-routed", markdown),
+            verb(s.routed_calls, "it", "them")
+        ));
+    }
+    if s.response_objects > 0 {
+        lines.push(format!(
+            "Skipped: {} SDK response or type object{} built in code, such as {} or {}: {} no request.",
+            s.response_objects,
+            if s.response_objects == 1 { "" } else { "s" },
+            tick("ChatCompletion(...)", markdown),
+            tick(".model_validate(...)", markdown),
+            verb(s.response_objects, "it sends", "they send")
         ));
     }
     lines
 }
 
+/// `OpenAI's pages read 18 Oct 2026; Anthropic's, Google's and Google
+/// Cloud's 16 Oct 2026`.
+fn provider_dates(report: &RetirementReport) -> String {
+    let mut by_date: Vec<(Date, Vec<&str>)> = Vec::new();
+    for provider in &report.data.providers {
+        match by_date.iter_mut().find(|(d, _)| *d == provider.as_of) {
+            Some((_, names)) => names.push(&provider.provider),
+            None => by_date.push((provider.as_of, vec![&provider.provider])),
+        }
+    }
+    by_date
+        .iter()
+        .map(|(date, names)| format!("{} as of {}", join_and(names), date.human()))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn join_and(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 fn data_line(report: &RetirementReport) -> String {
     format!(
-        "Retirement data: OpenAI, Anthropic and Google deprecation pages as of {}. Python files only for now. Runs locally: no code leaves this machine.",
-        report.data.as_of.human()
+        "Retirement data from the providers' deprecation pages: {}. Days are counted in UTC. Python and direct SDK calls only for now. Runs locally: no code leaves this machine.",
+        provider_dates(report)
     )
 }
 
@@ -486,6 +634,70 @@ fn capitalize(text: &str) -> String {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
     }
+}
+
+/// The choices a group of calls shares, merged by choice: the reason once,
+/// then each option with every effect the group's calls bring up.
+struct DecisionBlock {
+    reason: String,
+    /// `(label, [(effect, unverified)])`.
+    options: Vec<(String, Vec<(String, bool)>)>,
+}
+
+fn decision_blocks(group: &[Finding]) -> Vec<DecisionBlock> {
+    let mut blocks: Vec<(String, DecisionBlock)> = Vec::new();
+    for decision in group.iter().flat_map(|f| &f.decisions) {
+        let index = match blocks
+            .iter()
+            .position(|(choice, _)| choice == &decision.choice)
+        {
+            Some(index) => index,
+            None => {
+                blocks.push((
+                    decision.choice.clone(),
+                    DecisionBlock {
+                        reason: decision.reasons.first().cloned().unwrap_or_default(),
+                        options: decision
+                            .options
+                            .iter()
+                            .map(|o| (o.label.clone(), Vec::new()))
+                            .collect(),
+                    },
+                ));
+                blocks.len() - 1
+            }
+        };
+        let block = &mut blocks[index].1;
+        for option in &decision.options {
+            let Some((_, effects)) = block.options.iter_mut().find(|(l, _)| l == &option.label)
+            else {
+                continue;
+            };
+            for effect in &option.effects {
+                if !effects.iter().any(|(text, _)| text == &effect.text) {
+                    effects.push((
+                        effect.text.clone(),
+                        effect.status == OptionStatus::Unverified,
+                    ));
+                }
+            }
+        }
+    }
+    blocks.into_iter().map(|(_, block)| block).collect()
+}
+
+/// A finding's notes, its decisions' notes, deduplicated across a group.
+fn group_notes(group: &[Finding]) -> Vec<String> {
+    let mut notes: Vec<String> = Vec::new();
+    for finding in group {
+        let decision_notes = finding.decisions.iter().flat_map(|d| d.notes.iter());
+        for note in decision_notes.chain(&finding.notes) {
+            if !notes.contains(note) {
+                notes.push(note.clone());
+            }
+        }
+    }
+    notes
 }
 
 // ---------------------------------------------------------------------------
@@ -518,7 +730,7 @@ fn print_human(report: &RetirementReport, quiet: bool, offer: bool) {
     if !report.routed.is_empty() {
         println!(
             "\n{}",
-            "Through Azure, a custom base_url or another cloud (the provider's dates may not apply):"
+            "Through Azure, another host in base_url or another cloud (the provider's dates may not apply):"
                 .bold()
         );
         for group in groups(&report.routed) {
@@ -530,7 +742,7 @@ fn print_human(report: &RetirementReport, quiet: bool, offer: bool) {
     for line in not_checked_lines(report, false) {
         println!("{}", line.dimmed());
     }
-    for (i, line) in summary_lines(report).into_iter().enumerate() {
+    for (i, line) in summary_lines(report, false).into_iter().enumerate() {
         if i == 0 {
             println!("{} {}", "Summary:".bold(), line);
         } else {
@@ -561,23 +773,25 @@ fn print_group(group: &[Finding], today: Date) {
         .unwrap_or(0)
         .min(48);
     let indent = " ".repeat(width + 4);
-    let mut notes: Vec<String> = Vec::new();
     for finding in group {
-        let target = match &finding.replacement {
-            Some(r) => format!("{} {}", "→".dimmed(), clean(r).green()),
-            None => String::new(),
+        let (target, is_model) = target_text(finding);
+        let target = if is_model {
+            clean(&target).green().to_string()
+        } else {
+            clean(&target)
         };
-        let caveat = caveat(finding)
-            .map(|c| format!("  {}", c.dimmed()))
-            .unwrap_or_default();
-        println!(
-            "  {:<width$}  {} {}{}",
+        let mut line = format!(
+            "  {:<width$}  {} {} {}",
             clean(&location(finding)),
             clean(&model_text(finding)).cyan(),
+            "→".dimmed(),
             target,
-            caveat,
             width = width
         );
+        if let Some(caveat) = caveat(finding) {
+            line.push_str(&format!("  {}", clean(&caveat).dimmed()));
+        }
+        println!("{line}");
         if !finding.changes.is_empty() {
             println!(
                 "{indent}{} {}",
@@ -585,27 +799,38 @@ fn print_group(group: &[Finding], today: Date) {
                 clean(&describe_changes(&finding.changes, false))
             );
         }
+        for decision in &finding.decisions {
+            println!(
+                "{indent}{} {}",
+                "decide:".bold(),
+                clean(&describe_decision(decision, false))
+            );
+        }
         for item in &finding.review {
             println!("{indent}{} {}", "check:".bold(), clean(&item.message));
         }
-        for note in finding_notes(finding, today) {
-            if !notes.contains(&note) {
-                notes.push(note);
+    }
+    for block in decision_blocks(group) {
+        println!(
+            "  {} {}",
+            "decide once for this repo (Arbor does not choose):".bold(),
+            clean(&block.reason)
+        );
+        for (label, effects) in &block.options {
+            for (index, (effect, unverified)) in effects.iter().enumerate() {
+                let lead = if index == 0 {
+                    format!("{label}:")
+                } else {
+                    " ".repeat(label.chars().count() + 1)
+                };
+                let mark = if *unverified { " (not verified)" } else { "" };
+                println!("    {} {}{mark}", lead.bold(), clean(effect));
             }
         }
     }
-    for note in notes {
+    for note in group_notes(group) {
         println!("  {}", format!("note: {}", clean(&note)).dimmed());
     }
-}
-
-/// A finding's notes, plus one when its replacement is itself retiring.
-fn finding_notes(finding: &Finding, today: Date) -> Vec<String> {
-    let mut notes = finding.notes.clone();
-    if let Some(chain) = chain_note(finding, today) {
-        notes.push(chain);
-    }
-    notes
 }
 
 fn location(finding: &Finding) -> String {
@@ -642,7 +867,7 @@ fn markdown(report: &RetirementReport) -> String {
     let sections: [(&str, &[Finding]); 2] = [
         ("", &report.findings),
         (
-            "### Through Azure, a custom base_url or another cloud\n\nThe provider's dates may not apply to these calls.\n\n",
+            "### Through Azure, another host in base_url or another cloud\n\nThe provider's dates may not apply to these calls.\n\n",
             &report.routed,
         ),
     ];
@@ -653,19 +878,25 @@ fn markdown(report: &RetirementReport) -> String {
         out.push_str(title);
         for group in groups(findings) {
             out.push_str(&format!("**{}**\n\n", cell(&headline(group, report.today))));
-            out.push_str("| Call | Model | Replacement | Also change | Check by hand |\n");
-            out.push_str("| --- | --- | --- | --- | --- |\n");
-            let mut notes: Vec<String> = Vec::new();
+            out.push_str("| Call | Model | Replacement | Also change | Decide | Check by hand |\n");
+            out.push_str("| --- | --- | --- | --- | --- | --- |\n");
             for finding in group {
                 let mut model = code(&model_text(finding));
                 if let Some(c) = caveat(finding) {
                     model.push_str(&format!("<br>{}", cell(&c)));
                 }
-                let replacement = finding
-                    .replacement
-                    .as_deref()
-                    .map(code)
-                    .unwrap_or_else(|| "none listed".to_string());
+                let (target, is_model) = target_text(finding);
+                let replacement = if is_model {
+                    code(&target)
+                } else {
+                    cell(&target)
+                };
+                let decide = finding
+                    .decisions
+                    .iter()
+                    .map(|d| cell(&describe_decision(d, true)))
+                    .collect::<Vec<_>>()
+                    .join("<br>");
                 let checks = finding
                     .review
                     .iter()
@@ -673,21 +904,30 @@ fn markdown(report: &RetirementReport) -> String {
                     .collect::<Vec<_>>()
                     .join("<br>");
                 out.push_str(&format!(
-                    "| {} | {} | {} | {} | {} |\n",
+                    "| {} | {} | {} | {} | {} | {} |\n",
                     code(&location(finding)),
                     model,
                     replacement,
                     cell(&describe_changes(&finding.changes, true)),
+                    decide,
                     checks
                 ));
-                for note in finding_notes(finding, report.today) {
-                    if !notes.contains(&note) {
-                        notes.push(note);
-                    }
-                }
             }
             out.push('\n');
-            for note in notes {
+            for block in decision_blocks(group) {
+                out.push_str(&format!(
+                    "Decide once for this repo (Arbor does not choose): {}\n\n",
+                    cell(&block.reason)
+                ));
+                for (label, effects) in &block.options {
+                    for (effect, unverified) in effects {
+                        let mark = if *unverified { " (not verified)" } else { "" };
+                        out.push_str(&format!("- **{}**: {}{mark}\n", cell(label), cell(effect)));
+                    }
+                }
+                out.push('\n');
+            }
+            for note in group_notes(group) {
                 out.push_str(&format!("- {}\n", cell(&note)));
             }
             out.push('\n');
@@ -696,7 +936,7 @@ fn markdown(report: &RetirementReport) -> String {
     for line in not_checked_lines(report, true) {
         out.push_str(&format!("{line}\n\n"));
     }
-    for line in summary_lines(report) {
+    for line in summary_lines(report, true) {
         out.push_str(&format!("**{}**\n\n", cell(&line)));
     }
     out.push_str(&format!("<sub>{}</sub>\n", cell(&data_line(report))));
@@ -720,19 +960,27 @@ fn escape_property(text: &str) -> String {
     escape_data(text).replace(':', "%3A").replace(',', "%2C")
 }
 
-fn annotations(report: &RetirementReport) -> String {
+/// One warning per call, most urgent first, up to `limit` (GitHub drops
+/// warnings past its per-step limit); then one notice for the rest.
+fn annotations(report: &RetirementReport, limit: usize) -> String {
     let mut out = String::new();
-    for finding in report.findings.iter().chain(&report.routed) {
+    let all: Vec<&Finding> = report.findings.iter().chain(&report.routed).collect();
+    for finding in all.iter().take(limit) {
         let status = status_phrase(finding, report.today);
         let title = format!("{}: {}", finding.model, status);
         let mut message = format!("{}: {}.", finding.model, status);
-        if let Some(r) = &finding.replacement {
-            message.push_str(&format!(" Replacement: {r}."));
-        }
+        let (target, _) = target_text(finding);
+        message.push_str(&format!(" Replacement: {target}."));
         if !finding.changes.is_empty() {
             message.push_str(&format!(
                 " Also change: {}.",
                 describe_changes(&finding.changes, false)
+            ));
+        }
+        for decision in &finding.decisions {
+            message.push_str(&format!(
+                " Decide (per repo): {}.",
+                describe_decision(decision, false)
             ));
         }
         for item in &finding.review {
@@ -748,6 +996,19 @@ fn annotations(report: &RetirementReport) -> String {
             finding.end_line.max(finding.line),
             escape_property(&title),
             escape_data(&message)
+        ));
+    }
+    if all.len() > limit {
+        let more = all.len() - limit;
+        out.push_str(&format!(
+            "::notice title={}::{}\n",
+            escape_property("Arbor retirements"),
+            escape_data(&format!(
+                "{} more {} to retired or retiring models {} not annotated (at most {limit} warnings per step); the full report lists every call.",
+                more,
+                verb(more, "call", "calls"),
+                verb(more, "is", "are")
+            ))
         ));
     }
     out
@@ -782,6 +1043,13 @@ mod tests {
         assert_eq!(days(0), "today");
         assert_eq!(days(1), "1 day");
         assert_eq!(days(88), "88 days");
+        assert_eq!(verb(1, "uses", "use"), "uses");
+        assert_eq!(verb(2, "uses", "use"), "use");
+        assert_eq!(window_phrase(None), "already retired");
+        assert_eq!(window_phrase(Some(0)), "already retired");
+        assert_eq!(window_phrase(Some(1)), "retired or retiring within 1 day");
+        assert_eq!(join_and(&["A", "B", "C"]), "A, B and C");
+        assert_eq!(join_and(&["A"]), "A");
     }
 
     #[test]

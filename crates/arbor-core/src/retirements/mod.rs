@@ -12,16 +12,20 @@
 //! have moved on.
 //!
 //! [`check`] matches the model values that [`crate::usages`] found at SDK
-//! calls against this data. Nothing here reads files, runs code or reaches
-//! the network.
+//! calls against this data. Nothing in [`check`] reads files, runs code or
+//! reaches the network; [`read_base_urls`] parses source text its caller
+//! hands it.
 
+mod base_url;
 mod check;
 mod date;
 
+pub use base_url::{read_base_urls, BaseUrl, ClientBaseUrl};
 pub use check::{
-    check, python_literal, ChainInfo, Change, ChangeKind, CheckOptions, Confidence, DataInfo,
-    Finding, FixKind, MatchKind, NextShutdown, RecipeRef, ReportOptions, RetirementReport,
-    ReviewItem, RoutingClass, ScanInput, State, Summary, Unreadable, REPORT_VERSION,
+    check, python_literal, CallKind, ChainStep, Change, ChangeKind, CheckOptions, Confidence,
+    DataInfo, Decision, DecisionOption, Finding, FixKind, MatchKind, NextShutdown, OptionEffect,
+    ParamValue, ProviderDate, RecipeRef, ReportOptions, RetirementReport, ReviewItem, RoutingClass,
+    ScanInput, State, Summary, Unreadable, REPORT_VERSION,
 };
 pub use date::Date;
 
@@ -195,8 +199,16 @@ pub struct FineTuneEntry {
     pub recipe: String,
     pub status: EntryStatus,
     pub date: String,
+    /// The base model the provider lists for these fine-tunes, if any.
     #[serde(default)]
     pub replacement_base: Option<String>,
+    /// Whether `replacement_base` can itself be fine-tuned. Advice to
+    /// retrain is given only when it can.
+    #[serde(default)]
+    pub fine_tunable: bool,
+    /// Why the fine-tune cannot simply move (public wording).
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// What a parameter rule does when it applies.
@@ -213,6 +225,41 @@ pub enum RuleEffect {
     Keep,
     /// Worth knowing; changes nothing.
     Note,
+    /// A choice each repository makes (the recipe's `report_choice`): the
+    /// call is reported with every option and changed by none until the
+    /// repository picks one.
+    Choice,
+}
+
+/// How firmly an option's effect is established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionStatus {
+    /// A provider page states it, or a recorded live call shows it.
+    Confirmed,
+    /// Neither does yet.
+    Unverified,
+}
+
+/// One option of a [`RuleEffect::Choice`] rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChoiceOption {
+    /// `reasoning_none`, `model_default`.
+    pub id: String,
+    /// For people: `keep reasoning off`.
+    pub label: String,
+    #[serde(default)]
+    pub add: Vec<AddParam>,
+    /// Parameters the option removes (when the call passes them).
+    #[serde(default)]
+    pub remove: Vec<String>,
+    /// Parameters the option keeps (when the call passes them).
+    #[serde(default)]
+    pub keep: Vec<String>,
+    /// What changes for the call: behaviour and cost.
+    pub effect: String,
+    pub status: OptionStatus,
 }
 
 /// A parameter to add, for one endpoint (`*` for any).
@@ -272,6 +319,19 @@ pub struct ParamRule {
     /// For `keep`: verified only at reasoning effort `none`.
     #[serde(default)]
     pub keep_needs_effort_none: bool,
+    /// For [`RuleEffect::Choice`]: the choice this rule belongs to. The
+    /// rule whose `choice` is its own id is the choice's anchor.
+    #[serde(default)]
+    pub choice: Option<String>,
+    /// For [`RuleEffect::Choice`]: the options, in the anchor's order.
+    #[serde(default)]
+    pub options: Vec<ChoiceOption>,
+    /// An automatic change whose effect depends on a choice.
+    #[serde(default)]
+    pub see_choice: Option<String>,
+    /// What the choice means for this change (with `see_choice`).
+    #[serde(default)]
+    pub choice_note: Option<String>,
     /// For people; `{target}` is the replacement model.
     pub message: String,
     /// When the rule's change cannot be made at this call.
@@ -280,6 +340,17 @@ pub struct ParamRule {
     pub verified: Verified,
     #[serde(default)]
     pub verified_on: Option<String>,
+    /// For a live rule: the models the live calls used. The live label holds
+    /// only for these targets.
+    #[serde(default)]
+    pub live_models: Vec<String>,
+    /// For a live rule: the APIs the live calls used (`chat.completions`).
+    #[serde(default)]
+    pub live_endpoints: Vec<String>,
+    /// For a live rule: the label where the live calls did not reach (another
+    /// target or another API): `docs` or `unverified`.
+    #[serde(default)]
+    pub otherwise_verified: Option<Verified>,
     #[serde(default)]
     pub source_url: Option<String>,
 }
@@ -298,13 +369,16 @@ pub struct SkippedRule {
 #[serde(deny_unknown_fields)]
 pub struct RetirementData {
     pub schema: u32,
-    /// The newest date any recipe's pages were read.
+    /// The oldest date any recipe's pages were read; each recipe keeps its
+    /// own `retrieved_on`.
     pub data_as_of: String,
     pub generated_at: String,
     pub generator: String,
-    /// Where the recipes came from (`repository@commit:path`).
+    /// Where the recipes came from (`repository@commit:path`). The recipes
+    /// are in a private repository; every fact also names its provider page.
     pub source: String,
-    /// FNV-1a 64 of the canonical JSON of `entries`, `fine_tunes` and `rules`.
+    /// FNV-1a 64 of the canonical JSON of every key except `digest` and
+    /// `generated_at`.
     pub digest: String,
     pub recipes: Vec<RecipeInfo>,
     pub entries: Vec<ModelEntry>,
@@ -414,19 +488,23 @@ pub fn bundled() -> Result<&'static Retirements, String> {
         .map_err(Clone::clone)
 }
 
-/// FNV-1a 64 over the canonical JSON (sorted keys, no whitespace) of the
-/// checked sections, as `fnv1a64:<hex>`. The generator computes the same.
+/// Keys the digest leaves out: the digest itself, and the day the file was
+/// written.
+const UNDIGESTED: [&str; 2] = ["digest", "generated_at"];
+
+/// FNV-1a 64 over the canonical JSON (sorted keys, no whitespace) of every
+/// key except [`UNDIGESTED`], as `fnv1a64:<hex>`. The generator computes the
+/// same.
 pub fn content_digest(json: &str) -> Result<String, String> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "the data is not a JSON object".to_string())?;
     let mut body = serde_json::Map::new();
-    for key in ["entries", "fine_tunes", "rules"] {
-        body.insert(
-            key.to_string(),
-            value
-                .get(key)
-                .cloned()
-                .ok_or_else(|| format!("missing {key}"))?,
-        );
+    for (key, item) in object {
+        if !UNDIGESTED.contains(&key.as_str()) {
+            body.insert(key.clone(), item.clone());
+        }
     }
     let mut canonical = String::new();
     write_canonical(&serde_json::Value::Object(body), &mut canonical);
@@ -500,11 +578,39 @@ mod data_tests {
     }
 
     #[test]
+    fn digest_covers_provenance_but_not_the_write_date() {
+        let original = &data().data.digest;
+        let edit = |key: &str, value: serde_json::Value| {
+            let mut json: serde_json::Value = serde_json::from_str(DATA_JSON).unwrap();
+            json[key] = value;
+            content_digest(&json.to_string()).unwrap()
+        };
+        // Hand edits to the dates, the source, the recipe hashes or the
+        // skipped rules all change the digest.
+        assert_ne!(&edit("data_as_of", "2026-12-31".into()), original);
+        assert_ne!(&edit("source", "someone@else:recipes/".into()), original);
+        let mut recipes = serde_json::to_value(&data().data.recipes).unwrap();
+        recipes[0]["sha256"] = "0".repeat(64).into();
+        assert_ne!(&edit("recipes", recipes), original);
+        assert_ne!(&edit("skipped_rules", serde_json::json!([])), original);
+        // The day the file was written is not content.
+        assert_eq!(&edit("generated_at", "2030-01-01".into()), original);
+    }
+
+    #[test]
     fn provenance_is_recorded() {
         let d = &data().data;
         assert_eq!(d.schema, DATA_SCHEMA);
         assert!(Date::parse(&d.generated_at).is_some());
         assert!(data().as_of <= Date::parse(&d.generated_at).unwrap());
+        // The data date is the oldest page date, never a newer one.
+        let oldest = d
+            .recipes
+            .iter()
+            .map(|r| Date::parse(&r.retrieved_on).unwrap())
+            .min()
+            .unwrap();
+        assert_eq!(data().as_of, oldest);
         assert!(
             d.source.contains('@'),
             "source names a commit: {}",
@@ -619,8 +725,100 @@ mod data_tests {
                     "{}",
                     rule.id
                 );
+                // A live label names what the live calls covered.
+                assert!(!rule.live_models.is_empty(), "{}", rule.id);
+                assert_eq!(rule.live_endpoints, ["chat.completions"], "{}", rule.id);
+                assert!(rule.otherwise_verified.is_some(), "{}", rule.id);
+                assert_ne!(rule.otherwise_verified, Some(Verified::Live), "{}", rule.id);
             }
         }
+    }
+
+    #[test]
+    fn choices_offer_their_anchors_options() {
+        let r = data();
+        let mut anchors = 0;
+        for rule in &r.data.rules {
+            if let Some(choice) = &rule.choice {
+                assert_eq!(rule.effect, RuleEffect::Choice, "{}", rule.id);
+                let anchor = r
+                    .rules(&rule.rule_set)
+                    .find(|a| &a.id == choice && a.choice.as_deref() == Some(choice))
+                    .unwrap_or_else(|| panic!("{}: no anchor {choice}", rule.id));
+                anchors += usize::from(anchor.id == rule.id);
+                let ids = |rule: &ParamRule| -> Vec<String> {
+                    rule.options.iter().map(|o| o.id.clone()).collect()
+                };
+                assert!(rule.options.len() >= 2, "{}", rule.id);
+                assert_eq!(ids(rule), ids(anchor), "{}", rule.id);
+                for option in &rule.options {
+                    assert!(!option.label.is_empty() && !option.effect.is_empty());
+                }
+            } else {
+                assert_ne!(rule.effect, RuleEffect::Choice, "{}", rule.id);
+                assert!(rule.options.is_empty(), "{}", rule.id);
+            }
+            if let Some(choice) = &rule.see_choice {
+                assert!(rule.choice_note.is_some(), "{}", rule.id);
+                assert!(
+                    r.rules(&rule.rule_set).any(|a| &a.id == choice),
+                    "{}: see_choice {choice}",
+                    rule.id
+                );
+            }
+        }
+        assert_eq!(anchors, 2, "one reasoning choice per OpenAI dated recipe");
+    }
+
+    #[test]
+    fn no_automatic_change_sets_the_reasoning_effort() {
+        // The founder's 18 Oct decision: the reasoning effort is asked per
+        // repository. Only a choice's options may name it.
+        for rule in &data().data.rules {
+            if !matches!(
+                rule.effect,
+                RuleEffect::Add | RuleEffect::Rename | RuleEffect::Keep
+            ) {
+                continue;
+            }
+            for add in &rule.add {
+                let named = add.name.contains("effort")
+                    || (add.name == "reasoning" && add.value.get("effort").is_some());
+                assert!(!named, "{} sets {} automatically", rule.id, add.name);
+            }
+        }
+        for id in [
+            "OAI-REASONING-DEFAULT",
+            "OAI-TOOLS-CC",
+            "OAI-LEGACY-FUNCTIONS",
+            "OAI-SAMPLING",
+            "G6-REASONING-DEFAULT",
+            "G6-TOOLS-CC",
+            "G6-LEGACY-FUNCTIONS",
+            "G6-SAMPLING",
+        ] {
+            let rule = data().data.rules.iter().find(|r| r.id == id).expect(id);
+            assert_eq!(rule.effect, RuleEffect::Choice, "{id}");
+        }
+    }
+
+    #[test]
+    fn fine_tunes_name_a_base_only_when_it_can_be_fine_tuned() {
+        let r = data();
+        for fine in &r.data.fine_tunes {
+            assert!(fine.note.is_some(), "{}", fine.base);
+            assert!(
+                !fine.fine_tunable,
+                "{}: no listed base supports fine-tuning today",
+                fine.base
+            );
+        }
+        // gpt-6-luna does not support fine-tuning: no base is listed.
+        let mini = r
+            .fine_tune(Table::Openai, "gpt-4o-mini-2024-07-18")
+            .expect("fine-tunes of the gpt-4o mini snapshot are matched");
+        assert_eq!(mini.replacement_base, None);
+        assert_eq!(mini.date, "2027-01-14");
     }
 
     #[test]
@@ -653,6 +851,13 @@ mod data_tests {
                 from: "max_tokens".into(),
                 to: "max_completion_tokens".into()
             })
+        );
+        // The rename stays automatic and adds nothing; the reasoning effort
+        // is the per-repo choice it points to.
+        assert!(max_tokens.add.is_empty());
+        assert_eq!(
+            max_tokens.see_choice.as_deref(),
+            Some("G6-REASONING-DEFAULT")
         );
     }
 

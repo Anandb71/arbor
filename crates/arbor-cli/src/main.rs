@@ -371,7 +371,7 @@ enum Commands {
         json: bool,
     },
 
-    /// Find calls to AI models their provider has retired or is retiring, with the replacement and the argument changes it needs (Python today). Runs locally. Exit 0: nothing failing, 1: a call uses a retired model (or one retiring within --fail-within days), 2: error
+    /// Find direct SDK calls to AI models their provider has retired or is retiring, with the replacement, the argument changes and the choices it needs (Python today). Runs locally. Exit 0: nothing failing, 1: a confirmed call uses a retired model (or one retiring within --fail-within days), 2: error
     Retirements {
         /// Directory or file to scan (defaults to current directory)
         #[arg(default_value = ".")]
@@ -385,17 +385,29 @@ enum Commands {
         #[arg(long, conflicts_with = "annotations")]
         markdown: bool,
 
-        /// Output GitHub Actions annotations: one warning per affected call
+        /// Output GitHub Actions annotations: one warning per affected call, up to --max-annotations, then one notice for the rest
         #[arg(long)]
         annotations: bool,
+
+        /// With --annotations: the most warnings to print (GitHub shows 10 per step)
+        #[arg(long, value_name = "N", requires = "annotations")]
+        max_annotations: Option<usize>,
+
+        /// Also write the Markdown report to this file, from the same scan
+        #[arg(long, value_name = "FILE")]
+        markdown_out: Option<String>,
 
         /// Also fail (exit 1) when a model retires within this many days; by default only already-retired models fail
         #[arg(long, value_name = "DAYS", value_parser = clap::value_parser!(i64).range(0..=36500))]
         fail_within: Option<i64>,
 
-        /// List calls that go through Azure, a custom base_url or another cloud (the provider's dates may not apply) and let them fail the check
+        /// List calls that go through Azure, another host in base_url or another cloud (the provider's dates may not apply) and let them fail the check
         #[arg(long)]
         include_routed: bool,
+
+        /// Also let unconfirmed calls fail the check: environment or config fallbacks, parameter defaults, possible values, unresolved clients and unknown routing
+        #[arg(long)]
+        count_unconfirmed: bool,
 
         /// Print only the calls and the summary
         #[arg(short, long)]
@@ -855,8 +867,11 @@ async fn run() {
             json,
             markdown,
             annotations,
+            max_annotations,
+            markdown_out,
             fail_within,
             include_routed,
+            count_unconfirmed,
             quiet,
             today,
         } => std::process::exit(retirements::run(&retirements::Args {
@@ -864,8 +879,11 @@ async fn run() {
             json,
             markdown,
             annotations,
+            markdown_out,
+            max_annotations,
             fail_within,
             include_routed,
+            count_unconfirmed,
             quiet,
             today,
         })),
