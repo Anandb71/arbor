@@ -396,12 +396,15 @@ once and memoized. The output is bounded as well:
 
 Files over 4 MiB are skipped.
 
-Time and memory grow linearly with the file. The unit tests generate stress
-files of 0.3 to 2 MB for each superlinear shape that reviews found, and fail
-in a debug build past 10 s. Release builds of the reviewers' stress sets were
-measured on a Windows laptop:
+Time and memory grow linearly with the file: every lookup above is bounded,
+and every walk up the enclosing scopes stops at the 64-level scope cap. The
+unit tests generate stress files of 0.3 to 2 MB for each superlinear shape
+that reviews found, and fail in a debug build past 10 s. Release builds were
+measured on a Windows laptop, on the reviewers' stress sets and on the
+generators of each later review:
 
 - up to 2.6 MB: at most 3.2 s and 580 MB peak;
-- 2.6 MB to 4 MiB: the generated shapes at most 2.3 s and 370 MB, and the
-  3 MB scale files about 3.3 s and 780 MB, bound by the tree-sitter parse;
+- 2.6 MB to 4 MiB: the generated shapes at most 3.4 s and 660 MB (a
+  400,000-key dict expanded at 10,000 calls), and the 3 MB scale files about
+  3.3 s and 780 MB, bound by the tree-sitter parse;
 - 4 MiB: about 5 s and 1 GB, bound by the parse.
