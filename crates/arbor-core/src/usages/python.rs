@@ -588,6 +588,11 @@ enum ClientCaveat {
     BaseUrl { env: bool, fallback: bool },
     /// A dynamic feature of the file may rebind or replace the client.
     Dynamic(Feature),
+    /// A module-level API call passes `engine` or `deployment_id`, which
+    /// Azure deployments take, in a file that does not configure the API:
+    /// another module may route it to Azure (the SDK's module state is
+    /// process-wide).
+    ModuleConfig,
 }
 
 /// A Python feature that can change what a name, attribute, dict or the
@@ -1183,6 +1188,12 @@ struct ConfigAssign<'t> {
     attr: &'t str,
     value: Option<Node<'t>>,
     scope: usize,
+    /// The write is a statement of its own directly in the module body
+    /// (not in a branch, loop, `try`, `with`, class body or function, and
+    /// not part of a larger expression): it runs once, at import.
+    top: bool,
+    /// Where the write is.
+    at: usize,
 }
 
 /// Calls and the scope each is in.
@@ -1568,6 +1579,13 @@ struct Ctx<'t> {
     rerouted_any: Option<Feature>,
     /// Why the module-level OpenAI API's routing may not hold.
     openai_caveat: Option<ClientCaveat>,
+    /// The last write that configures the module-level OpenAI API's
+    /// routing, and where it is: a call that runs at import before it is
+    /// not routed by it.
+    openai_last_config: Option<(usize, Feature)>,
+    /// The attribute write or `setattr` call being recorded is a statement
+    /// of its own directly in the module body (see [`ConfigAssign::top`]).
+    config_top: bool,
     /// Wildcard imports from other modules, in order, and whether there
     /// were more than [`MAX_STARS`] or the module namespace is written with
     /// a run-time name (see [`DefRef::Dynamic`]).
@@ -1669,6 +1687,8 @@ impl<'t> Ctx<'t> {
             rerouted_pkgs: HashSet::new(),
             rerouted_any: None,
             openai_caveat: None,
+            openai_last_config: None,
+            config_top: false,
             module_stars: Vec::new(),
             dynamic_globals: false,
             loop_iter: None,
@@ -1796,7 +1816,9 @@ impl<'t> Ctx<'t> {
                         if let Some(left) = node.child_by_field_name("left") {
                             let value = node.child_by_field_name("right");
                             let annotation = node.child_by_field_name("type");
+                            self.config_top = is_top_statement(&frame);
                             self.record_target(left, value, annotation, scope, false, place);
+                            self.config_top = false;
                         }
                         self.note_chained_alias(node);
                     }
@@ -1887,7 +1909,9 @@ impl<'t> Ctx<'t> {
                     }
                     "call" => {
                         self.note_dynamic_call(node, scope);
+                        self.config_top = is_top_statement(&frame);
                         self.note_attr_write_call(node, scope, place);
+                        self.config_top = false;
                         self.calls.push((node, scope));
                         self.call_scope.insert(node.id(), scope);
                         if let Some(parent) = frame.parent {
@@ -3156,6 +3180,8 @@ impl<'t> Ctx<'t> {
             attr,
             value: assign.value,
             scope,
+            top: self.config_top && scope == 0,
+            at: object.start_byte(),
         });
     }
 
@@ -5484,9 +5510,15 @@ impl<'t> Ctx<'t> {
 
     /// Routing of the module-level OpenAI API, from `openai.api_type`,
     /// `openai.api_base` / `base_url` and `openai.azure_endpoint`
-    /// assignments anywhere in the file.
+    /// assignments anywhere in the file. The supported grammar is a
+    /// configuration made by top-level statements, each routing attribute
+    /// assigned once: one that is conditional, in a loop, `try`, `with`,
+    /// class body or function, or assigned more than once, is a
+    /// `dynamic_feature` (the routing reported is what the assignments
+    /// together suggest, as a candidate).
     fn module_openai_routing(&mut self) -> Routing {
         let (mut azure, mut unknown, mut custom) = (false, false, false);
+        let mut assigned: HashSet<&'t str> = HashSet::new();
         for assign in self.config_assigns.clone() {
             let target = self.eval(assign.object, assign.scope, 0);
             if !matches!(&target, Val::Module { pkg: Pkg::Openai, path } if path.is_empty()) {
@@ -5502,14 +5534,27 @@ impl<'t> Ctx<'t> {
                     | "azure_ad_token"
                     | "azure_ad_token_provider"
             ) || attr.starts_with("bedrock_");
-            // Set in a function, the configuration holds only once (and if)
-            // the function runs.
-            if routes && self.scopes[assign.scope].kind == ScopeKind::Function {
-                self.openai_caveat
-                    .get_or_insert(ClientCaveat::Dynamic(Self::feature(
-                        "the SDK configured inside a function, which may not run first",
-                        assign.object,
-                    )));
+            if routes && self.openai_last_config.is_none_or(|(at, _)| at < assign.at) {
+                let feature = Self::feature("the SDK configured after the call", assign.object);
+                self.openai_last_config = Some((assign.at, feature));
+            }
+            if routes {
+                // Set in a function, the configuration holds only once (and
+                // if) the function runs; in a branch, loop or `try`, only on
+                // that path; assigned twice, whichever ran last.
+                let what = if self.scopes[assign.scope].kind == ScopeKind::Function {
+                    Some("the SDK configured inside a function, which may not run first")
+                } else if !assign.top {
+                    Some("the SDK configured inside a branch, loop, `try`, `with` or class body, which may not run")
+                } else if !assigned.insert(attr) {
+                    Some("an SDK routing setting assigned more than once")
+                } else {
+                    None
+                };
+                if let Some(what) = what {
+                    self.openai_caveat
+                        .get_or_insert(ClientCaveat::Dynamic(Self::feature(what, assign.object)));
+                }
             }
             match attr {
                 "api_type" => match assign.value.and_then(|v| self.literal(v).ok()) {
@@ -5653,6 +5698,71 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// Routing of a module-level API call (`openai.ChatCompletion.create`)
+    /// and why it may not hold: the file's configuration (see
+    /// [`Self::module_openai_routing`]), a configuration written after a
+    /// call that runs at import, or (with no configuration in the file) an
+    /// `engine`/`deployment_id` argument, which another module's Azure
+    /// configuration would serve.
+    fn module_target(
+        &mut self,
+        pkg: Pkg,
+        call: Node<'t>,
+        scope: usize,
+    ) -> (Routing, Option<ClientCaveat>) {
+        let mut routing = self.module_routing(pkg);
+        let mut caveat = self.module_caveat(pkg);
+        if pkg != Pkg::Openai || caveat.is_some() {
+            return (routing, caveat);
+        }
+        match self.openai_last_config {
+            Some((at, feature)) => {
+                if call.start_byte() < at && self.runs_at_import(scope) {
+                    caveat = Some(ClientCaveat::Dynamic(feature));
+                }
+            }
+            None => {
+                if self.passes_engine(call, scope) {
+                    routing = Routing::Unknown;
+                    caveat = Some(ClientCaveat::ModuleConfig);
+                }
+            }
+        }
+        (routing, caveat)
+    }
+
+    /// Whether code in `scope` runs when the module is imported: the module
+    /// body, a class body in it, or a list, set or dict comprehension there.
+    fn runs_at_import(&self, scope: usize) -> bool {
+        let mut s = scope;
+        while s != 0 {
+            let current = &self.scopes[s];
+            if current.kind == ScopeKind::Function && !current.immediate {
+                return false;
+            }
+            s = current.parent.unwrap_or(0);
+        }
+        true
+    }
+
+    /// Whether `call` passes `engine` or `deployment_id`, by keyword or
+    /// possibly through a `**` expansion.
+    fn passes_engine(&mut self, call: Node<'t>, scope: usize) -> bool {
+        let args = self.arguments(call);
+        let azure_key = |k: &str| k == "engine" || k == "deployment_id";
+        if args.kwargs.iter().any(|k| azure_key(k)) {
+            return true;
+        }
+        args.splats
+            .iter()
+            .any(|splat| match self.expand_splat(*splat, scope) {
+                Some(expansion) => {
+                    expansion.opaque() || expansion.summary.last.keys().any(|k| azure_key(k))
+                }
+                None => true,
+            })
+    }
+
     fn analyze_call(&mut self, call: Node<'t>, scope: usize) {
         let Some(function) = call.child_by_field_name("function") else {
             return;
@@ -5686,26 +5796,28 @@ impl<'t> Ctx<'t> {
                 }
             }
             Val::Module { pkg, path } if !path.is_empty() => {
+                let (routing, caveat) = self.module_target(pkg, call, scope);
                 let target = CallTarget {
                     pkg,
                     member: path.join("."),
                     receiver: Receiver::Module,
-                    routing: self.module_routing(pkg),
+                    routing,
                     client_line: None,
                     ambiguous: false,
-                    caveat: self.module_caveat(pkg),
+                    caveat,
                 };
                 self.record_call(call, function, scope, target);
             }
             Val::Symbol { pkg, path } => {
+                let (routing, caveat) = self.module_target(pkg, call, scope);
                 let target = CallTarget {
                     pkg,
                     member: path.join("."),
                     receiver: Receiver::Symbol,
-                    routing: self.module_routing(pkg),
+                    routing,
                     client_line: None,
                     ambiguous: false,
-                    caveat: self.module_caveat(pkg),
+                    caveat,
                 };
                 self.record_call(call, function, scope, target);
             }
@@ -5996,6 +6108,12 @@ impl<'t> Ctx<'t> {
                     format!(
                         "the receiver of `{chain}` may be rebound or replaced at run time: {}",
                         feature.describe()
+                    ),
+                ),
+                ClientCaveat::ModuleConfig => (
+                    "module_config",
+                    format!(
+                        "`{chain}` passes `engine` or `deployment_id`, which Azure deployments take, but this file does not configure the module-level API, so another module may route it to Azure"
                     ),
                 ),
             };
@@ -8042,6 +8160,16 @@ const SHALLOW_CALLS: &[&str] = &["dict", "copy.copy", "copy"];
 /// Whether a field of a node of kind `parent` names a binding rather than
 /// using one: a definition's name, a parameter, an import, a keyword
 /// argument's name, an attribute name or an assignment target.
+/// Whether the node of `frame` is a statement of its own directly in the
+/// module body: an expression statement there, not a branch, loop, `try`,
+/// `with`, class body or function, nor part of a larger expression.
+fn is_top_statement(frame: &Frame<'_>) -> bool {
+    frame
+        .parent
+        .is_some_and(|p| p.kind() == "expression_statement")
+        && frame.grand.is_some_and(|g| g.kind() == "module")
+}
+
 fn is_declaration(parent: &str, field: Option<&str>) -> bool {
     matches!(
         (parent, field),

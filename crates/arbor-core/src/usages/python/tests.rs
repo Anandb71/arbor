@@ -2624,8 +2624,11 @@ client.chat.completions.create(model="gpt-4", messages=[], extra_body={"cred": {
     assert_eq!(keys, vec!["model"]);
 }
 
-/// `(line, routing, gap kinds and reasons at that line)` for every call.
-fn routes_and_gaps(found: &FileUsages) -> Vec<(u32, Routing, Vec<String>)> {
+/// `(line, routing, gap kinds and reasons at that line)` for one call.
+type RouteRow = (u32, Routing, Vec<String>);
+
+/// A [`RouteRow`] for every call.
+fn routes_and_gaps(found: &FileUsages) -> Vec<RouteRow> {
     found
         .calls
         .iter()
@@ -4832,6 +4835,113 @@ def ask(opts):
             (12, Routing::OpenaiDirect, vec![]),
             // `with_options(**opts)` routed `unknown` with no gap.
             (13, Routing::Unknown, gap("base_url_unresolved")),
+        ]
+    );
+}
+
+#[test]
+fn module_level_configuration_holds_only_when_top_level_once_and_before_the_call() {
+    // Blocker 2: the module-level API's routing was the OR of every
+    // configuration in the file, so `if USE_AZURE: openai.api_type =
+    // "azure"` reported `azure_openai` with no gap. A routing setting now
+    // counts with no gap only as a top-level statement, assigned once,
+    // before any call that runs at import; anything else is a
+    // `dynamic_feature` gap that keeps the suggested routing as a candidate.
+    let dynamic = || vec!["ambiguous_client/dynamic_feature".to_string()];
+    let cases: Vec<(&str, Vec<RouteRow>)> = vec![
+        (
+            // The reviewer's v0 Azure switch.
+            "import os\nimport openai\nif os.getenv(\"USE_AZURE\") == \"1\":\n    openai.api_type = \"azure\"\n    openai.api_base = \"https://myco.openai.azure.com/\"\ndef ask(p):\n    return openai.ChatCompletion.create(model=\"gpt-4\", messages=[])\n",
+            vec![(7, Routing::AzureOpenai, dynamic())],
+        ),
+        (
+            "import os\nimport openai\nif os.getenv(\"LLM_PROXY\"):\n    openai.base_url = \"https://litellm.internal/v1\"\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+            vec![(5, Routing::CustomBaseUrl, dynamic())],
+        ),
+        (
+            "import openai\ntry:\n    import proxy_settings\n    openai.base_url = proxy_settings.URL\nexcept ImportError:\n    pass\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+            vec![(7, Routing::Unknown, dynamic())],
+        ),
+        (
+            // Configured after a call that runs at import.
+            "import openai\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\nopenai.base_url = \"https://proxy.internal/v1\"\n",
+            vec![(2, Routing::CustomBaseUrl, dynamic())],
+        ),
+        (
+            "import openai\nclass Cfg:\n    openai.base_url = \"https://proxy.internal/v1\"\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+            vec![(4, Routing::CustomBaseUrl, dynamic())],
+        ),
+        (
+            "import openai\nfor _ in range(0):\n    openai.base_url = \"https://proxy.internal/v1\"\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+            vec![(4, Routing::CustomBaseUrl, dynamic())],
+        ),
+        (
+            // Assigned twice: Python sends it direct.
+            "import openai\nopenai.base_url = \"https://proxy.internal/v1\"\nopenai.base_url = \"https://api.openai.com/v1\"\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+            vec![(4, Routing::CustomBaseUrl, dynamic())],
+        ),
+        (
+            "import os\nimport openai\nopenai.base_url = \"https://proxy.internal/v1\"\nif os.getenv(\"DIRECT\"):\n    openai.base_url = \"https://api.openai.com/v1\"\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+            vec![(6, Routing::CustomBaseUrl, dynamic())],
+        ),
+        (
+            "import openai\nif __name__ == \"__main__\":\n    openai.base_url = \"https://proxy.internal/v1\"\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+            vec![(4, Routing::CustomBaseUrl, dynamic())],
+        ),
+        (
+            "import openai\nok = True\nok and setattr(openai, \"base_url\", \"https://proxy.internal/v1\")\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+            vec![(4, Routing::CustomBaseUrl, dynamic())],
+        ),
+        // Inside the grammar: still confirmed.
+        (
+            "import openai\nopenai.api_key = \"x\"\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+            vec![(3, Routing::OpenaiDirect, vec![])],
+        ),
+        (
+            "import openai\nopenai.api_type = \"azure\"\nopenai.api_base = \"https://myco.openai.azure.com/\"\nopenai.ChatCompletion.create(engine=\"gpt-35-turbo\", messages=[])\n",
+            vec![(4, Routing::AzureOpenai, vec![])],
+        ),
+        (
+            "import openai\nsetattr(openai, \"base_url\", \"https://proxy.internal/v1\")\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+            vec![(3, Routing::CustomBaseUrl, vec![])],
+        ),
+        (
+            // A function runs after the top-level configuration.
+            "import openai\ndef ask():\n    return openai.chat.completions.create(model=\"gpt-4o\", messages=[])\nopenai.base_url = \"https://proxy.internal/v1\"\n",
+            vec![(3, Routing::CustomBaseUrl, vec![])],
+        ),
+    ];
+    for (source, expected) in cases {
+        assert_eq!(routes_and_gaps(&usages(source)), expected, "{source}");
+    }
+}
+
+#[test]
+fn an_azure_argument_on_an_unconfigured_module_api_is_a_gap() {
+    // Lead decision 7: the SDK's module state is process-wide and v0 code
+    // configures it in a settings module, so `engine=` / `deployment_id=`
+    // (what Azure deployments take) on a module-level call in a file that
+    // configures nothing was `openai_direct` with no gap. It is now
+    // `unknown` with a `module_config` gap; a call without them stays
+    // direct, and a file that configures Azure stays confirmed (above).
+    let found = usages(
+        r#"import openai
+
+def ask(prompt):
+    return openai.ChatCompletion.create(engine="gpt-35-turbo", messages=[])
+
+PARAMS = {"deployment_id": "gpt-4", "messages": []}
+openai.ChatCompletion.create(**PARAMS)
+openai.chat.completions.create(model="gpt-4o", messages=[])
+"#,
+    );
+    let module_config = || vec!["ambiguous_client/module_config".to_string()];
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (4, Routing::Unknown, module_config()),
+            (7, Routing::Unknown, module_config()),
+            (8, Routing::OpenaiDirect, vec![]),
         ]
     );
 }
