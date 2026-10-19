@@ -1659,6 +1659,10 @@ struct Ctx<'t> {
     legacy_caveat: Option<ClientCaveat>,
     /// The file imports the legacy Gemini SDK (`google.generativeai`).
     legacy_imported: bool,
+    /// Names `__all__` lists, and whether it is built from names
+    /// (`__all__ = _EXPORTS`), when any module-level name may be exported.
+    exported: HashSet<&'t str>,
+    exports_dynamic: bool,
     /// An SDK member replaced in this file (`client.chat.completions.create
     /// = patched`, `openai.OpenAI = Sub`), by package: every route of that
     /// package is then a `dynamic_feature` gap.
@@ -1791,6 +1795,8 @@ impl<'t> Ctx<'t> {
             configure_calls: Vec::new(),
             legacy_caveat: None,
             legacy_imported: false,
+            exported: HashSet::new(),
+            exports_dynamic: false,
             sdk_patched: HashMap::new(),
             def_bindings: Vec::new(),
             openai_last_config: None,
@@ -2245,32 +2251,41 @@ impl<'t> Ctx<'t> {
             }
             _ => uses.escapes = true,
         }
-        // `_A__go`, the mangled name of `A.__go` used from outside `A`: a
-        // call this file cannot attribute, so `__go`'s calls are not all
-        // seen.
-        if let Some(rest) = name.strip_prefix('_') {
-            if let Some(at) = rest.find("__").filter(|at| *at > 0) {
-                let mangled = &rest[at..];
-                if mangled.len() > 2 && !mangled.ends_with("__") {
-                    self.attr_uses.entry(mangled).or_default().escapes = true;
-                }
-            }
-        }
+        self.note_mangled_use(name);
     }
 
     /// `__all__ = [...]`, `__all__ += [...]`, `__all__.extend([...])`: a
-    /// `_private` function listed there is exported, so other modules may
-    /// call it (its calls are not all in this file).
+    /// `_private` function or class listed there is exported, so other
+    /// modules may call or subclass it (its calls are not all in this
+    /// file). A list built from names (`__all__ = _EXPORTS`, `extend(names)`)
+    /// may export any module-level name ([`Ctx::exports_dynamic`]).
     fn note_exports(&mut self, node: Node<'t>) {
         let mut cursor = node.walk();
         let mut stack = vec![node];
         while let Some(current) = stack.pop() {
             if let Some(name) = self.plain_literal(current) {
                 self.name_uses.entry(name).or_default().escapes = true;
+                self.exported.insert(name);
                 continue;
+            }
+            if current.kind() == "identifier" {
+                self.exports_dynamic = true;
             }
             for child in current.named_children(&mut cursor) {
                 stack.push(child);
+            }
+        }
+    }
+
+    /// `_A__go`, the mangled name of `A.__go` used from outside `A`: a call
+    /// this file cannot attribute, so `__go`'s calls are not all seen.
+    fn note_mangled_use(&mut self, name: &'t str) {
+        if let Some(rest) = name.strip_prefix('_') {
+            if let Some(at) = rest.find("__").filter(|at| *at > 0) {
+                let mangled = &rest[at..];
+                if mangled.len() > 2 && !mangled.ends_with("__") {
+                    self.attr_uses.entry(mangled).or_default().escapes = true;
+                }
             }
         }
     }
@@ -3396,8 +3411,8 @@ impl<'t> Ctx<'t> {
     }
 
     /// Whether other modules can name `class` to subclass it: not
-    /// `_private` (nor inside a private class), not defined in a function,
-    /// and not in a script.
+    /// `_private` (nor inside a private class) unless `__all__` exports
+    /// it, not defined in a function, and not in a script.
     fn is_public_class(&self, class: usize) -> bool {
         if self.script {
             return false;
@@ -3408,7 +3423,11 @@ impl<'t> Ctx<'t> {
             match scope.kind {
                 ScopeKind::Module => return true,
                 ScopeKind::Function => return false,
-                ScopeKind::Class if scope.name.starts_with('_') => return false,
+                // `__all__` may export a private module-level class.
+                ScopeKind::Class if scope.name.starts_with('_') => {
+                    return scope.parent == Some(0)
+                        && (self.exports_dynamic || self.exported.contains(scope.name.as_str()));
+                }
                 ScopeKind::Class => current = scope.parent,
             }
         }
@@ -3902,6 +3921,8 @@ impl<'t> Ctx<'t> {
                 Some((_, Some(name))) => {
                     self.attr_uses.entry(name).or_default().escapes = true;
                     self.name_uses.entry(name).or_default().escapes = true;
+                    // `getattr(_A(), "_A__go")`.
+                    self.note_mangled_use(name);
                     // `getattr(os, "environ")`, `getattr(builtins, "exec")`.
                     if matches!(name, "environ" | "environb" | "putenv") {
                         self.env_wild.get_or_insert(Self::feature(
@@ -5379,7 +5400,7 @@ impl<'t> Ctx<'t> {
             && !self.imports.contains_key(&key)
             && !self.other_imports.contains_key(&key)
             && !self.params.contains_key(&key);
-        let escapes = (self.dynamic_function_calls && home == 0)
+        let escapes = ((self.dynamic_function_calls || self.exports_dynamic) && home == 0)
             || self
                 .name_uses
                 .get(fname.as_str())
@@ -5408,10 +5429,11 @@ impl<'t> Ctx<'t> {
             && !self.binds(home, &name)
             && !self.scopes[class].decorated
             && self.dynamic_constructors.is_none();
-        let escapes = self
-            .name_uses
-            .get(name.as_str())
-            .is_some_and(|uses| uses.escapes);
+        let escapes = (self.exports_dynamic && home == 0)
+            || self
+                .name_uses
+                .get(name.as_str())
+                .is_some_and(|uses| uses.escapes);
         let index = self.name_calls(&key.1);
         let calls = index
             .get(&home)

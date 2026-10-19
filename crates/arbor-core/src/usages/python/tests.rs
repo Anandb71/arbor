@@ -6061,3 +6061,46 @@ fn environb_module_aliases_and_configure_under_any_name_are_seen() {
     );
     assert!(found.gaps.is_empty());
 }
+
+#[test]
+fn exports_built_from_names_mangled_getattr_and_exported_private_classes_count() {
+    // Nits: `__all__ = _EXPORTS` (or `+=`/`extend` with a name) may export
+    // any module-level name; `getattr(_A(), "_A__go")` calls `A.__go` from
+    // outside under its mangled name; a `_Private` class listed in
+    // `__all__` may be subclassed by other modules.
+    let header = "from openai import OpenAI\nclient = OpenAI()\n";
+    let private = "def _ask(model=\"gpt-4o\"):\n    return client.chat.completions.create(model=model, messages=[])\n";
+    for exports in [
+        "_EXPORTS = [\"_ask\"]\n__all__ = _EXPORTS\n",
+        "__all__ = []\n__all__ += PUBLIC\n",
+        "__all__ = []\n__all__.extend(names)\n",
+    ] {
+        let source = format!("{header}{exports}{private}");
+        let rows = keyed_rows(&source, "model");
+        assert_eq!(
+            rows.last().unwrap().2,
+            vec!["unseen_callers".to_string()],
+            "{source}"
+        );
+    }
+    let source = format!(
+        "{header}class _A:\n    def __go(self, model=\"gpt-4o\"):\n        return client.chat.completions.create(model=model, messages=[])\n    def run(self):\n        return self.__go()\ngetattr(_A(), \"_A__go\")(\"o1-mini\")\n"
+    );
+    assert_eq!(
+        keyed_rows(&source, "model")[0].2,
+        vec!["unseen_callers".to_string()]
+    );
+    let source = format!(
+        "{header}__all__ = [\"_Bot\"]\nclass _Bot:\n    model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n"
+    );
+    assert_eq!(
+        keyed_rows(&source, "model")[0].2,
+        vec!["subclass_override".to_string()]
+    );
+    // Inside the grammar: a literal `__all__` that lists other names.
+    let source = format!("{header}__all__ = [\"ask\"]\n{private}def ask():\n    return _ask()\n");
+    assert_eq!(
+        keyed_rows(&source, "model"),
+        vec![(5, vec!["gpt-4o".to_string()], vec![])]
+    );
+}
