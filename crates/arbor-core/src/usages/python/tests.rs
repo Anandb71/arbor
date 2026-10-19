@@ -5596,3 +5596,41 @@ fn an_sdk_member_replaced_in_the_file_gaps_its_routes() {
         vec![(6, Routing::OpenaiDirect, vec![])]
     );
 }
+
+#[test]
+fn module_configuration_after_own_code_runs_at_import_is_a_gap() {
+    // Engine round 1: a module-level call in a function was routed by a
+    // top-level configuration written after it, even when this file runs
+    // that function at import before the configuration (`ask()` above
+    // `openai.base_url = ...`): the first request goes direct, the later
+    // ones to the proxy. That configuration now counts only before the
+    // first import-time call of this file's own functions or classes.
+    let dynamic = || vec!["ambiguous_client/dynamic_feature".to_string()];
+    let cases: Vec<(&str, Vec<RouteRow>)> = vec![
+        (
+            "import openai\ndef ask():\n    return openai.chat.completions.create(model=\"gpt-4o\", messages=[])\nask()\nopenai.base_url = \"https://proxy.internal/v1\"\n",
+            vec![(3, Routing::CustomBaseUrl, dynamic())],
+        ),
+        (
+            "import openai\nclass Bot:\n    def go(self):\n        return openai.chat.completions.create(model=\"gpt-4o\", messages=[])\nBot().go()\nopenai.base_url = \"https://proxy.internal/v1\"\n",
+            vec![(4, Routing::CustomBaseUrl, dynamic())],
+        ),
+        (
+            "import openai\nclass Bot:\n    @classmethod\n    def go(cls):\n        return openai.chat.completions.create(model=\"gpt-4o\", messages=[])\nRESULT = [Bot.go()]\nopenai.api_type = \"azure\"\n",
+            vec![(5, Routing::AzureOpenai, dynamic())],
+        ),
+        // Inside the grammar: the configuration comes first, or only other
+        // modules' code runs before it.
+        (
+            "import openai\nopenai.base_url = \"https://proxy.internal/v1\"\ndef ask():\n    return openai.chat.completions.create(model=\"gpt-4o\", messages=[])\nask()\n",
+            vec![(4, Routing::CustomBaseUrl, vec![])],
+        ),
+        (
+            "import openai\nfrom dotenv import load_dotenv\nload_dotenv()\ndef ask():\n    return openai.chat.completions.create(model=\"gpt-4o\", messages=[])\nopenai.base_url = \"https://proxy.internal/v1\"\nif __name__ == \"__main__\":\n    ask()\n",
+            vec![(5, Routing::CustomBaseUrl, vec![])],
+        ),
+    ];
+    for (source, expected) in cases {
+        assert_eq!(routes_and_gaps(&usages(source)), expected, "{source}");
+    }
+}

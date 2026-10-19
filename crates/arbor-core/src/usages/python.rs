@@ -1643,6 +1643,9 @@ struct Ctx<'t> {
     /// The attribute write or `setattr` call being recorded is a statement
     /// of its own directly in the module body (see [`ConfigAssign::top`]).
     config_top: bool,
+    /// Where the first call that runs at import and runs this file's own
+    /// code is (see [`Ctx::own_code_at_import`]); computed once.
+    own_code_at_import: Option<Option<usize>>,
     /// Wildcard imports from other modules, in order, and whether there
     /// were more than [`MAX_STARS`] or the module namespace is written with
     /// a run-time name (see [`DefRef::Dynamic`]).
@@ -1753,6 +1756,7 @@ impl<'t> Ctx<'t> {
             def_bindings: Vec::new(),
             openai_last_config: None,
             config_top: false,
+            own_code_at_import: None,
             module_stars: Vec::new(),
             dynamic_globals: false,
             loop_iter: None,
@@ -6386,7 +6390,16 @@ impl<'t> Ctx<'t> {
         }
         match self.openai_last_config {
             Some((at, feature)) => {
-                if call.start_byte() < at && self.runs_at_import(scope) {
+                // A call that runs at import before the configuration, or
+                // one in a function this file's own code may run at import
+                // before it (`ask()` above `openai.base_url = ...`), is
+                // sent both ways.
+                let before = if self.runs_at_import(scope) {
+                    call.start_byte() < at
+                } else {
+                    self.own_code_at_import().is_some_and(|first| first < at)
+                };
+                if before {
                     caveat = Some(ClientCaveat::Dynamic(feature));
                 }
             }
@@ -6398,6 +6411,42 @@ impl<'t> Ctx<'t> {
             }
         }
         (routing, caveat)
+    }
+
+    /// Where the first call that runs at import and may run this file's
+    /// own functions is: a call by name of a module-level function or class
+    /// of this file, or of an attribute of one (`main()`, `Bot()`,
+    /// `Bot.setup()`). One pass over the calls, memoized.
+    fn own_code_at_import(&mut self) -> Option<usize> {
+        if let Some(found) = self.own_code_at_import {
+            return found;
+        }
+        let mut first: Option<usize> = None;
+        for &(call, scope) in &self.calls {
+            if first.is_some_and(|f| f <= call.start_byte()) || !self.runs_at_import(scope) {
+                continue;
+            }
+            let mut callee = call.child_by_field_name("function");
+            while let Some(node) = callee.filter(|n| n.kind() == "attribute") {
+                callee = node.child_by_field_name("object");
+            }
+            let Some(name) = callee
+                .filter(|n| n.kind() == "identifier")
+                .map(|n| self.text(n))
+            else {
+                continue;
+            };
+            let own = self.functions.contains_key(&(0, name.to_string()))
+                || self
+                    .classes_by_name
+                    .get(name)
+                    .is_some_and(|classes| classes.iter().any(|&c| self.class_home(c) == 0));
+            if own {
+                first = Some(call.start_byte());
+            }
+        }
+        self.own_code_at_import = Some(first);
+        first
     }
 
     /// Whether code in `scope` runs when the module is imported: the module
