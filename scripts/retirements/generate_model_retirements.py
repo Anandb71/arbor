@@ -49,6 +49,7 @@ import copy
 import datetime as dt
 import hashlib
 import json
+import keyword
 import re
 import sys
 from pathlib import Path
@@ -767,6 +768,17 @@ RULE_HANDLED_KEYS = {
 RULE_OVERRIDE_KEYS = {"only_if", "caveat", "merge", "non_responses_endpoint"}
 
 
+def is_kwarg_name(name) -> bool:
+    """A name a Python call can pass as a keyword argument: an identifier that is not
+    a reserved word (`from=` cannot be passed, so a param `{from: ..., to: ...}` under
+    an add action is a rename written with the wrong action, not two parameters)."""
+    return (
+        isinstance(name, str)
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is not None
+        and not keyword.iskeyword(name)
+    )
+
+
 def add_specs(param, endpoints) -> list:
     """Normalises a recipe `param` into [{endpoint, name, value}]: `{name, value}`,
     `{param_name: value}`, or `{endpoint: {param_name: value}}`."""
@@ -776,28 +788,31 @@ def add_specs(param, endpoints) -> list:
         if set(param) != {"name", "value"}:
             raise GenerationError(f"unexpected param {param!r}")
         targets = endpoints or ["*"]
-        return [{"endpoint": e, "name": param["name"], "value": param["value"]} for e in targets]
-    keys = set(param)
-    if keys <= KNOWN_ENDPOINTS:
+        specs = [{"endpoint": e, "name": param["name"], "value": param["value"]} for e in targets]
+    elif set(param) <= KNOWN_ENDPOINTS:
         specs = []
         for endpoint, inner in param.items():
             if not isinstance(inner, dict) or len(inner) != 1:
                 raise GenerationError(f"unexpected param for {endpoint}: {inner!r}")
             (name, value), = inner.items()
             specs.append({"endpoint": endpoint, "name": name, "value": value})
-        return specs
-    if keys & KNOWN_ENDPOINTS:
+    elif set(param) & KNOWN_ENDPOINTS:
         raise GenerationError(f"param {param!r} mixes endpoints and parameter names")
-    return [
-        {"endpoint": e, "name": name, "value": value}
-        for name, value in param.items()
-        for e in (endpoints or ["*"])
-    ]
+    else:
+        specs = [
+            {"endpoint": e, "name": name, "value": value}
+            for name, value in param.items()
+            for e in (endpoints or ["*"])
+        ]
+    bad = sorted({str(s["name"]) for s in specs if not is_kwarg_name(s["name"])})
+    if bad:
+        raise GenerationError(f"param {param!r}: {bad} cannot be passed as keyword arguments")
+    return specs
 
 
 def keyword_names(rid: str, what: str, names) -> list:
     names = [str(n) for n in as_list(names)]
-    bad = [n for n in names if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", n)]
+    bad = [n for n in names if not is_kwarg_name(n)]
     if bad or not names:
         raise GenerationError(f"{rid}: {what} {names} are not keyword names")
     return names
@@ -924,6 +939,11 @@ def translate_rule(rule: dict, rule_set: str) -> tuple[list, list]:
         effect = item.get("effect") or ACTION_EFFECTS.get(action)
         if effect is None:
             raise GenerationError(f"{rid}: action {action!r} needs an explicit effect")
+        requires = rule.get("requires")
+        if requires is not None and (
+            effect != "rename" or not isinstance(requires, dict) or set(requires) - {"add_param"}
+        ):
+            raise GenerationError(f"{rid}: requires {requires!r} is translated only as add_param on a rename")
         endpoints = [e for e in as_list(when.get("endpoint"))]
         item_verified = item.get("verified", verified)
         live = item_verified == "live"
@@ -960,14 +980,16 @@ def translate_rule(rule: dict, rule_set: str) -> tuple[list, list]:
         if effect == "add" and "add" not in item:
             engine["add"] = add_specs(rule["param"], endpoints)
         if effect == "rename":
-            param = rule["param"]
+            param = rule.get("param")
+            if (
+                not isinstance(param, dict)
+                or set(param) != {"from", "to"}
+                or not all(is_kwarg_name(param[k]) for k in ("from", "to"))
+            ):
+                raise GenerationError(f"{rid}: a rename needs param {{from, to}} with keyword names, not {param!r}")
             engine["rename"] = {"from": param["from"], "to": param["to"]}
             required = (rule.get("requires") or {}).get("add_param") or {}
-            engine["add"] = [
-                {"endpoint": e, "name": k, "value": v}
-                for k, v in required.items()
-                for e in (endpoints or ["*"])
-            ]
+            engine["add"] = add_specs(required, endpoints) if required else []
         if effect == "keep":
             keep_when = rule.get("keep_when") or {}
             engine["keep_targets"] = as_list(keep_when.get("target"))
