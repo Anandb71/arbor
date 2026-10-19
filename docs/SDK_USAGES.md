@@ -338,5 +338,7 @@ files of 0.3 to 2 MB for each superlinear shape that reviews found, and fail
 in a debug build past 10 s. Release builds of the reviewers' stress sets were
 measured on a Windows laptop:
 
-- up to 2.6 MB: at most 3.2 s and 550 MB peak;
-- 4 MiB: about 5 s and 1 GB, bound by the tree-sitter parse.
+- up to 2.6 MB: at most 3.2 s and 580 MB peak;
+- 2.6 MB to 4 MiB: the generated shapes at most 2.3 s and 370 MB, and the
+  3 MB scale files about 3.3 s and 780 MB, bound by the tree-sitter parse;
+- 4 MiB: about 5 s and 1 GB, bound by the parse.
