@@ -15,7 +15,11 @@
 //!   `self`/`cls`, in a class with no decorator, class keyword or second
 //!   base, at most one same-file level of inheritance and at most 16
 //!   direct subclasses (a model value read through `self`/`cls` in a class
-//!   another module may subclass keeps a `subclass_override` gap);
+//!   another module may subclass keeps a `subclass_override` gap). Every
+//!   binding of the name in a class body (`def`, `class`, an import, a loop
+//!   target...) is an assignment of it, in the class, its base and its
+//!   subclasses alike; and a method that binds its `self`/`cls` name other
+//!   than as that parameter reads nothing through it;
 //! - a parameter default of a function whose calls are all in this file (a
 //!   nested or `_private` function, a private class's `__init__`, anything
 //!   in a script), none of which passes another value;
@@ -27,8 +31,12 @@
 //!   is `custom_base_url`), and for Gemini no `vertexai=True`, endpoint
 //!   `http_options` or `**` expansion, in a file that does not configure
 //!   the endpoint some other way;
-//! - the module-level API, configured by top-level statements, each
-//!   routing setting once, before any import-time call that may reach it.
+//! - the module-level API, configured only in the top-of-file setup block:
+//!   plain `=` statements, each routing setting once, on a name only
+//!   imports bind, before the first `def`, `class`, decorator, bare
+//!   expression or compound statement (and before any module-level call in
+//!   the block). No code of the file exists yet there, so none can run
+//!   first; import-time execution is not followed any further.
 //!
 //! The collection walk also records **dynamic features** that can change a
 //! resolved name, class, dict or the environment (`exec`, `globals()`,
@@ -37,10 +45,13 @@
 //! multiple or deep inheritance, a class used as a value, environment
 //! writes with run-time names, ...). A value or route one of them may affect
 //! keeps a `dynamic_feature` gap naming the feature and its line; the most
-//! dynamic ones affect the whole file. Replacing a precise but costly
-//! resolution with such a gap is always acceptable, so each lookup does a
-//! bounded amount of work (see the `MAX_*` constants) and the whole pass is
-//! linear in the file.
+//! dynamic ones affect the whole file (namespace builtins reached under
+//! any name, `builtins` or `sys` imported under another name or used as a
+//! value, a frame's `f_globals`, scopes nested past
+//! [`MAX_SCOPE_DEPTH`]). Replacing a precise but costly resolution with
+//! such a gap is always acceptable, so each lookup does a bounded amount of
+//! work (see the `MAX_*` constants), every walk up the scopes is bounded by
+//! [`MAX_SCOPE_DEPTH`], and the whole pass is linear in the file.
 //!
 //! # Passes
 //!

@@ -411,9 +411,10 @@ pub enum GapKind {
     /// (`base_url_unresolved`), a Gemini client given an option that may
     /// send it to Vertex AI or another endpoint (`endpoint_option`), a
     /// module-level call that passes `engine` or `deployment_id` in a file
-    /// that does not configure the module-level API (`module_config`), or a
-    /// receiver or configuration a dynamic feature of the file may change
-    /// (`dynamic_feature`).
+    /// that does not configure the module-level API, or any module-level
+    /// call in a file that configures it outside its top-of-file setup block
+    /// (`module_config`), or a receiver or configuration a dynamic feature of
+    /// the file may change (`dynamic_feature`).
     AmbiguousClient,
     /// `getattr` on a tracked binding, or an SDK method stored or passed as a
     /// value; calls through it are not tracked.

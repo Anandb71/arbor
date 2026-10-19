@@ -58,18 +58,37 @@ These are reported with no gap (`model`, `engine`, `deployment_id`,
    or through `self`/`cls` in the class's methods, and assigned once: in the
    class body, by `self.x = ...` or `cls.x = ...`, or by `Bot.x = ...`.
    - `self` and `cls` are the class only as the first parameter of a method
-     written directly in its body (and in closures that do not rebind them).
-     A `staticmethod` parameter named `self`, a nested `def inner(self)` and
-     a method another class borrows (`B2.go = B.go`, `go = B.go`) do not
-     count; a write through such a method's `self` is a write on another
-     object.
+     written directly in its body (a `lambda` in the body counts only when
+     the body assigns it to a name, `go = lambda self: ...`), and in the
+     closures nested in it. A `staticmethod` parameter named `self`, a
+     nested `def inner(self)`, a lambda passed in a class body
+     (`map(lambda self: ..., items)`) and a method another class borrows
+     (`B2.go = B.go`, `go = B.go`) do not count; a write through such a
+     method's `self` is a write on another object.
+   - A method that binds the name of its `self` or `cls` parameter in any
+     other way, in its body or in any scope nested in it, reads nothing
+     through that name: an assignment, `+=`, a `for`, `with`, `except` or
+     walrus target, a `match` capture, `del`, an import, a `def` or `class`,
+     and a closure's `nonlocal` or `global`. Every read through the name in
+     that method is a `dynamic_feature` gap, and every write through it is a
+     write on another object (below).
    - Read through `self` or `cls`, a value of a **public class** keeps a
      `subclass_override` gap, the way a public function's default keeps
      `parameter_default`: another module may subclass the class and set the
      attribute. A class is public when it is not `_private`, not inside a
-     private class or a function, and not in a script. A private class one of
-     whose direct same-file subclasses is public counts as public too. Reads
-     by class name are confirmed.
+     private class or a function, and not in a script. A `_private`
+     module-level class that `__all__` lists, or any one when `__all__` is
+     built from names (rule 4), counts as public, and so does a private class
+     one of whose direct same-file subclasses is public. Reads by class name
+     are confirmed.
+   - Every binding of a name in a class body is an assignment of that class
+     attribute, whatever else the class assigns: `=`, an annotation, `+=`,
+     `def`, `async def`, `class`, an import, a `for`, `with` or `except`
+     target, a walrus, `del` and a `match` capture. This holds for the
+     reading class, its base and its subclasses alike: `class
+     _Fast(_Base): from cfg import model` makes `self.model` in `_Base` a
+     `reassigned` gap. Only a class's single literal assignment is
+     confirmed.
 
    The class must meet all of these:
    - It has no decorator, metaclass or other class keyword, and at most one
@@ -89,9 +108,12 @@ These are reported with no gap (`model`, `engine`, `deployment_id`,
    function must also be undecorated and never passed, stored or rebound, and
    every in-file call must pass nothing for the parameter, or the same value.
    A `_private` function listed in `__all__` (assigned, extended or appended)
-   is exported, and a `__mangled` method called from outside under its
-   mangled name (`_A()._A__go(...)`) has callers this file does not show, so
-   both are treated as passed (`unseen_callers`).
+   is exported. An `__all__` built from names (`__all__ = _EXPORTS`,
+   `__all__ += names`, `__all__.extend(names)`) may list any module-level
+   name, so every `_private` module-level function and constructor counts as
+   exported. A `__mangled` method called from outside under its mangled name
+   (`_A()._A__go(...)`, `getattr(_A(), "_A__go")`) has callers this file
+   does not show. All of these are treated as passed (`unseen_callers`).
    Otherwise the default is still reported, with one of these gaps:
    - `parameter_default`: the function is public, so another module may pass
      another value.
@@ -131,23 +153,44 @@ these:
   expansion. Any of those may send it to Vertex AI or another endpoint, which
   retire models on another schedule, so it routes `unknown` with an
   `endpoint_option` gap. `vertexai=False` and `HttpOptions(api_version=...)`
-  stay confirmed. The legacy SDK's `configure(client_options=...)` gives its
-  calls the same gap.
+  stay confirmed. The legacy SDK's `configure(client_options=...)` or
+  `configure(**options)` gives its calls the same gap, under any name the
+  file calls it by (`from google.generativeai import configure as setup`,
+  `cfg = genai.configure`).
 - **The module-level API** (`openai.ChatCompletion.create`,
   `openai.chat.completions.create`). Its routing comes from the file's
-  `openai.api_type`, `openai.api_base`, `openai.base_url` and
-  `openai.azure_endpoint` settings, which count with no gap only when:
-  - each is a statement of its own directly in the module body: not in an
-    `if`, loop, `try`, `with`, class body or function;
-  - each routing setting is assigned once;
-  - each comes before the call runs: a call that runs at import must come
-    after them, and a call in a function must not be reachable from code of
-    this file that runs at import before them (a call of a function or class
-    defined in this file, such as `main()` or `Bot()`).
+  routing settings: `openai.api_type`, `openai.api_base`,
+  `openai.base_url`, `openai.azure_endpoint`, `openai.azure_ad_token`,
+  `openai.azure_ad_token_provider` and `openai.bedrock_*`. They count with
+  no gap only when every one of them is in the file's **top-of-file setup
+  block**:
+  - The setup block is the module's statements from the top up to, not
+    including, the first statement that is none of these: an `import` or
+    `from ... import`, a string (the docstring), or an assignment (`=`,
+    annotated or `+=`) with no `lambda`, comprehension, generator
+    expression, walrus, `yield` or `await` in it. A `def`, a `class`, a
+    decorator, a bare expression or call (`load_dotenv()`, `main()`,
+    `setattr(...)`) and any compound statement (`if`, `try`, `for`,
+    `while`, `with`, `match`) end it.
+  - Each routing setting is a plain `=` statement of its own in the block
+    (not `+=`, `setattr` or `del`), on a name that only `import` statements
+    bind (`import openai as oai` counts; `o = openai` does not), and is
+    assigned once.
+  - A module-level call that runs at import inside the block
+    (`R = openai.chat.completions.create(...)`) comes after every setting.
 
-  Otherwise the call keeps the routing the settings suggest, with a
-  `dynamic_feature` gap. A file that configures nothing is reported direct
-  (see [Outside the file](#outside-the-file)), except that a call passing
+  Before the block ends, the file has defined no function, class or lambda,
+  so none of its own code can run before the configuration is complete. The
+  report does not follow import-time execution any further than that.
+
+  Anything else gives every module-level call of the file a `module_config`
+  gap that keeps the routing the settings suggest: a setting in a function,
+  in an `if`, loop, `try`, `with` or class body, after the setup block, by
+  `+=`, `setattr` or `del`, through an alias, or assigned twice; a routing
+  attribute written on an object the file cannot identify; and an attribute
+  written with a run-time name on the module or on such an object. A file
+  that configures nothing is reported direct (see
+  [Outside the file](#outside-the-file)), except that a call passing
   `engine` or `deployment_id`, which Azure deployments take, routes
   `unknown` with a `module_config` gap.
 
@@ -204,12 +247,23 @@ every route gets that gap.
 - `import __main__`, or the module importing itself: `__import__(__name__)`,
   `importlib.import_module(__name__)`, or an import of its own module name
   (`import app` in `app.py`; not in a package's `__init__.py`, a
-  `__main__.py` or a script, and not when the name is a tracked SDK's).
+  `__main__.py` or a script, and not when the name is a tracked SDK's);
+- `builtins` or `sys` imported under another name (`import sys as S`), used
+  as a value (`s = sys`, `f(builtins)`), or imported by name
+  (`__import__("builtins")`, `importlib.import_module("sys")`);
+- a frame's namespace: `f_globals`, `f_locals` or `f_builtins`
+  (`inspect.currentframe().f_globals[...]`, `sys._getframe(1).f_locals`);
+- scopes (functions, classes, lambdas, comprehensions) nested more than 64
+  deep. They are not analyzed, so what they bind or write is not seen; each
+  is also a `truncated` gap.
 
-These builtins count under any name: aliased (`run = exec`, `g = globals`),
-reached through `builtins` or `__builtins__` (`builtins.exec`,
-`getattr(builtins, "exec")`), or imported from `builtins`. A parameter or
-keyword argument that the file names `eval` is not the builtin.
+These builtins count under any name the file reaches them by: aliased
+(`run = exec`, `g = globals`), through `builtins` or `__builtins__`
+(`builtins.exec`, `getattr(builtins, "exec")`, and `builtins` itself under
+another name, above), or imported from `builtins`. A parameter or keyword
+argument that the file names `eval` is not the builtin. A module imported
+with a name known only at run time is an assumption of the report (see
+[Outside the file](#outside-the-file)).
 
 **Class attributes, read by class name or through `self`/`cls`:**
 - a class decorator, a metaclass or other class keyword, or more than one base,
@@ -222,7 +276,8 @@ keyword argument that the file names `eval` is not the builtin.
 - a write of that attribute name on any object other than `self`, `cls` or the
   class itself (`obj.model = ...`, `setattr(obj, "model", ...)`,
   `configure(Settings)` writing `cfg.MODEL`), including one through a call
-  or `__class__` (`type(self).model = ...`, `self.__class__.model = ...`);
+  or `__class__` (`type(self).model = ...`, `self.__class__.model = ...`),
+  and one through the `self` or `cls` of a method that rebinds it (rule 3);
 - a write whose attribute name is known only at run time (`setattr(obj, name,
   v)`, `delattr`, `obj.__setattr__(name, v)`): on `self` of the class or its
   base, or on any other object (then it affects every class);
@@ -246,15 +301,18 @@ with a gap:
 - `os.environ.update(...)` with anything but literal keys;
 - `os.environ.setdefault(key, v)`, `os.environ.__setitem__(key, v)` or
   `os.putenv(key, v)` with a key that is not a literal;
-- `os.environ` aliased, passed or updated in place.
+- `os.environ` aliased, passed, updated in place or replaced
+  (`os.environ = {...}`, `setattr(os, "environ", {...})`).
 
-Writes are matched by the attribute name `environ` (and `putenv`) on any
-object, so `import os as _os; _os.environ[...] = ...` counts. Looking `os`
-or `os.environ` up by name (`importlib.import_module("os")`,
-`getattr(os, "environ")`) and importing `environ` or `putenv` under another
-name (`from os import environ as E`) alias the process environment. A bare
-`environ` counts only when it is imported from `os`; a WSGI `environ`
-parameter does not count.
+`os.environb` counts as `os.environ` throughout: on POSIX it shares its data
+with it. Writes are matched by the attribute name `environ` or `environb`
+(and `putenv`) on any object, so `import os as _os; _os.environ[...] = ...`
+counts. Looking `os`, `os.environ` or `os.environb` up by name
+(`importlib.import_module("os")`, `getattr(os, "environ")`) and importing
+`environ`, `environb` or `putenv` under another name (`from os import
+environ as E`) alias the process environment. A bare `environ` or `environb`
+counts only when it is imported from `os`; a WSGI `environ` parameter does
+not count.
 
 **Dicts and lists:** a container reached through more than its one name is not
 read at all. That covers an alias, a container holding it, a loop over a tuple
@@ -304,6 +362,10 @@ The report assumes the rest. In particular:
   configure it, a call is reported direct, although another module may
   configure it. A call that passes `engine` or `deployment_id` is the
   exception, with a `module_config` gap.
+- A module imported with a name known only at run time
+  (`importlib.import_module(name)`), or through an importer the file binds
+  under another name (`from importlib import import_module as load`), is
+  taken not to be `builtins`, `sys`, `os` or the file's own module.
 
 ## Bounds
 
@@ -319,6 +381,7 @@ Each lookup reads a bounded number of things:
 | callers read per function | 256 |
 | value resolution depth | 16 |
 | expression and name nesting | 64 |
+| scope nesting (functions, classes, lambdas, comprehensions) | 64; a deeper scope is not analyzed: a `truncated` gap and a whole-file dynamic feature |
 
 Lists, loop items, class lookups and every-definition candidate lists are read
 once and memoized. The output is bounded as well:
