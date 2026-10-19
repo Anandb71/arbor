@@ -306,6 +306,7 @@ pub fn extract(tree: &Tree, source: &str, file_path: &str) -> FileUsages {
     let mut cx = Ctx::new(source, file_path);
     cx.collect(tree.root_node());
     cx.place_nonlocal_assigns();
+    cx.bind_definitions();
     cx.index_definitions();
     cx.settle_dict_escapes();
     cx.analyze();
@@ -1046,6 +1047,9 @@ struct Scope {
     /// For a lambda assigned to a plain name (`ask = lambda q: ...`): that
     /// name, through which its in-file calls are found.
     bound_name: Option<String>,
+    /// For a function or lambda: where its body starts. A walrus before it
+    /// (in a default or an annotation) binds in the enclosing scope.
+    body_start: usize,
 }
 
 impl Scope {
@@ -1071,6 +1075,7 @@ impl Scope {
             comprehension: false,
             immediate: kind == ScopeKind::Class,
             bound_name: None,
+            body_start: 0,
         }
     }
 }
@@ -1579,6 +1584,10 @@ struct Ctx<'t> {
     rerouted_any: Option<Feature>,
     /// Why the module-level OpenAI API's routing may not hold.
     openai_caveat: Option<ClientCaveat>,
+    /// Names bound by `def` and `class` statements and class-body imports,
+    /// where they bind: a name also assigned there gets an assignment of no
+    /// known value for each (see [`Ctx::bind_definitions`]).
+    def_bindings: Vec<(Key, usize, Place)>,
     /// The last write that configures the module-level OpenAI API's
     /// routing, and where it is: a call that runs at import before it is
     /// not routed by it.
@@ -1687,6 +1696,7 @@ impl<'t> Ctx<'t> {
             rerouted_pkgs: HashSet::new(),
             rerouted_any: None,
             openai_caveat: None,
+            def_bindings: Vec::new(),
             openai_last_config: None,
             config_top: false,
             module_stars: Vec::new(),
@@ -1839,10 +1849,18 @@ impl<'t> Ctx<'t> {
                         if let Some(name) = node.child_by_field_name("name") {
                             let value = node.child_by_field_name("value");
                             // A walrus in a comprehension binds in the
-                            // enclosing function or module (PEP 572).
+                            // enclosing function or module (PEP 572), and
+                            // one in a default or annotation of a `def` or
+                            // `lambda` where that header runs.
                             let mut home = scope;
-                            while self.scopes[home].comprehension {
-                                home = self.scopes[home].parent.unwrap_or(0);
+                            loop {
+                                let current = &self.scopes[home];
+                                let header = current.kind == ScopeKind::Function
+                                    && node.start_byte() < current.body_start;
+                                if home == 0 || !(current.comprehension || header) {
+                                    break;
+                                }
+                                home = current.parent.unwrap_or(0);
                             }
                             let place = Place {
                                 at: node.end_byte(),
@@ -1851,6 +1869,7 @@ impl<'t> Ctx<'t> {
                             self.record_target(name, value, None, home, false, place);
                         }
                     }
+                    "type_alias_statement" => self.record_type_alias(node, scope, place),
                     "case_clause" => {
                         for pattern in named_children(node) {
                             if pattern.kind() == "case_pattern" {
@@ -1858,7 +1877,7 @@ impl<'t> Ctx<'t> {
                             }
                         }
                     }
-                    "except_clause" => {
+                    "except_clause" | "except_group_clause" => {
                         // `except E as name:` binds `name` in the handler
                         // only (it is deleted after it).
                         for child in named_children(node) {
@@ -1876,7 +1895,9 @@ impl<'t> Ctx<'t> {
                         }
                     }
                     "global_statement" | "nonlocal_statement" => {
-                        if self.scopes[scope].kind == ScopeKind::Function {
+                        // In a class body too: `class C: global M; M = 1`
+                        // binds the module's `M`, not a class attribute.
+                        if self.scopes[scope].kind != ScopeKind::Module {
                             let global = node.kind() == "global_statement";
                             for name in named_children(node) {
                                 let name = self.text(name).to_string();
@@ -2787,6 +2808,9 @@ impl<'t> Ctx<'t> {
                 }
             }
         }
+        scope.body_start = node
+            .child_by_field_name("body")
+            .map_or(node.end_byte(), |b| b.start_byte());
         let id = self.scopes.len();
         self.scopes.push(scope);
         if let Some(params) = node.child_by_field_name("parameters") {
@@ -2797,6 +2821,14 @@ impl<'t> Ctx<'t> {
             ScopeKind::Class => parent,
             _ => self.import_home(parent, &name),
         };
+        self.def_bindings.push((
+            (home, name.clone()),
+            parent,
+            Place {
+                at: node.end_byte(),
+                region: None,
+            },
+        ));
         self.functions.entry((home, name)).or_default().push(id);
         id
     }
@@ -2850,6 +2882,9 @@ impl<'t> Ctx<'t> {
         scope.symbol = self.scopes[parent].symbol.clone();
         scope.name = "<lambda>".to_string();
         scope.lambda = true;
+        scope.body_start = node
+            .child_by_field_name("body")
+            .map_or(node.end_byte(), |b| b.start_byte());
         scope.bound_name = holder
             .filter(|h| h.kind() == "assignment" && field == Some("right"))
             .and_then(|h| h.child_by_field_name("left"))
@@ -2997,6 +3032,18 @@ impl<'t> Ctx<'t> {
         scope.class_feature = what.map(|what| Feature { what, line });
         scope.line = line;
         self.scopes.push(scope);
+        let home = match self.scopes[parent].kind {
+            ScopeKind::Class => parent,
+            _ => self.import_home(parent, &name),
+        };
+        self.def_bindings.push((
+            (home, name.clone()),
+            parent,
+            Place {
+                at: node.end_byte(),
+                region: None,
+            },
+        ));
         self.classes_by_name.entry(name).or_default().push(id);
         id
     }
@@ -3053,10 +3100,9 @@ impl<'t> Ctx<'t> {
             "identifier" => {
                 let name = self.text(target).to_string();
                 let current = &self.scopes[scope];
-                let home = if current.kind == ScopeKind::Function && current.globals.contains(&name)
-                {
+                let home = if current.kind != ScopeKind::Module && current.globals.contains(&name) {
                     0
-                } else if current.kind == ScopeKind::Function && current.nonlocals.contains(&name) {
+                } else if current.kind != ScopeKind::Module && current.nonlocals.contains(&name) {
                     self.nonlocal_assigns.push((scope, name, assign));
                     return;
                 } else {
@@ -3462,6 +3508,7 @@ impl<'t> Ctx<'t> {
     }
 
     fn other_import(&mut self, scope: usize, local: String, module: &Rc<str>, place: Place) {
+        self.class_body_import(scope, &local, place);
         let home = self.import_home(scope, &local);
         self.other_imports
             .entry((home, local))
@@ -3685,6 +3732,7 @@ impl<'t> Ctx<'t> {
         node: Node<'t>,
         place: Place,
     ) {
+        self.class_body_import(scope, binding.local, place);
         let key = (
             self.import_home(scope, binding.local),
             binding.local.to_string(),
@@ -3709,6 +3757,85 @@ impl<'t> Ctx<'t> {
             file: self.file.clone(),
             span,
         });
+    }
+
+    /// An import in a class body binds a class attribute too (`class Bot:
+    /// model = "gpt-4o"; from cfg import model`): when the class also
+    /// assigns that name, it is one more assignment, of no known value (see
+    /// [`Ctx::bind_definitions`]). The import is still bound at module
+    /// level, as before.
+    fn class_body_import(&mut self, scope: usize, local: &str, place: Place) {
+        if self.scopes[scope].kind == ScopeKind::Class {
+            self.def_bindings
+                .push(((scope, local.to_string()), scope, place));
+        }
+    }
+
+    /// `type M = ...` binds `M` to a type alias object: an assignment of no
+    /// known value. tree-sitter also reads `type(self).model = v` as a type
+    /// alias statement whose left side is an attribute (`(self).model`):
+    /// that is a write of `model` on an object this file cannot identify.
+    fn record_type_alias(&mut self, node: Node<'t>, scope: usize, place: Place) {
+        let parts = named_children(node);
+        let (Some(left), value) = (
+            parts.first().and_then(|t| t.named_child(0)),
+            parts.get(1).and_then(|t| t.named_child(0)),
+        ) else {
+            return;
+        };
+        match left.kind() {
+            "identifier" => self.record_target(left, None, None, scope, true, place),
+            "generic_type" => {
+                if let Some(name) = left.named_child(0).filter(|n| n.kind() == "identifier") {
+                    self.record_target(name, None, None, scope, true, place);
+                }
+            }
+            "attribute" => {
+                let (Some(object), Some(attr)) = (
+                    left.child_by_field_name("object"),
+                    left.child_by_field_name("attribute"),
+                ) else {
+                    return;
+                };
+                let attr = self.text(attr);
+                let assign = Assign {
+                    id: self.fresh_id(),
+                    scope,
+                    value,
+                    annotation: None,
+                    unknowable: value.is_none(),
+                    place,
+                    iter: None,
+                };
+                self.note_mutated_root(object);
+                self.record_attr_write(object, attr, assign, scope);
+            }
+            _ => {}
+        }
+    }
+
+    /// A `def`, `class` or class-body import that rebinds an assigned name
+    /// (`MODEL = "gpt-4o"` then `def MODEL(): ...`) is one more definition
+    /// of it, of no known value. Names never assigned are left alone, so
+    /// functions, classes and imports still resolve as before.
+    fn bind_definitions(&mut self) {
+        for (key, scope, place) in std::mem::take(&mut self.def_bindings) {
+            if !self.assigns.contains_key(&key) {
+                continue;
+            }
+            // `scope` is where the statement runs: a `global` def in a
+            // function binds the module's name whenever it is called.
+            let assign = Assign {
+                id: self.fresh_id(),
+                scope,
+                value: None,
+                annotation: None,
+                unknowable: true,
+                place,
+                iter: None,
+            };
+            self.assigns.entry(key).or_default().push(assign);
+        }
     }
 
     /// Moves each assignment to a `nonlocal` name into the nearest

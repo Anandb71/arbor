@@ -4701,8 +4701,11 @@ fn locals_in_a_function_is_not_a_dynamic_feature() {
 // Policy round 2 (re-review of faa403f)
 // ---------------------------------------------------------------------------
 
-/// Every value or gap reason of `key` per call: `(line, values, gaps)`.
-fn keyed_rows(source: &str, key: &str) -> Vec<(u32, Vec<String>, Vec<String>)> {
+/// `(line, values, gap reasons)` of one key at one call.
+type KeyedRow = (u32, Vec<String>, Vec<String>);
+
+/// Every value or gap reason of `key` per call.
+fn keyed_rows(source: &str, key: &str) -> Vec<KeyedRow> {
     let found = usages(source);
     found
         .calls
@@ -4943,5 +4946,102 @@ openai.chat.completions.create(model="gpt-4o", messages=[])
             (7, Routing::Unknown, module_config()),
             (8, Routing::OpenaiDirect, vec![]),
         ]
+    );
+}
+
+#[test]
+fn every_way_a_name_or_attribute_is_rebound_counts() {
+    // Should-fix 3: tree-sitter reads `type(self).model = v` as a type
+    // alias statement, which was never handled, so the class attribute kept
+    // its literal with no gap. It is now a write of `model` on an object
+    // this file cannot identify (a dynamic feature for every `model`
+    // attribute read). The nits that rebind a name the same quiet way are
+    // now definitions too: `type M = ...`, a `def` or `class` of an
+    // assigned name, a class-body import, `global`/`nonlocal` in a class
+    // body, `except* E as M`, and a walrus in a default argument (which
+    // binds in the scope the `def` or `lambda` runs in).
+    let header = "from openai import OpenAI\nclient = OpenAI()\n";
+    let gap = |line: u32, reason: &str| (line, vec![], vec![reason.to_string()]);
+    let gapped = |line: u32, value: &str, reason: &str| {
+        (line, vec![value.to_string()], vec![reason.to_string()])
+    };
+    let cases: Vec<(&str, Vec<KeyedRow>)> = vec![
+        (
+            "class B1:\n    model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n    def switch(self):\n        type(self).model = \"o1-mini\"\n",
+            vec![gapped(6, "gpt-4o", "dynamic_feature")],
+        ),
+        (
+            "MODEL = \"gpt-4o\"\ntype MODEL = int\nclient.chat.completions.create(model=MODEL, messages=[])\n",
+            vec![gap(5, "non_literal")],
+        ),
+        (
+            "class B48:\n    model = \"gpt-4o\"\n    from cfg import model\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n",
+            vec![gap(7, "reassigned")],
+        ),
+        (
+            "MODEL = \"gpt-4o\"\ndef MODEL():\n    pass\ndef go():\n    return client.chat.completions.create(model=MODEL, messages=[])\n",
+            vec![gap(7, "reassigned")],
+        ),
+        (
+            "MODEL = \"gpt-4o\"\nclass MODEL:\n    pass\nclient.chat.completions.create(model=MODEL, messages=[])\n",
+            vec![gap(6, "reassigned")],
+        ),
+        (
+            "MODEL = \"gpt-4o\"\ndef f():\n    global MODEL\n    def MODEL(): pass\nclient.chat.completions.create(model=MODEL, messages=[])\n",
+            vec![gap(7, "reassigned")],
+        ),
+        (
+            "MODEL = \"gpt-4o\"\nclass K:\n    global MODEL\n    MODEL = \"o1-mini\"\nclient.chat.completions.create(model=MODEL, messages=[])\n",
+            vec![gap(7, "reassigned")],
+        ),
+        (
+            "def outer():\n    M = \"gpt-4o\"\n    class K:\n        nonlocal M\n        M = \"o1-mini\"\n    return client.chat.completions.create(model=M, messages=[])\n",
+            vec![gap(8, "reassigned")],
+        ),
+        (
+            "MODEL = \"gpt-4o\"\ndef f():\n    global MODEL\n    try:\n        pass\n    except* Exception as MODEL:\n        pass\nclient.chat.completions.create(model=MODEL, messages=[])\n",
+            vec![gap(10, "reassigned")],
+        ),
+        (
+            "def f():\n    M = \"gpt-4o\"\n    def g(a=(M := \"o1-mini\")):\n        pass\n    return client.chat.completions.create(model=M, messages=[])\n",
+            vec![gap(7, "reassigned")],
+        ),
+        (
+            "def f():\n    M = \"gpt-4o\"\n    g = lambda a=(M := \"o1-mini\"): a\n    return client.chat.completions.create(model=M, messages=[])\n",
+            vec![gap(6, "reassigned")],
+        ),
+        // Inside the grammar: a def, class or import that does not rebind
+        // an assigned name changes nothing.
+        (
+            "MODEL = \"gpt-4o\"\ndef ask():\n    pass\nclass Bot:\n    pass\nclient.chat.completions.create(model=MODEL, messages=[])\n",
+            vec![(8, vec!["gpt-4o".to_string()], vec![])],
+        ),
+        (
+            "def f():\n    M = \"gpt-4o\"\n    def g(a=(N := \"o1-mini\")):\n        pass\n    return client.chat.completions.create(model=M, messages=[])\n",
+            vec![(7, vec!["gpt-4o".to_string()], vec![])],
+        ),
+    ];
+    for (body, expected) in cases {
+        let source = format!("{header}{body}");
+        assert_eq!(keyed_rows(&source, "model"), expected, "{source}");
+    }
+    // `type(B8()).client = OpenAI(base_url=...)` re-routes what
+    // `self.client` reads.
+    let found = usages(
+        r#"from openai import OpenAI
+class B8:
+    client = OpenAI()
+    def go(self):
+        return self.client.chat.completions.create(model="gpt-4o", messages=[])
+type(B8()).client = OpenAI(base_url="https://proxy.internal/v1")
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![(
+            5,
+            Routing::OpenaiDirect,
+            vec!["ambiguous_client/dynamic_feature".to_string()]
+        )]
     );
 }
