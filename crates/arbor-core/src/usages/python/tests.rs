@@ -5514,3 +5514,85 @@ fn values_and_gap_rows(found: &FileUsages) -> Vec<KeyedRow> {
         })
         .collect()
 }
+
+#[test]
+fn exported_and_name_mangled_private_functions_have_unseen_callers() {
+    // Nits: a `_private` function listed in `__all__` is exported, and
+    // `_A()._A__go(...)` calls `A.__go` from outside under its mangled name;
+    // neither call was counted, so the default had no gap.
+    let header = "from openai import OpenAI\nclient = OpenAI()\n";
+    for (body, line) in [
+        (
+            "__all__ = [\"_ask\"]\ndef _ask(prompt, model=\"gpt-4o\"):\n    return client.chat.completions.create(model=model, messages=[])\n_ask(\"x\")\n",
+            5,
+        ),
+        (
+            "__all__ = []\n__all__ += [\"_ask\"]\ndef _ask(prompt, model=\"gpt-4o\"):\n    return client.chat.completions.create(model=model, messages=[])\n",
+            6,
+        ),
+        (
+            "__all__ = []\n__all__.extend([\"_ask\"])\ndef _ask(prompt, model=\"gpt-4o\"):\n    return client.chat.completions.create(model=model, messages=[])\n",
+            6,
+        ),
+        (
+            "class _A:\n    def __go(self, model=\"gpt-4o\"):\n        return client.chat.completions.create(model=model, messages=[])\n    def run(self):\n        return self.__go()\n_A()._A__go(model=\"o1-mini\")\n",
+            5,
+        ),
+    ] {
+        let source = format!("{header}{body}");
+        let rows = keyed_rows(&source, "model");
+        assert_eq!(
+            rows,
+            vec![(
+                line,
+                vec!["gpt-4o".to_string()],
+                vec!["unseen_callers".to_string()]
+            )],
+            "{source}"
+        );
+    }
+    // Inside the grammar: a private function not exported.
+    let source = format!(
+        "{header}__all__ = [\"ask\"]\ndef _ask(prompt, model=\"gpt-4o\"):\n    return client.chat.completions.create(model=model, messages=[])\n_ask(\"x\")\n"
+    );
+    assert_eq!(
+        keyed_rows(&source, "model"),
+        vec![(5, vec!["gpt-4o".to_string()], vec![])]
+    );
+}
+
+#[test]
+fn an_sdk_member_replaced_in_the_file_gaps_its_routes() {
+    // Nit: `client.chat.completions.create = patched`, `openai.OpenAI =
+    // Sub` and `client.chat = ...` replace what a call runs, but its route
+    // had no gap. Each now makes every route of that SDK a
+    // `dynamic_feature` gap (a literal model at the call stays, as P2
+    // says). Settings such as `openai.api_key` change nothing.
+    let dynamic = || vec!["ambiguous_client/dynamic_feature".to_string()];
+    for setup in [
+        "client.chat.completions.create = _patched\n",
+        "setattr(client.chat.completions, \"create\", _patched)\n",
+        "client.chat = Other()\n",
+        "openai.OpenAI = Other\n",
+        "openai.chat.completions.create = _patched\n",
+    ] {
+        let source = format!(
+            "import openai\nfrom openai import OpenAI\nclient = OpenAI()\n{setup}client.chat.completions.create(model=\"gpt-4o\", messages=[])\n"
+        );
+        let found = usages(&source);
+        let call = found.calls.last().unwrap();
+        assert_eq!(value(call, "model"), Some("gpt-4o"), "{setup}");
+        assert_eq!(
+            routes_and_gaps(&found).last().unwrap().2,
+            dynamic(),
+            "{setup}"
+        );
+    }
+    let found = usages(
+        "import openai\nfrom openai import OpenAI\nclient = OpenAI()\nopenai.api_key = \"x\"\nclient.max_retries = 3\nclient.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+    );
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![(6, Routing::OpenaiDirect, vec![])]
+    );
+}

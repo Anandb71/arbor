@@ -1628,6 +1628,10 @@ struct Ctx<'t> {
     configure_calls: Vec<(Node<'t>, usize)>,
     /// Why the legacy Gemini SDK's module-level routing may not hold.
     legacy_caveat: Option<ClientCaveat>,
+    /// An SDK member replaced in this file (`client.chat.completions.create
+    /// = patched`, `openai.OpenAI = Sub`), by package: every route of that
+    /// package is then a `dynamic_feature` gap.
+    sdk_patched: HashMap<Pkg, Feature>,
     /// Names bound by `def` and `class` statements and class-body imports,
     /// where they bind: a name also assigned there gets an assignment of no
     /// known value for each (see [`Ctx::bind_definitions`]).
@@ -1745,6 +1749,7 @@ impl<'t> Ctx<'t> {
             method_self_writes: Vec::new(),
             configure_calls: Vec::new(),
             legacy_caveat: None,
+            sdk_patched: HashMap::new(),
             def_bindings: Vec::new(),
             openai_last_config: None,
             config_top: false,
@@ -1871,6 +1876,19 @@ impl<'t> Ctx<'t> {
                     "for_in_clause" => self.record_loop_target(node, scope),
                     "import_statement" => self.import_statement(node, scope, place),
                     "import_from_statement" => self.import_from(node, scope, place),
+                    "assignment" | "augmented_assignment"
+                        if node
+                            .child_by_field_name("left")
+                            .is_some_and(|l| self.text(l) == "__all__")
+                            && node.child_by_field_name("right").is_some() =>
+                    {
+                        if let Some(right) = node.child_by_field_name("right") {
+                            self.note_exports(right);
+                        }
+                        if let Some(left) = node.child_by_field_name("left") {
+                            self.record_target(left, None, None, scope, true, place);
+                        }
+                    }
                     "assignment" => {
                         if let Some(left) = node.child_by_field_name("left") {
                             let value = node.child_by_field_name("right");
@@ -1979,6 +1997,15 @@ impl<'t> Ctx<'t> {
                     }
                     "call" => {
                         let callee = node.child_by_field_name("function");
+                        // `__all__.extend([...])`, `__all__.append("name")`.
+                        if callee
+                            .and_then(|f| f.child_by_field_name("object"))
+                            .is_some_and(|o| self.text(o) == "__all__")
+                        {
+                            if let Some(args) = node.child_by_field_name("arguments") {
+                                self.note_exports(args);
+                            }
+                        }
                         if callee
                             .and_then(|f| match f.kind() {
                                 "identifier" => Some(f),
@@ -2143,6 +2170,34 @@ impl<'t> Ctx<'t> {
                 uses.calls.push((parent, scope));
             }
             _ => uses.escapes = true,
+        }
+        // `_A__go`, the mangled name of `A.__go` used from outside `A`: a
+        // call this file cannot attribute, so `__go`'s calls are not all
+        // seen.
+        if let Some(rest) = name.strip_prefix('_') {
+            if let Some(at) = rest.find("__").filter(|at| *at > 0) {
+                let mangled = &rest[at..];
+                if mangled.len() > 2 && !mangled.ends_with("__") {
+                    self.attr_uses.entry(mangled).or_default().escapes = true;
+                }
+            }
+        }
+    }
+
+    /// `__all__ = [...]`, `__all__ += [...]`, `__all__.extend([...])`: a
+    /// `_private` function listed there is exported, so other modules may
+    /// call it (its calls are not all in this file).
+    fn note_exports(&mut self, node: Node<'t>) {
+        let mut cursor = node.walk();
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            if let Some(name) = self.plain_literal(current) {
+                self.name_uses.entry(name).or_default().escapes = true;
+                continue;
+            }
+            for child in current.named_children(&mut cursor) {
+                stack.push(child);
+            }
         }
     }
 
@@ -6035,6 +6090,7 @@ impl<'t> Ctx<'t> {
         let mut assigned: HashSet<&'t str> = HashSet::new();
         for assign in self.config_assigns.clone() {
             let target = self.eval(assign.object, assign.scope, 0);
+            self.note_sdk_patch(&target, assign);
             if !matches!(&target, Val::Module { pkg: Pkg::Openai, path } if path.is_empty()) {
                 continue;
             }
@@ -6155,6 +6211,48 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// A write that replaces an SDK member rather than configuring it: on a
+    /// submodule, a class, an SDK symbol or a client's resource
+    /// (`client.chat.completions.create = patched`), or a class or resource
+    /// of the module or a client (`openai.OpenAI = Sub`, `client.chat =
+    /// wrapper`). Settings (`openai.api_key`, `client.max_retries`) are not.
+    fn note_sdk_patch(&mut self, target: &Val, assign: ConfigAssign<'t>) {
+        const RESOURCES: &[&str] = &[
+            "chat",
+            "completions",
+            "responses",
+            "messages",
+            "models",
+            "beta",
+            "embeddings",
+            "images",
+            "audio",
+            "files",
+            "batches",
+            "aio",
+            "chats",
+            "with_options",
+            "with_raw_response",
+            "with_streaming_response",
+            "copy",
+            "generate_content",
+            "generate_content_async",
+        ];
+        let attr = assign.attr;
+        let resource =
+            RESOURCES.contains(&attr) || attr.starts_with(|c: char| c.is_ascii_uppercase());
+        let pkg = match target {
+            Val::Module { pkg, path } if !path.is_empty() || resource => *pkg,
+            Val::Class(class) => class.pkg,
+            Val::Symbol { pkg, .. } => *pkg,
+            Val::Client { client, path } if !path.is_empty() || resource => client.pkg,
+            _ => return,
+        };
+        self.sdk_patched
+            .entry(pkg)
+            .or_insert_with(|| Self::feature("an SDK member replaced in this file", assign.object));
+    }
+
     /// Clients given a new `base_url` after they are built
     /// (`client.base_url = "https://openrouter.ai/api/v1"`).
     fn note_rerouted_clients(&mut self) {
@@ -6236,6 +6334,11 @@ impl<'t> Ctx<'t> {
                 client.caveat = Some(ClientCaveat::Dynamic(feature));
             }
         }
+        if let Some(feature) = self.sdk_patched.get(&client.pkg) {
+            if client.caveat.is_none() && !client.ambiguous {
+                client.caveat = Some(ClientCaveat::Dynamic(*feature));
+            }
+        }
         client
     }
 
@@ -6272,6 +6375,12 @@ impl<'t> Ctx<'t> {
     ) -> (Routing, Option<ClientCaveat>) {
         let mut routing = self.module_routing(pkg);
         let mut caveat = self.module_caveat(pkg);
+        if caveat.is_none() {
+            caveat = self
+                .sdk_patched
+                .get(&pkg)
+                .map(|f| ClientCaveat::Dynamic(*f));
+        }
         if pkg != Pkg::Openai || caveat.is_some() {
             return (routing, caveat);
         }
@@ -6350,7 +6459,11 @@ impl<'t> Ctx<'t> {
                         routing: self.module_routing(class.pkg),
                         client_line: None,
                         ambiguous: false,
-                        caveat: self.module_caveat(class.pkg),
+                        caveat: self.module_caveat(class.pkg).or_else(|| {
+                            self.sdk_patched
+                                .get(&class.pkg)
+                                .map(|f| ClientCaveat::Dynamic(*f))
+                        }),
                     };
                     self.record_call(call, function, scope, target);
                 }
