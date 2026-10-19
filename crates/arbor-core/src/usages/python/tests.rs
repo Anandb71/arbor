@@ -796,10 +796,11 @@ other.aio.models.generate_content(model="gemini-1.5-pro", contents="x")
 "#,
     );
     assert_eq!(found.clients.len(), 2);
-    assert!(found
-        .clients
-        .iter()
-        .all(|c| c.routing == Routing::GoogleGenai));
+    assert_eq!(found.clients[0].routing, Routing::GoogleGenai);
+    // `vertexai=True` sends it to Vertex AI: `unknown` with an
+    // `endpoint_option` gap (policy round 2, should-fix 5; it was
+    // `google_genai` with no gap).
+    assert_eq!(found.clients[1].routing, Routing::Unknown);
     assert_eq!(found.clients[1].chain, "google.genai.Client");
     let generate = call(&found, "client.models.generate_content");
     assert_eq!(value(generate, "model"), Some("gemini-2.0-flash"));
@@ -815,10 +816,12 @@ other.aio.models.generate_content(model="gemini-1.5-pro", contents="x")
         call(&found, "chat.send_message").routing,
         Routing::GoogleGenai
     );
-    assert_eq!(
-        value(call(&found, "other.aio.models.generate_content"), "model"),
-        Some("gemini-1.5-pro")
-    );
+    let vertex = call(&found, "other.aio.models.generate_content");
+    assert_eq!(value(vertex, "model"), Some("gemini-1.5-pro"));
+    assert_eq!(vertex.routing, Routing::Unknown);
+    assert!(found.gaps.iter().any(|g| g.span.map(|s| s.start_byte)
+        == Some(vertex.span.start_byte)
+        && g.reason == "endpoint_option"));
 }
 
 // ---------------------------------------------------------------------------
@@ -4591,7 +4594,10 @@ i.chat.completions.create(model="gpt-4o", messages=[])
             (6, Routing::OpenaiDirect, vec![]),
             (8, Routing::Unknown, gap("base_url_env")),
             (10, Routing::OpenaiDirect, gap("base_url_env")),
-            (12, Routing::CustomBaseUrl, vec![]),
+            // Another host as an environment fallback: the deployment may
+            // point it anywhere (policy round 2, lead decision 6; it was
+            // `custom_base_url` with no gap).
+            (12, Routing::CustomBaseUrl, gap("base_url_env")),
             (14, Routing::OpenaiDirect, vec![]),
             (16, Routing::Unknown, gap("base_url_unresolved")),
             (18, Routing::AnthropicDirect, vec![]),
@@ -5149,4 +5155,174 @@ fn namespace_builtins_reached_under_another_name_downgrade_the_whole_file() {
         keyed_rows(&source, "model"),
         vec![(9, vec!["gpt-4o".to_string()], vec![])]
     );
+}
+
+#[test]
+fn gemini_clients_built_for_vertex_or_another_endpoint_are_gaps() {
+    // Should-fix 5: `google.genai.Client` was `google_genai` with no gap
+    // whatever it was given, although `vertexai=True`, an `http_options`
+    // `base_url` or `GOOGLE_GENAI_USE_VERTEXAI` send it to Vertex AI or
+    // another endpoint (which retire models on another schedule). Each now
+    // routes `unknown` with an `endpoint_option` (or `endpoint_env`) gap;
+    // the legacy SDK's `configure(client_options=...)` does the same for
+    // every legacy call. Options that name no endpoint stay confirmed.
+    let option = || vec!["ambiguous_client/endpoint_option".to_string()];
+    let cases: Vec<(&str, Vec<RouteRow>)> = vec![
+        (
+            "c = genai.Client(vertexai=True, project=\"p\", location=\"us-central1\")\n",
+            vec![(5, Routing::Unknown, option())],
+        ),
+        (
+            "c = genai.Client(http_options=types.HttpOptions(base_url=\"https://proxy.internal\"))\n",
+            // `types.HttpOptions(...)` is an SDK type call of its own.
+            vec![
+                (4, Routing::GoogleGenai, vec![]),
+                (5, Routing::Unknown, option()),
+            ],
+        ),
+        (
+            "c = genai.Client(http_options={\"base_url\": \"https://proxy.internal\"})\n",
+            vec![(5, Routing::Unknown, option())],
+        ),
+        (
+            "OPTS = {\"api_version\": \"v1\"}\nc = genai.Client(http_options=OPTS)\n",
+            vec![(6, Routing::Unknown, option())],
+        ),
+        (
+            "def make(**opts):\n    return genai.Client(**opts)\nc = make()\nc2 = genai.Client(**{})\n",
+            vec![],
+        ),
+        (
+            "os.environ[\"GOOGLE_GENAI_USE_VERTEXAI\"] = \"true\"\nc = genai.Client()\n",
+            vec![(
+                6,
+                Routing::Unknown,
+                vec!["ambiguous_client/endpoint_env".to_string()],
+            )],
+        ),
+        (
+            "os.environ[NAME] = \"true\"\nc = genai.Client()\n",
+            vec![(
+                6,
+                Routing::Unknown,
+                vec!["ambiguous_client/dynamic_feature".to_string()],
+            )],
+        ),
+        // Inside the grammar.
+        (
+            "c = genai.Client(api_key=os.environ[\"GEMINI_API_KEY\"])\n",
+            vec![(5, Routing::GoogleGenai, vec![])],
+        ),
+        (
+            "c = genai.Client(vertexai=False, http_options=types.HttpOptions(api_version=\"v1alpha\"))\n",
+            vec![
+                (4, Routing::GoogleGenai, vec![]),
+                (5, Routing::GoogleGenai, vec![]),
+            ],
+        ),
+    ];
+    for (setup, expected) in cases {
+        let source = format!(
+            "import os\nfrom google import genai\nfrom google.genai import types\n{setup}c.models.generate_content(model=\"gemini-2.0-flash\", contents=\"x\")\n"
+        );
+        let found = usages(&source);
+        // `make()` is a factory this file does not resolve: no route at all.
+        if expected.is_empty() {
+            assert!(
+                found
+                    .calls
+                    .iter()
+                    .all(|c| c.routing != Routing::GoogleGenai),
+                "{source}"
+            );
+            continue;
+        }
+        assert_eq!(routes_and_gaps(&found), expected, "{source}");
+    }
+    // The legacy SDK.
+    let found = usages(
+        r#"import google.generativeai as genai
+genai.configure(api_key=KEY, client_options={"api_endpoint": "proxy.internal"})
+model = genai.GenerativeModel("gemini-1.5-flash")
+model.generate_content("x")
+"#,
+    );
+    let rows = routes_and_gaps(&found);
+    assert!(
+        rows.iter()
+            .filter(|r| r.0 >= 3)
+            .all(|r| r.1 == Routing::Unknown && r.2 == option()),
+        "{rows:?}"
+    );
+    assert_eq!(rows.iter().filter(|r| r.0 >= 3).count(), 2, "{rows:?}");
+    let found = usages(
+        r#"import google.generativeai as genai
+genai.configure(api_key=KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
+model.generate_content("x")
+"#,
+    );
+    assert!(routes_and_gaps(&found)
+        .iter()
+        .filter(|r| r.0 >= 3)
+        .all(|r| r.1 == Routing::GoogleGenerativeaiLegacy && r.2.is_empty()));
+}
+
+#[test]
+fn an_environment_base_url_with_another_host_as_fallback_is_a_gap() {
+    // Lead decision 6: `base_url=os.getenv("LLM_URL", "https://proxy...")`
+    // was `custom_base_url` with no gap, but the deployment may point it at
+    // the provider or another gateway. Only a literal or absent `base_url`
+    // is confirmed (P1), so it keeps `custom_base_url` with a
+    // `base_url_env` gap, like the provider-host fallback keeps
+    // `openai_direct` with one.
+    let env = || vec!["ambiguous_client/base_url_env".to_string()];
+    let cases: Vec<(&str, Vec<RouteRow>)> = vec![
+        (
+            "c = OpenAI(base_url=os.getenv(\"LLM_URL\", \"https://proxy.internal/v1\"))\n",
+            vec![(5, Routing::CustomBaseUrl, env())],
+        ),
+        (
+            "c = OpenAI(base_url=os.getenv(\"LLM_URL\") or \"https://proxy.internal/v1\")\n",
+            vec![(5, Routing::CustomBaseUrl, env())],
+        ),
+        (
+            "c = OpenAI(base_url=os.environ.get(\"LLM_URL\", \"https://proxy.internal/v1\"))\n",
+            vec![(5, Routing::CustomBaseUrl, env())],
+        ),
+        (
+            "BASE = os.environ.get(\"OPENAI_BASE_URL\", \"https://proxy.internal/v1\")\nc = OpenAI(base_url=BASE)\n",
+            vec![(6, Routing::CustomBaseUrl, env())],
+        ),
+        (
+            "c = OpenAI().with_options(base_url=os.getenv(\"LLM_URL\", \"https://proxy.internal/v1\"))\n",
+            vec![
+                (4, Routing::OpenaiDirect, vec![]),
+                (5, Routing::CustomBaseUrl, env()),
+            ],
+        ),
+        (
+            "c = openai\nopenai.base_url = os.getenv(\"LLM_URL\", \"https://proxy.internal/v1\")\n",
+            vec![(6, Routing::CustomBaseUrl, env())],
+        ),
+        // Unchanged: the provider's host as fallback, and no fallback.
+        (
+            "c = OpenAI(base_url=os.getenv(\"LLM_URL\", \"https://api.openai.com/v1\"))\n",
+            vec![(5, Routing::OpenaiDirect, env())],
+        ),
+        (
+            "c = OpenAI(base_url=os.getenv(\"LLM_URL\"))\n",
+            vec![(5, Routing::Unknown, env())],
+        ),
+        (
+            "c = OpenAI(base_url=\"https://proxy.internal/v1\")\n",
+            vec![(5, Routing::CustomBaseUrl, vec![])],
+        ),
+    ];
+    for (setup, expected) in cases {
+        let source = format!(
+            "import os\nimport openai\nfrom openai import OpenAI\n{setup}c.chat.completions.create(model=\"gpt-4o\", messages=[])\n"
+        );
+        assert_eq!(routes_and_gaps(&usages(&source)), expected, "{source}");
+    }
 }

@@ -444,7 +444,9 @@ impl ClientClass {
         let adapter = kwargs.iter().any(|k| k == "provider");
         match self.family {
             Family::OpenaiDirect | Family::AnthropicDirect if adapter => Routing::Unknown,
-            Family::OpenaiDirect | Family::AnthropicDirect if base_url == BaseUrl::Custom => {
+            Family::OpenaiDirect | Family::AnthropicDirect
+                if matches!(base_url, BaseUrl::Custom | BaseUrl::CustomFallback) =>
+            {
                 Routing::CustomBaseUrl
             }
             Family::OpenaiDirect | Family::AnthropicDirect
@@ -469,10 +471,11 @@ impl ClientClass {
     }
 
     /// Routing known from a type annotation alone: a direct client may still
-    /// have been given a `base_url`, so it is `unknown`.
+    /// have been given a `base_url` (a Gemini client `vertexai=True` or an
+    /// endpoint), so it is `unknown`.
     fn typed_routing(self) -> Routing {
         match self.family {
-            Family::OpenaiDirect | Family::AnthropicDirect => Routing::Unknown,
+            Family::OpenaiDirect | Family::AnthropicDirect | Family::Genai => Routing::Unknown,
             _ => self.routing(&[], false, BaseUrl::Absent),
         }
     }
@@ -589,6 +592,11 @@ enum ClientCaveat {
     BaseUrl { env: bool, fallback: bool },
     /// A dynamic feature of the file may rebind or replace the client.
     Dynamic(Feature),
+    /// A Gemini client built with an option that may send its requests to
+    /// Vertex AI or another endpoint (`vertexai=True`, `http_options=` with
+    /// a `base_url`, `**options`), or the legacy SDK configured with
+    /// `client_options`.
+    EndpointOption { option: &'static str },
     /// A module-level API call passes `engine` or `deployment_id`, which
     /// Azure deployments take, in a file that does not configure the API:
     /// another module may route it to Azure (the SDK's module state is
@@ -623,6 +631,9 @@ enum BaseUrl {
     Custom,
     /// The provider's own host as the fallback of an environment lookup.
     ProviderFallback,
+    /// Another host as the fallback of an environment lookup: the
+    /// deployment may point it anywhere, the provider included.
+    CustomFallback,
     /// Read from the environment with no fallback (`env`), or not a string
     /// this file resolves.
     Unknown { env: bool },
@@ -664,6 +675,11 @@ fn host_kind(pkg: Pkg, url: &str) -> BaseUrl {
 const ENDPOINT_ENV: &[(Pkg, &str)] = &[
     (Pkg::Openai, "OPENAI_BASE_URL"),
     (Pkg::Anthropic, "ANTHROPIC_BASE_URL"),
+    // `google.genai.Client()` reads whether to use Vertex AI, and its
+    // endpoints, from these.
+    (Pkg::GoogleGenai, "GOOGLE_GENAI_USE_VERTEXAI"),
+    (Pkg::GoogleGenai, "GOOGLE_GEMINI_BASE_URL"),
+    (Pkg::GoogleGenai, "GOOGLE_VERTEX_BASE_URL"),
 ];
 
 /// Environment variables the module-level OpenAI API (v0 and the v1 module
@@ -1587,6 +1603,11 @@ struct Ctx<'t> {
     /// Namespace builtins used as a value, by name (see
     /// [`Ctx::note_builtin_value`]).
     builtin_values: HashMap<&'t str, Feature>,
+    /// Calls named `configure`, which may set up the legacy Gemini SDK, and
+    /// the scope each is in.
+    configure_calls: Vec<(Node<'t>, usize)>,
+    /// Why the legacy Gemini SDK's module-level routing may not hold.
+    legacy_caveat: Option<ClientCaveat>,
     /// Names bound by `def` and `class` statements and class-body imports,
     /// where they bind: a name also assigned there gets an assignment of no
     /// known value for each (see [`Ctx::bind_definitions`]).
@@ -1700,6 +1721,8 @@ impl<'t> Ctx<'t> {
             rerouted_any: None,
             openai_caveat: None,
             builtin_values: HashMap::new(),
+            configure_calls: Vec::new(),
+            legacy_caveat: None,
             def_bindings: Vec::new(),
             openai_last_config: None,
             config_top: false,
@@ -1933,6 +1956,17 @@ impl<'t> Ctx<'t> {
                         }
                     }
                     "call" => {
+                        let callee = node.child_by_field_name("function");
+                        if callee
+                            .and_then(|f| match f.kind() {
+                                "identifier" => Some(f),
+                                "attribute" => f.child_by_field_name("attribute"),
+                                _ => None,
+                            })
+                            .is_some_and(|n| self.text(n) == "configure")
+                        {
+                            self.configure_calls.push((node, scope));
+                        }
                         self.note_dynamic_call(node, scope);
                         self.config_top = is_top_statement(&frame);
                         self.note_attr_write_call(node, scope, place);
@@ -5437,6 +5471,13 @@ impl<'t> Ctx<'t> {
         }
         match base_url {
             BaseUrl::Custom => client.routing = Routing::CustomBaseUrl,
+            BaseUrl::CustomFallback => {
+                client.routing = Routing::CustomBaseUrl;
+                client.caveat.get_or_insert(ClientCaveat::BaseUrl {
+                    env: true,
+                    fallback: true,
+                });
+            }
             BaseUrl::Unknown { env } => {
                 client.routing = Routing::Unknown;
                 client.caveat.get_or_insert(ClientCaveat::BaseUrl {
@@ -5480,7 +5521,7 @@ impl<'t> Ctx<'t> {
             Ok(resolved) if resolved.origin == ValueOrigin::EnvDefault => {
                 match host_kind(pkg, &resolved.value) {
                     BaseUrl::Provider => BaseUrl::ProviderFallback,
-                    _ => BaseUrl::Custom,
+                    _ => BaseUrl::CustomFallback,
                 }
             }
             Ok(resolved) if resolved.caveats.is_empty() => host_kind(pkg, &resolved.value),
@@ -5536,12 +5577,21 @@ impl<'t> Ctx<'t> {
             None => BaseUrl::Absent,
         };
         let mut routing = class.routing(&args.kwargs, args.splat, base_url);
-        let mut caveat = self.endpoint_env(class, base_url);
+        let mut caveat = match self.genai_endpoint_option(call, class, &args) {
+            Some(option) => Some(ClientCaveat::EndpointOption { option }),
+            None => self.endpoint_env(class, base_url),
+        };
         if caveat.is_some() {
             routing = Routing::Unknown;
         }
         if direct {
             match base_url {
+                BaseUrl::CustomFallback => {
+                    caveat.get_or_insert(ClientCaveat::BaseUrl {
+                        env: true,
+                        fallback: true,
+                    });
+                }
                 BaseUrl::Unknown { env } => {
                     caveat.get_or_insert(ClientCaveat::BaseUrl {
                         env,
@@ -5599,14 +5649,71 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// For `google.genai.Client(...)`: the option that may send its requests
+    /// to Vertex AI or another endpoint instead of the Gemini API, if any.
+    /// `vertexai=` (unless `False` or `None`), `http_options=` (unless `None`
+    /// or a dict literal or `HttpOptions(...)` call that names no
+    /// `base_url` and expands nothing) and a `**` expansion each count.
+    fn genai_endpoint_option(
+        &self,
+        call: Node<'t>,
+        class: ClientClass,
+        args: &Args<'t>,
+    ) -> Option<&'static str> {
+        if class.family != Family::Genai {
+            return None;
+        }
+        if args.splat {
+            return Some("a `**` expansion");
+        }
+        let text = |n: Node<'t>| self.text(n);
+        if let Some(value) = keyword_value(call, text, |k| k == "vertexai") {
+            if !matches!(value.kind(), "false" | "none") {
+                return Some("`vertexai=`");
+            }
+        }
+        let options = keyword_value(call, text, |k| k == "http_options")?;
+        let names_no_endpoint = match options.kind() {
+            "none" => true,
+            "dictionary" => dict_entries(options, |n| self.literal(n).ok(), text)
+                .iter()
+                .all(|entry| entry.as_ref().is_some_and(|(k, _)| k != "base_url")),
+            "call" => {
+                let last = options
+                    .child_by_field_name("function")
+                    .and_then(|f| match f.kind() {
+                        "identifier" => Some(f),
+                        "attribute" => f.child_by_field_name("attribute"),
+                        _ => None,
+                    });
+                last.is_some_and(|n| self.text(n) == "HttpOptions")
+                    && options
+                        .child_by_field_name("arguments")
+                        .is_some_and(|list| {
+                            named_children(list).iter().all(|arg| {
+                                arg.kind() == "comment"
+                                    || (arg.kind() == "keyword_argument"
+                                        && arg
+                                            .child_by_field_name("name")
+                                            .is_some_and(|n| self.text(n) != "base_url"))
+                            })
+                        })
+            }
+            _ => false,
+        };
+        (!names_no_endpoint).then_some("`http_options=`")
+    }
+
     /// Why a client built by `class` may not reach the endpoint its
     /// constructor names: when it names none (`base_url` absent or `None`),
     /// the SDK reads its endpoint variable, which this file sets
     /// ([`ClientCaveat::EndpointEnv`]) or may set through a run-time name or
     /// an alias of `os.environ` ([`ClientCaveat::EnvWrite`]).
     fn endpoint_env(&self, class: ClientClass, base_url: BaseUrl) -> Option<ClientCaveat> {
-        if !matches!(class.family, Family::OpenaiDirect | Family::AnthropicDirect)
-            || base_url != BaseUrl::Absent
+        if !matches!(
+            class.family,
+            Family::OpenaiDirect | Family::AnthropicDirect | Family::Genai
+        ) || base_url != BaseUrl::Absent
         {
             return None;
         }
@@ -5724,6 +5831,7 @@ impl<'t> Ctx<'t> {
             }
             self.openai_caveat = Some(ClientCaveat::EnvWrite(feature));
         }
+        self.note_legacy_configure();
         self.note_rerouted_clients();
         for (call, scope) in self.calls.clone() {
             if self.records() >= MAX_FILE_RECORDS {
@@ -5830,6 +5938,13 @@ impl<'t> Ctx<'t> {
                     match kind {
                         BaseUrl::Absent | BaseUrl::Provider => {}
                         BaseUrl::Custom => custom = true,
+                        BaseUrl::CustomFallback => {
+                            custom = true;
+                            self.openai_caveat.get_or_insert(ClientCaveat::BaseUrl {
+                                env: true,
+                                fallback: true,
+                            });
+                        }
                         BaseUrl::ProviderFallback => {
                             self.openai_caveat.get_or_insert(ClientCaveat::BaseUrl {
                                 env: false,
@@ -5857,6 +5972,35 @@ impl<'t> Ctx<'t> {
             Routing::CustomBaseUrl
         } else {
             Routing::OpenaiDirect
+        }
+    }
+
+    /// `genai.configure(client_options=...)` (the legacy Gemini SDK) may
+    /// point every legacy call at another endpoint: they then route
+    /// `unknown` with an `endpoint_option` gap. So may `**options`.
+    fn note_legacy_configure(&mut self) {
+        for (call, scope) in self.configure_calls.clone() {
+            let Some(function) = call.child_by_field_name("function") else {
+                continue;
+            };
+            let configures = matches!(
+                self.eval(function, scope, 0),
+                Val::Module { pkg: Pkg::GoogleGenerativeai, ref path }
+                    | Val::Symbol { pkg: Pkg::GoogleGenerativeai, ref path }
+                    if path.last().is_some_and(|p| p == "configure")
+            );
+            if !configures {
+                continue;
+            }
+            let args = self.arguments(call);
+            let endpoint = keyword_value(call, |n| self.text(n), |k| k == "client_options")
+                .is_some_and(|v| v.kind() != "none");
+            if endpoint || args.splat {
+                self.legacy_caveat
+                    .get_or_insert(ClientCaveat::EndpointOption {
+                        option: "`configure(client_options=...)`",
+                    });
+            }
         }
     }
 
@@ -5908,6 +6052,14 @@ impl<'t> Ctx<'t> {
     /// `client` with its routing unknown when a `base_url` is assigned to it
     /// after it is built.
     fn reroute(&self, mut client: Client) -> Client {
+        // A legacy Gemini model object: `configure(client_options=...)`
+        // routes every one of them.
+        if client.pkg == Pkg::GoogleGenerativeai && client.caveat.is_none() && !client.ambiguous {
+            if let Some(caveat) = &self.legacy_caveat {
+                client.routing = Routing::Unknown;
+                client.caveat = Some(caveat.clone());
+            }
+        }
         let assigned = client
             .site
             .is_some_and(|site| self.rerouted.contains(&site))
@@ -5940,6 +6092,7 @@ impl<'t> Ctx<'t> {
     fn module_caveat(&self, pkg: Pkg) -> Option<ClientCaveat> {
         match pkg {
             Pkg::Openai => self.openai_caveat.clone(),
+            Pkg::GoogleGenerativeai => self.legacy_caveat.clone(),
             _ => None,
         }
     }
@@ -5949,6 +6102,7 @@ impl<'t> Ctx<'t> {
             Pkg::Openai => self.openai_routing,
             Pkg::Anthropic => Routing::AnthropicDirect,
             Pkg::GoogleGenai => Routing::GoogleGenai,
+            Pkg::GoogleGenerativeai if self.legacy_caveat.is_some() => Routing::Unknown,
             Pkg::GoogleGenerativeai => Routing::GoogleGenerativeaiLegacy,
         }
     }
@@ -6042,10 +6196,10 @@ impl<'t> Ctx<'t> {
                         pkg: class.pkg,
                         member: class.name.to_string(),
                         receiver,
-                        routing: Routing::GoogleGenerativeaiLegacy,
+                        routing: self.module_routing(class.pkg),
                         client_line: None,
                         ambiguous: false,
-                        caveat: None,
+                        caveat: self.module_caveat(class.pkg),
                     };
                     self.record_call(call, function, scope, target);
                 }
@@ -6338,6 +6492,21 @@ impl<'t> Ctx<'t> {
                     format!(
                         "this file may set the SDK's endpoint variable ({}), so `{chain}` may send its requests elsewhere",
                         feature.describe()
+                    ),
+                ),
+                ClientCaveat::BaseUrl {
+                    env: true,
+                    fallback: true,
+                } => (
+                    "base_url_env",
+                    format!(
+                        "the `base_url` of the client behind `{chain}` is read from the environment and falls back to another host, so the deployment may point it anywhere"
+                    ),
+                ),
+                ClientCaveat::EndpointOption { option } => (
+                    "endpoint_option",
+                    format!(
+                        "the client behind `{chain}` is configured with {option}, which may send its requests to Vertex AI or another endpoint"
                     ),
                 ),
                 ClientCaveat::BaseUrl { env: true, .. } => (
