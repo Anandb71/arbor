@@ -114,8 +114,8 @@ RULES = {
     # options (edits, effect, status) are read from the recipe.
     "OAI-TOOLS-CC": {"message": "Chat Completions function tools work on {target} only at reasoning_effort \"none\" (400 otherwise)."},
     "OAI-TOOLS-CC-REASONING-SOURCE": {"message": "On {target}, Chat Completions tools work only without reasoning, and this reasoning model's call relies on it: move the call to the Responses API or review it by hand."},
-    "OAI-LEGACY-FUNCTIONS": {"message": "Legacy functions/function_call work on {target} at reasoning_effort \"none\"; without it they were not tested."},
-    "OAI-REASONING-DEFAULT": {"message": "{target} reasons at medium effort by default, and this model answered without a reasoning step."},
+    "OAI-LEGACY-FUNCTIONS": {"message": "Legacy functions/function_call were checked only on gpt-5.6-terra, where they work at reasoning_effort \"none\"; on other models, and without that setting, they were not tested."},
+    "OAI-REASONING-DEFAULT": {"message": "{target} runs at medium reasoning effort by default, so it can reason; the model it replaces answered without a reasoning step."},
     "OAI-SAMPLING": {"message": "temperature, top_p and logprobs are accepted on {target} at reasoning_effort \"none\"; at its default effort a non-default temperature returns 400."},
     "OAI-SAMPLING-RESPONSES": {"message": "Whether {target} accepts temperature, top_p or logprobs on the Responses API is not verified."},
     "OAI-SAMPLING-REASONING-SOURCE": {"message": "temperature, top_p and logprobs work on {target} only at reasoning_effort \"none\", which would turn off this reasoning model's reasoning."},
@@ -143,7 +143,7 @@ RULES = {
     # -- OpenAI, shutdown 2027-01-14 (gpt-6-luna target) --
     "G6-TOOLS-CC": {"message": "Chat Completions function tools work on {target} only at reasoning_effort \"none\" (400 otherwise)."},
     "G6-LEGACY-FUNCTIONS": {"message": "Legacy functions/function_call work on {target} at reasoning_effort \"none\"; without it they were not tested."},
-    "G6-REASONING-DEFAULT": {"message": "{target} reasons at medium effort by default, and this model answered without a reasoning step."},
+    "G6-REASONING-DEFAULT": {"message": "{target} runs at medium reasoning effort by default, so it can reason; the model it replaces answered without a reasoning step."},
     "G6-SAMPLING": {"message": "temperature, top_p and logprobs are accepted on {target} at reasoning_effort \"none\"; at its default effort a non-default temperature returns 400."},
     "G6-SAMPLING-RESPONSES": {"message": "Whether {target} accepts temperature, top_p or logprobs on the Responses API is not verified."},
     "G6-MAX-TOKENS": {
@@ -295,6 +295,9 @@ OPTION_STATUSES = {"confirmed": "confirmed", "unverified": "unverified"}
 # Recipe text copied into the data is shown to people; it must not carry internal
 # references (live-check ids, decisions, the memo).
 INTERNAL_WORDS = re.compile(r"\b(L-[A-Z]+-\d+|founder|decision|memo|Anandb71)\b", re.IGNORECASE)
+# A live-check id in brackets on its own, such as "(L-OAI-12)", only points to the
+# record: it is dropped. Any other internal reference still stops generation.
+LIVE_CHECK_REF = re.compile(r"\s*\(L-[A-Z]+-\d+(?:(?:,\s*|\s+and\s+)L-[A-Z]+-\d+)*\)")
 
 # Every live check recorded in the recipes called Chat Completions (the recipe headers
 # and live-checks/ records say so); no Responses API call was made. A live result
@@ -822,7 +825,7 @@ def public_text(rid: str, text) -> str:
     """Recipe text shown to people as it is: one line, no internal references."""
     if not isinstance(text, str) or not text.strip():
         raise GenerationError(f"{rid}: expected text, got {text!r}")
-    text = " ".join(text.split())
+    text = " ".join(LIVE_CHECK_REF.sub("", text).split())
     if INTERNAL_WORDS.search(text):
         raise GenerationError(f"{rid}: text shown to people has an internal reference: {text!r}")
     return text
