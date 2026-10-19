@@ -5841,3 +5841,85 @@ ask()
         ]
     );
 }
+
+#[test]
+fn a_method_that_rebinds_self_or_cls_reads_nothing_through_it() {
+    // Blocker 4 (lead decision D3): `self = other`, a tuple, `for`,
+    // `with`, walrus, `except` or `match` target, a closure's `nonlocal
+    // self`, or `cls = _Other` in a classmethod left reads through the name
+    // as the class's attribute. A method that binds its first parameter's
+    // name in any other way now reads nothing through it: every read there
+    // is a `dynamic_feature` gap, and a write through it is a write on
+    // another object.
+    let header = "from openai import OpenAI\nclient = OpenAI()\nclass _Err(Exception):\n    model = \"o1-mini\"\nclass _Other:\n    model = \"o1-mini\"\n";
+    let read = "client.chat.completions.create(model=self.model, messages=[])";
+    for body in [
+        format!("    def go(self, other):\n        self = other\n        return {read}\n"),
+        format!("    def go(self, other):\n        self, n = other, 1\n        return {read}\n"),
+        format!("    def go(self, others):\n        for self in others:\n            {read}\n"),
+        format!("    def go(self, cm):\n        with cm as self:\n            {read}\n"),
+        format!("    def go(self, other):\n        if (self := other):\n            {read}\n"),
+        format!("    def go(self):\n        try:\n            pass\n        except _Err as self:\n            {read}\n"),
+        format!("    def go(self, x):\n        match x:\n            case _Other() as self:\n                {read}\n"),
+        format!("    def go(self, other):\n        def inner():\n            nonlocal self\n            self = other\n        inner()\n        return {read}\n"),
+        format!("    def go(self, other):\n        def inner():\n            self = other\n            return {read}\n        return inner()\n"),
+        format!("    def go(self, other):\n        self += other\n        return {read}\n"),
+        format!("    def go(self):\n        from cfg import other as self\n        return {read}\n"),
+        format!("    def go(self, other):\n        del self\n        self = other\n        return {read}\n"),
+        format!("    def go(self, others):\n        return [{read} for self in others]\n"),
+        format!("    def go(self):\n        def self():\n            pass\n        return {read}\n"),
+        format!("    def go(self):\n        class self:\n            model = \"o1-mini\"\n        return {read}\n"),
+        format!("    @classmethod\n    def go(cls):\n        cls = _Other\n        return {}\n", read.replace("self.", "cls.")),
+    ] {
+        let source = format!("{header}class _Bot:\n    model = \"gpt-4o\"\n{body}");
+        let rows = keyed_rows(&source, "model");
+        assert_eq!(rows.len(), 1, "{source}");
+        assert!(rows[0].1.is_empty(), "{source}");
+        assert_eq!(rows[0].2, vec!["dynamic_feature".to_string()], "{source}");
+    }
+    // The route through a rebound `self` is a gap too.
+    let source = "from openai import OpenAI\nclass _Proxy:\n    def __init__(self):\n        self.client = OpenAI(base_url=\"https://proxy.internal/v1\")\nclass _Svc:\n    def __init__(self):\n        self.client = OpenAI()\n    def go(self, other):\n        self = other\n        return self.client.chat.completions.create(model=\"gpt-4o\", messages=[])\n    def ok(self):\n        return self.client.chat.completions.create(model=\"gpt-4o\", messages=[])\n";
+    let found = usages(source);
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![(12, Routing::OpenaiDirect, vec![])]
+    );
+    let receiver = gaps(&found, GapKind::UnknownClientFactory);
+    assert_eq!(receiver.len(), 1);
+    assert_eq!(receiver[0].reason, "dynamic_feature");
+    assert_eq!(receiver[0].span.map(|s| s.line), Some(10));
+    // A write through a rebound `self` may set another class's attribute.
+    let source = format!(
+        "{header}class _Bot:\n    def poison(self, other):\n        self = other\n        self.model = \"gpt-4o\"\nclass _Third:\n    model = \"o1\"\n    def go(self):\n        return {read}\n"
+    );
+    let rows = keyed_rows(&source, "model");
+    assert_eq!(rows[0].2, vec!["dynamic_feature".to_string()], "{source}");
+    // A lambda passed in a class body is not a method; one assigned to a
+    // name is.
+    let source = format!(
+        "{header}class _Bot:\n    model = \"gpt-4o\"\n    items = []\n    calls = list(map(lambda self: {read}, items))\n    go = lambda self: {read}\n"
+    );
+    let rows = keyed_rows(&source, "model");
+    assert_eq!(rows.len(), 2, "{source}");
+    assert!(rows[0].1.is_empty() && !rows[0].2.is_empty(), "{source}");
+    assert_eq!(
+        rows[1],
+        (11, vec!["gpt-4o".to_string()], vec![]),
+        "{source}"
+    );
+    // Inside the grammar: other methods of the class, and the method
+    // itself when it only reads.
+    let source = format!(
+        "{header}class _Bot:\n    model = \"gpt-4o\"\n    def bad(self, other):\n        self = other\n    def go(self):\n        return {read}\n    @classmethod\n    def go_cls(cls):\n        return {}\n",
+        read.replace("self.", "cls.")
+    );
+    let rows = keyed_rows(&source, "model");
+    assert_eq!(
+        rows,
+        vec![
+            (12, vec!["gpt-4o".to_string()], vec![]),
+            (15, vec!["gpt-4o".to_string()], vec![]),
+        ],
+        "{source}"
+    );
+}

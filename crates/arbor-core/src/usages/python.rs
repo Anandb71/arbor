@@ -317,6 +317,7 @@ pub fn extract(tree: &Tree, source: &str, file_path: &str) -> FileUsages {
     let mut cx = Ctx::new(source, file_path);
     cx.collect(tree.root_node());
     cx.place_nonlocal_assigns();
+    cx.note_rebound_receivers();
     cx.bind_definitions();
     cx.index_definitions();
     cx.settle_dict_escapes();
@@ -1068,7 +1069,8 @@ struct Scope {
     /// whatever its body says: a decorator, a metaclass or other class
     /// keyword, or more than one base.
     class_feature: Option<Feature>,
-    /// The 1-based line the scope starts on (set for classes).
+    /// The 1-based line the scope starts on (set for classes, functions
+    /// and lambdas).
     line: u32,
     staticmethod: bool,
     lambda: bool,
@@ -1644,6 +1646,12 @@ struct Ctx<'t> {
     /// Attribute writes through a method's `self`/`cls`: the method, the
     /// attribute and the object written.
     method_self_writes: Vec<(usize, &'t str, Node<'t>)>,
+    /// Methods that bind their `self` (`true`) or `cls` (`false`) other
+    /// than as the first parameter, themselves or in a scope nested in them
+    /// (`self = other`, `for self in ...`, `nonlocal self`...): a read
+    /// through the name there is a `dynamic_feature` gap, and a write an
+    /// outside write (see [`Ctx::note_rebound_receivers`]).
+    rebound_receivers: HashMap<(usize, bool), Feature>,
     /// Calls named `configure`, which may set up the legacy Gemini SDK, and
     /// the scope each is in.
     configure_calls: Vec<(Node<'t>, usize)>,
@@ -1777,6 +1785,7 @@ impl<'t> Ctx<'t> {
             builtin_values: HashMap::new(),
             member_values: HashSet::new(),
             method_self_writes: Vec::new(),
+            rebound_receivers: HashMap::new(),
             configure_calls: Vec::new(),
             legacy_caveat: None,
             sdk_patched: HashMap::new(),
@@ -3060,6 +3069,7 @@ impl<'t> Ctx<'t> {
         );
         scope.class = class;
         scope.symbol = Some(clip_owned(symbol));
+        scope.line = node.start_position().row as u32 + 1;
         scope.name = name.clone();
         if self.scopes[parent].kind == ScopeKind::Class
             && matches!(
@@ -3165,6 +3175,7 @@ impl<'t> Ctx<'t> {
         // enclosing function.
         scope.symbol = self.scopes[parent].symbol.clone();
         scope.name = "<lambda>".to_string();
+        scope.line = node.start_position().row as u32 + 1;
         scope.lambda = true;
         scope.body_start = node
             .child_by_field_name("body")
@@ -3194,7 +3205,12 @@ impl<'t> Ctx<'t> {
         let Some(parent) = self.scopes[id].parent else {
             return;
         };
-        let method = self.scopes[parent].kind == ScopeKind::Class && !self.scopes[id].staticmethod;
+        // A lambda in a class body is a method only when the body assigns it
+        // to a name (`go = lambda self: ...`), not when it is passed
+        // (`map(lambda self: ..., items)`).
+        let method = self.scopes[parent].kind == ScopeKind::Class
+            && !self.scopes[id].staticmethod
+            && (!self.scopes[id].lambda || self.scopes[id].bound_name.is_some());
         let first = self.scopes[id].slots.first().map(|s| s.name.clone());
         for name in ["self", "cls"] {
             let bound = self.params.contains_key(&(id, name.to_string()));
@@ -3258,20 +3274,92 @@ impl<'t> Ctx<'t> {
         ))
     }
 
+    /// Lead decision D3: a method that binds its `self` or `cls` in any way
+    /// other than as its first parameter, in its body or in a scope nested
+    /// in it (an assignment, `+=`, a `for`, `with`, `except` or walrus
+    /// target, a `match` capture, `del`, an import, a `def` or `class`, a
+    /// closure's `nonlocal` or `global`), reads nothing through that name:
+    /// every such read is a `dynamic_feature` gap. One pass over the
+    /// scopes, after `nonlocal` assignments are placed.
+    fn note_rebound_receivers(&mut self) {
+        let mut found: Vec<(usize, bool)> = Vec::new();
+        for s in 0..self.scopes.len() {
+            for (name, is_self) in [("self", true), ("cls", false)] {
+                let Some((_, method)) = self.receiver(name, s) else {
+                    continue;
+                };
+                let key = (s, name.to_string());
+                if self.assigns.contains_key(&key)
+                    || self.imports.contains_key(&key)
+                    || self.other_imports.contains_key(&key)
+                    || self.functions.contains_key(&key)
+                    || self.scopes[s].globals.contains(name)
+                {
+                    found.push((method, is_self));
+                }
+            }
+        }
+        for ((home, name), _, _) in &self.def_bindings {
+            let is_self = name == "self";
+            if is_self || name == "cls" {
+                if let Some((_, method)) = self.receiver(name, *home) {
+                    found.push((method, is_self));
+                }
+            }
+        }
+        for (method, is_self) in found {
+            let line = self.scopes[method].line;
+            self.rebound_receivers
+                .entry((method, is_self))
+                .or_insert(Feature {
+                    what: "`self` or `cls` rebound in the method",
+                    line,
+                });
+        }
+    }
+
+    /// The feature that makes a read through `object` unknown when it is
+    /// `self` / `cls` of a method that rebinds the name (D3).
+    fn rebound_receiver(&self, object: Node<'t>, scope: usize) -> Option<Feature> {
+        if object.kind() != "identifier" || self.rebound_receivers.is_empty() {
+            return None;
+        }
+        let name = self.text(object);
+        let is_self = match name {
+            "self" => true,
+            "cls" => false,
+            _ => return None,
+        };
+        let (_, method) = self.receiver(name, scope)?;
+        self.rebound_receivers.get(&(method, is_self)).copied()
+    }
+
     /// A write through `self` in a method another class may borrow sets
-    /// that class's instances too: an outside write of the attribute.
+    /// that class's instances too, and one through a rebound `self` (D3)
+    /// sets whatever the name holds then: an outside write of the
+    /// attribute. So is a write with a run-time name through a rebound
+    /// `self`.
     fn settle_borrowed_methods(&mut self) {
-        if self.member_values.is_empty() {
+        if self.member_values.is_empty() && self.rebound_receivers.is_empty() {
             return;
         }
         for (method, attr, object) in std::mem::take(&mut self.method_self_writes) {
-            if self.is_borrowed(method) {
-                self.outside_attr_writes.entry(attr).or_insert_with(|| {
-                    Self::feature(
-                        "a write through `self` in a method another class may borrow",
-                        object,
-                    )
-                });
+            let what = if self.is_borrowed(method) {
+                "a write through `self` in a method another class may borrow"
+            } else if self.rebound_receivers.contains_key(&(method, true))
+                || self.rebound_receivers.contains_key(&(method, false))
+            {
+                "a write through `self` or `cls` in a method that rebinds it"
+            } else {
+                continue;
+            };
+            self.outside_attr_writes
+                .entry(attr)
+                .or_insert_with(|| Self::feature(what, object));
+        }
+        for (object, scope) in self.wild_attr_objects.clone() {
+            if let Some(feature) = self.rebound_receiver(object, scope) {
+                self.wild_attr_any.get_or_insert(feature);
             }
         }
     }
@@ -4627,6 +4715,9 @@ impl<'t> Ctx<'t> {
                     return Val::untracked(Origin::Other);
                 };
                 let attr = self.text(attr).to_string();
+                if let Some(feature) = self.rebound_receiver(object, scope) {
+                    return Val::untracked(Origin::Dynamic(feature));
+                }
                 if let Some((class, dynamic)) = self.class_receiver(object, scope) {
                     return self.resolve_attr(class, &attr, dynamic);
                 }
@@ -4705,6 +4796,9 @@ impl<'t> Ctx<'t> {
             // Only a method's own first parameter is its instance (or
             // class), and not when another class may borrow the method.
             let (class, method) = self.receiver(name, scope)?;
+            if self.rebound_receiver(object, scope).is_some() {
+                return None;
+            }
             return (!self.is_borrowed(method)).then_some((class, true));
         }
         // The one class of that name, which nothing else rebinds (`Bot =
@@ -7741,6 +7835,9 @@ impl<'t> Ctx<'t> {
                     // `self.secret`, `ApiKeys.openai`, `cfg.credentials.model`.
                     if is_secret_key(&attr) || self.chain_has_secret_name(object) {
                         return Err(Unresolved::new("credential", rendered));
+                    }
+                    if let Some(feature) = self.rebound_receiver(object, scope) {
+                        return Err(Unresolved::dynamic(feature).via(&rendered));
                     }
                     if let Some((class, through_self)) = self.class_receiver(object, scope) {
                         let lookup = self.attr_lookup(class, &attr, through_self);
