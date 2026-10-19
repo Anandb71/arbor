@@ -4693,3 +4693,145 @@ fn locals_in_a_function_is_not_a_dynamic_feature() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Policy round 2 (re-review of faa403f)
+// ---------------------------------------------------------------------------
+
+/// Every value or gap reason of `key` per call: `(line, values, gaps)`.
+fn keyed_rows(source: &str, key: &str) -> Vec<(u32, Vec<String>, Vec<String>)> {
+    let found = usages(source);
+    found
+        .calls
+        .iter()
+        .map(|c| {
+            let values = c
+                .values
+                .iter()
+                .filter(|v| v.key == key)
+                .map(|v| v.value.clone())
+                .collect();
+            let reasons = found
+                .gaps
+                .iter()
+                .filter(|g| g.span.map(|s| s.start_byte) == Some(c.span.start_byte))
+                .filter(|g| g.key.as_deref().is_none_or(|k| k == key))
+                .map(|g| g.reason.clone())
+                .collect();
+            (c.span.line, values, reasons)
+        })
+        .collect()
+}
+
+#[test]
+fn an_entry_a_later_expansion_or_computed_key_may_replace_is_a_gap() {
+    // Blocker 1: `dict_lookup` honoured `**other` and computed keys after
+    // an entry, but `**PARAMS` at a call, `dict_nested` and the nested
+    // reader did not, so the defaults-then-overrides idiom reported the
+    // default with no gap. Each entry is now a `splat` gap unless nothing
+    // unreadable follows it, and a nested dict keeps its last entry.
+    let header = "from openai import OpenAI\nfrom anthropic import Anthropic\nclient = OpenAI()\nclaude = Anthropic()\n";
+    let splat = |line: u32| (line, vec![], vec!["splat".to_string()]);
+    let rows = keyed_rows(
+        &format!(
+            "{header}\
+def ask(messages, **overrides):
+    params = {{\"model\": \"gpt-4o\", \"temperature\": 0, **overrides}}
+    return client.chat.completions.create(messages=messages, **params)
+def _ask(messages, **overrides):
+    return client.chat.completions.create(messages=messages, **{{\"model\": \"gpt-4o\", **overrides}})
+def ask_claude(prompt, **overrides):
+    request = {{\"model\": \"claude-3-5-sonnet-latest\", \"max_tokens\": 1024, **overrides}}
+    return claude.messages.create(messages=[], **request)
+def ask_dict(messages, **kwargs):
+    params = dict(model=\"gpt-4o\", temperature=0, **kwargs)
+    return client.chat.completions.create(messages=messages, **params)
+client.chat.completions.create(**{{\"model\": \"gpt-4o\", KEY: \"o1-mini\"}}, messages=[])
+client.chat.completions.create(**{{\"model\": \"gpt-4o\", **{{\"model\": \"o1-mini\"}}}}, messages=[])
+PARAMS = {{\"model\": \"gpt-4o\", **{{\"model\": \"o1-mini\"}}}}
+client.chat.completions.create(messages=[], **PARAMS)
+client.chat.completions.create(**{{**BASE, \"model\": \"gpt-4o\"}}, messages=[])
+client.chat.completions.create(**{{\"model\": \"gpt-4o\", \"model\": \"o1-mini\"}}, messages=[])
+client.chat.completions.create(**dict({{\"model\": \"x\"}}, model=\"gpt-4o\"), messages=[])
+"
+        ),
+        "model",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            splat(7),
+            splat(9),
+            splat(12),
+            splat(15),
+            splat(16),
+            splat(17),
+            splat(19),
+            // Nothing unreadable after the entry: still confirmed.
+            (20, vec!["gpt-4o".to_string()], vec![]),
+            (21, vec!["o1-mini".to_string()], vec![]),
+            (22, vec!["gpt-4o".to_string()], vec![]),
+        ]
+    );
+    // Nested values: the last entry of a key, and a gap for one a later
+    // expansion may replace (inside the dict, or around it).
+    let path = "extra_body.fallbacks.model";
+    let rows = keyed_rows(
+        &format!(
+            "{header}\
+client.chat.completions.create(model=\"gpt-4o\", messages=[], extra_body={{\"fallbacks\": [{{\"model\": \"a\", **X}}]}})
+client.chat.completions.create(model=\"gpt-4o\", messages=[], extra_body={{\"fallbacks\": [{{\"model\": \"a\"}}], **EB}})
+client.chat.completions.create(model=\"gpt-4o\", messages=[], extra_body={{\"fallbacks\": [{{\"model\": \"a\"}}], \"fallbacks\": []}})
+client.chat.completions.create(model=\"gpt-4o\", messages=[], extra_body={{\"fallbacks\": [{{\"model\": \"a\"}}, {{\"model\": \"b\", \"model\": \"c\"}}]}})
+EB2 = {{\"fallbacks\": [{{\"model\": \"a\"}}], **EB}}
+client.chat.completions.create(model=\"gpt-4o\", messages=[], **{{\"extra_body\": EB2}})
+OPTS = {{\"extra_body\": {{\"fallbacks\": [{{\"model\": \"a\"}}]}}, **MORE}}
+client.chat.completions.create(model=\"gpt-4o\", messages=[], **OPTS)
+"
+        ),
+        path,
+    );
+    let overridden = |line: u32| (line, vec![], vec!["splat".to_string()]);
+    assert_eq!(
+        rows,
+        vec![
+            overridden(5),
+            overridden(6),
+            (7, vec![], vec![]),
+            (8, vec!["a".to_string(), "c".to_string()], vec![]),
+            // A name in a nested position is not read (no value, no gap).
+            (10, vec![], vec![]),
+            overridden(12),
+        ]
+    );
+    // A client built from an expansion: its `base_url` may be in it.
+    let found = usages(
+        r#"import os
+from openai import OpenAI
+GW = {"base_url": os.environ["GW_URL"]}
+c2 = OpenAI(**{"base_url": "https://api.openai.com/v1", **GW})
+c2.chat.completions.create(model="gpt-4o", messages=[])
+CFG = {"base_url": "https://api.openai.com/v1", **GW}
+c5 = OpenAI(**CFG)
+c5.chat.completions.create(model="gpt-4o", messages=[])
+c6 = OpenAI().with_options(**{"base_url": "https://api.openai.com/v1", **GW})
+c6.chat.completions.create(model="gpt-4o", messages=[])
+def ask(opts):
+    c7 = OpenAI().with_options(**opts)
+    return c7.chat.completions.create(model="gpt-4o", messages=[])
+"#,
+    );
+    let gap = |reason: &str| vec![format!("ambiguous_client/{reason}")];
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (5, Routing::Unknown, gap("base_url_unresolved")),
+            (8, Routing::Unknown, gap("base_url_unresolved")),
+            (9, Routing::OpenaiDirect, vec![]),
+            (10, Routing::Unknown, gap("base_url_unresolved")),
+            (12, Routing::OpenaiDirect, vec![]),
+            // `with_options(**opts)` routed `unknown` with no gap.
+            (13, Routing::Unknown, gap("base_url_unresolved")),
+        ]
+    );
+}

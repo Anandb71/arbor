@@ -908,6 +908,10 @@ struct NestedRead {
     /// Entries were left unread when the budget ran out.
     cut: bool,
     found: Vec<NestedValue>,
+    /// Key paths of model values that a `**` expansion or computed key
+    /// written after them may replace (`{"model": "a", **extra}`): each is
+    /// a gap, not a value.
+    overridden: Vec<String>,
 }
 
 impl NestedRead {
@@ -916,13 +920,26 @@ impl NestedRead {
             left: MAX_NESTED_ENTRIES,
             cut: false,
             found: Vec::new(),
+            overridden: Vec::new(),
         }
     }
+}
+
+/// Where a nested read is: the key path so far, whether the outer argument
+/// is positional, the scope its values resolve in, and whether an enclosing
+/// entry may be replaced by a later `**` expansion or computed key.
+#[derive(Clone, Copy)]
+struct NestedPlace<'p> {
+    prefix: &'p str,
+    positional: bool,
+    scope: usize,
+    overridden: bool,
 }
 
 /// What a dict literal's `**` expansion nests, read once.
 struct NestedList {
     found: Vec<NestedValue>,
+    overridden: Vec<String>,
     cut: bool,
 }
 
@@ -1282,10 +1299,20 @@ struct DictSummary<'t> {
     /// key): it may override any key before it.
     last_unknown: Option<usize>,
     /// Identifier-keyed entries a `**` expansion reads (allowlisted keys,
-    /// base URLs, containers), the last one per key, at most 256.
-    expansion: Vec<(String, Node<'t>)>,
+    /// base URLs, containers): the last one per key with its index, at most
+    /// 256.
+    expansion: Vec<(String, usize, Node<'t>)>,
     /// Part of the dict could not be read, or the expansion list was cut.
     opaque: bool,
+}
+
+impl DictSummary<'_> {
+    /// Whether an entry that cannot be read (`**other`, a computed key)
+    /// comes after entry `index`, so it may replace that entry's value:
+    /// the entry is then not the dict's value for its key (rules 1 and 5).
+    fn overridable(&self, index: usize) -> bool {
+        self.last_unknown.is_some_and(|unknown| unknown > index)
+    }
 }
 
 /// A dict expanded with `**`.
@@ -5104,10 +5131,17 @@ impl<'t> Ctx<'t> {
                         .summary
                         .expansion
                         .iter()
-                        .find(|(k, _)| is_base_url_key(k))
-                        .map(|(_, v)| *v);
-                    if let Some(expr) = given {
-                        base_url = self.base_url_kind(client.pkg, expr, expansion.scope);
+                        .find(|(k, _, _)| is_base_url_key(k))
+                        .map(|(_, index, v)| (*index, *v));
+                    match given {
+                        // A later `**other` may replace it.
+                        Some((index, _)) if expansion.summary.overridable(index) => {
+                            base_url = BaseUrl::Unknown { env: false };
+                        }
+                        Some((_, expr)) => {
+                            base_url = self.base_url_kind(client.pkg, expr, expansion.scope);
+                        }
+                        None => {}
                     }
                     opaque |= expansion.opaque();
                 }
@@ -5136,7 +5170,14 @@ impl<'t> Ctx<'t> {
                     fallback: true,
                 });
             }
-            BaseUrl::Absent if opaque => client.routing = Routing::Unknown,
+            // `with_options(**opts)`: the expansion may hold a `base_url`.
+            BaseUrl::Absent if opaque => {
+                client.routing = Routing::Unknown;
+                client.caveat.get_or_insert(ClientCaveat::BaseUrl {
+                    env: false,
+                    fallback: false,
+                });
+            }
             BaseUrl::Absent | BaseUrl::Provider => {}
         }
         client
@@ -5231,6 +5272,13 @@ impl<'t> Ctx<'t> {
                     caveat.get_or_insert(ClientCaveat::BaseUrl {
                         env: false,
                         fallback: true,
+                    });
+                }
+                // `OpenAI(**options)`: the expansion may hold a `base_url`.
+                BaseUrl::Absent if args.splat => {
+                    caveat.get_or_insert(ClientCaveat::BaseUrl {
+                        env: false,
+                        fallback: false,
                     });
                 }
                 _ => {}
@@ -5754,9 +5802,16 @@ impl<'t> Ctx<'t> {
                 .as_ref()
                 .map(|k| format!("{k}."))
                 .unwrap_or_default();
-            self.nested_values_in(*expr, &prefix, keyword.is_none(), scope, 0, &mut read);
+            let place = NestedPlace {
+                prefix: &prefix,
+                positional: keyword.is_none(),
+                scope,
+                overridden: false,
+            };
+            self.nested_values_in(*expr, place, 0, &mut read);
         }
         let mut nested = read.found;
+        let mut nested_overridden = read.overridden;
         let mut nested_cut = read.cut;
 
         // `**PARAMS` where `PARAMS` is a same-file dict literal.
@@ -5773,13 +5828,13 @@ impl<'t> Ctx<'t> {
                 continue;
             }
             expanded.push(expansion.node.id());
-            for (key, value) in expansion.summary.expansion.iter() {
+            for (key, index, value) in expansion.summary.expansion.iter() {
                 if !is_value_key(key) {
                     continue;
                 }
                 keyed = true;
                 let label = expansion.name.as_ref().map(|n| format!("{n}[\"{key}\"]"));
-                let result = self
+                let mut result = self
                     .resolve_value(*value, expansion.scope, 0)
                     .map(|mut r| {
                         if r.origin == ValueOrigin::Literal {
@@ -5792,13 +5847,61 @@ impl<'t> Ctx<'t> {
                         Some(label) => u.via(label),
                         None => u,
                     });
+                // `{"model": "gpt-4o", **overrides}`: the `**overrides` (or a
+                // computed key) written after the entry may replace it, so
+                // the entry is a candidate, not the value.
+                if expansion.summary.overridable(*index) {
+                    let shape = expansion
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| "{...}".to_string());
+                    let candidates: Vec<Resolved> = result.ok().into_iter().collect();
+                    result =
+                        Err(Unresolved::new("splat", shape).with_candidates(candidates, false));
+                }
                 self.take_value(&site, key, false, result, &mut values);
             }
             let list = self.dict_nested(&expansion);
             nested.extend(list.found.iter().cloned());
+            nested_overridden.extend(list.overridden.iter().cloned());
             nested_cut |= list.cut;
         }
         self.take_nested(&site, nested, nested_cut, &mut values);
+        if site.gap_worthy && !nested_overridden.is_empty() {
+            // One gap per key path, at most [`MAX_NESTED_VALUES`]; past
+            // that, one `truncated` gap stands for the rest.
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut cut = false;
+            for path in nested_overridden {
+                if seen.contains(&path) {
+                    continue;
+                }
+                if seen.len() >= MAX_NESTED_VALUES {
+                    cut = true;
+                    break;
+                }
+                let unresolved = Unresolved::new("splat", "{...}".to_string());
+                self.unresolved_gap(&site, &path, &unresolved, None);
+                seen.insert(path);
+            }
+            if cut {
+                self.out.gaps.push(UsageGap {
+                    kind: GapKind::UnresolvedModel,
+                    sdk: Some(site.sdk),
+                    file: self.file.clone(),
+                    span: Some(span),
+                    symbol: symbol.clone(),
+                    chain: Some(chain.clone()),
+                    key: None,
+                    reason: "truncated".to_string(),
+                    detail: format!(
+                        "`{chain}` passes more nested model values that a `**` expansion may replace than are listed ({MAX_NESTED_VALUES} listed); the rest are not reported"
+                    ),
+                    values: Vec::new(),
+                    values_complete: false,
+                });
+            }
+        }
 
         let model_key = if member == "GenerativeModel" {
             "model_name"
@@ -6074,6 +6177,9 @@ impl<'t> Ctx<'t> {
         let phrase = unresolved.phrase();
         let shape = &unresolved.shape;
         let mut detail = match unresolved.via.as_deref() {
+            _ if unresolved.reason == "splat" && shape != "**kwargs" => format!(
+                "`{key}` for `{chain}` is set in a dict (`{shape}`) where a `**` expansion or a computed key written after it may replace it"
+            ),
             _ if unresolved.reason == "splat" => {
                 format!("`{key}` for `{chain}` is not passed by name and may come from `**kwargs`")
             }
@@ -6403,14 +6509,21 @@ impl<'t> Ctx<'t> {
             return Rc::clone(list);
         }
         let mut read = NestedRead::new();
-        for (key, value) in expansion.summary.expansion.iter() {
+        for (key, index, value) in expansion.summary.expansion.iter() {
             if !is_value_key(key) && is_container(*value) {
                 let prefix = format!("{key}.");
-                self.nested_values_in(*value, &prefix, false, expansion.scope, 0, &mut read);
+                let place = NestedPlace {
+                    prefix: &prefix,
+                    positional: false,
+                    scope: expansion.scope,
+                    overridden: expansion.summary.overridable(*index),
+                };
+                self.nested_values_in(*value, place, 0, &mut read);
             }
         }
         let list = Rc::new(NestedList {
             found: read.found,
+            overridden: read.overridden,
             cut: read.cut,
         });
         self.dict_nested
@@ -6422,14 +6535,15 @@ impl<'t> Ctx<'t> {
     /// (`fallbacks=[{"model": "claude-opus-4-8"}]`). Only identifier-shaped
     /// keys are followed and only keys [`is_value_key`] accepts are read; an
     /// unresolvable nested value is skipped, not reported, because the
-    /// argument may not configure the request at all. `read` bounds the
-    /// entries read (see [`MAX_NESTED_ENTRIES`]).
+    /// argument may not configure the request at all. A dict keeps the last
+    /// entry of each key, as Python does, and an entry that a later `**`
+    /// expansion or computed key may replace (or one inside such an entry,
+    /// `place.overridden`) is listed in `read.overridden` instead of read.
+    /// `read` bounds the entries read (see [`MAX_NESTED_ENTRIES`]).
     fn nested_values_in(
         &mut self,
         node: Node<'t>,
-        prefix: &str,
-        positional: bool,
-        scope: usize,
+        place: NestedPlace<'_>,
         depth: u32,
         read: &mut NestedRead,
     ) {
@@ -6439,7 +6553,17 @@ impl<'t> Ctx<'t> {
         let mut cursor = node.walk();
         match node.kind() {
             "dictionary" => {
+                // Read once per literal (memoized), like any dict lookup.
+                let summary = self.dict_summary(node);
+                // Indexes as `dict_entries` counts them: every named child
+                // but comments.
+                let mut index = 0;
                 for pair in node.named_children(&mut cursor) {
+                    if pair.kind() == "comment" {
+                        continue;
+                    }
+                    let at = index;
+                    index += 1;
                     if read.left == 0 {
                         read.cut = true;
                         return;
@@ -6462,18 +6586,31 @@ impl<'t> Ctx<'t> {
                     if !is_identifier_key(&key) {
                         continue;
                     }
-                    let path = format!("{prefix}{key}");
+                    // `{"model": "a", "model": "b"}` sends `b`: an earlier
+                    // entry of a key is discarded.
+                    if summary.last.get(&key).is_some_and(|(last, _)| *last != at) {
+                        continue;
+                    }
+                    let overridden = place.overridden || summary.overridable(at);
+                    let path = format!("{}{key}", place.prefix);
                     if is_value_key(&key) {
-                        if let Ok(resolved) = self.resolve_value(value, scope, 0) {
+                        if overridden {
+                            read.overridden.push(path);
+                        } else if let Ok(resolved) = self.resolve_value(value, place.scope, 0) {
                             read.found.push(NestedValue {
                                 path,
-                                positional,
+                                positional: place.positional,
                                 resolved,
                             });
                         }
                     } else if is_container(value) {
                         let nested = format!("{path}.");
-                        self.nested_values_in(value, &nested, positional, scope, depth + 1, read);
+                        let inner = NestedPlace {
+                            prefix: &nested,
+                            overridden,
+                            ..place
+                        };
+                        self.nested_values_in(value, inner, depth + 1, read);
                     }
                 }
             }
@@ -6484,7 +6621,7 @@ impl<'t> Ctx<'t> {
                         return;
                     }
                     read.left -= 1;
-                    self.nested_values_in(item, prefix, positional, scope, depth + 1, read);
+                    self.nested_values_in(item, place, depth + 1, read);
                 }
             }
             _ => {}
@@ -7550,9 +7687,7 @@ impl<'t> Ctx<'t> {
     fn dict_lookup(&mut self, dict: Node<'t>, key: &str) -> Lookup<'t> {
         let summary = self.dict_summary(dict);
         match summary.last.get(key) {
-            Some((index, value)) if summary.last_unknown.is_none_or(|u| u < *index) => {
-                Lookup::Found(*value)
-            }
+            Some((index, value)) if !summary.overridable(*index) => Lookup::Found(*value),
             Some(_) => Lookup::Unknown,
             None if summary.last_unknown.is_some() => Lookup::Unknown,
             None => Lookup::Absent,
@@ -7581,10 +7716,11 @@ impl<'t> Ctx<'t> {
             let relevant = is_identifier_key(&key)
                 && (is_value_key(&key) || is_base_url_key(&key) || is_container(value));
             if relevant {
-                if let Some(slot) = summary.expansion.iter_mut().find(|(k, _)| *k == key) {
-                    slot.1 = value;
+                if let Some(slot) = summary.expansion.iter_mut().find(|(k, _, _)| *k == key) {
+                    slot.1 = index;
+                    slot.2 = value;
                 } else if summary.expansion.len() < 256 {
-                    summary.expansion.push((key.clone(), value));
+                    summary.expansion.push((key.clone(), index, value));
                 } else {
                     summary.opaque = true;
                 }
