@@ -771,12 +771,11 @@ fn call_routing(
     at_call: &[&UsageGap],
 ) -> CallRouting {
     let base_url = base_url_of(call, at_call, clients);
+    let vertex = vertex_client(call, clients);
     let (class, table) = match call.routing {
         Routing::OpenaiDirect => (RoutingClass::Direct, Some(Table::Openai)),
         Routing::AnthropicDirect => (RoutingClass::Direct, Some(Table::Anthropic)),
-        Routing::GoogleGenai if vertex_client(call, clients) => {
-            (RoutingClass::Direct, Some(Table::Vertex))
-        }
+        Routing::GoogleGenai if vertex => (RoutingClass::Direct, Some(Table::Vertex)),
         Routing::GoogleGenai | Routing::GoogleGenerativeaiLegacy => {
             (RoutingClass::Direct, Some(Table::GeminiApi))
         }
@@ -784,6 +783,12 @@ fn call_routing(
         | Routing::CustomBaseUrl
         | Routing::AnthropicBedrock
         | Routing::AnthropicVertex => (RoutingClass::Routed, None),
+        // The usage scan leaves a client built with `vertexai=` unrouted (an
+        // `endpoint_option` gap); Vertex AI's schedule is still the one its
+        // constructor names.
+        Routing::Unknown if call.sdk == Sdk::Google && vertex => {
+            (RoutingClass::Unknown, Some(Table::Vertex))
+        }
         Routing::Unknown => (RoutingClass::Unknown, None),
     };
     let gap = at_call.iter().find(|g| gaps::holds_routing(g));
@@ -982,7 +987,16 @@ fn resolve<'d>(
     let table = model_family(value)
         .map(sdk_table)
         .or(routing.sdk.map(sdk_table))?;
-    let hit = lookup(data, table, value)?;
+    let hit = match lookup(data, table, value) {
+        Some(hit) => hit,
+        // A Google client whose endpoint is not known may be on Vertex AI,
+        // which keeps its own schedule (`text-bison` is listed only there).
+        None if table == Table::GeminiApi && routing.sdk == Some(Sdk::Google) => {
+            lookup(data, Table::Vertex, value)?
+        }
+        None => return None,
+    };
+    let table = hit.table;
     // An SDK sending another provider's model is talking to a proxy.
     let crosses = routing.sdk.is_some_and(|sdk| sdk_table(sdk) != table)
         && !(routing.sdk == Some(Sdk::Google) && table == Table::Vertex);
@@ -3046,6 +3060,64 @@ mod tests {
         let report = check(input, bundled().unwrap(), &options("2026-10-20"));
         assert_eq!(report.findings[0].status, State::Unconfirmed);
         assert_eq!(report.exit_code, 0);
+    }
+
+    #[test]
+    fn an_unrouted_google_client_still_finds_vertex_models() {
+        // The usage scan routes a `vertexai=` client as unknown, with an
+        // `endpoint_option` gap at each call: the Vertex schedule still
+        // applies, and the routing reads as not confirmed.
+        let mut gemini = call(
+            Sdk::Google,
+            Routing::Unknown,
+            "client.models.generate_content",
+            "gemini-2.5-flash",
+            &["contents"],
+            70,
+        );
+        let vertex = ClientConstruction {
+            sdk: Sdk::Google,
+            package: "google.genai".into(),
+            constructor: "google.genai.Client".into(),
+            chain: "genai.Client".into(),
+            binding: Some("client".into()),
+            scope: crate::usages::ClientScope::Module,
+            routing: Routing::Unknown,
+            is_async: false,
+            kwargs: vec!["vertexai".into(), "project".into()],
+            splat: false,
+            file: "app.py".into(),
+            span: span(1),
+            symbol: None,
+        };
+        let mut option = gap_at(GapKind::AmbiguousClient, "endpoint_option", 70, None);
+        option.sdk = Some(Sdk::Google);
+        let report = check(
+            ScanInput {
+                calls: std::slice::from_ref(&gemini),
+                gaps: std::slice::from_ref(&option),
+                clients: std::slice::from_ref(&vertex),
+            },
+            bundled().unwrap(),
+            &options("2026-10-18"),
+        );
+        let finding = &report.findings[0];
+        assert_eq!(finding.provider, Table::Vertex);
+        assert_eq!(finding.routing_class, RoutingClass::Unknown);
+        assert_eq!(finding.routing_gap.as_deref(), Some("endpoint_option"));
+        assert!(!finding.fails);
+
+        // With no `vertexai=` in sight, a model only Vertex lists is still
+        // found there.
+        gemini.values[0] = value("text-bison", ValueOrigin::Literal, 70);
+        let report = run(
+            std::slice::from_ref(&gemini),
+            std::slice::from_ref(&option),
+            &options("2026-10-18"),
+        );
+        let finding = &report.findings[0];
+        assert_eq!(finding.provider, Table::Vertex);
+        assert_eq!(finding.routing_class, RoutingClass::Unknown);
     }
 
     #[test]
