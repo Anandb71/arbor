@@ -5984,3 +5984,157 @@ fn every_class_body_binding_is_a_write_of_the_attribute() {
         ]
     );
 }
+
+#[test]
+fn environb_module_aliases_and_configure_under_any_name_are_seen() {
+    // Should-fix 6: `os.environb`, which shares its data with `os.environ`
+    // on POSIX, and `setattr(os, "environ", {...})` left a direct client
+    // with no gap.
+    let client =
+        "client = OpenAI()\nclient.chat.completions.create(model=\"gpt-4o\", messages=[])\n";
+    for setup in [
+        "import os\nos.environb[b\"OPENAI_BASE_URL\"] = b\"https://proxy.internal/v1\"\n",
+        "import os\nos.environb.update({b\"OPENAI_BASE_URL\": b\"https://proxy.internal/v1\"})\n",
+        "import os\nsetattr(os, \"environ\", {\"OPENAI_BASE_URL\": \"https://proxy.internal/v1\"})\n",
+        "from os import environb\nenvironb[b\"OPENAI_BASE_URL\"] = b\"https://proxy.internal/v1\"\n",
+        "import os\nE = os.environb\nE[b\"OPENAI_BASE_URL\"] = b\"https://proxy.internal/v1\"\n",
+    ] {
+        let source = format!("from openai import OpenAI\n{setup}{client}");
+        let rows = routes_and_gaps(&usages(&source));
+        assert_eq!(rows.len(), 1, "{source}");
+        assert_eq!(rows[0].1, Routing::Unknown, "{source}");
+        assert!(!rows[0].2.is_empty(), "{source}");
+    }
+    // Should-fix 7: `builtins` and `sys` under another name, and the
+    // exotic nits: `__import__("builtins")`, `import_module("builtins")`
+    // and a frame's `f_globals`.
+    let read = "client.chat.completions.create(model=MODEL, messages=[])\n";
+    for setup in [
+        "import builtins as B\nB.exec(\"MODEL = 'o1-mini'\")\n",
+        "import sys as S\nsetattr(S.modules[__name__], \"MODEL\", \"o1-mini\")\n",
+        "__import__(\"builtins\").exec(\"MODEL = 'o1-mini'\")\n",
+        "import importlib\nimportlib.import_module(\"builtins\").exec(\"MODEL = 'o1-mini'\")\n",
+        "import inspect\ninspect.currentframe().f_globals[\"MODEL\"] = \"o1-mini\"\n",
+        "import sys\ndef poke():\n    sys._getframe(1).f_globals[\"MODEL\"] = \"o1-mini\"\npoke()\n",
+        "import sys\ns = sys\nsetattr(s.modules[__name__], \"MODEL\", \"o1-mini\")\n",
+    ] {
+        let source = format!("from openai import OpenAI\nMODEL = \"gpt-4o\"\n{setup}{client}{read}");
+        let rows = keyed_rows(&source, "model");
+        assert!(
+            rows[1].2.contains(&"dynamic_feature".to_string()),
+            "{source}"
+        );
+    }
+    // `sys` read through its attributes stays inside the grammar.
+    let source = format!(
+        "import sys\nfrom openai import OpenAI\nMODEL = \"gpt-4o\"\nprint(\"go\", file=sys.stderr)\n{client}{read}"
+    );
+    assert_eq!(
+        keyed_rows(&source, "model")[1],
+        (7, vec!["gpt-4o".to_string()], vec![])
+    );
+    // Should-fix 8: the legacy `configure` under another name.
+    let call =
+        "model = genai.GenerativeModel(\"gemini-1.5-pro\")\nmodel.generate_content(\"hi\")\n";
+    for setup in [
+        "from google.generativeai import configure as setup\nsetup(client_options={\"api_endpoint\": \"proxy.internal\"})\n",
+        "cfg = genai.configure\ncfg(client_options={\"api_endpoint\": \"proxy.internal\"})\n",
+        "OPTS = {\"client_options\": {\"api_endpoint\": \"proxy.internal\"}}\nsetup = genai.configure\nsetup(**OPTS)\n",
+    ] {
+        let source = format!("import google.generativeai as genai\n{setup}{call}");
+        let found = usages(&source);
+        let last = found.calls.last().unwrap();
+        assert_eq!(last.routing, Routing::Unknown, "{source}");
+        assert!(
+            found.gaps.iter().any(|g| g.reason == "endpoint_option"
+                && g.span.map(|s| s.start_byte) == Some(last.span.start_byte)),
+            "{source}"
+        );
+    }
+    let source = format!(
+        "import os\nimport google.generativeai as genai\ngenai.configure(api_key=os.environ[\"GEMINI_API_KEY\"])\n{call}"
+    );
+    let found = usages(&source);
+    assert_eq!(
+        found.calls.last().unwrap().routing,
+        Routing::GoogleGenerativeaiLegacy
+    );
+    assert!(found.gaps.is_empty());
+}
+
+#[test]
+fn environb_module_aliases_and_configure_under_any_name_are_seen() {
+    // Should-fix 6: `os.environb`, which shares its data with `os.environ`
+    // on POSIX, and `setattr(os, "environ", {...})` left a direct client
+    // with no gap.
+    let client =
+        "client = OpenAI()\nclient.chat.completions.create(model=\"gpt-4o\", messages=[])\n";
+    for setup in [
+        "import os\nos.environb[b\"OPENAI_BASE_URL\"] = b\"https://proxy.internal/v1\"\n",
+        "import os\nos.environb.update({b\"OPENAI_BASE_URL\": b\"https://proxy.internal/v1\"})\n",
+        "import os\nsetattr(os, \"environ\", {\"OPENAI_BASE_URL\": \"https://proxy.internal/v1\"})\n",
+        "from os import environb\nenvironb[b\"OPENAI_BASE_URL\"] = b\"https://proxy.internal/v1\"\n",
+        "import os\nE = os.environb\nE[b\"OPENAI_BASE_URL\"] = b\"https://proxy.internal/v1\"\n",
+    ] {
+        let source = format!("from openai import OpenAI\n{setup}{client}");
+        let rows = routes_and_gaps(&usages(&source));
+        assert_eq!(rows.len(), 1, "{source}");
+        assert_eq!(rows[0].1, Routing::Unknown, "{source}");
+        assert!(!rows[0].2.is_empty(), "{source}");
+    }
+    // Should-fix 7: `builtins` and `sys` under another name, and the
+    // exotic nits: `__import__("builtins")`, `import_module("builtins")`
+    // and a frame's `f_globals`.
+    let read = "client.chat.completions.create(model=MODEL, messages=[])\n";
+    for setup in [
+        "import builtins as B\nB.exec(\"MODEL = 'o1-mini'\")\n",
+        "import sys as S\nsetattr(S.modules[__name__], \"MODEL\", \"o1-mini\")\n",
+        "__import__(\"builtins\").exec(\"MODEL = 'o1-mini'\")\n",
+        "import importlib\nimportlib.import_module(\"builtins\").exec(\"MODEL = 'o1-mini'\")\n",
+        "import inspect\ninspect.currentframe().f_globals[\"MODEL\"] = \"o1-mini\"\n",
+        "import sys\ndef poke():\n    sys._getframe(1).f_globals[\"MODEL\"] = \"o1-mini\"\npoke()\n",
+        "import sys\ns = sys\nsetattr(s.modules[__name__], \"MODEL\", \"o1-mini\")\n",
+    ] {
+        let source = format!("from openai import OpenAI\nMODEL = \"gpt-4o\"\n{setup}{client}{read}");
+        let rows = keyed_rows(&source, "model");
+        assert!(rows[1].2.contains(&"dynamic_feature".to_string()), "{source}");
+    }
+    // `sys` read through its attributes stays inside the grammar.
+    let source = format!(
+        "import sys\nfrom openai import OpenAI\nMODEL = \"gpt-4o\"\nprint(\"go\", file=sys.stderr)\n{client}{read}"
+    );
+    assert_eq!(
+        keyed_rows(&source, "model")[1],
+        (7, vec!["gpt-4o".to_string()], vec![])
+    );
+    // Should-fix 8: the legacy `configure` under another name.
+    let call =
+        "model = genai.GenerativeModel(\"gemini-1.5-pro\")\nmodel.generate_content(\"hi\")\n";
+    for setup in [
+        "from google.generativeai import configure as setup\nsetup(client_options={\"api_endpoint\": \"proxy.internal\"})\n",
+        "cfg = genai.configure\ncfg(client_options={\"api_endpoint\": \"proxy.internal\"})\n",
+        "OPTS = {\"client_options\": {\"api_endpoint\": \"proxy.internal\"}}\nsetup = genai.configure\nsetup(**OPTS)\n",
+    ] {
+        let source = format!("import google.generativeai as genai\n{setup}{call}");
+        let found = usages(&source);
+        let last = found.calls.last().unwrap();
+        assert_eq!(last.routing, Routing::Unknown, "{source}");
+        assert!(
+            found
+                .gaps
+                .iter()
+                .any(|g| g.reason == "endpoint_option"
+                    && g.span.map(|s| s.start_byte) == Some(last.span.start_byte)),
+            "{source}"
+        );
+    }
+    let source = format!(
+        "import os\nimport google.generativeai as genai\ngenai.configure(api_key=os.environ[\"GEMINI_API_KEY\"])\n{call}"
+    );
+    let found = usages(&source);
+    assert_eq!(
+        found.calls.last().unwrap().routing,
+        Routing::GoogleGenerativeaiLegacy
+    );
+    assert!(found.gaps.is_empty());
+}

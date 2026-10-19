@@ -1652,11 +1652,13 @@ struct Ctx<'t> {
     /// through the name there is a `dynamic_feature` gap, and a write an
     /// outside write (see [`Ctx::note_rebound_receivers`]).
     rebound_receivers: HashMap<(usize, bool), Feature>,
-    /// Calls named `configure`, which may set up the legacy Gemini SDK, and
-    /// the scope each is in.
+    /// Calls named `configure` or passing `client_options=` or `**`, which
+    /// may set up the legacy Gemini SDK, and the scope each is in.
     configure_calls: Vec<(Node<'t>, usize)>,
     /// Why the legacy Gemini SDK's module-level routing may not hold.
     legacy_caveat: Option<ClientCaveat>,
+    /// The file imports the legacy Gemini SDK (`google.generativeai`).
+    legacy_imported: bool,
     /// An SDK member replaced in this file (`client.chat.completions.create
     /// = patched`, `openai.OpenAI = Sub`), by package: every route of that
     /// package is then a `dynamic_feature` gap.
@@ -1788,6 +1790,7 @@ impl<'t> Ctx<'t> {
             rebound_receivers: HashMap::new(),
             configure_calls: Vec::new(),
             legacy_caveat: None,
+            legacy_imported: false,
             sdk_patched: HashMap::new(),
             def_bindings: Vec::new(),
             openai_last_config: None,
@@ -2074,14 +2077,17 @@ impl<'t> Ctx<'t> {
                                 self.note_exports(args);
                             }
                         }
-                        if callee
+                        // `configure(client_options=...)` under any name
+                        // (`setup = genai.configure`): every call that may
+                        // pass `client_options` has its callee evaluated.
+                        let named_configure = callee
                             .and_then(|f| match f.kind() {
                                 "identifier" => Some(f),
                                 "attribute" => f.child_by_field_name("attribute"),
                                 _ => None,
                             })
-                            .is_some_and(|n| self.text(n) == "configure")
-                        {
+                            .is_some_and(|n| self.text(n) == "configure");
+                        if named_configure || self.may_pass_client_options(node) {
                             self.configure_calls.push((node, scope));
                         }
                         self.note_dynamic_call(node, scope);
@@ -2128,7 +2134,7 @@ impl<'t> Ctx<'t> {
                         self.note_dict_name(node, &frame, scope);
                         self.note_class_use(node, &frame);
                         self.note_builtin_value(node, &frame);
-                        if self.text(node) == "environ" {
+                        if is_environ_name(self.text(node)) {
                             self.note_environ_use(node, &frame, true);
                         }
                     }
@@ -2285,7 +2291,9 @@ impl<'t> Ctx<'t> {
             return;
         };
         let reads = match (node.kind(), self.text(object), member.map(|m| self.text(m))) {
-            ("attribute", "os", Some(member)) => matches!(member, "environ" | "getenv"),
+            ("attribute", "os", Some(member)) => {
+                matches!(member, "environ" | "environb" | "getenv" | "getenvb")
+            }
             ("attribute", "environ", Some(member)) => matches!(member, "get" | "setdefault"),
             ("call", name, _) => name == "getenv",
             ("subscript", name, _) => name == "environ",
@@ -2307,10 +2315,10 @@ impl<'t> Ctx<'t> {
         // for `import os as _os`, `import_module("os").environ`): matched by
         // the attribute name, so an alias of `os` cannot hide a write.
         let environ = |n: Node<'t>| match n.kind() {
-            "identifier" => self.text(n) == "environ",
+            "identifier" => is_environ_name(self.text(n)),
             "attribute" => n
                 .child_by_field_name("attribute")
-                .is_some_and(|a| self.text(a) == "environ"),
+                .is_some_and(|a| is_environ_name(self.text(a))),
             _ => false,
         };
         let mut names: Vec<String> = Vec::new();
@@ -2424,14 +2432,19 @@ impl<'t> Ctx<'t> {
         let Some(function) = call.child_by_field_name("function") else {
             return;
         };
-        // `__import__(__name__)`, `importlib.import_module(__name__)`.
+        // `__import__(__name__)`, `importlib.import_module(__name__)`, and
+        // the same for `builtins` and `sys`, whose namespace features are
+        // then reached under a name this file does not spell.
         let imports_itself = |cx: &Self| {
             call_arguments(call, |n| cx.text(n))
                 .0
                 .first()
                 .is_some_and(|arg| match arg.kind() {
                     "identifier" => cx.text(*arg) == "__name__",
-                    _ => cx.plain_literal(*arg) == Some("__main__"),
+                    _ => matches!(
+                        cx.plain_literal(*arg),
+                        Some("__main__" | "builtins" | "sys")
+                    ),
                 })
         };
         match function.kind() {
@@ -2491,6 +2504,18 @@ impl<'t> Ctx<'t> {
     /// binding is known ([`Ctx::settle_builtin_values`]).
     fn note_builtin_value(&mut self, node: Node<'t>, frame: &Frame<'t>) {
         let name = self.text(node);
+        if matches!(name, "builtins" | "sys") {
+            // The module itself handed on (`s = sys`, `f(builtins)`): its
+            // namespace features are then reached under another name.
+            let used = frame.parent.is_some_and(|parent| {
+                !(parent.kind() == "attribute" && frame.field == Some("object"))
+                    && !is_declaration(parent.kind(), frame.field)
+            });
+            if used && !frame.annotation {
+                self.note_file_dynamic("`builtins` or `sys` used as a value", node);
+            }
+            return;
+        }
         if !is_namespace_builtin(name) && name != "__builtins__" {
             return;
         }
@@ -2546,7 +2571,7 @@ impl<'t> Ctx<'t> {
                 "a builtin that reads or rebinds names (`exec`, `eval`, `globals`...) imported by name",
                 node,
             ),
-            ("os", "environ" | "putenv") if local != name => {
+            ("os", "environ" | "environb" | "putenv") if local != name => {
                 self.env_wild.get_or_insert(Self::feature(
                     "`os.environ` or `os.putenv` imported under another name",
                     node,
@@ -2588,8 +2613,14 @@ impl<'t> Ctx<'t> {
                 self.dynamic_constructors
                     .get_or_insert(Self::feature("`__class__`", node));
             }
-            // `os.environ`, or through an alias of `os`.
-            "environ" => self.note_environ_use(node, frame, false),
+            // `os.environ` (or `os.environb`, which shares its data on
+            // POSIX), or through an alias of `os`.
+            "environ" | "environb" => self.note_environ_use(node, frame, false),
+            // A frame's namespaces (`inspect.currentframe().f_globals`,
+            // `sys._getframe(1).f_locals`) rebind names at run time.
+            "f_globals" | "f_locals" | "f_builtins" => {
+                self.note_file_dynamic("a frame's namespace (`f_globals`, `f_locals`)", node);
+            }
             name if is_namespace_builtin(name) && (on("builtins") || on("__builtins__")) => {
                 self.note_file_dynamic(
                     "a builtin that reads or rebinds names (`exec`, `eval`, `globals`...) reached through `builtins`",
@@ -3872,7 +3903,7 @@ impl<'t> Ctx<'t> {
                     self.attr_uses.entry(name).or_default().escapes = true;
                     self.name_uses.entry(name).or_default().escapes = true;
                     // `getattr(os, "environ")`, `getattr(builtins, "exec")`.
-                    if matches!(name, "environ" | "putenv") {
+                    if matches!(name, "environ" | "environb" | "putenv") {
                         self.env_wild.get_or_insert(Self::feature(
                             "`os.environ` or `os.putenv` looked up by name",
                             call,
@@ -3923,6 +3954,14 @@ impl<'t> Ctx<'t> {
             };
             let value = value.copied();
             match self.plain_literal(name) {
+                Some(attr) if is_environ_name(attr) && !deleting => {
+                    // `setattr(os, "environ", {...})`, like `os.environ =
+                    // {...}`, replaces the process environment.
+                    self.env_wild.get_or_insert(Self::feature(
+                        "`os.environ` replaced through `setattr`",
+                        call,
+                    ));
+                }
                 Some(attr) => {
                     let assign = Assign {
                         id: self.fresh_id(),
@@ -4075,6 +4114,12 @@ impl<'t> Ctx<'t> {
             if written == "__main__" {
                 // The running script's namespace, which may be this one.
                 self.note_file_dynamic("`import __main__`", node);
+            }
+            if alias.is_some() && matches!(written, "builtins" | "sys") {
+                // `import builtins as B; B.exec(...)`, `import sys as S;
+                // S.modules[...]`: the names this file matches are spelled
+                // differently.
+                self.note_file_dynamic("`builtins` or `sys` imported under another name", node);
             }
             self.note_self_import(written, node);
             let module = clip(written);
@@ -4274,6 +4319,7 @@ impl<'t> Ctx<'t> {
 
     fn record_import(&mut self, binding: Binding<'_>, node: Node<'t>) {
         self.sdk_imported.insert(binding.pkg.sdk());
+        self.legacy_imported |= binding.pkg == Pkg::GoogleGenerativeai;
         let span = self.span(node);
         self.out.imports.push(SdkImport {
             sdk: binding.pkg.sdk(),
@@ -6210,10 +6256,11 @@ impl<'t> Ctx<'t> {
         self.settle_borrowed_methods();
         // A bare `environ` is the process environment only when imported
         // from `os`.
-        let environ_from_os = self
-            .other_imports
-            .get(&(0, "environ".to_string()))
-            .is_some_and(|defs| defs.iter().any(|d| &*d.module == "os"));
+        let environ_from_os = ["environ", "environb"].iter().any(|name| {
+            self.other_imports
+                .get(&(0, name.to_string()))
+                .is_some_and(|defs| defs.iter().any(|d| &*d.module == "os"))
+        });
         if environ_from_os {
             if let Some(feature) = self.bare_environ_wild {
                 self.env_wild.get_or_insert(feature);
@@ -6469,10 +6516,33 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// Whether `call` passes `client_options=` or a `**` expansion, which
+    /// may hold it.
+    fn may_pass_client_options(&self, call: Node<'t>) -> bool {
+        let Some(args) = call.child_by_field_name("arguments") else {
+            return false;
+        };
+        let mut cursor = args.walk();
+        let found = args
+            .named_children(&mut cursor)
+            .any(|arg| match arg.kind() {
+                "dictionary_splat" => true,
+                "keyword_argument" => arg
+                    .child_by_field_name("name")
+                    .is_some_and(|n| self.text(n) == "client_options"),
+                _ => false,
+            });
+        found
+    }
+
     /// `genai.configure(client_options=...)` (the legacy Gemini SDK) may
     /// point every legacy call at another endpoint: they then route
-    /// `unknown` with an `endpoint_option` gap. So may `**options`.
+    /// `unknown` with an `endpoint_option` gap. So may `**options`. The
+    /// callee is evaluated, so `configure` under another name counts.
     fn note_legacy_configure(&mut self) {
+        if !self.legacy_imported {
+            return;
+        }
         for (call, scope) in self.configure_calls.clone() {
             let Some(function) = call.child_by_field_name("function") else {
                 continue;
@@ -9182,6 +9252,11 @@ fn is_namespace_builtin(name: &str) -> bool {
 /// Whether the node of `frame` is a statement of its own directly in the
 /// module body: an expression statement there, not a branch, loop, `try`,
 /// `with`, class body or function, nor part of a larger expression.
+/// `os.environ` or `os.environb`, which shares its data on POSIX.
+fn is_environ_name(name: &str) -> bool {
+    matches!(name, "environ" | "environb")
+}
+
 /// A module attribute that routes the module-level OpenAI API.
 fn is_module_routing_attr(attr: &str) -> bool {
     matches!(
