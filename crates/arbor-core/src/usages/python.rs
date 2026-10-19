@@ -14,16 +14,21 @@
 //! - a class attribute assigned once, read by class name or through
 //!   `self`/`cls`, in a class with no decorator, class keyword or second
 //!   base, at most one same-file level of inheritance and at most 16
-//!   direct subclasses;
+//!   direct subclasses (a model value read through `self`/`cls` in a class
+//!   another module may subclass keeps a `subclass_override` gap);
 //! - a parameter default of a function whose calls are all in this file (a
 //!   nested or `_private` function, a private class's `__init__`, anything
 //!   in a script), none of which passes another value;
 //! - an entry of a same-file dict literal read by literal key, when the dict
-//!   is only ever used through its one name;
+//!   is only ever used through its one name and no `**` expansion or
+//!   computed key follows the entry (in a dict written at the call too);
 //! - a client from a tracked constructor with no `base_url`, or one that
 //!   resolves to a string (the provider's own host is direct, another host
-//!   is `custom_base_url`), in a file that does not configure the endpoint
-//!   some other way.
+//!   is `custom_base_url`), and for Gemini no `vertexai=True`, endpoint
+//!   `http_options` or `**` expansion, in a file that does not configure
+//!   the endpoint some other way;
+//! - the module-level API, configured by top-level statements, each
+//!   routing setting once, before any import-time call that may reach it.
 //!
 //! The collection walk also records **dynamic features** that can change a
 //! resolved name, class, dict or the environment (`exec`, `globals()`,
@@ -873,7 +878,7 @@ impl Unresolved {
             }
             "dynamic_feature" => "something this file may change at run time",
             "subclass_override" => {
-                "an attribute of a public class read through `self`, which a subclass in another module may set"
+                "an attribute read through `self` or `cls` in a public class (or one with a public subclass), which a subclass in another module may override"
             }
             _ => "not a string literal",
         }
@@ -8915,9 +8920,6 @@ const READ_ONLY_CALLS: &[&str] = &[
 /// Calls that return a shallow copy, sharing nested containers.
 const SHALLOW_CALLS: &[&str] = &["dict", "copy.copy", "copy"];
 
-/// Whether a field of a node of kind `parent` names a binding rather than
-/// using one: a definition's name, a parameter, an import, a keyword
-/// argument's name, an attribute name or an assignment target.
 /// Builtins that read or rebind a namespace by name.
 fn is_namespace_builtin(name: &str) -> bool {
     matches!(
@@ -8936,6 +8938,9 @@ fn is_top_statement(frame: &Frame<'_>) -> bool {
         && frame.grand.is_some_and(|g| g.kind() == "module")
 }
 
+/// Whether a field of a node of kind `parent` names a binding rather than
+/// using one: a definition's name, a parameter, an import, a keyword
+/// argument's name, an attribute name or an assignment target.
 fn is_declaration(parent: &str, field: Option<&str>) -> bool {
     matches!(
         (parent, field),

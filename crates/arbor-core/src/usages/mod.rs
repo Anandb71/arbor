@@ -392,8 +392,10 @@ pub enum GapKind {
     /// default applies). A value captured next to such a gap is one the code
     /// names but cannot confirm: an environment fallback, a parameter
     /// default (`parameter_default`, `parameter_overridden`,
-    /// `unseen_callers`) or a value a dynamic feature of the file may change
-    /// (`dynamic_feature`, which names the feature and its line).
+    /// `unseen_callers`), an attribute a subclass in another module may
+    /// override (`subclass_override`) or a value a dynamic feature of the
+    /// file may change (`dynamic_feature`, which names the feature and its
+    /// line).
     UnresolvedModel,
     /// A call shaped like an SDK endpoint whose receiver is not a tracked
     /// client: built by an unknown factory, passed in as a parameter, or
@@ -406,8 +408,12 @@ pub enum GapKind {
     /// whose `base_url` is assigned after it is built (`base_url_assigned`),
     /// a file that sets the SDK's endpoint variable (`endpoint_env`), a
     /// `base_url` read from the environment (`base_url_env`) or not resolved
-    /// (`base_url_unresolved`), or a receiver or configuration a dynamic
-    /// feature of the file may change (`dynamic_feature`).
+    /// (`base_url_unresolved`), a Gemini client given an option that may
+    /// send it to Vertex AI or another endpoint (`endpoint_option`), a
+    /// module-level call that passes `engine` or `deployment_id` in a file
+    /// that does not configure the module-level API (`module_config`), or a
+    /// receiver or configuration a dynamic feature of the file may change
+    /// (`dynamic_feature`).
     AmbiguousClient,
     /// `getattr` on a tracked binding, or an SDK method stored or passed as a
     /// value; calls through it are not tracked.

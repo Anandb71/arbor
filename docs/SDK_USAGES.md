@@ -30,6 +30,12 @@ These are reported with no gap (`model`, `engine`, `deployment_id`,
    list literal written in the call (`**{"model": ...}`,
    `extra_body={"fallbacks": [{"model": ...}]}`). A literal written at the call
    is never downgraded, even when a dynamic feature applies to the file.
+   - An entry of a dict literal counts only when no `**` expansion and no
+     computed key follows it in that literal. `{"model": "gpt-4o",
+     **overrides}` is a `splat` gap that lists `gpt-4o` as a candidate;
+     `{**base, "model": "gpt-4o"}` is confirmed. The same holds for
+     `dict(model=..., **kw)` and for nested dicts in `extra_body`.
+   - A key written twice counts once, by its last entry, as Python does.
 2. **A name with one reaching assignment.** The assignment is a string literal,
    or another name or attribute that resolves under these rules. The name is a
    module constant, a function local or a local of an enclosing function.
@@ -39,15 +45,33 @@ These are reported with no gap (`model`, `engine`, `deployment_id`,
    - A use inside a nested function, lambda or generator also sees every
      assignment after its definition, because it may run after them.
    - `global` and `nonlocal` writes from other functions reach every use.
-   - Loop targets, `with ... as`, `except ... as`, `match` captures, walrus
-     targets, `globals()["NAME"] = ...`, a wildcard import from another module
-     and `del NAME` are all assignments.
+   - Loop targets, `with ... as`, `except ... as` and `except* ... as`,
+     `match` captures, walrus targets, `globals()["NAME"] = ...`, a wildcard
+     import from another module and `del NAME` are all assignments. So are a
+     `def` or `class` of the name, an import of it (in a class body too),
+     `type NAME = ...`, and `global` or `nonlocal` in a class body.
+   - A walrus in a default argument (`def f(a=(M := ...))`) binds where the
+     `def` or `lambda` runs, in the enclosing scope.
    - When more than one assignment reaches the use, the call gets a
      `reassigned` gap.
 3. **A class attribute assigned once.** It is read by class name (`Bot.MODEL`)
    or through `self`/`cls` in the class's methods, and assigned once: in the
-   class body, by `self.x = ...` or `cls.x = ...`, or by `Bot.x = ...`. The class
-   must meet all of these:
+   class body, by `self.x = ...` or `cls.x = ...`, or by `Bot.x = ...`.
+   - `self` and `cls` are the class only as the first parameter of a method
+     written directly in its body (and in closures that do not rebind them).
+     A `staticmethod` parameter named `self`, a nested `def inner(self)` and
+     a method another class borrows (`B2.go = B.go`, `go = B.go`) do not
+     count; a write through such a method's `self` is a write on another
+     object.
+   - Read through `self` or `cls`, a value of a **public class** keeps a
+     `subclass_override` gap, the way a public function's default keeps
+     `parameter_default`: another module may subclass the class and set the
+     attribute. A class is public when it is not `_private`, not inside a
+     private class or a function, and not in a script. A private class one of
+     whose direct same-file subclasses is public counts as public too. Reads
+     by class name are confirmed.
+
+   The class must meet all of these:
    - It has no decorator, metaclass or other class keyword, and at most one
      base (`object` and `ABC` do not count). That base is either a same-file
      class with no same-file base of its own, or a class from another module.
@@ -64,6 +88,10 @@ These are reported with no gap (`model`, `engine`, `deployment_id`,
    any function in a script (an extensionless file or `__main__.py`). The
    function must also be undecorated and never passed, stored or rebound, and
    every in-file call must pass nothing for the parameter, or the same value.
+   A `_private` function listed in `__all__` (assigned, extended or appended)
+   is exported, and a `__mangled` method called from outside under its
+   mangled name (`_A()._A__go(...)`) has callers this file does not show, so
+   both are treated as passed (`unseen_callers`).
    Otherwise the default is still reported, with one of these gaps:
    - `parameter_default`: the function is public, so another module may pass
      another value.
@@ -74,7 +102,11 @@ These are reported with no gap (`model`, `engine`, `deployment_id`,
    must never be mutated, assigned to another name, stored in a container or
    an attribute, passed to anything but a read-only builtin (`len`, `print`,
    `json.dumps`...), or returned. A part that hands out a nested container
-   counts the same way.
+   counts the same way. As in rule 1, the entry counts only when no `**`
+   expansion and no computed key follows it in the literal (the
+   defaults-then-overrides idiom `params = {"model": "gpt-4o",
+   **overrides}` is a `splat` gap), and a repeated key counts by its last
+   entry.
 
 The fallback of an environment or configuration lookup
 (`os.getenv("MODEL", "gpt-4o")`) is captured with origin `env_default` and
@@ -90,32 +122,69 @@ these:
 - **A client from a tracked constructor** (`OpenAI`, `AzureOpenAI`,
   `Anthropic`, `AnthropicBedrock`, `AnthropicVertex`, `genai.Client`...). It
   must have no `base_url`, `base_url=None`, or a `base_url` that resolves to a
-  string under the value rules.
-- **The module-level API**, configured at module level (`openai.api_type`,
-  `openai.api_base`, `openai.base_url`).
+  string under the value rules, given as a keyword or as a dict entry that no
+  later `**` expansion or computed key may replace. A client built or copied
+  from an expansion that may hold a `base_url` routes `unknown` with a
+  `base_url_unresolved` gap.
+- **A Gemini client** (`genai.Client`) also needs no `vertexai=True`, no
+  `http_options` that names a `base_url` or expands anything, and no `**`
+  expansion. Any of those may send it to Vertex AI or another endpoint, which
+  retire models on another schedule, so it routes `unknown` with an
+  `endpoint_option` gap. `vertexai=False` and `HttpOptions(api_version=...)`
+  stay confirmed. The legacy SDK's `configure(client_options=...)` gives its
+  calls the same gap.
+- **The module-level API** (`openai.ChatCompletion.create`,
+  `openai.chat.completions.create`). Its routing comes from the file's
+  `openai.api_type`, `openai.api_base`, `openai.base_url` and
+  `openai.azure_endpoint` settings, which count with no gap only when:
+  - each is a statement of its own directly in the module body: not in an
+    `if`, loop, `try`, `with`, class body or function;
+  - each routing setting is assigned once;
+  - each comes before the call runs: a call that runs at import must come
+    after them, and a call in a function must not be reachable from code of
+    this file that runs at import before them (a call of a function or class
+    defined in this file, such as `main()` or `Bot()`).
 
-A `base_url` routes by its host. The URL itself is never reported.
+  Otherwise the call keeps the routing the settings suggest, with a
+  `dynamic_feature` gap. A file that configures nothing is reported direct
+  (see [Outside the file](#outside-the-file)), except that a call passing
+  `engine` or `deployment_id`, which Azure deployments take, routes
+  `unknown` with a `module_config` gap.
+
+A client read through `self` (`self.client`) is confirmed under rule 3
+without the `subclass_override` gap that a model value read the same way
+gets. That is an assumption of the report: a subclass in another module
+that replaces a public class's client is not seen.
+
+An OpenAI or Anthropic client's `base_url` routes by its host (a Gemini
+client's endpoint options are a gap, above). The URL itself is never
+reported.
 
 | `base_url` | routing | gap |
 |---|---|---|
 | absent or `None` | `openai_direct` / `anthropic_direct` | none |
-| the provider's own host (`api.openai.com`, `api.anthropic.com`, `generativelanguage.googleapis.com`) | direct | none |
+| the provider's own host (`api.openai.com`, `api.anthropic.com`) | direct | none |
 | any other host | `custom_base_url` | none |
 | an environment lookup whose fallback is the provider's host | direct | `base_url_env` |
 | an environment lookup with no fallback | `unknown` | `base_url_env` |
-| an environment lookup with another host as its fallback | `custom_base_url` | none |
+| an environment lookup with another host as its fallback | `custom_base_url` | `base_url_env` |
 | anything that does not resolve to a string | `unknown` | `base_url_unresolved` |
 
 The file must not do any of these:
 
-- set the SDK's endpoint variable (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`;
-  `endpoint_env`);
+- set the SDK's endpoint variable (`endpoint_env`): `OPENAI_BASE_URL`,
+  `ANTHROPIC_BASE_URL`, `GOOGLE_GENAI_USE_VERTEXAI`,
+  `GOOGLE_GEMINI_BASE_URL` or `GOOGLE_VERTEX_BASE_URL`, and for the
+  module-level API also `OPENAI_API_BASE` and `OPENAI_API_TYPE`;
 - write the environment with a name known only at run time (a
   `dynamic_feature`, below);
 - assign a `base_url` to the client after it is built (`base_url_assigned`), or
   to an object the file cannot identify (`dynamic_feature`);
-- configure the module-level API inside a function, which may not run first
-  (`dynamic_feature`).
+- replace an SDK member rather than configure it
+  (`client.chat.completions.create = patched`, `openai.OpenAI = Sub`,
+  `client.chat = ...`), which makes every route of that SDK a
+  `dynamic_feature` gap. Settings such as `openai.api_key` or
+  `client.max_retries` change nothing.
 
 ## Dynamic features
 
@@ -131,8 +200,16 @@ every route gets that gap.
 - `locals()` or `vars()` at module or class level, where it is that namespace
   (a function's `locals()` cannot rebind its names);
 - `vars(obj)` or `x.__dict__`;
-- `sys.modules`;
-- `import __main__`, or the module importing itself.
+- `sys.modules`, also through `from sys import modules`;
+- `import __main__`, or the module importing itself: `__import__(__name__)`,
+  `importlib.import_module(__name__)`, or an import of its own module name
+  (`import app` in `app.py`; not in a package's `__init__.py`, a
+  `__main__.py` or a script, and not when the name is a tracked SDK's).
+
+These builtins count under any name: aliased (`run = exec`, `g = globals`),
+reached through `builtins` or `__builtins__` (`builtins.exec`,
+`getattr(builtins, "exec")`), or imported from `builtins`. A parameter or
+keyword argument that the file names `eval` is not the builtin.
 
 **Class attributes, read by class name or through `self`/`cls`:**
 - a class decorator, a metaclass or other class keyword, or more than one base,
@@ -144,7 +221,8 @@ every route gets that gap.
   `__setattr__`, `__delattr__`, `__init_subclass__`);
 - a write of that attribute name on any object other than `self`, `cls` or the
   class itself (`obj.model = ...`, `setattr(obj, "model", ...)`,
-  `configure(Settings)` writing `cfg.MODEL`);
+  `configure(Settings)` writing `cfg.MODEL`), including one through a call
+  or `__class__` (`type(self).model = ...`, `self.__class__.model = ...`);
 - a write whose attribute name is known only at run time (`setattr(obj, name,
   v)`, `delattr`, `obj.__setattr__(name, v)`): on `self` of the class or its
   base, or on any other object (then it affects every class);
@@ -170,7 +248,12 @@ with a gap:
   `os.putenv(key, v)` with a key that is not a literal;
 - `os.environ` aliased, passed or updated in place.
 
-A bare `environ` counts only when it is imported from `os`; a WSGI `environ`
+Writes are matched by the attribute name `environ` (and `putenv`) on any
+object, so `import os as _os; _os.environ[...] = ...` counts. Looking `os`
+or `os.environ` up by name (`importlib.import_module("os")`,
+`getattr(os, "environ")`) and importing `environ` or `putenv` under another
+name (`from os import environ as E`) alias the process environment. A bare
+`environ` counts only when it is imported from `os`; a WSGI `environ`
 parameter does not count.
 
 **Dicts and lists:** a container reached through more than its one name is not
@@ -202,14 +285,25 @@ its items are not listed.
 
 ## Outside the file
 
-Resolution is per file. Writes or subclasses in other modules are not seen:
-another module may assign this module's constants, write a class's attributes
-from outside, or subclass a public class and override an attribute that a
-method reads through `self`. The one exception is parameter defaults, since
-calling a public function with an argument is that function's interface (see
-rule 4). The process environment at run time is not known either: a direct
-client built without a `base_url` is reported direct, although the deployment
-(or a `.env` file loaded with `load_dotenv`) may set `OPENAI_BASE_URL`.
+Resolution is per file. Writes in other modules are not seen: another
+module may assign this module's constants or write a class's attributes from
+outside. Two kinds of outside change are part of a module's interface, so
+they keep a gap instead: a public function's parameter default
+(`parameter_default`, rule 4), and a model value a public class reads through
+`self` or `cls`, which a subclass may override (`subclass_override`, rule 3).
+
+The report assumes the rest. In particular:
+
+- A client a public class reads through `self` is confirmed, although a
+  subclass in another module may replace it (see [Routes](#routes)).
+- The process environment at run time is not known: a direct client built
+  without a `base_url` is reported direct, although the deployment (or a
+  `.env` file loaded with `load_dotenv`) may set `OPENAI_BASE_URL`,
+  `ANTHROPIC_BASE_URL` or `GOOGLE_GENAI_USE_VERTEXAI`.
+- The module-level API's state is process-wide: in a file that does not
+  configure it, a call is reported direct, although another module may
+  configure it. A call that passes `engine` or `deployment_id` is the
+  exception, with a `module_config` gap.
 
 ## Bounds
 
