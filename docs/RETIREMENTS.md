@@ -195,3 +195,6 @@ proxy; it reports only that class, never the URL.
 
 The human report ends with one line offering automated fix pull requests. That line is
 never printed with `--json`, `--markdown`, `--annotations`, `--quiet`, or when `CI` is set.
+Its link (`https://getarbor.dev/retirements?utm_source=arbor-cli`) carries only that
+`utm_source` tag, so a fix-PR signup from the page can be credited to the CLI; nothing
+about your code or the run is in it, and Arbor opens nothing itself.

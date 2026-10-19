@@ -674,7 +674,12 @@ fn human_report_reads_plainly_and_offers_fix_prs_once() {
     assert!(text.contains("Runs locally: no code leaves this machine."));
     // No line ends in a space.
     assert!(text.lines().all(|l| !l.ends_with(' ')), "{text}");
-    assert_eq!(text.matches("https://getarbor.dev/retirements").count(), 1);
+    assert_eq!(
+        text.matches("https://getarbor.dev/retirements?utm_source=arbor-cli\n")
+            .count(),
+        1,
+        "{text}"
+    );
 
     // Never in CI, with --quiet, or in machine-readable output.
     for output in [

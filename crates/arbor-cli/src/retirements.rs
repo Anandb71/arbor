@@ -31,8 +31,10 @@ use std::io::Write;
 use std::path::Path;
 
 /// Where the closing line of the human report points people who want the
-/// fix PRs opened for them. The only place this URL is written.
-pub const FIX_PRS_URL: &str = "https://getarbor.dev/retirements";
+/// fix PRs opened for them. The only place this URL is written. The
+/// `utm_source` tag lets the page credit a fix-PR signup to the CLI; the
+/// link carries nothing about the scanned code or the run.
+pub const FIX_PRS_URL: &str = "https://getarbor.dev/retirements?utm_source=arbor-cli";
 
 /// Data older than this gets a reminder to update Arbor.
 const STALE_AFTER_DAYS: i64 = 90;
@@ -1152,9 +1154,10 @@ mod tests {
 
     #[test]
     fn the_offer_url_is_one_constant() {
-        assert!(FIX_PRS_URL.starts_with("https://"));
-        let source = include_str!("retirements.rs");
         let needle = ["https://getarbor.dev", "/retirements"].concat();
+        // The page credits a fix-PR signup to the CLI by this tag.
+        assert_eq!(FIX_PRS_URL, format!("{needle}?utm_source=arbor-cli"));
+        let source = include_str!("retirements.rs");
         assert_eq!(
             source.matches(&needle).count(),
             1,
