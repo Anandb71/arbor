@@ -5670,3 +5670,37 @@ fn a_private_class_with_a_public_subclass_keeps_a_subclass_override_gap() {
         assert_eq!(rows[0].2, reasons, "{source}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Engine round-1 re-review of #276 (head a3a1256)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn engine_keys_of_a_large_expanded_dict_are_found_in_constant_time() {
+    // Blocker 1: in a file that does not configure the module-level API,
+    // each `openai.Completion.create(**P)` walked every key of `P` looking
+    // for `engine`: 10k calls x 400k keys took 26 s in a release build. It
+    // is now two lookups per call.
+    for (last, gapped) in [("'tail': 0", false), ("'engine': 'gpt-4o'", true)] {
+        let mut source = String::from("import openai\nP = {");
+        for i in 0..100_000 {
+            source.push_str(&format!("'k{i}': 0, "));
+        }
+        source.push_str(last);
+        source.push_str("}\n");
+        for f in 0..100 {
+            source.push_str(&format!("def f{f}():\n"));
+            for _ in 0..100 {
+                source.push_str("    openai.Completion.create(**P)\n");
+            }
+        }
+        let found = usages_within(&source, 10);
+        assert_eq!(found.calls.len(), 10_000);
+        let module_config = found
+            .gaps
+            .iter()
+            .filter(|g| g.reason == "module_config")
+            .count();
+        assert_eq!(module_config, if gapped { 10_000 } else { 0 }, "{last}");
+    }
+}

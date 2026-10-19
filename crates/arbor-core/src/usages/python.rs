@@ -6482,7 +6482,8 @@ impl<'t> Ctx<'t> {
     }
 
     /// Whether `call` passes `engine` or `deployment_id`, by keyword or
-    /// possibly through a `**` expansion.
+    /// possibly through a `**` expansion. Two lookups per expansion, however
+    /// many keys its dict has.
     fn passes_engine(&mut self, call: Node<'t>, scope: usize) -> bool {
         let args = self.arguments(call);
         let azure_key = |k: &str| k == "engine" || k == "deployment_id";
@@ -6493,7 +6494,10 @@ impl<'t> Ctx<'t> {
             .iter()
             .any(|splat| match self.expand_splat(*splat, scope) {
                 Some(expansion) => {
-                    expansion.opaque() || expansion.summary.last.keys().any(|k| azure_key(k))
+                    let last = &expansion.summary.last;
+                    expansion.opaque()
+                        || last.contains_key("engine")
+                        || last.contains_key("deployment_id")
                 }
                 None => true,
             })
