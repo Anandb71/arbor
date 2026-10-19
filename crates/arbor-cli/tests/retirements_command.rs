@@ -438,10 +438,14 @@ fn a_base_url_on_the_provider_host_is_a_direct_call() {
     assert_eq!(official["routing_class"], "direct");
     assert_eq!(official["base_url"], "provider_host");
     assert_eq!(official["fails"], true);
-    let fallback = at(15).expect("an environment fallback to the provider is direct");
+    // An environment lookup, even one that falls back to the provider's
+    // host: the deployment may set it, so the routing is unknown until
+    // confirmed. Listed, not counted.
+    let fallback = at(15).expect("an environment fallback to the provider is listed");
     assert_eq!(fallback["base_url"], "env_provider_default");
-    assert_eq!(fallback["routing_class"], "direct");
-    // Set only by the environment: listed with routing unknown, not counted.
+    assert_eq!(fallback["routing_class"], "unknown");
+    assert_eq!(fallback["routing_gap"], "base_url_env");
+    assert_eq!(fallback["fails"], false);
     let deployed = at(19).expect("an environment-only base_url is listed");
     assert_eq!(deployed["routing_class"], "unknown");
     assert_eq!(deployed["base_url"], "env_only");
@@ -450,8 +454,8 @@ fn a_base_url_on_the_provider_host_is_a_direct_call() {
     assert!(at(23).is_none());
     assert_eq!(report["summary"]["routed_calls"], 1);
     assert_eq!(code, Some(1));
-    assert_eq!(report["summary"]["failing"], 2);
-    assert_eq!(report["summary"]["uncounted"], 1);
+    assert_eq!(report["summary"]["failing"], 1);
+    assert_eq!(report["summary"]["uncounted"], 2);
 
     let (_, report) = run_json(dir.path(), &["--count-unconfirmed"]);
     assert_eq!(report["summary"]["failing"], 3);
@@ -863,4 +867,102 @@ fn argument_errors_are_json_with_json() {
     let output = arbor(dir.path(), &["retirements", ".", "--fail-within", "soon"]);
     assert_eq!(output.status.code(), Some(2));
     assert!(stdout(&output).is_empty());
+}
+
+/// A file that may rebind its names at run time (`exec`): the module
+/// constant and the client are both unconfirmed.
+const DYNAMIC: &str = r#"from openai import OpenAI
+
+MODEL = "gpt-3.5-turbo-0613"
+client = OpenAI()
+exec("MODEL = 'gpt-6-luna'")
+
+
+def run():
+    return client.chat.completions.create(model=MODEL, messages=[])
+"#;
+
+/// A public class's attribute read through `self` (a subclass elsewhere may
+/// override it), and an SDK method reached through `getattr`.
+const SUBCLASS: &str = r#"from openai import OpenAI
+
+client = OpenAI()
+
+
+class Bot:
+    MODEL = "gpt-3.5-turbo-0613"
+
+    def run(self):
+        return client.chat.completions.create(model=self.MODEL, messages=[])
+
+
+def dispatch():
+    return getattr(client.chat.completions, "create")(model="gpt-3.5-turbo-0613", messages=[])
+"#;
+
+#[test]
+fn usage_gaps_never_read_as_confirmed() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("dynamic.py"), DYNAMIC).unwrap();
+    fs::write(dir.path().join("bot.py"), SUBCLASS).unwrap();
+    // Scopes nested past the usage scan's cap are not analyzed.
+    let mut deep =
+        r#"client.chat.completions.create(model="gpt-3.5-turbo-0613", messages=[])"#.to_string();
+    for _ in 0..70 {
+        deep = format!("(lambda: {deep})");
+    }
+    fs::write(
+        dir.path().join("deep.py"),
+        format!("from openai import OpenAI\n\nclient = OpenAI()\n\ndeep = {deep}\n"),
+    )
+    .unwrap();
+
+    // Every model here is already retired, and nothing is confirmed.
+    let (code, report) = run_json(dir.path(), &[]);
+    assert_eq!(code, Some(0), "{report:#}");
+    for f in report["findings"].as_array().unwrap() {
+        assert!(
+            f["confidence"] != "confirmed" || f["routing_class"] != "direct",
+            "{f:#}"
+        );
+        assert_eq!(f["fails"], false, "{f:#}");
+        assert_eq!(f["fix"], "manual", "{f:#}");
+    }
+    let by_file = |file: &str| {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["file"].as_str().is_some_and(|p| p.ends_with(file)))
+            .cloned()
+            .unwrap_or_else(|| panic!("no finding in {file}: {report:#}"))
+    };
+    let dynamic = by_file("dynamic.py");
+    assert_eq!(dynamic["confidence"], "confirm_first");
+    assert_eq!(dynamic["gap_reason"], "dynamic_feature");
+    assert_eq!(dynamic["routing_class"], "unknown");
+    assert_eq!(dynamic["routing_gap"], "dynamic_feature");
+    let bot = by_file("bot.py");
+    assert_eq!(bot["confidence"], "confirm_first");
+    assert_eq!(bot["gap_reason"], "subclass_override");
+    assert_eq!(bot["routing_class"], "direct");
+    assert_eq!(report["summary"]["affected_calls"], 2);
+    assert_eq!(report["summary"]["uncounted"], 2);
+    assert_eq!(report["summary"]["not_analyzed"], 1);
+    assert_eq!(report["summary"]["untracked_methods"], 1);
+
+    let (code, _) = run_json(dir.path(), &["--count-unconfirmed"]);
+    assert_eq!(code, Some(1));
+
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    for line in [
+        "the model is a class attribute that a subclass in another module may override: confirm the model this call uses",
+        "this file may change the model at run time (exec, globals(), setattr...): confirm the model this call uses; routing not confirmed (this file may rebind the client or the SDK's configuration at run time): confirm this call reaches OpenAI directly",
+        "Not checked: 1 part of a file Arbor did not analyze",
+        "Not checked: calls through 1 SDK method reached with getattr or stored or passed as a value.",
+        "Not counted toward the exit code: 2 calls",
+    ] {
+        assert!(text.contains(line), "missing {line:?} in:\n{text}");
+    }
+    assert!(!text.contains("Failing (exit 1)"), "{text}");
 }

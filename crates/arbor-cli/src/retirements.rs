@@ -20,9 +20,9 @@
 //! `--include-routed`.
 
 use arbor_core::retirements::{
-    bundled, check, python_literal, Change, ChangeKind, CheckOptions, Confidence, Date, DateKind,
-    Decision, Finding, MatchKind, OptionStatus, RetirementReport, RoutingClass, ScanInput, State,
-    REPORT_VERSION,
+    bundled, check, python_literal, routing_gap_text, value_gap_text, BaseUrl, Change, ChangeKind,
+    CheckOptions, Confidence, Date, DateKind, Decision, Finding, MatchKind, OptionStatus,
+    RetirementReport, RoutingClass, ScanInput, State, REPORT_VERSION,
 };
 use arbor_core::usages::{is_unsafe_char, ValueOrigin};
 use arbor_watcher::usages::{scan_usages, UsageScanOptions};
@@ -157,6 +157,9 @@ fn build_report(args: &Args) -> Result<RetirementReport, String> {
     let mut report = check(input, data, &options);
     report.root = scan.root;
     report.summary.files_scanned = scan.summary.files_scanned;
+    report.summary.syntax_error_files = scan.skipped.syntax_errors.len();
+    report.summary.skipped_files = scan.skipped.too_large.len() + scan.skipped.unreadable.len();
+    report.summary.hidden_calls = scan.skipped.hidden_calls;
     Ok(report)
 }
 
@@ -367,33 +370,78 @@ fn describe_decision(decision: &Decision, code: bool) -> String {
         .join(" or ")
 }
 
-/// What to keep in mind about how the value was found or where the call
-/// goes.
+/// What to keep in mind about how the value was found and where the call
+/// goes: a clause for each that is not confirmed.
 fn caveat(finding: &Finding) -> Option<String> {
+    let parts: Vec<String> = [value_caveat(finding), routing_caveat(finding)]
+        .into_iter()
+        .flatten()
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+fn value_caveat(finding: &Finding) -> Option<String> {
     let provider = finding.provider.provider();
     let text = match (finding.confidence, finding.origin) {
         _ if finding.candidate => {
             "one of the values this call may get at run time: confirm which one it uses".to_string()
         }
+        (Confidence::Gap, _) => match finding.gap_reason.as_deref().and_then(routing_gap_text) {
+            Some(why) => {
+                format!("client not resolved ({why}): confirm this call reaches {provider}")
+            }
+            None => format!("client not resolved: confirm this call reaches {provider}"),
+        },
         (Confidence::ConfirmFirst, Some(ValueOrigin::EnvDefault)) => {
             "fallback of an environment or config lookup: confirm the deployed value".to_string()
         }
-        (Confidence::ConfirmFirst, _) => {
+        (Confidence::ConfirmFirst, Some(ValueOrigin::ParameterDefault)) => {
             "default of a function parameter: callers may pass another model".to_string()
         }
-        (Confidence::Gap, _) => {
-            format!("client not resolved: confirm this call reaches {provider}")
+        (Confidence::ConfirmFirst, _) => {
+            match finding.gap_reason.as_deref().and_then(value_gap_text) {
+                Some(why) => format!("{why}: confirm the model this call uses"),
+                None => "not confirmed: confirm the model this call uses".to_string(),
+            }
         }
-        _ if finding.routing_class == RoutingClass::Routed => {
+        (Confidence::Confirmed, _) => return None,
+    };
+    Some(text)
+}
+
+fn routing_caveat(finding: &Finding) -> Option<String> {
+    let provider = finding.provider.provider();
+    let text = match finding.routing_class {
+        RoutingClass::Direct => return None,
+        // The value's clause already says the client is not resolved.
+        RoutingClass::Unknown if finding.confidence == Confidence::Gap => return None,
+        RoutingClass::Routed => {
             format!("via {}: {provider}'s dates may not apply", finding.routing)
         }
-        _ if finding.routing_class == RoutingClass::Unknown && finding.base_url.is_some() => {
-            format!("base_url set from the environment or code Arbor cannot read: confirm this call reaches {provider} directly")
+        RoutingClass::Unknown => {
+            let why = match finding.base_url {
+                Some(BaseUrl::EnvProviderDefault) => Some(format!(
+                    "the base_url is read from the environment and falls back to {provider}'s host"
+                )),
+                Some(BaseUrl::EnvOnly) => {
+                    Some("the base_url is read from the environment with no fallback".to_string())
+                }
+                Some(BaseUrl::OtherHost) if finding.routing_gap.is_some() => Some(
+                    "the base_url is read from the environment and falls back to another host"
+                        .to_string(),
+                ),
+                _ => finding
+                    .routing_gap
+                    .as_deref()
+                    .map(|reason| routing_gap_text(reason).unwrap_or(reason).to_string()),
+            };
+            match why {
+                Some(why) => format!(
+                    "routing not confirmed ({why}): confirm this call reaches {provider} directly"
+                ),
+                None => format!("routing unknown: confirm this call reaches {provider} directly"),
+            }
         }
-        _ if finding.routing_class == RoutingClass::Unknown => {
-            format!("routing unknown: confirm this call reaches {provider} directly")
-        }
-        _ => return None,
     };
     Some(text)
 }
@@ -571,6 +619,44 @@ fn not_checked_lines(report: &RetirementReport, markdown: bool) -> Vec<String> {
             verb(s.routed_calls, "reaches", "reach"),
             tick("--include-routed", markdown),
             verb(s.routed_calls, "it", "them")
+        ));
+    }
+    if s.not_analyzed > 0 {
+        lines.push(format!(
+            "Not checked: {} {} Arbor did not analyze (scopes nested more than 64 deep, or more than it reads in one file); {} lists {}.",
+            s.not_analyzed,
+            verb(s.not_analyzed, "part of a file", "parts of files"),
+            tick("arbor usages", markdown),
+            verb(s.not_analyzed, "it", "them")
+        ));
+    }
+    if s.untracked_methods > 0 {
+        lines.push(format!(
+            "Not checked: calls through {} SDK {} reached with {} or stored or passed as a value.",
+            s.untracked_methods,
+            verb(s.untracked_methods, "method", "methods"),
+            tick("getattr", markdown)
+        ));
+    }
+    if s.syntax_error_files > 0 {
+        lines.push(format!(
+            "Partly checked: {} {} syntax errors, so calls inside a broken region may be missing.",
+            s.syntax_error_files,
+            verb(s.syntax_error_files, "file has", "files have")
+        ));
+    }
+    if s.skipped_files > 0 {
+        lines.push(format!(
+            "Not checked: {} {} over the size limit or not readable as UTF-8.",
+            s.skipped_files,
+            verb(s.skipped_files, "file", "files")
+        ));
+    }
+    if s.hidden_calls > 0 {
+        lines.push(format!(
+            "Not checked: {} in hidden directories (such as {}).",
+            calls(s.hidden_calls),
+            tick(".github/", markdown)
         ));
     }
     if s.response_objects > 0 {

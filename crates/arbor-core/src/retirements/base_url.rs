@@ -5,9 +5,10 @@
 //! direct, another host is [`Routing::CustomBaseUrl`], and an environment
 //! lookup or a value that does not resolve leaves the routing unknown or
 //! direct with an `ambiguous_client` gap at each call (`base_url_env`,
-//! `base_url_unresolved`). [`super::check`] follows that routing as it is
-//! and only names the class here, so `arbor usages` and
-//! `arbor retirements` always agree. The URL itself is never reported.
+//! `base_url_unresolved`). [`super::check`] follows that routing, treats the
+//! gap like any other client gap (the routing is unknown until confirmed)
+//! and only names the class here, so `arbor usages` and `arbor retirements`
+//! always agree. The URL itself is never reported.
 
 use crate::usages::{ClientConstruction, GapKind, Routing, SdkCall, UsageGap};
 use serde::Serialize;
@@ -22,7 +23,9 @@ pub enum BaseUrl {
     ProviderHost,
     /// An environment lookup whose fallback is the provider's host
     /// (`os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")`), what
-    /// the SDK does when no `base_url` is given: a direct call.
+    /// the SDK does when no `base_url` is given. Direct unless the
+    /// deployment sets the variable, so the routing is unknown until
+    /// confirmed, as the usage scan's `base_url_env` gap says.
     EnvProviderDefault,
     /// An environment lookup with no fallback (`os.environ.get("BASE_URL")`):
     /// the host depends on the deployment, so the routing is unknown.
@@ -40,19 +43,17 @@ fn is_base_url_key(key: &str) -> bool {
 }
 
 /// The class of the `base_url` behind `call`, or `None` when its client was
-/// given none.
+/// given none. `at_call` are the usage scan's gaps at the call.
 pub(super) fn base_url_of(
     call: &SdkCall,
-    gaps: &[UsageGap],
+    at_call: &[&UsageGap],
     clients: &[ClientConstruction],
 ) -> Option<BaseUrl> {
     if call.routing == Routing::CustomBaseUrl {
         return Some(BaseUrl::OtherHost);
     }
-    let gap = gaps.iter().find(|g| {
+    let gap = at_call.iter().find(|g| {
         g.kind == GapKind::AmbiguousClient
-            && g.file == call.file
-            && g.span.is_some_and(|s| s.start_byte == call.span.start_byte)
             && matches!(g.reason.as_str(), "base_url_env" | "base_url_unresolved")
     });
     let direct = matches!(

@@ -18,6 +18,7 @@
 mod base_url;
 mod check;
 mod date;
+mod gaps;
 
 pub use base_url::BaseUrl;
 pub use check::{
@@ -27,6 +28,7 @@ pub use check::{
     ScanInput, State, Summary, Unreadable, REPORT_VERSION,
 };
 pub use date::Date;
+pub use gaps::{gap_text, routing_gap_text, value_gap_text, GAP_REASONS};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

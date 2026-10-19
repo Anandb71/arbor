@@ -21,6 +21,14 @@
 //!   not necessarily apply through Azure, a proxy or another cloud, so those
 //!   calls are kept apart in [`RetirementReport::routed`].
 //!
+//! A value is confirmed only when the usage scan put no gap at its call for
+//! it, and a route only when no client gap sits at the call: any
+//! `unresolved_model` gap for the value's key (or for no key) makes it
+//! confirm-first, and any other gap at the call makes the routing unknown
+//! (see `gaps.rs`). Parts of files the scan did not analyze, SDK methods it
+//! does not follow and files it skipped are counted in the [`Summary`], so a
+//! clean report never claims more than was read.
+//!
 //! Only SDK calls that send a request, bind a model for later requests
 //! (`genai.GenerativeModel(...)`) or set a model in a request parameter
 //! object (a tool config) are checked. Response and type objects built in
@@ -28,6 +36,7 @@
 //! nothing; they are counted in [`Summary::response_objects`] and skipped.
 
 use super::base_url::{base_url_of, BaseUrl};
+use super::gaps;
 use super::{
     Action, DateKind, EntryStatus, OptionStatus, ParamRule, RecipeInfo, RetirementData,
     Retirements, RuleEffect, Table, Verified,
@@ -38,7 +47,7 @@ use crate::usages::{
     ValueOrigin,
 };
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Version of the [`RetirementReport`] JSON shape.
 pub const REPORT_VERSION: u32 = 1;
@@ -322,9 +331,16 @@ pub struct Finding {
     pub value_from: Option<String>,
     /// Line of the string literal itself.
     pub value_line: u32,
-    /// For a gap: why the client or the model was not resolved
-    /// (`factory_call`, `parameter_overridden`...).
+    /// Why the value is not confirmed: the reason of the usage scan's gap
+    /// for this key at this call (`subclass_override`, `dynamic_feature`,
+    /// `truncated`, `parameter_overridden`...), or, for a client Arbor could
+    /// not resolve, why (`factory_call`).
     pub gap_reason: Option<String>,
+    /// Why the routing is not confirmed: the reason of the usage scan's
+    /// client gap at this call (`dynamic_feature`, `module_config`,
+    /// `endpoint_env`, `base_url_env`...). The routing class is then
+    /// `unknown`.
+    pub routing_gap: Option<String>,
     /// The value is one of several the call may get at run time (a lookup's
     /// entries, a branch, what an in-file caller passes), not the call's own.
     pub candidate: bool,
@@ -431,6 +447,22 @@ pub struct Summary {
     /// SDK response or type objects built in code with a model value
     /// (`ChatCompletion(...)`, `.model_validate(...)`): no request, skipped.
     pub response_objects: usize,
+    /// Parts of files the usage scan did not analyze (scopes nested too
+    /// deep, more records or imports than it reads): calls there are not
+    /// checked.
+    pub not_analyzed: usize,
+    /// SDK methods reached through `getattr` or stored or passed as values:
+    /// calls through them are not checked.
+    pub untracked_methods: usize,
+    /// Files whose syntax errors the parser recovered from: calls inside a
+    /// broken region may be missing (filled in by the caller).
+    pub syntax_error_files: usize,
+    /// Files over the size limit, or not readable as UTF-8 (filled in by the
+    /// caller).
+    pub skipped_files: usize,
+    /// SDK calls in hidden directories (`.github/`), which the scan excludes
+    /// (filled in by the caller).
+    pub hidden_calls: usize,
 }
 
 /// The result of [`check`].
@@ -460,23 +492,54 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
     let mut routed = Vec::new();
     let mut response_objects = 0;
 
+    // The gaps at each call, and each call by its position.
+    let mut gaps_at: HashMap<(&str, u32), Vec<&UsageGap>> = HashMap::new();
+    for gap in input.gaps.iter().filter(|g| !gaps::is_region(g)) {
+        if let Some(span) = gap.span {
+            gaps_at
+                .entry((gap.file.as_str(), span.start_byte))
+                .or_default()
+                .push(gap);
+        }
+    }
+    let calls_at: HashMap<(&str, u32), &SdkCall> = input
+        .calls
+        .iter()
+        .map(|c| ((c.file.as_str(), c.span.start_byte), c))
+        .collect();
+    let at_call = |call: &SdkCall| -> Vec<&UsageGap> {
+        gaps_at
+            .get(&(call.file.as_str(), call.span.start_byte))
+            .cloned()
+            .unwrap_or_default()
+    };
+
     for call in input.calls {
         let Some(kind) = call_kind(call) else {
             response_objects += usize::from(!call.values.is_empty());
             continue;
         };
-        let class = call_routing(call, input.clients, input.gaps);
+        let here = at_call(call);
+        let class = call_routing(call, input.clients, &here);
         for value in &call.values {
-            let Some(finding) = finding_for(
+            // A gap for this key (or for none) leaves the value unconfirmed,
+            // whatever its origin.
+            let value_gap = here.iter().find(|g| gaps::holds_value(g, &value.key));
+            let confidence = match (confidence_of(value.origin), value_gap) {
+                (Confidence::Confirmed, Some(_)) => Confidence::ConfirmFirst,
+                (confidence, _) => confidence,
+            };
+            let Some(mut finding) = finding_for(
                 data,
                 options,
                 Site::Call(call, kind),
                 &class,
                 value,
-                confidence_of(value.origin),
+                confidence,
             ) else {
                 continue;
             };
+            finding.gap_reason = value_gap.map(|g| g.reason.clone());
             if finding.routing_class == RoutingClass::Routed {
                 routed.push(finding);
             } else {
@@ -491,10 +554,9 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
         // whose client was not resolved.
         let call = (gap.kind == GapKind::UnresolvedModel)
             .then(|| {
-                input.calls.iter().find(|c| {
-                    c.file == gap.file
-                        && gap.span.is_some_and(|s| s.start_byte == c.span.start_byte)
-                })
+                gap.span
+                    .and_then(|s| calls_at.get(&(gap.file.as_str(), s.start_byte)))
+                    .copied()
             })
             .flatten();
         let (site, class, confidence) = match call {
@@ -504,7 +566,7 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
                 };
                 (
                     Site::Call(call, kind),
-                    call_routing(call, input.clients, input.gaps),
+                    call_routing(call, input.clients, &at_call(call)),
                     Confidence::ConfirmFirst,
                 )
             }
@@ -516,6 +578,7 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
                     sdk: gap.sdk,
                     table: None,
                     base_url: None,
+                    gap: None,
                 },
                 if gap.kind == GapKind::UnresolvedModel {
                     Confidence::ConfirmFirst
@@ -554,6 +617,12 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
     let mut summary = summarize(&direct, &routed, routed_calls, unreadable.len());
     summary.no_model_calls = no_model_calls;
     summary.response_objects = response_objects;
+    summary.not_analyzed = input.gaps.iter().filter(|g| gaps::is_region(g)).count();
+    summary.untracked_methods = input
+        .gaps
+        .iter()
+        .filter(|g| g.kind == GapKind::DynamicDispatch)
+        .count();
     let exit_code = i32::from(summary.failing > 0);
 
     RetirementReport {
@@ -686,13 +755,22 @@ struct CallRouting {
     /// The schedule a direct client follows.
     table: Option<Table>,
     base_url: Option<BaseUrl>,
+    /// The client gap at the call that leaves its routing unknown.
+    gap: Option<String>,
 }
 
 /// The routing [`crate::usages`] decided. A `base_url` is already routed by
 /// its host there (the provider's own host is direct; an environment-only or
 /// unresolved value is unknown), so it is followed as it is and only named.
-fn call_routing(call: &SdkCall, clients: &[ClientConstruction], gaps: &[UsageGap]) -> CallRouting {
-    let base_url = base_url_of(call, gaps, clients);
+/// Any client gap at the call (`at_call`) makes the routing unknown: the
+/// scan could not confirm where the call goes. The provider's schedule is
+/// still the one looked up.
+fn call_routing(
+    call: &SdkCall,
+    clients: &[ClientConstruction],
+    at_call: &[&UsageGap],
+) -> CallRouting {
+    let base_url = base_url_of(call, at_call, clients);
     let (class, table) = match call.routing {
         Routing::OpenaiDirect => (RoutingClass::Direct, Some(Table::Openai)),
         Routing::AnthropicDirect => (RoutingClass::Direct, Some(Table::Anthropic)),
@@ -708,12 +786,18 @@ fn call_routing(call: &SdkCall, clients: &[ClientConstruction], gaps: &[UsageGap
         | Routing::AnthropicVertex => (RoutingClass::Routed, None),
         Routing::Unknown => (RoutingClass::Unknown, None),
     };
+    let gap = at_call.iter().find(|g| gaps::holds_routing(g));
     CallRouting {
-        class,
+        class: if gap.is_some() {
+            RoutingClass::Unknown
+        } else {
+            class
+        },
         routing: call.routing.as_str().to_string(),
         sdk: Some(call.sdk),
         table,
         base_url,
+        gap: gap.map(|g| g.reason.clone()),
     }
 }
 
@@ -1261,6 +1345,7 @@ fn finding_for(
         value_from: value.name.clone(),
         value_line: value.span.line,
         gap_reason,
+        routing_gap: routing.gap.clone(),
         candidate: false,
         splat,
         in_window,
@@ -2677,7 +2762,9 @@ mod tests {
     fn base_url_routing_follows_the_usage_scan() {
         // The usage scan routes a base_url by its host: the provider's own
         // host stays direct, an environment lookup adds a gap, another host
-        // is custom_base_url.
+        // is custom_base_url. A gap leaves the routing unknown, even when the
+        // lookup falls back to the provider's own host: the deployment may
+        // set the variable.
         let model = "gpt-3.5-turbo-0613";
         let at = |line: u32, routing: Routing| {
             let mut c = call(
@@ -2757,15 +2844,15 @@ mod tests {
             class(21),
             Some((RoutingClass::Direct, Some(BaseUrl::ProviderHost), true))
         );
+        // Listed with routing unknown, and not counted by default.
         assert_eq!(
             class(22),
             Some((
-                RoutingClass::Direct,
+                RoutingClass::Unknown,
                 Some(BaseUrl::EnvProviderDefault),
-                true
+                false
             ))
         );
-        // Listed with routing unknown, and not counted by default.
         assert_eq!(
             class(23),
             Some((RoutingClass::Unknown, Some(BaseUrl::EnvOnly), false))
@@ -2777,7 +2864,17 @@ mod tests {
         assert_eq!(class(25), None, "another host stays routed");
         assert_eq!(class(26), Some((RoutingClass::Direct, None, true)));
         assert_eq!(report.summary.routed_calls, 1);
-        assert_eq!(report.summary.uncounted, 2);
+        assert_eq!(report.summary.uncounted, 3);
+        let gap_of = |line: u32| {
+            report
+                .findings
+                .iter()
+                .find(|f| f.line == line)
+                .and_then(|f| f.routing_gap.clone())
+        };
+        assert_eq!(gap_of(22).as_deref(), Some("base_url_env"));
+        assert_eq!(gap_of(24).as_deref(), Some("base_url_unresolved"));
+        assert_eq!(gap_of(21), None);
 
         let mut opts = options("2026-10-18");
         opts.count_unconfirmed = true;
@@ -3048,6 +3145,464 @@ mod tests {
         // other passes no model at all.
         assert_eq!(report.summary.unreadable_calls, 0);
         assert_eq!(report.summary.no_model_calls, 1);
+    }
+
+    /// A gap of `kind` and `reason` at line `line` of `app.py`.
+    fn gap_at(kind: GapKind, reason: &str, line: u32, key: Option<&str>) -> UsageGap {
+        UsageGap {
+            kind,
+            sdk: Some(Sdk::Openai),
+            file: "app.py".into(),
+            span: Some(span(line)),
+            symbol: None,
+            chain: Some("client.chat.completions.create".into()),
+            key: key.map(str::to_string),
+            reason: reason.into(),
+            detail: String::new(),
+            values: Vec::new(),
+            values_complete: false,
+        }
+    }
+
+    #[test]
+    fn every_gap_at_a_call_keeps_it_from_reading_as_confirmed() {
+        // A retired model at a direct call fails the check on its own...
+        let call = openai("gpt-3.5-turbo-0613", &[]);
+        let clean = run(std::slice::from_ref(&call), &[], &options("2026-10-18"));
+        assert_eq!(clean.findings[0].confidence, Confidence::Confirmed);
+        assert_eq!(clean.exit_code, 1);
+
+        // ...and never with any gap at its call: every reason the usage scan
+        // names, and a reason it may add later, of every kind.
+        let mut cases: Vec<(GapKind, String)> = gaps::GAP_REASONS
+            .iter()
+            .map(|(kind, reason, _)| (*kind, reason.to_string()))
+            .collect();
+        for kind in [
+            GapKind::UnresolvedModel,
+            GapKind::AmbiguousClient,
+            GapKind::UnknownClientFactory,
+            GapKind::DynamicDispatch,
+            GapKind::VendoredPath,
+        ] {
+            cases.push((kind, "a_reason_added_later".to_string()));
+        }
+        for (kind, reason) in &cases {
+            let key = (*kind == GapKind::UnresolvedModel).then_some("model");
+            let gap = gap_at(*kind, reason, 10, key);
+            let report = run(
+                std::slice::from_ref(&call),
+                std::slice::from_ref(&gap),
+                &options("2026-10-18"),
+            );
+            let finding = &report.findings[0];
+            let label = format!("{kind}/{reason}");
+            assert!(
+                finding.confidence != Confidence::Confirmed
+                    || finding.routing_class != RoutingClass::Direct,
+                "{label} reads as confirmed"
+            );
+            assert!(!finding.fails, "{label} counts toward the exit code");
+            assert_eq!(report.exit_code, 0, "{label}");
+            assert_eq!(finding.fix, FixKind::Manual, "{label} is never a swap");
+            if *kind == GapKind::UnresolvedModel {
+                assert_eq!(finding.confidence, Confidence::ConfirmFirst, "{label}");
+                assert_eq!(finding.routing_class, RoutingClass::Direct, "{label}");
+                assert_eq!(finding.gap_reason.as_deref(), Some(reason.as_str()));
+            } else {
+                assert_eq!(finding.routing_class, RoutingClass::Unknown, "{label}");
+                assert_eq!(finding.routing_gap.as_deref(), Some(reason.as_str()));
+            }
+            // Counted when asked.
+            let mut opts = options("2026-10-18");
+            opts.count_unconfirmed = true;
+            let counted = run(
+                std::slice::from_ref(&call),
+                std::slice::from_ref(&gap),
+                &opts,
+            );
+            assert_eq!(counted.exit_code, 1, "{label} with --count-unconfirmed");
+        }
+    }
+
+    #[test]
+    fn a_value_gap_holds_its_own_key_or_every_key() {
+        let mut call = openai("gpt-3.5-turbo-0613", &["extra_body"]);
+        let mut fallback = value("gpt-3.5-turbo-0613", ValueOrigin::Literal, 10);
+        fallback.key = "extra_body.fallbacks.model".into();
+        call.values.push(fallback);
+        let confidence = |gaps: &[UsageGap]| -> Vec<(String, Confidence)> {
+            run(std::slice::from_ref(&call), gaps, &options("2026-10-18"))
+                .findings
+                .iter()
+                .map(|f| (f.key.clone(), f.confidence))
+                .collect()
+        };
+        // A gap for the fallback leaves the model confirmed.
+        let other = gap_at(
+            GapKind::UnresolvedModel,
+            "env_var",
+            10,
+            Some("extra_body.fallbacks.model"),
+        );
+        let found = confidence(std::slice::from_ref(&other));
+        assert!(found.contains(&("model".into(), Confidence::Confirmed)));
+        assert!(found.contains(&(
+            "extra_body.fallbacks.model".into(),
+            Confidence::ConfirmFirst
+        )));
+        // A gap that names no key (more nested values than are read) holds
+        // every value at the call.
+        let truncated = gap_at(GapKind::UnresolvedModel, "truncated", 10, None);
+        assert!(confidence(&[truncated])
+            .iter()
+            .all(|(_, c)| *c == Confidence::ConfirmFirst));
+    }
+
+    #[test]
+    fn unanalyzed_parts_and_untracked_methods_are_counted() {
+        // A region the scan did not analyze has no callee; it is counted,
+        // never matched to a call or listed as an unreadable model.
+        let region = UsageGap {
+            sdk: None,
+            chain: None,
+            ..gap_at(GapKind::UnresolvedModel, "truncated", 30, None)
+        };
+        let dispatch = gap_at(GapKind::DynamicDispatch, "getattr", 40, None);
+        let report = run(&[], &[region, dispatch], &options("2026-10-18"));
+        assert_eq!(report.summary.not_analyzed, 1);
+        assert_eq!(report.summary.untracked_methods, 1);
+        assert!(report.unreadable.is_empty());
+        assert_eq!(report.exit_code, 0);
+    }
+
+    /// Python files that give the usage scan each gap the retirement check
+    /// has to keep from reading as confirmed.
+    const GAP_FIXTURES: &[(&str, &str)] = &[
+        (
+            "value_gaps.py",
+            r#"import functools
+import os
+
+from openai import OpenAI
+
+client = OpenAI()
+
+
+class Bot:
+    MODEL = "gpt-4o"
+
+    def run(self):
+        return client.chat.completions.create(model=self.MODEL, messages=[])
+
+
+def ask(model="gpt-4o"):
+    return client.chat.completions.create(model=model, messages=[])
+
+
+@functools.lru_cache
+def cached(model="gpt-4o"):
+    return client.chat.completions.create(model=model, messages=[])
+
+
+def _private(model="gpt-4o"):
+    return client.chat.completions.create(model=model, messages=[])
+
+
+_private("gpt-4o-mini")
+
+
+def env_fallback():
+    return client.chat.completions.create(model=os.getenv("MODEL", "gpt-4o"), messages=[])
+
+
+def splatted(overrides):
+    return client.chat.completions.create(**{"model": "gpt-4o", **overrides}, messages=[])
+
+
+def no_model():
+    return client.chat.completions.create(messages=[])
+"#,
+        ),
+        (
+            "dynamic_value.py",
+            r#"from openai import OpenAI
+
+MODEL = "gpt-4o"
+client = OpenAI()
+exec("MODEL = 'gpt-6-luna'")
+
+
+def run():
+    return client.chat.completions.create(model=MODEL, messages=[])
+
+
+def literal():
+    return client.chat.completions.create(model="gpt-4o", messages=[])
+"#,
+        ),
+        (
+            "module_config.py",
+            r#"import openai
+
+
+def legacy():
+    return openai.ChatCompletion.create(engine="gpt-4o", messages=[])
+"#,
+        ),
+        (
+            "endpoint_env.py",
+            r#"import os
+
+from openai import OpenAI
+
+os.environ["OPENAI_BASE_URL"] = "http://localhost:4000"
+client = OpenAI()
+
+
+def run():
+    return client.chat.completions.create(model="gpt-4o", messages=[])
+"#,
+        ),
+        (
+            "base_url_env.py",
+            r#"import os
+
+from openai import OpenAI
+
+client = OpenAI(base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+other = OpenAI(base_url=os.environ.get("OPENAI_BASE_URL"))
+
+
+def run():
+    return client.chat.completions.create(model="gpt-4o", messages=[])
+
+
+def run_env_only():
+    return other.chat.completions.create(model="gpt-4o", messages=[])
+"#,
+        ),
+        (
+            "endpoint_option.py",
+            r#"from google import genai
+
+client = genai.Client(http_options={"base_url": "https://example.invalid"})
+
+
+def run():
+    return client.models.generate_content(model="gemini-2.0-flash", contents="hi")
+"#,
+        ),
+        (
+            "routing_gaps.py",
+            r#"import random
+
+from openai import AzureOpenAI, OpenAI
+
+
+def make():
+    return OpenAI()
+
+
+plain = OpenAI()
+either = OpenAI() if random.random() > 0.5 else AzureOpenAI()
+moved = OpenAI()
+moved.base_url = "http://localhost:4000"
+unread = OpenAI(base_url=random.choice(["a", "b"]))
+made = make()
+
+
+def branch():
+    return either.chat.completions.create(model="gpt-4o", messages=[])
+
+
+def assigned():
+    return moved.chat.completions.create(model="gpt-4o", messages=[])
+
+
+def unresolved():
+    return unread.chat.completions.create(model="gpt-4o", messages=[])
+
+
+def factory():
+    return made.chat.completions.create(model="gpt-4o", messages=[])
+
+
+def dispatch():
+    return getattr(plain.chat.completions, "create")(model="gpt-4o", messages=[])
+
+
+def send(c=plain):
+    return c.chat.completions.create(model="gpt-4o", messages=[])
+
+
+def _helper(c):
+    return c.chat.completions.create(model="gpt-4o", messages=[])
+
+
+_helper(plain)
+"#,
+        ),
+    ];
+
+    /// Every `.py` file under `dir`, with its path relative to `root`.
+    fn python_files(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut Vec<(String, String)>,
+    ) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                python_files(root, &path, out);
+            } else if path.extension().is_some_and(|e| e == "py") {
+                let name = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((name, std::fs::read_to_string(&path).unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn no_gap_from_the_usage_scan_reads_as_confirmed() {
+        // The fixtures above, a file with scopes nested past the scan's cap
+        // and a call with more nested values than it reads, and every SDK
+        // eval corpus.
+        let mut files: Vec<(String, String)> = GAP_FIXTURES
+            .iter()
+            .map(|(name, source)| (name.to_string(), source.to_string()))
+            .collect();
+        let mut deep = r#"client.chat.completions.create(model="gpt-4o", messages=[])"#.to_string();
+        for _ in 0..70 {
+            deep = format!("(lambda: {deep})");
+        }
+        files.push((
+            "truncated_scopes.py".into(),
+            format!(
+                "from openai import OpenAI\n\nclient = OpenAI()\n\ndeep = {deep}\n\n\ndef shallow():\n    return client.chat.completions.create(model=\"gpt-4o\", messages=[])\n"
+            ),
+        ));
+        let fallbacks = vec![r#"{"model": "gpt-4o"}"#; 40].join(", ");
+        files.push((
+            "truncated_values.py".into(),
+            format!(
+                "from openai import OpenAI\n\nclient = OpenAI()\n\n\ndef run():\n    return client.chat.completions.create(model=\"gpt-4o\", messages=[], extra_body={{\"fallbacks\": [{fallbacks}]}})\n"
+            ),
+        ));
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval/corpus");
+        let mut corpora = 0;
+        for entry in std::fs::read_dir(&corpus).expect("the eval corpus is in the workspace") {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("py-sdk-"))
+            {
+                corpora += 1;
+                python_files(&corpus, &path, &mut files);
+            }
+        }
+        assert!(corpora >= 4, "the SDK eval corpora moved");
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::language())
+            .unwrap();
+        let (mut calls, mut gaps_found, mut clients) = (Vec::new(), Vec::new(), Vec::new());
+        for (name, source) in &files {
+            let tree = parser.parse(source, None).unwrap();
+            let found = crate::usages::python::extract(&tree, source, name);
+            calls.extend(found.calls);
+            gaps_found.extend(found.gaps);
+            clients.extend(found.clients);
+        }
+
+        // Every reason the scan gave is one this check names.
+        let seen: BTreeSet<(GapKind, &str)> = gaps_found
+            .iter()
+            .map(|g| (g.kind, g.reason.as_str()))
+            .collect();
+        for (kind, reason) in &seen {
+            assert!(
+                gaps::gap_text(*kind, reason).is_some(),
+                "the usage scan gave a {kind} gap with reason `{reason}`, which GAP_REASONS does not name"
+            );
+        }
+        // The fixtures keep covering the gaps this check has to hold.
+        let reasons: BTreeSet<&str> = seen.iter().map(|(_, r)| *r).collect();
+        for needed in [
+            "dynamic_feature",
+            "subclass_override",
+            "module_config",
+            "endpoint_option",
+            "endpoint_env",
+            "base_url_env",
+            "base_url_unresolved",
+            "base_url_assigned",
+            "multiple_assignments",
+            "in_file_callers",
+            "splat",
+            "unseen_callers",
+            "parameter_default",
+            "parameter_overridden",
+            "missing_model",
+            "truncated",
+            "env_var",
+            "factory_call",
+            "getattr",
+        ] {
+            assert!(reasons.contains(needed), "no fixture gives `{needed}`");
+        }
+
+        let opts = CheckOptions {
+            today: Date::parse("2026-10-20").unwrap(),
+            fail_within: Some(36_500),
+            include_routed: true,
+            count_unconfirmed: false,
+        };
+        let input = ScanInput {
+            calls: &calls,
+            gaps: &gaps_found,
+            clients: &clients,
+        };
+        let report = check(input, bundled().unwrap(), &opts);
+        assert!(report.findings.len() > 50, "{}", report.findings.len());
+        let mut held = 0;
+        for finding in report.findings.iter().chain(&report.routed) {
+            let here: Vec<&UsageGap> = gaps_found
+                .iter()
+                .filter(|g| {
+                    g.file == finding.file
+                        && g.chain.is_some()
+                        && g.span
+                            .is_some_and(|s| s.line == finding.line && s.column == finding.column)
+                })
+                .collect();
+            let value_gap = here.iter().any(|g| gaps::holds_value(g, &finding.key));
+            let routing_gap = here.iter().any(|g| gaps::holds_routing(g));
+            let at = format!("{}:{} {}", finding.file, finding.line, finding.model);
+            if value_gap {
+                assert_ne!(finding.confidence, Confidence::Confirmed, "{at}");
+            }
+            if routing_gap {
+                assert_ne!(finding.routing_class, RoutingClass::Direct, "{at}");
+            }
+            if value_gap || routing_gap {
+                held += 1;
+                assert!(!finding.fails, "{at} counts toward the exit code");
+                assert_ne!(finding.fix, FixKind::Swap, "{at}");
+                assert_ne!(finding.fix, FixKind::Decide, "{at}");
+            }
+        }
+        assert!(held >= 30, "only {held} findings had a gap at their call");
+        assert_eq!(report.summary.not_analyzed, 1, "the nested scopes");
+        assert!(report.summary.untracked_methods >= 1, "the getattr call");
     }
 
     #[test]
