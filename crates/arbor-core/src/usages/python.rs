@@ -872,6 +872,9 @@ impl Unresolved {
                 "a parameter of a function other modules may call with another value"
             }
             "dynamic_feature" => "something this file may change at run time",
+            "subclass_override" => {
+                "an attribute of a public class read through `self`, which a subclass in another module may set"
+            }
             _ => "not a string literal",
         }
     }
@@ -1066,6 +1069,14 @@ struct Scope {
     /// For a function or lambda: where its body starts. A walrus before it
     /// (in a default or an annotation) binds in the enclosing scope.
     body_start: usize,
+    /// The class whose instance (`self_recv`) or which class itself
+    /// (`cls_recv`) the name `self` / `cls` holds here, and the method that
+    /// binds it: the first parameter of a method directly in the class body
+    /// that is not a `staticmethod`, seen from that method and the
+    /// functions, lambdas and comprehensions nested in it that do not bind
+    /// the name again.
+    self_recv: Option<(usize, usize)>,
+    cls_recv: Option<(usize, usize)>,
 }
 
 impl Scope {
@@ -1092,6 +1103,8 @@ impl Scope {
             immediate: kind == ScopeKind::Class,
             bound_name: None,
             body_start: 0,
+            self_recv: None,
+            cls_recv: None,
         }
     }
 }
@@ -1603,6 +1616,13 @@ struct Ctx<'t> {
     /// Namespace builtins used as a value, by name (see
     /// [`Ctx::note_builtin_value`]).
     builtin_values: HashMap<&'t str, Feature>,
+    /// `C.m` read as a value (not called, not written): when `C` is a class
+    /// and `m` one of its methods, the method may run on another class's
+    /// instance (`B2.go = B.go`, `go = B.go` in another class body).
+    member_values: HashSet<(&'t str, &'t str)>,
+    /// Attribute writes through a method's `self`/`cls`: the method, the
+    /// attribute and the object written.
+    method_self_writes: Vec<(usize, &'t str, Node<'t>)>,
     /// Calls named `configure`, which may set up the legacy Gemini SDK, and
     /// the scope each is in.
     configure_calls: Vec<(Node<'t>, usize)>,
@@ -1721,6 +1741,8 @@ impl<'t> Ctx<'t> {
             rerouted_any: None,
             openai_caveat: None,
             builtin_values: HashMap::new(),
+            member_values: HashSet::new(),
+            method_self_writes: Vec::new(),
             configure_calls: Vec::new(),
             legacy_caveat: None,
             def_bindings: Vec::new(),
@@ -2004,6 +2026,7 @@ impl<'t> Ctx<'t> {
                         self.note_env_read(node);
                         self.note_dict_attribute(node, &frame);
                         self.note_dynamic_attribute(node, &frame);
+                        self.note_member_value(node, &frame);
                     }
                     "identifier" => {
                         self.note_name_use(node, &frame, scope);
@@ -2958,6 +2981,7 @@ impl<'t> Ctx<'t> {
         if let Some(params) = node.child_by_field_name("parameters") {
             self.record_params(params, id);
         }
+        self.bind_receivers(id);
         // A method binds in its class; any other `def` where an import would.
         let home = match self.scopes[parent].kind {
             ScopeKind::Class => parent,
@@ -2996,6 +3020,8 @@ impl<'t> Ctx<'t> {
         scope.lambda = true;
         scope.comprehension = true;
         scope.immediate = node.kind() != "generator_expression";
+        scope.self_recv = self.scopes[parent].self_recv;
+        scope.cls_recv = self.scopes[parent].cls_recv;
         let id = self.scopes.len();
         self.scopes.push(scope);
         id
@@ -3037,7 +3063,120 @@ impl<'t> Ctx<'t> {
         if let Some(params) = node.child_by_field_name("parameters") {
             self.record_params(params, id);
         }
+        self.bind_receivers(id);
         id
+    }
+
+    /// What `self` and `cls` hold in function or lambda `id` (see
+    /// [`Scope::self_recv`]): the method's own class when it is a method
+    /// directly in a class body, not a `staticmethod`, and the name is its
+    /// first parameter; nothing when it binds the name some other way (a
+    /// nested `def inner(self)`, a later parameter); else what the enclosing
+    /// scope's name holds.
+    fn bind_receivers(&mut self, id: usize) {
+        let Some(parent) = self.scopes[id].parent else {
+            return;
+        };
+        let method = self.scopes[parent].kind == ScopeKind::Class && !self.scopes[id].staticmethod;
+        let first = self.scopes[id].slots.first().map(|s| s.name.clone());
+        for name in ["self", "cls"] {
+            let bound = self.params.contains_key(&(id, name.to_string()));
+            let recv = if !bound {
+                match name {
+                    "self" => self.scopes[parent].self_recv,
+                    _ => self.scopes[parent].cls_recv,
+                }
+            } else if method && first.as_deref() == Some(name) {
+                Some((parent, id))
+            } else {
+                None
+            };
+            match name {
+                "self" => self.scopes[id].self_recv = recv,
+                _ => self.scopes[id].cls_recv = recv,
+            }
+        }
+    }
+
+    /// The class and method `self` / `cls` (`name`) refers to in `scope`.
+    fn receiver(&self, name: &str, scope: usize) -> Option<(usize, usize)> {
+        match name {
+            "self" => self.scopes[scope].self_recv,
+            "cls" => self.scopes[scope].cls_recv,
+            _ => None,
+        }
+    }
+
+    /// `C.m` read as a value, recorded for [`Ctx::member_values`].
+    fn note_member_value(&mut self, node: Node<'t>, frame: &Frame<'t>) {
+        let (Some(object), Some(attr)) = (
+            node.child_by_field_name("object"),
+            node.child_by_field_name("attribute"),
+        ) else {
+            return;
+        };
+        if object.kind() != "identifier" || matches!(self.text(object), "self" | "cls") {
+            return;
+        }
+        if let Some(parent) = frame.parent {
+            let called = parent.kind() == "call" && frame.field == Some("function");
+            if called || is_declaration(parent.kind(), frame.field) {
+                return;
+            }
+        }
+        self.member_values
+            .insert((self.text(object), self.text(attr)));
+    }
+
+    /// Whether method `method` of its class is read as a value through the
+    /// class (`B.go`), so it may run with another class's instance as
+    /// `self`.
+    fn is_borrowed(&self, method: usize) -> bool {
+        let Some(class) = self.scopes[method].parent else {
+            return false;
+        };
+        self.member_values.contains(&(
+            self.scopes[class].name.as_str(),
+            self.scopes[method].name.as_str(),
+        ))
+    }
+
+    /// A write through `self` in a method another class may borrow sets
+    /// that class's instances too: an outside write of the attribute.
+    fn settle_borrowed_methods(&mut self) {
+        if self.member_values.is_empty() {
+            return;
+        }
+        for (method, attr, object) in std::mem::take(&mut self.method_self_writes) {
+            if self.is_borrowed(method) {
+                self.outside_attr_writes.entry(attr).or_insert_with(|| {
+                    Self::feature(
+                        "a write through `self` in a method another class may borrow",
+                        object,
+                    )
+                });
+            }
+        }
+    }
+
+    /// Whether other modules can name `class` to subclass it: not
+    /// `_private` (nor inside a private class), not defined in a function,
+    /// and not in a script.
+    fn is_public_class(&self, class: usize) -> bool {
+        if self.script {
+            return false;
+        }
+        let mut current = Some(class);
+        while let Some(s) = current {
+            let scope = &self.scopes[s];
+            match scope.kind {
+                ScopeKind::Module => return true,
+                ScopeKind::Function => return false,
+                ScopeKind::Class if scope.name.starts_with('_') => return false,
+                ScopeKind::Class => current = scope.parent,
+            }
+        }
+        true
     }
 
     fn record_params(&mut self, params: Node<'t>, scope: usize) {
@@ -3339,14 +3478,16 @@ impl<'t> Ctx<'t> {
         }
         if object.kind() == "identifier" {
             let object_name = self.text(object);
-            if matches!(object_name, "self" | "cls") {
-                if let Some(class) = self.scopes[scope].class {
-                    self.attr_assigns
-                        .entry((class, attr.to_string()))
-                        .or_default()
-                        .push(assign);
-                    return;
-                }
+            // `self`/`cls` of a method: its class's attribute. Anywhere else
+            // (a `staticmethod`, a nested `def inner(self)`) the name is not
+            // the instance: an outside write, below.
+            if let Some((class, method)) = self.receiver(object_name, scope) {
+                self.attr_assigns
+                    .entry((class, attr.to_string()))
+                    .or_default()
+                    .push(assign);
+                self.method_self_writes.push((method, attr, object));
+                return;
             }
             if let Some([class]) = self.classes_by_name.get(object_name).map(Vec::as_slice) {
                 let class = *class;
@@ -3448,10 +3589,16 @@ impl<'t> Ctx<'t> {
             self.dynamic_globals = true;
             return;
         }
-        let own = (object.kind() == "identifier" && matches!(self.text(object), "self" | "cls"))
-            || is_super_call(object, |n| self.text(n));
+        let own = if object.kind() == "identifier" {
+            self.receiver(self.text(object), scope)
+                .map(|(class, _)| class)
+        } else if is_super_call(object, |n| self.text(n)) {
+            self.scopes[scope].class
+        } else {
+            None
+        };
         let feature = Self::feature("an attribute written with a run-time name", object);
-        match own.then(|| self.scopes[scope].class).flatten() {
+        match own {
             Some(class) => {
                 self.wild_attr_writes.entry(class).or_insert(feature);
             }
@@ -4423,7 +4570,10 @@ impl<'t> Ctx<'t> {
         }
         let name = self.text(object);
         if matches!(name, "self" | "cls") {
-            return self.scopes[scope].class.map(|class| (class, true));
+            // Only a method's own first parameter is its instance (or
+            // class), and not when another class may borrow the method.
+            let (class, method) = self.receiver(name, scope)?;
+            return (!self.is_borrowed(method)).then_some((class, true));
         }
         // The one class of that name, which nothing else rebinds (`Bot =
         // wrap(Bot)`, an import, a function of the same name).
@@ -5805,6 +5955,7 @@ impl<'t> Ctx<'t> {
             return;
         }
         self.settle_builtin_values();
+        self.settle_borrowed_methods();
         // A bare `environ` is the process environment only when imported
         // from `os`.
         let environ_from_os = self
@@ -7288,6 +7439,13 @@ impl<'t> Ctx<'t> {
                                     resolved
                                         .caveats
                                         .push(Unresolved::dynamic(feature).via(&rendered));
+                                } else if through_self && self.is_public_class(class) {
+                                    // Other modules may subclass a public
+                                    // class and set the attribute (rule 3,
+                                    // like a public function's default).
+                                    resolved
+                                        .caveats
+                                        .push(Unresolved::new("subclass_override", rendered));
                                 }
                                 Ok(resolved)
                             }

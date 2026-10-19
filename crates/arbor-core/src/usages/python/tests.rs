@@ -515,13 +515,23 @@ def param(model="o1-mini"):
         ("o1-mini", ValueOrigin::ParameterDefault, Some("model"))
     );
     // Policy round (P1): other modules may call a public function with
-    // another model, so its default keeps a `parameter_default` gap.
+    // another model, so its default keeps a `parameter_default` gap; and
+    // (policy round 2, lead decision 8) they may subclass the public class
+    // `Chat` and set `model`, so its reads through `self` keep a
+    // `subclass_override` gap. `Chat.a` and `Chat.d` read module constants.
     let reasons: Vec<(Option<&str>, &str)> = found
         .gaps
         .iter()
         .map(|g| (g.symbol.as_deref(), g.reason.as_str()))
         .collect();
-    assert_eq!(reasons, vec![(Some("param"), "parameter_default")]);
+    assert_eq!(
+        reasons,
+        vec![
+            (Some("Chat.b"), "subclass_override"),
+            (Some("Chat.c"), "subclass_override"),
+            (Some("param"), "parameter_default")
+        ]
+    );
 }
 
 #[test]
@@ -3438,10 +3448,15 @@ _Hidden()
     assert_eq!(
         values_and_gaps(&found),
         vec![
+            // A public class's `self.model` also keeps a `subclass_override`
+            // gap (policy round 2, lead decision 8).
             (
                 7,
                 "gpt-4o".to_string(),
-                vec!["parameter_overridden".to_string()]
+                vec![
+                    "parameter_overridden".to_string(),
+                    "subclass_override".to_string()
+                ]
             ),
             (
                 13,
@@ -3455,7 +3470,10 @@ _Hidden()
             (
                 19,
                 "gpt-4o".to_string(),
-                vec!["parameter_default".to_string()]
+                vec![
+                    "parameter_default".to_string(),
+                    "subclass_override".to_string()
+                ]
             ),
             (25, "gpt-4o".to_string(), vec![]),
         ]
@@ -4113,11 +4131,24 @@ fn annotated_fields_of_data_classes_are_constructor_defaults() {
         assert_eq!(rows[0].1, "gpt-4o", "{body}");
         assert_eq!(rows[0].2, vec!["dynamic_feature".to_string()], "{body}");
     }
-    // A plain class's annotated attribute is a class attribute.
+    // A plain class's annotated attribute is a class attribute: confirmed in
+    // a private class; a public one keeps a `subclass_override` gap (policy
+    // round 2, lead decision 8).
+    let rows = rows_of(&format!(
+        "{header}class _Plain:\n    model: str = \"gpt-4o\"\n    def run(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n"
+    ));
+    assert_eq!(rows, vec![(9, "gpt-4o".to_string(), vec![])]);
     let rows = rows_of(&format!(
         "{header}class Plain:\n    model: str = \"gpt-4o\"\n    def run(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n"
     ));
-    assert_eq!(rows, vec![(9, "gpt-4o".to_string(), vec![])]);
+    assert_eq!(
+        rows,
+        vec![(
+            9,
+            "gpt-4o".to_string(),
+            vec!["subclass_override".to_string()]
+        )]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4313,12 +4344,27 @@ fn multiple_or_deep_inheritance_is_a_dynamic_feature() {
         let rows = rows_gapped(&source, &[]);
         assert_eq!(rows.len(), 1);
     }
-    // One level of single inheritance is the supported grammar.
+    // One level of single inheritance is the supported grammar. The classes
+    // are private: a public one's `self.model` keeps a `subclass_override`
+    // gap, since other modules may subclass it (policy round 2, lead
+    // decision 8).
+    let rows = rows_gapped(
+        &format!("{header}class _Base:\n    model = \"gpt-4o\"\nclass _Child(_Base):\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n"),
+        &[8],
+    );
+    assert_eq!(rows, vec![(8, "gpt-4o".to_string(), vec![])]);
     let rows = rows_gapped(
         &format!("{header}class Base:\n    model = \"gpt-4o\"\nclass Child(Base):\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n"),
         &[8],
     );
-    assert_eq!(rows, vec![(8, "gpt-4o".to_string(), vec![])]);
+    assert_eq!(
+        rows,
+        vec![(
+            8,
+            "gpt-4o".to_string(),
+            vec!["subclass_override".to_string()]
+        )]
+    );
 }
 
 #[test]
@@ -5325,4 +5371,146 @@ fn an_environment_base_url_with_another_host_as_fallback_is_a_gap() {
         );
         assert_eq!(routes_and_gaps(&usages(&source)), expected, "{source}");
     }
+}
+
+#[test]
+fn self_is_the_instance_only_as_a_methods_first_parameter() {
+    // Nits: a `self` that is not the instance still read the class: a
+    // `staticmethod`'s parameter named `self`, a nested `def inner(self)`,
+    // and a method another class borrows (`B2.go = B.go`, `go = B.go` in a
+    // class body). `self`/`cls` now hold the class only as the first
+    // parameter of a method directly in its class body (and in closures
+    // that do not rebind it), and not in a method read as a value through
+    // its class; a write through such a method's `self` is an outside
+    // write. The classes are private so that only this rule applies.
+    let header = "from openai import OpenAI\nclient = OpenAI()\n";
+    let cases: Vec<(&str, u32)> = vec![
+        (
+            "class _B3:\n    model = \"gpt-4o\"\n    @staticmethod\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n",
+            7,
+        ),
+        (
+            "class _B4:\n    model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\nclass _B4b:\n    model = \"o1-mini\"\n_B4b.go = _B4.go\n_B4b().go()\n",
+            6,
+        ),
+        (
+            "class _B4:\n    model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\nclass _B4b:\n    model = \"o1-mini\"\n    go = _B4.go\n_B4b().go()\n",
+            6,
+        ),
+        (
+            "class _B5:\n    model = \"gpt-4o\"\n    def go(self):\n        def inner(self):\n            return client.chat.completions.create(model=self.model, messages=[])\n        return inner(object())\n",
+            7,
+        ),
+        (
+            // The borrowed method writes the borrower's instances.
+            "class _B6:\n    def setm(self):\n        self.model = \"o1-mini\"\nclass _B7:\n    model = \"gpt-4o\"\n    setm = _B6.setm\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n",
+            10,
+        ),
+    ];
+    for (body, line) in cases {
+        let source = format!("{header}{body}");
+        let rows = keyed_rows(&source, "model");
+        let row = rows.iter().find(|r| r.0 == line).expect("the call");
+        assert!(!row.2.is_empty(), "{source}: {rows:?}");
+        assert!(
+            row.1.is_empty() || row.2.iter().any(|r| r == "dynamic_feature"),
+            "{source}: {rows:?}"
+        );
+    }
+    // A `staticmethod`'s `self.client` is not the class's client.
+    let found = usages(
+        r#"from openai import OpenAI
+class _B9:
+    client = OpenAI()
+    @staticmethod
+    def go(self):
+        return self.client.chat.completions.create(model="gpt-4o", messages=[])
+"#,
+    );
+    assert!(found.calls.iter().all(|c| c.span.line != 6));
+    assert!(gaps(&found, GapKind::UnknownClientFactory)
+        .iter()
+        .any(|g| g.span.is_some_and(|s| s.line == 6)));
+    // Inside the grammar: a closure in a method, and a classmethod's `cls`.
+    let source = format!(
+        "{header}class _B8:\n    model = \"gpt-4o\"\n    def go(self):\n        ask = lambda: client.chat.completions.create(model=self.model, messages=[])\n        return ask()\n    @classmethod\n    def make(cls):\n        return client.chat.completions.create(model=cls.model, messages=[])\n"
+    );
+    assert_eq!(
+        keyed_rows(&source, "model"),
+        vec![
+            (6, vec!["gpt-4o".to_string()], vec![]),
+            (10, vec!["gpt-4o".to_string()], vec![]),
+        ]
+    );
+}
+
+#[test]
+fn a_public_classs_attribute_read_through_self_keeps_a_gap() {
+    // Lead decision 8: other modules may subclass a public class and set
+    // the attribute a method reads through `self`, the way they may pass
+    // another model to a public function (rule 4). Such a value keeps a
+    // `subclass_override` gap. Read by class name, in a private class, or in
+    // a class defined in a function it is confirmed; routes through
+    // `self.client` are kept.
+    let found = usages(
+        r#"from openai import OpenAI
+client = OpenAI()
+class Bot:
+    MODEL = "gpt-4o"
+    def go(self):
+        return client.chat.completions.create(model=self.MODEL, messages=[])
+    def by_name(self):
+        return client.chat.completions.create(model=Bot.MODEL, messages=[])
+class _Hidden:
+    MODEL = "gpt-4o"
+    def go(self):
+        return client.chat.completions.create(model=self.MODEL, messages=[])
+def factory():
+    class Local:
+        MODEL = "gpt-4o"
+        def go(self):
+            return client.chat.completions.create(model=self.MODEL, messages=[])
+    return Local().go()
+class Svc:
+    def __init__(self):
+        self.client = OpenAI()
+    def go(self):
+        return self.client.chat.completions.create(model="gpt-4o", messages=[])
+"#,
+    );
+    let gpt = || vec!["gpt-4o".to_string()];
+    assert_eq!(
+        values_and_gap_rows(&found),
+        vec![
+            (6, gpt(), vec!["subclass_override".to_string()]),
+            (8, gpt(), vec![]),
+            (12, gpt(), vec![]),
+            (17, gpt(), vec![]),
+            (23, gpt(), vec![]),
+        ]
+    );
+    assert_eq!(found.calls[4].routing, Routing::OpenaiDirect);
+}
+
+/// `(line, model values, gap reasons)` per call.
+fn values_and_gap_rows(found: &FileUsages) -> Vec<KeyedRow> {
+    found
+        .calls
+        .iter()
+        .map(|c| {
+            let values = c
+                .values
+                .iter()
+                .filter(|v| v.key == "model")
+                .map(|v| v.value.clone())
+                .collect();
+            let reasons = found
+                .gaps
+                .iter()
+                .filter(|g| g.span.map(|s| s.start_byte) == Some(c.span.start_byte))
+                .map(|g| g.reason.clone())
+                .collect();
+            (c.span.line, values, reasons)
+        })
+        .collect()
 }
