@@ -613,6 +613,10 @@ enum ClientCaveat {
     /// another module may route it to Azure (the SDK's module state is
     /// process-wide).
     ModuleConfig,
+    /// The module-level API's routing is configured outside the top-of-file
+    /// setup block (in a function, a branch, after a `def`...), so it may
+    /// not hold when a call runs (see [`Ctx::module_openai_routing`]).
+    ModuleSetup(Feature),
 }
 
 /// A Python feature that can change what a name, attribute, dict or the
@@ -1241,6 +1245,8 @@ struct ConfigAssign<'t> {
     /// (not in a branch, loop, `try`, `with`, class body or function, and
     /// not part of a larger expression): it runs once, at import.
     top: bool,
+    /// A plain `=` assignment (not `+=`, `setattr` or `del`).
+    plain: bool,
     /// Where the write is.
     at: usize,
 }
@@ -1656,11 +1662,14 @@ struct Ctx<'t> {
     /// not routed by it.
     openai_last_config: Option<(usize, Feature)>,
     /// The attribute write or `setattr` call being recorded is a statement
-    /// of its own directly in the module body (see [`ConfigAssign::top`]).
+    /// of its own directly in the module body (see [`ConfigAssign::top`]),
+    /// and a plain `=` assignment ([`ConfigAssign::plain`]).
     config_top: bool,
-    /// Where the first call that runs at import and runs this file's own
-    /// code is (see [`Ctx::own_code_at_import`]); computed once.
-    own_code_at_import: Option<Option<usize>>,
+    config_plain: bool,
+    /// Where the top-of-file setup block ends (see
+    /// [`Ctx::setup_block_end`]): the module-level API's configuration
+    /// counts only before it.
+    setup_end: usize,
     /// Scopes nested deeper than [`MAX_SCOPE_DEPTH`], which are not walked,
     /// and the scope each is in: one `truncated` gap each.
     scope_cuts: Vec<(Node<'t>, usize)>,
@@ -1774,7 +1783,8 @@ impl<'t> Ctx<'t> {
             def_bindings: Vec::new(),
             openai_last_config: None,
             config_top: false,
-            own_code_at_import: None,
+            config_plain: false,
+            setup_end: 0,
             scope_cuts: Vec::new(),
             module_stars: Vec::new(),
             dynamic_globals: false,
@@ -1840,6 +1850,7 @@ impl<'t> Ctx<'t> {
     fn collect(&mut self, root: Node<'t>) {
         self.scopes[0].start = root.start_byte();
         self.scopes[0].end = root.end_byte();
+        self.setup_end = self.setup_block_end(root);
         let mut stack = vec![Frame {
             node: root,
             scope: 0,
@@ -1935,14 +1946,18 @@ impl<'t> Ctx<'t> {
                             let value = node.child_by_field_name("right");
                             let annotation = node.child_by_field_name("type");
                             self.config_top = is_top_statement(&frame);
+                            self.config_plain = true;
                             self.record_target(left, value, annotation, scope, false, place);
                             self.config_top = false;
+                            self.config_plain = false;
                         }
                         self.note_chained_alias(node);
                     }
                     "augmented_assignment" => {
                         if let Some(left) = node.child_by_field_name("left") {
+                            self.config_top = is_top_statement(&frame);
                             self.record_target(left, None, None, scope, true, place);
+                            self.config_top = false;
                         }
                     }
                     "with_item" => {
@@ -2029,7 +2044,10 @@ impl<'t> Ctx<'t> {
                                 // later read sees (a base's attribute, or
                                 // nothing): an assignment of no value.
                                 if matches!(target.kind(), "identifier" | "attribute") {
+                                    self.config_top =
+                                        frame.parent.is_some_and(|p| p.kind() == "module");
                                     self.record_target(target, None, None, scope, true, place);
+                                    self.config_top = false;
                                 } else {
                                     self.note_mutated_root(target);
                                 }
@@ -3623,6 +3641,7 @@ impl<'t> Ctx<'t> {
             value: assign.value,
             scope,
             top: self.config_top && scope == 0,
+            plain: self.config_plain,
             at: object.start_byte(),
         });
     }
@@ -6156,33 +6175,98 @@ impl<'t> Ctx<'t> {
         });
     }
 
+    /// Where the top-of-file setup block ends: the start of the first
+    /// module-level statement that is not an import, a string (the
+    /// docstring), or an assignment (`=`, annotated or augmented) with no
+    /// lambda, comprehension, generator expression, walrus, `yield` or
+    /// `await` in it. A `def`, a `class`, a decorator, a bare expression or
+    /// call, and any compound statement (`if`, `try`, `for`, `with`...) end
+    /// it. Before it this file has defined no function, class or lambda,
+    /// so no code of its own can run: a configuration written there holds
+    /// for every call this file's functions make. One pass over the
+    /// statements of the block.
+    fn setup_block_end(&self, root: Node<'t>) -> usize {
+        let mut cursor = root.walk();
+        for statement in root.named_children(&mut cursor) {
+            let setup = match statement.kind() {
+                "import_statement"
+                | "import_from_statement"
+                | "future_import_statement"
+                | "comment" => true,
+                "expression_statement" => match named_children(statement).as_slice() {
+                    [only] => match only.kind() {
+                        "string" | "concatenated_string" => true,
+                        "assignment" | "augmented_assignment" => !self.may_define_code(*only),
+                        _ => false,
+                    },
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !setup {
+                return statement.start_byte();
+            }
+        }
+        root.end_byte()
+    }
+
+    /// Whether `node` holds a lambda, comprehension, generator expression,
+    /// walrus, `yield` or `await`: code that defines a scope or binds a name
+    /// where it runs.
+    fn may_define_code(&self, node: Node<'t>) -> bool {
+        let mut cursor = node.walk();
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            if matches!(
+                current.kind(),
+                "lambda"
+                    | "list_comprehension"
+                    | "set_comprehension"
+                    | "dictionary_comprehension"
+                    | "generator_expression"
+                    | "named_expression"
+                    | "yield"
+                    | "await"
+            ) {
+                return true;
+            }
+            stack.extend(current.named_children(&mut cursor));
+        }
+        false
+    }
+
     /// Routing of the module-level OpenAI API, from `openai.api_type`,
     /// `openai.api_base` / `base_url` and `openai.azure_endpoint`
     /// assignments anywhere in the file. The supported grammar is a
-    /// configuration made by top-level statements, each routing attribute
-    /// assigned once: one that is conditional, in a loop, `try`, `with`,
-    /// class body or function, or assigned more than once, is a
-    /// `dynamic_feature` (the routing reported is what the assignments
-    /// together suggest, as a candidate).
+    /// configuration written in the top-of-file setup block (see
+    /// [`Ctx::setup_block_end`]): plain `=` statements directly in the
+    /// module body, each routing attribute assigned once. Anything else (a
+    /// routing setting in a function, a branch, loop, `try`, `with` or class
+    /// body, after a `def`, `class`, decorator or other statement, by `+=`,
+    /// `setattr` or `del`, assigned twice, or written on an object this file
+    /// cannot identify) gives every module-level call a `module_config` gap;
+    /// the routing reported is what the assignments together suggest, as a
+    /// candidate.
     fn module_openai_routing(&mut self) -> Routing {
         let (mut azure, mut unknown, mut custom) = (false, false, false);
         let mut assigned: HashSet<&'t str> = HashSet::new();
         for assign in self.config_assigns.clone() {
             let target = self.eval(assign.object, assign.scope, 0);
             self.note_sdk_patch(&target, assign);
+            let attr = assign.attr;
+            let routes = is_module_routing_attr(attr);
             if !matches!(&target, Val::Module { pkg: Pkg::Openai, path } if path.is_empty()) {
+                // An object this file cannot identify (an alias chosen at
+                // run time, a parameter) may be the module.
+                if routes && matches!(target, Val::Untracked(_)) {
+                    self.openai_caveat
+                        .get_or_insert(ClientCaveat::ModuleSetup(Self::feature(
+                            "a routing setting written on an object this file cannot identify, which may be the SDK module",
+                            assign.object,
+                        )));
+                }
                 continue;
             }
-            let attr = assign.attr;
-            let routes = matches!(
-                attr,
-                "api_type"
-                    | "api_base"
-                    | "base_url"
-                    | "azure_endpoint"
-                    | "azure_ad_token"
-                    | "azure_ad_token_provider"
-            ) || attr.starts_with("bedrock_");
             if routes && self.openai_last_config.is_none_or(|(at, _)| at < assign.at) {
                 let feature = Self::feature("the SDK configured after the call", assign.object);
                 self.openai_last_config = Some((assign.at, feature));
@@ -6190,11 +6274,18 @@ impl<'t> Ctx<'t> {
             if routes {
                 // Set in a function, the configuration holds only once (and
                 // if) the function runs; in a branch, loop or `try`, only on
-                // that path; assigned twice, whichever ran last.
+                // that path; after the setup block, perhaps after this
+                // file's own code ran; assigned twice, whichever ran last.
                 let what = if self.scopes[assign.scope].kind == ScopeKind::Function {
                     Some("the SDK configured inside a function, which may not run first")
                 } else if !assign.top {
                     Some("the SDK configured inside a branch, loop, `try`, `with` or class body, which may not run")
+                } else if !assign.plain {
+                    Some("the SDK configured by `+=`, `setattr` or `del`")
+                } else if !self.imported_only(assign.object) {
+                    Some("the SDK configured through a name this file also assigns, or a wildcard import may rebind")
+                } else if assign.at >= self.setup_end {
+                    Some("the SDK configured after the top-of-file setup block, where this file's own code may already have run")
                 } else if !assigned.insert(attr) {
                     Some("an SDK routing setting assigned more than once")
                 } else {
@@ -6202,7 +6293,10 @@ impl<'t> Ctx<'t> {
                 };
                 if let Some(what) = what {
                     self.openai_caveat
-                        .get_or_insert(ClientCaveat::Dynamic(Self::feature(what, assign.object)));
+                        .get_or_insert(ClientCaveat::ModuleSetup(Self::feature(
+                            what,
+                            assign.object,
+                        )));
                 }
             }
             match attr {
@@ -6248,6 +6342,21 @@ impl<'t> Ctx<'t> {
                 }
                 _ if attr.starts_with("bedrock_") => unknown = true,
                 _ => {}
+            }
+        }
+        // An attribute written with a run-time name may be a routing
+        // setting of the module.
+        for (object, scope) in self.wild_attr_objects.clone() {
+            let target = self.eval(object, scope, 0);
+            let module =
+                matches!(&target, Val::Module { pkg: Pkg::Openai, path } if path.is_empty());
+            if module || matches!(target, Val::Untracked(_)) {
+                self.openai_caveat
+                    .get_or_insert(ClientCaveat::ModuleSetup(Self::feature(
+                        "an attribute written with a run-time name on an object that may be the SDK module",
+                        object,
+                    )));
+                break;
             }
         }
         if azure {
@@ -6465,17 +6574,13 @@ impl<'t> Ctx<'t> {
         }
         match self.openai_last_config {
             Some((at, feature)) => {
-                // A call that runs at import before the configuration, or
-                // one in a function this file's own code may run at import
-                // before it (`ask()` above `openai.base_url = ...`), is
-                // sent both ways.
-                let before = if self.runs_at_import(scope) {
-                    call.start_byte() < at
-                } else {
-                    self.own_code_at_import().is_some_and(|first| first < at)
-                };
-                if before {
-                    caveat = Some(ClientCaveat::Dynamic(feature));
+                // The configuration is in the setup block (else the caveat
+                // is set): no function of this file exists before it, but a
+                // call that runs at import in the block itself
+                // (`R = openai.chat.completions.create(...)`) may come
+                // before it.
+                if self.runs_at_import(scope) && call.start_byte() < at {
+                    caveat = Some(ClientCaveat::ModuleSetup(feature));
                 }
             }
             None => {
@@ -6488,40 +6593,16 @@ impl<'t> Ctx<'t> {
         (routing, caveat)
     }
 
-    /// Where the first call that runs at import and may run this file's
-    /// own functions is: a call by name of a module-level function or class
-    /// of this file, or of an attribute of one (`main()`, `Bot()`,
-    /// `Bot.setup()`). One pass over the calls, memoized.
-    fn own_code_at_import(&mut self) -> Option<usize> {
-        if let Some(found) = self.own_code_at_import {
-            return found;
-        }
-        let mut first: Option<usize> = None;
-        for &(call, scope) in &self.calls {
-            if first.is_some_and(|f| f <= call.start_byte()) || !self.runs_at_import(scope) {
-                continue;
-            }
-            let mut callee = call.child_by_field_name("function");
-            while let Some(node) = callee.filter(|n| n.kind() == "attribute") {
-                callee = node.child_by_field_name("object");
-            }
-            let Some(name) = callee
-                .filter(|n| n.kind() == "identifier")
-                .map(|n| self.text(n))
-            else {
-                continue;
-            };
-            let own = self.functions.contains_key(&(0, name.to_string()))
-                || self
-                    .classes_by_name
-                    .get(name)
-                    .is_some_and(|classes| classes.iter().any(|&c| self.class_home(c) == 0));
-            if own {
-                first = Some(call.start_byte());
-            }
-        }
-        self.own_code_at_import = Some(first);
-        first
+    /// Whether `object` is a name only import statements bind at module
+    /// level: never assigned (an alias such as `o = openai if x else y`),
+    /// and no wildcard import or namespace write may rebind it.
+    fn imported_only(&self, object: Node<'t>) -> bool {
+        object.kind() == "identifier"
+            && !self
+                .assigns
+                .contains_key(&(0, self.text(object).to_string()))
+            && self.module_stars.is_empty()
+            && !self.dynamic_globals
     }
 
     /// Whether code in `scope` runs when the module is imported: the module
@@ -6923,6 +7004,13 @@ impl<'t> Ctx<'t> {
                     "dynamic_feature",
                     format!(
                         "the receiver of `{chain}` may be rebound or replaced at run time: {}",
+                        feature.describe()
+                    ),
+                ),
+                ClientCaveat::ModuleSetup(feature) => (
+                    "module_config",
+                    format!(
+                        "the module-level API's routing is not configured by a top-of-file setup block ({}), so it may not hold when `{chain}` runs",
                         feature.describe()
                     ),
                 ),
@@ -8992,6 +9080,19 @@ fn is_namespace_builtin(name: &str) -> bool {
 /// Whether the node of `frame` is a statement of its own directly in the
 /// module body: an expression statement there, not a branch, loop, `try`,
 /// `with`, class body or function, nor part of a larger expression.
+/// A module attribute that routes the module-level OpenAI API.
+fn is_module_routing_attr(attr: &str) -> bool {
+    matches!(
+        attr,
+        "api_type"
+            | "api_base"
+            | "base_url"
+            | "azure_endpoint"
+            | "azure_ad_token"
+            | "azure_ad_token_provider"
+    ) || attr.starts_with("bedrock_")
+}
+
 fn is_top_statement(frame: &Frame<'_>) -> bool {
     frame
         .parent

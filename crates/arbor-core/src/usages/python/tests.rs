@@ -4672,7 +4672,7 @@ i.chat.completions.create(model="gpt-4o", messages=[])
         vec![(
             5,
             Routing::CustomBaseUrl,
-            vec!["ambiguous_client/dynamic_feature".to_string()]
+            vec!["ambiguous_client/module_config".to_string()]
         )]
     );
 }
@@ -4895,14 +4895,15 @@ def ask(opts):
 }
 
 #[test]
-fn module_level_configuration_holds_only_when_top_level_once_and_before_the_call() {
+fn module_level_configuration_holds_only_in_the_top_of_file_setup_block() {
     // Blocker 2: the module-level API's routing was the OR of every
     // configuration in the file, so `if USE_AZURE: openai.api_type =
     // "azure"` reported `azure_openai` with no gap. A routing setting now
-    // counts with no gap only as a top-level statement, assigned once,
-    // before any call that runs at import; anything else is a
-    // `dynamic_feature` gap that keeps the suggested routing as a candidate.
-    let dynamic = || vec!["ambiguous_client/dynamic_feature".to_string()];
+    // counts with no gap only as a plain top-level statement in the
+    // top-of-file setup block, assigned once, before any call that runs at
+    // import (engine round 1, lead decision D2); anything else is a
+    // `module_config` gap that keeps the suggested routing as a candidate.
+    let dynamic = || vec!["ambiguous_client/module_config".to_string()];
     let cases: Vec<(&str, Vec<RouteRow>)> = vec![
         (
             // The reviewer's v0 Azure switch.
@@ -4947,6 +4948,16 @@ fn module_level_configuration_holds_only_when_top_level_once_and_before_the_call
             "import openai\nok = True\nok and setattr(openai, \"base_url\", \"https://proxy.internal/v1\")\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
             vec![(4, Routing::CustomBaseUrl, dynamic())],
         ),
+        (
+            // `setattr` is a call, not an assignment: it ends the block.
+            "import openai\nsetattr(openai, \"base_url\", \"https://proxy.internal/v1\")\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+            vec![(3, Routing::CustomBaseUrl, dynamic())],
+        ),
+        (
+            // After a `def`, this file's own code may have run first.
+            "import openai\ndef ask():\n    return openai.chat.completions.create(model=\"gpt-4o\", messages=[])\nopenai.base_url = \"https://proxy.internal/v1\"\n",
+            vec![(3, Routing::CustomBaseUrl, dynamic())],
+        ),
         // Inside the grammar: still confirmed.
         (
             "import openai\nopenai.api_key = \"x\"\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
@@ -4957,13 +4968,9 @@ fn module_level_configuration_holds_only_when_top_level_once_and_before_the_call
             vec![(4, Routing::AzureOpenai, vec![])],
         ),
         (
-            "import openai\nsetattr(openai, \"base_url\", \"https://proxy.internal/v1\")\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
-            vec![(3, Routing::CustomBaseUrl, vec![])],
-        ),
-        (
-            // A function runs after the top-level configuration.
-            "import openai\ndef ask():\n    return openai.chat.completions.create(model=\"gpt-4o\", messages=[])\nopenai.base_url = \"https://proxy.internal/v1\"\n",
-            vec![(3, Routing::CustomBaseUrl, vec![])],
+            // A function defined after the setup block runs after it.
+            "import openai\nopenai.base_url = \"https://proxy.internal/v1\"\ndef ask():\n    return openai.chat.completions.create(model=\"gpt-4o\", messages=[])\nask()\n",
+            vec![(4, Routing::CustomBaseUrl, vec![])],
         ),
     ];
     for (source, expected) in cases {
@@ -5598,44 +5605,6 @@ fn an_sdk_member_replaced_in_the_file_gaps_its_routes() {
 }
 
 #[test]
-fn module_configuration_after_own_code_runs_at_import_is_a_gap() {
-    // Engine round 1: a module-level call in a function was routed by a
-    // top-level configuration written after it, even when this file runs
-    // that function at import before the configuration (`ask()` above
-    // `openai.base_url = ...`): the first request goes direct, the later
-    // ones to the proxy. That configuration now counts only before the
-    // first import-time call of this file's own functions or classes.
-    let dynamic = || vec!["ambiguous_client/dynamic_feature".to_string()];
-    let cases: Vec<(&str, Vec<RouteRow>)> = vec![
-        (
-            "import openai\ndef ask():\n    return openai.chat.completions.create(model=\"gpt-4o\", messages=[])\nask()\nopenai.base_url = \"https://proxy.internal/v1\"\n",
-            vec![(3, Routing::CustomBaseUrl, dynamic())],
-        ),
-        (
-            "import openai\nclass Bot:\n    def go(self):\n        return openai.chat.completions.create(model=\"gpt-4o\", messages=[])\nBot().go()\nopenai.base_url = \"https://proxy.internal/v1\"\n",
-            vec![(4, Routing::CustomBaseUrl, dynamic())],
-        ),
-        (
-            "import openai\nclass Bot:\n    @classmethod\n    def go(cls):\n        return openai.chat.completions.create(model=\"gpt-4o\", messages=[])\nRESULT = [Bot.go()]\nopenai.api_type = \"azure\"\n",
-            vec![(5, Routing::AzureOpenai, dynamic())],
-        ),
-        // Inside the grammar: the configuration comes first, or only other
-        // modules' code runs before it.
-        (
-            "import openai\nopenai.base_url = \"https://proxy.internal/v1\"\ndef ask():\n    return openai.chat.completions.create(model=\"gpt-4o\", messages=[])\nask()\n",
-            vec![(4, Routing::CustomBaseUrl, vec![])],
-        ),
-        (
-            "import openai\nfrom dotenv import load_dotenv\nload_dotenv()\ndef ask():\n    return openai.chat.completions.create(model=\"gpt-4o\", messages=[])\nopenai.base_url = \"https://proxy.internal/v1\"\nif __name__ == \"__main__\":\n    ask()\n",
-            vec![(5, Routing::CustomBaseUrl, vec![])],
-        ),
-    ];
-    for (source, expected) in cases {
-        assert_eq!(routes_and_gaps(&usages(source)), expected, "{source}");
-    }
-}
-
-#[test]
 fn a_private_class_with_a_public_subclass_keeps_a_subclass_override_gap() {
     // Engine round 1: `self.model` in a private class was confirmed even
     // when a public same-file subclass inherits the method, although
@@ -5761,5 +5730,114 @@ fn scopes_nested_past_the_cap_are_one_truncated_gap_in_linear_time() {
     assert_eq!(
         keyed_rows(&source, "model"),
         vec![(66, vec!["gpt-4o".to_string()], vec![])]
+    );
+}
+
+#[test]
+fn module_configuration_counts_only_in_the_top_of_file_setup_block() {
+    // Blocker 3 (lead decision D2): with `openai.base_url = ...` at the
+    // bottom of the file, a decorator, a default argument, a generator, a
+    // bound lambda, a class body, an alias, `map`, a `key=` lambda, an
+    // immediately called lambda or `__init_subclass__` ran `ask()` at
+    // import first, and the call was confirmed. Rather than following
+    // import-time execution, a routing setting now counts only in the
+    // top-of-file setup block: before the first `def`, `class`, decorator,
+    // bare expression or compound statement. Anything else gives every
+    // module-level call a `module_config` gap.
+    let ask = "def ask(p=None):\n    return openai.chat.completions.create(model=\"gpt-4o\", messages=[])\n";
+    let config = "openai.base_url = \"https://proxy.internal/v1\"\n";
+    for runs in [
+        "def warm(f):\n    f(\"w\")\n    return f\n@warm\ndef other(p):\n    return p\n",
+        "def register(cls):\n    ask(\"w\")\n    return cls\n@register\nclass Bot:\n    pass\n",
+        "def handler(x=ask(\"w\")):\n    return x\n",
+        "P = [\"a\"]\nwarm = list(ask(p) for p in P)\n",
+        "class Warm:\n    def go(p):\n        return ask(p)\n    go(\"w\")\n",
+        "run = ask\nrun()\n",
+        "list(map(ask, [\"a\"]))\n",
+        "sorted([\"a\"], key=lambda p: ask(p))\n",
+        "(lambda: ask())()\n",
+        "class Base:\n    def __init_subclass__(cls, **kw):\n        ask()\nclass Sub(Base):\n    pass\n",
+        "class H(ask(\"w\").__class__):\n    pass\n",
+        "if __name__ == \"__main__\":\n    ask()\n",
+        "from dotenv import load_dotenv\nload_dotenv()\n",
+        "",
+    ] {
+        let source = format!("import openai\n{ask}{runs}{config}");
+        let rows = routes_and_gaps(&usages(&source));
+        assert_eq!(
+            rows,
+            vec![(
+                3,
+                Routing::CustomBaseUrl,
+                vec!["ambiguous_client/module_config".to_string()]
+            )],
+            "{source}"
+        );
+    }
+    // A lambda bound before the configuration ends the block too.
+    let source = format!(
+        "import openai\nask = lambda p: openai.chat.completions.create(model=\"gpt-4o\", messages=[])\nask(\"w\")\n{config}"
+    );
+    assert_eq!(
+        routes_and_gaps(&usages(&source)),
+        vec![(
+            2,
+            Routing::CustomBaseUrl,
+            vec!["ambiguous_client/module_config".to_string()]
+        )]
+    );
+    // `+=`, an alias chosen at run time, and a run-time attribute name.
+    for (setup, line) in [
+        ("openai.api_base = \"https://proxy.internal\"\nopenai.api_base += \"/v1\"\n", 5),
+        ("import json, os\no = openai if os.getenv(\"X\") else json\no.base_url = \"https://proxy.internal/v1\"\n", 6),
+        ("import os\nsetattr(openai, os.getenv(\"ATTR\"), \"https://proxy.internal/v1\")\n", 5),
+    ] {
+        let source = format!(
+            "import openai\n{setup}def ask():\n    return openai.chat.completions.create(model=\"gpt-4o\", messages=[])\n"
+        );
+        let rows = routes_and_gaps(&usages(&source));
+        assert_eq!(rows.len(), 1, "{source}");
+        assert_eq!(rows[0].0, line, "{source}");
+        assert_eq!(
+            rows[0].2,
+            vec!["ambiguous_client/module_config".to_string()],
+            "{source}"
+        );
+    }
+    // Inside the grammar: a setup block of imports, a docstring and
+    // assignments (calls of other modules' code included), then code. A
+    // call in the block itself counts only after the configuration.
+    let source = r#""""Configured at the top."""
+from __future__ import annotations
+
+import os
+
+import openai
+
+TIMEOUT = 30
+openai.api_key = os.getenv("OPENAI_API_KEY")
+early = openai.chat.completions.create(model="gpt-4o", messages=[])
+openai.base_url = "https://proxy.internal/v1"
+openai.default_headers = {"x-team": "ml"}
+stream = openai.chat.completions.create(model="gpt-4o", messages=[])
+
+
+def ask():
+    return openai.chat.completions.create(model="gpt-4o", messages=[])
+
+
+ask()
+"#;
+    assert_eq!(
+        routes_and_gaps(&usages(source)),
+        vec![
+            (
+                10,
+                Routing::CustomBaseUrl,
+                vec!["ambiguous_client/module_config".to_string()]
+            ),
+            (13, Routing::CustomBaseUrl, vec![]),
+            (17, Routing::CustomBaseUrl, vec![]),
+        ]
     );
 }
