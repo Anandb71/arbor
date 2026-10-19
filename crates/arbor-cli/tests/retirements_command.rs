@@ -309,6 +309,73 @@ fn the_reasoning_effort_is_a_decision_and_max_tokens_a_change() {
         .any(|r| r["message"].as_str().unwrap().contains("stop")));
 }
 
+/// Two calls that retire the same day but move to different models.
+const TWO_TARGETS: &str = r#"
+from openai import OpenAI
+
+client = OpenAI()
+
+
+def sol(fns):
+    return client.chat.completions.create(model="gpt-4", messages=[], functions=fns)
+
+
+def terra(fns):
+    return client.chat.completions.create(model="gpt-3.5-turbo", messages=[], functions=fns)
+"#;
+
+#[test]
+fn a_shared_decision_names_every_replacement_and_scopes_its_evidence() {
+    let dir = project(TWO_TARGETS);
+    let (_, report) = run_json(dir.path(), &[]);
+    for (model, target) in [("gpt-4", "gpt-5.6-sol"), ("gpt-3.5-turbo", "gpt-5.6-terra")] {
+        let call = finding(&report, model);
+        assert_eq!(call["fix"], "decide", "{model}");
+        let decision = &call["decisions"][0];
+        assert_eq!(decision["choice"], "OAI-REASONING-DEFAULT");
+        // Legacy functions were called only on gpt-5.6-terra: keeping them is
+        // not verified for any target, and the reason says where they were checked.
+        let keep = &decision["options"][0];
+        assert_eq!(keep["keep"][0], "functions");
+        assert!(keep["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["rule"] == "OAI-LEGACY-FUNCTIONS" && e["status"] == "unverified"));
+        let reasons = decision["reasons"].as_array().unwrap();
+        assert!(
+            reasons[0].as_str().unwrap().starts_with(target),
+            "{reasons:?}"
+        );
+        assert!(reasons.iter().any(|r| r
+            .as_str()
+            .unwrap()
+            .contains("checked only on gpt-5.6-terra")));
+    }
+
+    // One decision block for the day, naming both replacement models.
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    let header = text
+        .lines()
+        .find(|l| l.contains("decide once for this repo"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(header.contains("gpt-5.6-sol runs at medium"), "{header}");
+    assert!(header.contains("gpt-5.6-terra runs at medium"), "{header}");
+    assert_eq!(
+        text.matches("decide once for this repo").count(),
+        1,
+        "{text}"
+    );
+    let markdown = stdout(&arbor(
+        dir.path(),
+        &["retirements", ".", "--markdown", "--today", TODAY],
+    ));
+    assert!(
+        markdown.contains("gpt-5.6-terra runs at medium"),
+        "{markdown}"
+    );
+}
+
 #[test]
 fn environment_fallbacks_are_flagged_confirm_first() {
     let dir = project(APP);

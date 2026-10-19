@@ -633,10 +633,11 @@ fn capitalize(text: &str) -> String {
     }
 }
 
-/// The choices a group of calls shares, merged by choice: the reason once,
-/// then each option with every effect the group's calls bring up.
+/// The choices a group of calls shares, merged by choice: each distinct
+/// reason once (one per replacement model), then each option with every
+/// effect the group's calls bring up.
 struct DecisionBlock {
-    reason: String,
+    reasons: Vec<String>,
     /// `(label, [(effect, unverified)])`.
     options: Vec<(String, Vec<(String, bool)>)>,
 }
@@ -653,7 +654,7 @@ fn decision_blocks(group: &[Finding]) -> Vec<DecisionBlock> {
                 blocks.push((
                     decision.choice.clone(),
                     DecisionBlock {
-                        reason: decision.reasons.first().cloned().unwrap_or_default(),
+                        reasons: Vec::new(),
                         options: decision
                             .options
                             .iter()
@@ -665,6 +666,11 @@ fn decision_blocks(group: &[Finding]) -> Vec<DecisionBlock> {
             }
         };
         let block = &mut blocks[index].1;
+        if let Some(reason) = decision.reasons.first() {
+            if !block.reasons.contains(reason) {
+                block.reasons.push(reason.clone());
+            }
+        }
         for option in &decision.options {
             let Some((_, effects)) = block.options.iter_mut().find(|(l, _)| l == &option.label)
             else {
@@ -811,7 +817,7 @@ fn print_group(group: &[Finding], today: Date) {
         println!(
             "  {} {}",
             "decide once for this repo (Arbor does not choose):".bold(),
-            clean(&block.reason)
+            clean(&block.reasons.join(" "))
         );
         for (label, effects) in &block.options {
             for (index, (effect, unverified)) in effects.iter().enumerate() {
@@ -914,7 +920,7 @@ fn markdown(report: &RetirementReport) -> String {
             for block in decision_blocks(group) {
                 out.push_str(&format!(
                     "Decide once for this repo (Arbor does not choose): {}\n\n",
-                    cell(&block.reason)
+                    cell(&block.reasons.join(" "))
                 ));
                 for (label, effects) in &block.options {
                     for (effect, unverified) in effects {
