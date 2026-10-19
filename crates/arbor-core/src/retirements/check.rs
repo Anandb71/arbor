@@ -1017,8 +1017,10 @@ fn days_phrase(days: i64) -> String {
     }
 }
 
-/// Why a chained replacement needs a person.
-fn chain_message(provider: &str, chain: &Chain<'_>, today: Date) -> String {
+/// Why a chained replacement needs a person. `rules_known` says whether a
+/// rule set describes the last hop's move; without one the parameters the
+/// live model needs are unchecked, and the message says so.
+fn chain_message(provider: &str, chain: &Chain<'_>, today: Date, rules_known: bool) -> String {
     let dead: Vec<&ChainStep> = chain
         .steps
         .iter()
@@ -1042,8 +1044,11 @@ fn chain_message(provider: &str, chain: &Chain<'_>, today: Date) -> String {
     }
     let last = dead.last().map(|s| s.model.as_str()).unwrap_or_default();
     match &chain.live {
-        Some(live) => text.push_str(&format!(
+        Some(live) if rules_known => text.push_str(&format!(
             ". {live} is the replacement {provider} lists for {last}; the changes shown are for {live}."
+        )),
+        Some(live) => text.push_str(&format!(
+            ". {live} is the replacement {provider} lists for {last}; the parameters {live} needs have not been checked yet."
         )),
         None => match dead.last().and_then(|s| s.replacement_text.as_deref()) {
             Some(listed) => text.push_str(&format!(
@@ -1167,7 +1172,7 @@ fn finding_for(
     if let Some(chain) = replacement_chain.as_ref().filter(|c| c.chained()) {
         reasons.push(ReviewItem {
             rule: None,
-            message: chain_message(hit.table.provider(), chain, today),
+            message: chain_message(hit.table.provider(), chain, today, source.is_some()),
             because: Vec::new(),
             verified: None,
         });
@@ -2520,6 +2525,23 @@ mod tests {
         );
         assert_eq!(finding.live_replacement.as_deref(), Some("gpt-5.6-terra"));
         assert_eq!(finding.replacement_chain[0].status, Some(State::Retired));
+        // No rule set covers gpt-3.5-turbo-instruct → gpt-5.6-terra (a past
+        // shutdown, report only): no changes, and the message does not imply
+        // there are none to make.
+        assert!(finding.changes.is_empty());
+        assert!(
+            finding.review.iter().any(|r| r.message
+                == "OpenAI lists gpt-3.5-turbo-instruct as the replacement, and it shut down on \
+                    28 Sep 2026. gpt-5.6-terra is the replacement OpenAI lists for \
+                    gpt-3.5-turbo-instruct; the parameters gpt-5.6-terra needs have not been \
+                    checked yet."),
+            "{:#?}",
+            finding.review
+        );
+        assert!(!finding
+            .review
+            .iter()
+            .any(|r| r.message.contains("the changes shown are for")));
 
         // A dead end: Vertex text-bison → gemini-2.5-flash-lite, which retires
         // too and has several replacements.

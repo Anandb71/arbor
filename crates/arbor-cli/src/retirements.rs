@@ -924,10 +924,13 @@ fn markdown(report: &RetirementReport) -> String {
                 }
                 out.push('\n');
             }
-            for note in group_notes(group) {
-                out.push_str(&format!("- {}\n", cell(&note)));
+            let notes = group_notes(group);
+            for note in &notes {
+                out.push_str(&format!("- {}\n", cell(note)));
             }
-            out.push('\n');
+            if !notes.is_empty() {
+                out.push('\n');
+            }
         }
     }
     for line in not_checked_lines(report, true) {
