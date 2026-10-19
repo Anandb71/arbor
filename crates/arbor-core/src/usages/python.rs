@@ -1663,9 +1663,6 @@ struct Ctx<'t> {
     /// through the name there is a `dynamic_feature` gap, and a write an
     /// outside write (see [`Ctx::note_rebound_receivers`]).
     rebound_receivers: HashMap<(usize, bool), Feature>,
-    /// Calls named `configure` or passing `client_options=` or `**`, which
-    /// may set up the legacy Gemini SDK, and the scope each is in.
-    configure_calls: Vec<(Node<'t>, usize)>,
     /// Why the legacy Gemini SDK's module-level routing may not hold.
     legacy_caveat: Option<ClientCaveat>,
     /// The file imports the legacy Gemini SDK (`google.generativeai`).
@@ -1693,8 +1690,11 @@ struct Ctx<'t> {
     config_plain: bool,
     /// Where the top-of-file setup block ends (see
     /// [`Ctx::setup_block_end`]): the module-level API's configuration
-    /// counts only before it.
-    setup_end: usize,
+    /// counts only before it. Computed on first use: most files never
+    /// configure the module-level API.
+    setup_end: Option<usize>,
+    /// The module node.
+    root: Option<Node<'t>>,
     /// Scopes nested deeper than [`MAX_SCOPE_DEPTH`], which are not walked,
     /// and the scope each is in: one `truncated` gap each.
     scope_cuts: Vec<(Node<'t>, usize)>,
@@ -1803,7 +1803,6 @@ impl<'t> Ctx<'t> {
             member_values: HashSet::new(),
             method_self_writes: Vec::new(),
             rebound_receivers: HashMap::new(),
-            configure_calls: Vec::new(),
             legacy_caveat: None,
             legacy_imported: false,
             exported: HashSet::new(),
@@ -1813,7 +1812,8 @@ impl<'t> Ctx<'t> {
             openai_last_config: None,
             config_top: false,
             config_plain: false,
-            setup_end: 0,
+            setup_end: None,
+            root: None,
             scope_cuts: Vec::new(),
             module_stars: Vec::new(),
             dynamic_globals: false,
@@ -1879,7 +1879,7 @@ impl<'t> Ctx<'t> {
     fn collect(&mut self, root: Node<'t>) {
         self.scopes[0].start = root.start_byte();
         self.scopes[0].end = root.end_byte();
-        self.setup_end = self.setup_block_end(root);
+        self.root = Some(root);
         let mut stack = vec![Frame {
             node: root,
             scope: 0,
@@ -2093,19 +2093,6 @@ impl<'t> Ctx<'t> {
                             if let Some(args) = node.child_by_field_name("arguments") {
                                 self.note_exports(args);
                             }
-                        }
-                        // `configure(client_options=...)` under any name
-                        // (`setup = genai.configure`): every call that may
-                        // pass `client_options` has its callee evaluated.
-                        let named_configure = callee
-                            .and_then(|f| match f.kind() {
-                                "identifier" => Some(f),
-                                "attribute" => f.child_by_field_name("attribute"),
-                                _ => None,
-                            })
-                            .is_some_and(|n| self.text(n) == "configure");
-                        if named_configure || self.may_pass_client_options(node) {
-                            self.configure_calls.push((node, scope));
                         }
                         self.note_dynamic_call(node, scope);
                         self.config_top = is_top_statement(&frame);
@@ -2461,16 +2448,19 @@ impl<'t> Ctx<'t> {
         // `__import__(__name__)`, `importlib.import_module(__name__)`, and
         // the same for `builtins` and `sys`, whose namespace features are
         // then reached under a name this file does not spell.
-        let imports_itself = |cx: &Self| {
+        let imported = |cx: &Self| {
             call_arguments(call, |n| cx.text(n))
                 .0
                 .first()
-                .is_some_and(|arg| match arg.kind() {
-                    "identifier" => cx.text(*arg) == "__name__",
-                    _ => matches!(
-                        cx.plain_literal(*arg),
-                        Some("__main__" | "builtins" | "sys")
-                    ),
+                .and_then(|arg| match arg.kind() {
+                    "identifier" if cx.text(*arg) == "__name__" => {
+                        Some("the module importing itself")
+                    }
+                    _ => match cx.plain_literal(*arg) {
+                        Some("__main__") => Some("the module importing itself"),
+                        Some("builtins" | "sys") => Some("`builtins` or `sys` imported by name"),
+                        _ => None,
+                    },
                 })
         };
         match function.kind() {
@@ -2489,8 +2479,10 @@ impl<'t> Ctx<'t> {
                     }
                     "locals" => "`locals()`",
                     "vars" => "`vars()`",
-                    "__import__" if imports_itself(self) => "the module importing itself",
-                    "import_module" if imports_itself(self) => "the module importing itself",
+                    "__import__" | "import_module" => match imported(self) {
+                        Some(what) => what,
+                        None => return,
+                    },
                     "cls" => {
                         self.dynamic_constructors
                             .get_or_insert(Self::feature("`cls(...)`", call));
@@ -2504,8 +2496,8 @@ impl<'t> Ctx<'t> {
                 let imports = function
                     .child_by_field_name("attribute")
                     .is_some_and(|a| matches!(self.text(a), "import_module" | "reload"));
-                if imports && imports_itself(self) {
-                    self.note_file_dynamic("the module importing itself", call);
+                if let Some(what) = imports.then(|| imported(self)).flatten() {
+                    self.note_file_dynamic(what, call);
                 }
             }
             "call" => {
@@ -6363,7 +6355,17 @@ impl<'t> Ctx<'t> {
     /// it. Before it this file has defined no function, class or lambda,
     /// so no code of its own can run: a configuration written there holds
     /// for every call this file's functions make. One pass over the
-    /// statements of the block.
+    /// statements of the block, on first use.
+    fn setup_end(&mut self) -> usize {
+        if let Some(end) = self.setup_end {
+            return end;
+        }
+        let end = self.root.map_or(0, |root| self.setup_block_end(root));
+        self.setup_end = Some(end);
+        end
+    }
+
+    /// [`Ctx::setup_end`], read from the module's statements.
     fn setup_block_end(&self, root: Node<'t>) -> usize {
         let mut cursor = root.walk();
         for statement in root.named_children(&mut cursor) {
@@ -6463,7 +6465,7 @@ impl<'t> Ctx<'t> {
                     Some("the SDK configured by `+=`, `setattr` or `del`")
                 } else if !self.imported_only(assign.object) {
                     Some("the SDK configured through a name this file also assigns, or a wildcard import may rebind")
-                } else if assign.at >= self.setup_end {
+                } else if assign.at >= self.setup_end() {
                     Some("the SDK configured after the top-of-file setup block, where this file's own code may already have run")
                 } else if !assigned.insert(attr) {
                     Some("an SDK routing setting assigned more than once")
@@ -6570,13 +6572,18 @@ impl<'t> Ctx<'t> {
 
     /// `genai.configure(client_options=...)` (the legacy Gemini SDK) may
     /// point every legacy call at another endpoint: they then route
-    /// `unknown` with an `endpoint_option` gap. So may `**options`. The
-    /// callee is evaluated, so `configure` under another name counts.
+    /// `unknown` with an `endpoint_option` gap. So may `**options`. In a
+    /// file that imports the legacy SDK, the callee of every call that may
+    /// pass `client_options` is evaluated, so `configure` under another
+    /// name (`setup = genai.configure`) counts.
     fn note_legacy_configure(&mut self) {
         if !self.legacy_imported {
             return;
         }
-        for (call, scope) in self.configure_calls.clone() {
+        for (call, scope) in self.calls.clone() {
+            if !self.may_pass_client_options(call) {
+                continue;
+            }
             let Some(function) = call.child_by_field_name("function") else {
                 continue;
             };
