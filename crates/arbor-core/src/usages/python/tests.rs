@@ -5634,3 +5634,39 @@ fn module_configuration_after_own_code_runs_at_import_is_a_gap() {
         assert_eq!(routes_and_gaps(&usages(source)), expected, "{source}");
     }
 }
+
+#[test]
+fn a_private_class_with_a_public_subclass_keeps_a_subclass_override_gap() {
+    // Engine round 1: `self.model` in a private class was confirmed even
+    // when a public same-file subclass inherits the method, although
+    // another module may subclass that public class and set `model`, as
+    // it may for a public class (lead decision 8). Reads by class name
+    // stay confirmed, and so does a private class whose subclasses are
+    // private.
+    let header = "from openai import OpenAI\nclient = OpenAI()\n";
+    let subclass_override = || vec!["subclass_override".to_string()];
+    for (body, reasons) in [
+        (
+            "class _Base:\n    model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\nclass Pub(_Base):\n    pass\n",
+            subclass_override(),
+        ),
+        (
+            "class _Base:\n    model = \"gpt-4o\"\n    @classmethod\n    def go(cls):\n        return client.chat.completions.create(model=cls.model, messages=[])\nclass Pub(_Base):\n    pass\n",
+            subclass_override(),
+        ),
+        (
+            "class _Base:\n    model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=_Base.model, messages=[])\nclass Pub(_Base):\n    pass\n",
+            vec![],
+        ),
+        (
+            "class _Base:\n    model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\nclass _Other(_Base):\n    pass\n",
+            vec![],
+        ),
+    ] {
+        let source = format!("{header}{body}");
+        let rows = rows_of(&source);
+        assert_eq!(rows.len(), 1, "{source}");
+        assert_eq!(rows[0].1, "gpt-4o", "{source}");
+        assert_eq!(rows[0].2, reasons, "{source}");
+    }
+}

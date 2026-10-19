@@ -3238,6 +3238,19 @@ impl<'t> Ctx<'t> {
         true
     }
 
+    /// Whether another module may subclass `class` and set an attribute its
+    /// methods read through `self`/`cls`: it is public, or one of its direct
+    /// same-file subclasses is (deeper inheritance is a dynamic feature
+    /// already, and so are more than [`MAX_SUBCLASSES`] subclasses).
+    fn may_be_subclassed_elsewhere(&self, class: usize) -> bool {
+        self.is_public_class(class)
+            || self.subclasses.get(&class).is_some_and(|subs| {
+                subs.iter()
+                    .take(MAX_SUBCLASSES)
+                    .any(|&sub| self.is_public_class(sub))
+            })
+    }
+
     fn record_params(&mut self, params: Node<'t>, scope: usize) {
         let mut kind = SlotKind::Positional;
         let mut slots: Vec<Slot> = Vec::new();
@@ -7601,10 +7614,11 @@ impl<'t> Ctx<'t> {
                                     resolved
                                         .caveats
                                         .push(Unresolved::dynamic(feature).via(&rendered));
-                                } else if through_self && self.is_public_class(class) {
+                                } else if through_self && self.may_be_subclassed_elsewhere(class) {
                                     // Other modules may subclass a public
-                                    // class and set the attribute (rule 3,
-                                    // like a public function's default).
+                                    // class (or a private one's public
+                                    // subclass) and set the attribute (rule
+                                    // 3, like a public function's default).
                                     resolved
                                         .caveats
                                         .push(Unresolved::new("subclass_override", rendered));
