@@ -110,11 +110,15 @@ def make_fixture():
 
 
 def from_cache(raw):
-    return ChatCompletion.model_validate({"model": "gpt-3.5-turbo-0613", **raw})
+    return ChatCompletion.model_validate({**raw, "model": "gpt-3.5-turbo-0613"})
 
 
 def image_tool():
     return ImageGeneration(type="image_generation", model="dall-e-2")
+
+
+def from_partial(raw):
+    return ChatCompletion.model_validate({"model": "gpt-3.5-turbo-0613", **raw})
 "#;
 
 /// Clients given a base_url: the provider's host, an environment fallback
@@ -512,7 +516,11 @@ fn response_and_type_objects_are_not_reported() {
     let tool = findings.iter().find(|f| f["model"] == "dall-e-2").unwrap();
     assert_eq!(tool["call_kind"], "request_param");
     assert_eq!(tool["fix"], "manual");
+    // ChatCompletion(...) and from_cache's .model_validate carry a model and
+    // are skipped. In from_partial the later `**raw` may replace the model,
+    // so the usage scan reads no value there: nothing to skip or report.
     assert_eq!(report["summary"]["response_objects"], 2);
+    assert_eq!(report["summary"]["unreadable_calls"], 0);
 }
 
 #[test]
@@ -791,6 +799,11 @@ def caller():
 
 def nothing():
     return client.chat.completions.create(messages=[])
+
+
+def merged(overrides):
+    params = {"model": "gpt-4.1", **overrides}
+    return client.chat.completions.create(**params, messages=[])
 "#;
 
 #[test]
@@ -813,7 +826,16 @@ fn values_a_call_may_take_are_listed_to_confirm() {
     assert_eq!(o3["days_left"], 5);
     assert_eq!(o3["value_line"], 16);
 
-    assert_eq!(report["summary"]["affected_calls"], 2);
+    // A dict entry that a later `**` expansion may replace is one of the
+    // values the call may get, not a confirmed one.
+    let merged = finding(&report, "gpt-4.1");
+    assert_eq!(merged["candidate"], true);
+    assert_eq!(merged["confidence"], "confirm_first");
+    assert_eq!(merged["fix"], "manual");
+    assert_eq!(merged["line"], 25);
+    assert_eq!(merged["value_line"], 24);
+
+    assert_eq!(report["summary"]["affected_calls"], 3);
     assert_eq!(report["summary"]["no_model_calls"], 1);
     assert_eq!(report["summary"]["unreadable_calls"], 0);
 
