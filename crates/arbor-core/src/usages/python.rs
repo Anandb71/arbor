@@ -244,6 +244,12 @@ const MAX_DEPTH: u32 = 64;
 /// chain of names that each use the previous one more than once stays
 /// linear instead of doubling per link.
 const MAX_NAME_DEPTH: u32 = 64;
+/// Maximum nesting of scopes (functions, classes, lambdas, comprehensions)
+/// the collection pass follows. Every scope walk (name binding, `self`,
+/// import time) is then bounded by it. A deeper scope is not analyzed: it
+/// is a `truncated` gap, and a dynamic feature of the whole file, since
+/// what it binds or writes is not seen.
+const MAX_SCOPE_DEPTH: u32 = 64;
 /// Bases read per class when same-file subclasses are indexed.
 const MAX_BASES: usize = 32;
 /// Direct same-file subclasses a `self.x` read looks at, and assignments
@@ -1082,6 +1088,9 @@ struct Scope {
     /// the name again.
     self_recv: Option<(usize, usize)>,
     cls_recv: Option<(usize, usize)>,
+    /// How many scopes enclose this one (the module is 0); at most
+    /// [`MAX_SCOPE_DEPTH`].
+    depth: u32,
 }
 
 impl Scope {
@@ -1110,6 +1119,7 @@ impl Scope {
             body_start: 0,
             self_recv: None,
             cls_recv: None,
+            depth: 0,
         }
     }
 }
@@ -1651,6 +1661,9 @@ struct Ctx<'t> {
     /// Where the first call that runs at import and runs this file's own
     /// code is (see [`Ctx::own_code_at_import`]); computed once.
     own_code_at_import: Option<Option<usize>>,
+    /// Scopes nested deeper than [`MAX_SCOPE_DEPTH`], which are not walked,
+    /// and the scope each is in: one `truncated` gap each.
+    scope_cuts: Vec<(Node<'t>, usize)>,
     /// Wildcard imports from other modules, in order, and whether there
     /// were more than [`MAX_STARS`] or the module namespace is written with
     /// a run-time name (see [`DefRef::Dynamic`]).
@@ -1762,6 +1775,7 @@ impl<'t> Ctx<'t> {
             openai_last_config: None,
             config_top: false,
             own_code_at_import: None,
+            scope_cuts: Vec::new(),
             module_stars: Vec::new(),
             dynamic_globals: false,
             loop_iter: None,
@@ -1853,6 +1867,24 @@ impl<'t> Ctx<'t> {
             let mut child_loop = frame.inner_loop;
             if node.is_named() {
                 match node.kind() {
+                    "function_definition"
+                    | "class_definition"
+                    | "lambda"
+                    | "list_comprehension"
+                    | "set_comprehension"
+                    | "dictionary_comprehension"
+                    | "generator_expression"
+                        if self.scopes[scope].depth >= MAX_SCOPE_DEPTH =>
+                    {
+                        // Nothing inside is walked: every scope walk stays
+                        // bounded, and what it binds or writes is unknown.
+                        self.note_file_dynamic(
+                            "scopes nested more than 64 deep, which are not analyzed",
+                            node,
+                        );
+                        self.scope_cuts.push((node, scope));
+                        continue;
+                    }
                     "function_definition" => {
                         inner = self.enter_function(node, scope, frame.parent);
                         child_loop = None;
@@ -3041,6 +3073,7 @@ impl<'t> Ctx<'t> {
             .child_by_field_name("body")
             .map_or(node.end_byte(), |b| b.start_byte());
         let id = self.scopes.len();
+        scope.depth = self.scopes[parent].depth + 1;
         self.scopes.push(scope);
         if let Some(params) = node.child_by_field_name("parameters") {
             self.record_params(params, id);
@@ -3087,6 +3120,7 @@ impl<'t> Ctx<'t> {
         scope.self_recv = self.scopes[parent].self_recv;
         scope.cls_recv = self.scopes[parent].cls_recv;
         let id = self.scopes.len();
+        scope.depth = self.scopes[parent].depth + 1;
         self.scopes.push(scope);
         id
     }
@@ -3123,6 +3157,7 @@ impl<'t> Ctx<'t> {
             .filter(|left| left.kind() == "identifier")
             .map(|left| self.text(left).to_string());
         let id = self.scopes.len();
+        scope.depth = self.scopes[parent].depth + 1;
         self.scopes.push(scope);
         if let Some(params) = node.child_by_field_name("parameters") {
             self.record_params(params, id);
@@ -3389,6 +3424,7 @@ impl<'t> Ctx<'t> {
         scope.decorated = decorated;
         scope.class_feature = what.map(|what| Feature { what, line });
         scope.line = line;
+        scope.depth = self.scopes[parent].depth + 1;
         self.scopes.push(scope);
         let home = match self.scopes[parent].kind {
             ScopeKind::Class => parent,
@@ -6030,6 +6066,27 @@ impl<'t> Ctx<'t> {
                 values_complete: false,
             });
             return;
+        }
+        // Calls inside a scope nested past the cap are not analyzed.
+        for (node, scope) in std::mem::take(&mut self.scope_cuts) {
+            if self.records() >= MAX_FILE_RECORDS {
+                return self.truncate_file(node, scope);
+            }
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::UnresolvedModel,
+                sdk: None,
+                file: self.file.clone(),
+                span: Some(self.span(node)),
+                symbol: self.symbol(scope),
+                chain: None,
+                key: None,
+                reason: "truncated".to_string(),
+                detail: format!(
+                    "scopes here are nested more than {MAX_SCOPE_DEPTH} deep, so the calls inside are not analyzed"
+                ),
+                values: Vec::new(),
+                values_complete: false,
+            });
         }
         self.settle_builtin_values();
         self.settle_borrowed_methods();

@@ -5704,3 +5704,62 @@ fn engine_keys_of_a_large_expanded_dict_are_found_in_constant_time() {
         assert_eq!(module_config, if gapped { 10_000 } else { 0 }, "{last}");
     }
 }
+
+#[test]
+fn scopes_nested_past_the_cap_are_one_truncated_gap_in_linear_time() {
+    // Blocker 2: each call rooted in a name walked every enclosing scope
+    // to find the name's binding. Comprehensions, generators and lambdas
+    // nest without indentation, so 45k levels fit in 1 MB and 5k levels
+    // around 50k calls took 19 s in a release build. Scopes nested past 64
+    // are now not walked: a `truncated` gap, and a dynamic feature of the
+    // whole file, since what they bind or write is not seen.
+    let head =
+        "from openai import OpenAI\nclient = OpenAI()\nM = \"gpt-4o\"\nR = [1]\ndef g(): pass\n";
+    let tail = "client.chat.completions.create(model=M, messages=[])\nclient.chat.completions.create(model=\"o1-mini\", messages=[])\n";
+    let shapes: [(&str, &str, usize, &str, usize); 5] = [
+        ("[", " for a in R]", 45_000, "g(),", 100_000),
+        ("(", " for a in R)", 20_000, "g(),", 50_000),
+        ("(lambda: ", ")", 20_000, "g.h(),", 50_000),
+        ("(lambda a: ", ")()", 20_000, "a(),", 50_000),
+        ("[", " for a in R]", 20_000, "(y := g()),", 50_000),
+    ];
+    for (open, close, levels, call, calls) in shapes {
+        let source = format!(
+            "{head}X = {}({}){}\n{tail}",
+            open.repeat(levels),
+            call.repeat(calls),
+            close.repeat(levels)
+        );
+        assert!(source.len() <= 1 << 20, "{open} x {levels}");
+        let found = usages_within(&source, 10);
+        let truncated = gaps(&found, GapKind::UnresolvedModel)
+            .into_iter()
+            .filter(|g| g.reason == "truncated")
+            .count();
+        assert_eq!(truncated, 1, "{open} x {levels}");
+        // Every route, and every value read through a name, keeps a gap; a
+        // literal at the call stays confirmed.
+        let dynamic = |n: usize| vec!["dynamic_feature".to_string(); n];
+        assert_eq!(
+            keyed_rows(&source, "model"),
+            vec![
+                (7, vec!["gpt-4o".to_string()], dynamic(2)),
+                (8, vec!["o1-mini".to_string()], dynamic(1)),
+            ],
+            "{open} x {levels}"
+        );
+    }
+    // Within the cap a deep nest is analyzed as before.
+    let mut source = String::from(head);
+    for i in 0..60 {
+        source.push_str(&format!("{}def f{i}():\n", "    ".repeat(i)));
+    }
+    source.push_str(&format!(
+        "{}return client.chat.completions.create(model=M, messages=[])\n",
+        "    ".repeat(60)
+    ));
+    assert_eq!(
+        keyed_rows(&source, "model"),
+        vec![(66, vec!["gpt-4o".to_string()], vec![])]
+    );
+}
