@@ -78,8 +78,10 @@ report says that no fine-tunable replacement is listed.
 Objects built from SDK types in code that sends nothing, such as
 `ChatCompletion(model=...)` in a test fixture, Anthropic's `Message(...)`, or
 `.model_validate(...)`, are skipped and counted on one "Skipped" line. Tool configs
-and other request parameter objects (`ImageGeneration(model=...)`) are checked, since
-their model is sent with a request.
+and other request parameter objects (`ImageGeneration(model=...)`, and types named
+`...Param`, `...Params`, `...Config` or `...Request` such as
+`RealtimeSessionCreateRequest(model=...)`) are checked, since their model is sent with
+a request.
 
 ## Options and exit codes
 

@@ -645,9 +645,11 @@ const OBJECT_BUILDERS: &[&str] = &[
     "model_copy",
 ];
 
-/// Request-side type names: parameter TypedDicts and configs
-/// (`ChatCompletionToolParam`, `GenerateContentConfig`).
-const REQUEST_TYPE_SUFFIXES: &[&str] = &["Param", "Params", "Parameters", "Config"];
+/// Request-side type names: parameter TypedDicts, configs and request
+/// models (`ChatCompletionToolParam`, `GenerateContentConfig`, and
+/// `RealtimeSessionCreateRequest`, which openai-agents-python builds with the
+/// session's model and sends).
+const REQUEST_TYPE_SUFFIXES: &[&str] = &["Param", "Params", "Parameters", "Config", "Request"];
 
 /// The kind of call, or `None` for a response or type object built in code,
 /// which sends no request. [`SdkCall::member`] keeps the module path of an
@@ -2474,6 +2476,19 @@ mod tests {
             .review
             .iter()
             .any(|r| r.message.contains("request parameter object")));
+
+        // A request model built in code and sent (a realtime session) is
+        // request-side too.
+        let session = object(
+            Sdk::Openai,
+            "RealtimeSessionCreateRequest",
+            "types.realtime.realtime_session_create_request.RealtimeSessionCreateRequest",
+            "gpt-4o-realtime-preview",
+            11,
+        );
+        let finding = one(&[session]);
+        assert_eq!(finding.call_kind, CallKind::RequestParam);
+        assert_eq!(finding.status, State::Retired);
 
         // `genai.GenerativeModel("gemini-1.5-pro")` binds the model.
         let mut binding = call(
