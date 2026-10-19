@@ -5923,3 +5923,64 @@ fn a_method_that_rebinds_self_or_cls_reads_nothing_through_it() {
         "{source}"
     );
 }
+
+#[test]
+fn every_class_body_binding_is_a_write_of_the_attribute() {
+    // Blocker 5 (lead decision D4): a class-body `def`, `class` or import
+    // of a name counted only when the same class also assigned it, so
+    // `class _Fast(_Base): from cfg import model` left `self.model` in
+    // `_Base` as `gpt-4o`. Every binding form in a class body is now a
+    // write of that attribute for the class, read from subclasses and bases
+    // alike: only a class's single literal assignment is confirmed.
+    let header = "from openai import OpenAI\nclient = OpenAI()\n";
+    let base = "class _Base:\n    model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n";
+    for binding in [
+        "from cfg import model",
+        "import model",
+        "class model:\n        pass",
+        "def model(self):\n        return \"o1-mini\"",
+        "async def model(self):\n        return \"o1-mini\"",
+        "for model in [\"o1-mini\"]:\n        pass",
+        "with open(\"m\") as model:\n        pass",
+        "try:\n        pass\n    except Exception as model:\n        pass",
+        "(model := \"o1-mini\")",
+        "match \"o1-mini\":\n        case str() as model:\n            pass",
+        "model: str = \"o1-mini\"",
+        "model = \"o1-mini\"\n    del model",
+        "model += \"-mini\"",
+    ] {
+        let source = format!("{header}{base}class _Fast(_Base):\n    {binding}\n");
+        let rows = keyed_rows(&source, "model");
+        assert_eq!(rows.len(), 1, "{source}");
+        assert!(rows[0].1.is_empty(), "{source}");
+        assert_eq!(rows[0].2.len(), 1, "{source}");
+    }
+    // The reading class binds the name while its base assigns it.
+    let source = format!(
+        "{header}class _Base:\n    model = \"gpt-4o\"\nclass _Fast(_Base):\n    from cfg import model\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n    def by_name(self):\n        return client.chat.completions.create(model=_Fast.model, messages=[])\n"
+    );
+    let rows = keyed_rows(&source, "model");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter().all(|r| r.1.is_empty() && r.2.len() == 1),
+        "{rows:?}"
+    );
+    // A client a subclass imports into its body.
+    let source = "from openai import OpenAI\nclass _Svc:\n    client = OpenAI()\n    def go(self):\n        return self.client.chat.completions.create(model=\"gpt-4o\", messages=[])\nclass _Proxy(_Svc):\n    from clients import client\n";
+    let rows = routes_and_gaps(&usages(source));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, Routing::Unknown);
+    assert!(!rows[0].2.is_empty());
+    // Inside the grammar: a base read by its own name, and a class whose
+    // body binds the name once.
+    let source = format!(
+        "{header}class _Base:\n    model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=_Base.model, messages=[])\nclass _Fast(_Base):\n    from cfg import model\nclass _Fine:\n    model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model, messages=[])\n"
+    );
+    assert_eq!(
+        keyed_rows(&source, "model"),
+        vec![
+            (6, vec!["gpt-4o".to_string()], vec![]),
+            (12, vec!["gpt-4o".to_string()], vec![]),
+        ]
+    );
+}

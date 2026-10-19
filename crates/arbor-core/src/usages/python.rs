@@ -4344,11 +4344,16 @@ impl<'t> Ctx<'t> {
 
     /// A `def`, `class` or class-body import that rebinds an assigned name
     /// (`MODEL = "gpt-4o"` then `def MODEL(): ...`) is one more definition
-    /// of it, of no known value. Names never assigned are left alone, so
-    /// functions, classes and imports still resolve as before.
+    /// of it, of no known value. Elsewhere names never assigned are left
+    /// alone, so functions, classes and imports still resolve as before.
+    /// In a class body every one of them is a write of that class
+    /// attribute (lead decision D4), whatever the class assigns: a read
+    /// through the class, a subclass or a base that may see it then has an
+    /// assignment of no known value, and a gap.
     fn bind_definitions(&mut self) {
         for (key, scope, place) in std::mem::take(&mut self.def_bindings) {
-            if !self.assigns.contains_key(&key) {
+            let class_body = self.scopes[key.0].kind == ScopeKind::Class;
+            if !class_body && !self.assigns.contains_key(&key) {
                 continue;
             }
             // `scope` is where the statement runs: a `global` def in a
