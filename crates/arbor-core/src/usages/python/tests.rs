@@ -5045,3 +5045,108 @@ type(B8()).client = OpenAI(base_url="https://proxy.internal/v1")
         )]
     );
 }
+
+#[test]
+fn environment_writes_through_an_os_alias_are_seen() {
+    // Should-fix 4: the environment scan matched the spelled names `os` and
+    // `environ`, so a write through `import os as _os`, `import_module`,
+    // `getattr(os, "environ")` or `from os import environ as E` left a
+    // direct client `openai_direct` with no gap. A write is now matched by
+    // the attribute name `environ` on any object, and the other shapes alias
+    // the process environment (a `dynamic_feature`).
+    let endpoint = || vec!["ambiguous_client/endpoint_env".to_string()];
+    let dynamic = || vec!["ambiguous_client/dynamic_feature".to_string()];
+    let cases: Vec<(&str, Vec<RouteRow>)> = vec![
+        (
+            "import os as _os\n_os.environ[\"OPENAI_BASE_URL\"] = \"https://proxy.internal/v1\"\n",
+            vec![(5, Routing::Unknown, endpoint())],
+        ),
+        (
+            "import os as _os\n_os.environ.setdefault(\"OPENAI_BASE_URL\", \"https://proxy.internal/v1\")\n",
+            vec![(5, Routing::Unknown, endpoint())],
+        ),
+        (
+            "import os as o\no.environ.update({\"OPENAI_BASE_URL\": \"https://proxy.internal/v1\"})\n",
+            vec![(5, Routing::Unknown, endpoint())],
+        ),
+        (
+            "import os as o\no.putenv(\"OPENAI_BASE_URL\", \"https://proxy.internal/v1\")\n",
+            vec![(5, Routing::Unknown, endpoint())],
+        ),
+        (
+            "import importlib\nimportlib.import_module(\"os\").environ[\"OPENAI_BASE_URL\"] = \"https://proxy.internal/v1\"\n",
+            vec![(5, Routing::Unknown, endpoint())],
+        ),
+        (
+            "import os\ngetattr(os, \"environ\")[\"OPENAI_BASE_URL\"] = \"https://proxy.internal/v1\"\n",
+            vec![(5, Routing::Unknown, dynamic())],
+        ),
+        (
+            "from os import environ as E\nE[\"OPENAI_BASE_URL\"] = \"https://proxy.internal/v1\"\n",
+            vec![(5, Routing::Unknown, dynamic())],
+        ),
+        (
+            "from os import putenv as P\nP(\"OPENAI_BASE_URL\", \"https://proxy.internal/v1\")\n",
+            vec![(5, Routing::Unknown, dynamic())],
+        ),
+        // Inside the grammar: reading through an alias changes nothing.
+        (
+            "import os as o\nTIMEOUT = o.getenv(\"TIMEOUT\")\n",
+            vec![(5, Routing::OpenaiDirect, vec![])],
+        ),
+    ];
+    for (setup, expected) in cases {
+        let source = format!(
+            "from openai import OpenAI\n{setup}c = OpenAI()\nc.chat.completions.create(model=\"gpt-4o\", messages=[])\n"
+        );
+        assert_eq!(routes_and_gaps(&usages(&source)), expected, "{source}");
+    }
+}
+
+#[test]
+fn namespace_builtins_reached_under_another_name_downgrade_the_whole_file() {
+    // Nit: `exec`, `globals`, `sys.modules` and the module importing itself
+    // were matched by spelling, so `run = exec`, `g = globals`,
+    // `builtins.exec`, `getattr(builtins, "exec")`, `from sys import
+    // modules` and `import app as me` (in `app.py`) left the constant with
+    // no gap. Each is now a whole-file dynamic feature. A parameter or a
+    // keyword that happens to be named `eval` is not the builtin.
+    let header = "import builtins\nfrom openai import OpenAI\nclient = OpenAI()\nM = \"gpt-4o\"\n";
+    for body in [
+        "run = exec\nrun(\"M = 'o1-mini'\")\n",
+        "g = globals\ng()[\"M\"] = \"o1-mini\"\n",
+        "builtins.globals()[\"M\"] = \"o1-mini\"\n",
+        "builtins.exec(\"M = 'o1-mini'\")\n",
+        "getattr(builtins, \"exec\")(\"M = 'o1-mini'\")\n",
+        "__builtins__.exec(\"M = 'o1-mini'\")\n",
+        "from sys import modules\nsetattr(modules[__name__], \"M\", \"o1-mini\")\n",
+        "from builtins import exec as run\nrun(\"M = 'o1-mini'\")\n",
+        "import app as me\nme.M = \"o1-mini\"\n",
+        "from app import M as _m\n",
+    ] {
+        let source =
+            format!("{header}{body}client.chat.completions.create(model=M, messages=[])\n");
+        let rows = keyed_rows(&source, "model");
+        // The constant may still be listed, next to its gap.
+        assert_eq!(rows.len(), 1, "{body}");
+        assert!(
+            rows[0].2.iter().any(|r| r == "dynamic_feature"),
+            "{body}: {rows:?}"
+        );
+        let found = usages(&source);
+        assert!(
+            gaps(&found, GapKind::AmbiguousClient)
+                .iter()
+                .any(|g| g.reason == "dynamic_feature"),
+            "{body}"
+        );
+    }
+    // Not the builtin: a parameter, a keyword and an attribute named `eval`.
+    let source = format!(
+        "{header}def train(eval=False):\n    if eval:\n        return model.eval()\n    return run(eval=eval)\nclient.chat.completions.create(model=M, messages=[])\n"
+    );
+    assert_eq!(
+        keyed_rows(&source, "model"),
+        vec![(9, vec!["gpt-4o".to_string()], vec![])]
+    );
+}

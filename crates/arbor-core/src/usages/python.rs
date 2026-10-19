@@ -1584,6 +1584,9 @@ struct Ctx<'t> {
     rerouted_any: Option<Feature>,
     /// Why the module-level OpenAI API's routing may not hold.
     openai_caveat: Option<ClientCaveat>,
+    /// Namespace builtins used as a value, by name (see
+    /// [`Ctx::note_builtin_value`]).
+    builtin_values: HashMap<&'t str, Feature>,
     /// Names bound by `def` and `class` statements and class-body imports,
     /// where they bind: a name also assigned there gets an assignment of no
     /// known value for each (see [`Ctx::bind_definitions`]).
@@ -1696,6 +1699,7 @@ impl<'t> Ctx<'t> {
             rerouted_pkgs: HashSet::new(),
             rerouted_any: None,
             openai_caveat: None,
+            builtin_values: HashMap::new(),
             def_bindings: Vec::new(),
             openai_last_config: None,
             config_top: false,
@@ -1971,6 +1975,7 @@ impl<'t> Ctx<'t> {
                         self.note_name_use(node, &frame, scope);
                         self.note_dict_name(node, &frame, scope);
                         self.note_class_use(node, &frame);
+                        self.note_builtin_value(node, &frame);
                         if self.text(node) == "environ" {
                             self.note_environ_use(node, &frame, true);
                         }
@@ -2118,8 +2123,16 @@ impl<'t> Ctx<'t> {
     /// name that is not a literal may be any variable: the write is a
     /// dynamic feature ([`Ctx::env_wild`]).
     fn note_env_write(&mut self, node: Node<'t>) {
-        let environ =
-            |n: Node<'t>| matches!(self.render_links(n, 4).as_str(), "os.environ" | "environ");
+        // `os.environ`, or the same through any other object (`_os.environ`
+        // for `import os as _os`, `import_module("os").environ`): matched by
+        // the attribute name, so an alias of `os` cannot hide a write.
+        let environ = |n: Node<'t>| match n.kind() {
+            "identifier" => self.text(n) == "environ",
+            "attribute" => n
+                .child_by_field_name("attribute")
+                .is_some_and(|a| self.text(a) == "environ"),
+            _ => false,
+        };
         let mut names: Vec<String> = Vec::new();
         let mut wild = false;
         let mut bare = false;
@@ -2153,7 +2166,7 @@ impl<'t> Ctx<'t> {
                     return;
                 }
                 let (positional, keywords) = call_arguments(node, |n| self.text(n));
-                let callee = self.render_links(function, 4);
+                let putenv = last.is_some_and(|n| self.text(n) == "putenv");
                 let method = function
                     .child_by_field_name("attribute")
                     .map(|a| self.text(a))
@@ -2161,9 +2174,7 @@ impl<'t> Ctx<'t> {
                 let object = function.child_by_field_name("object");
                 let on_environ = object.is_some_and(environ);
                 bare = object.is_some_and(|o| o.kind() == "identifier");
-                if matches!(callee.as_str(), "os.putenv" | "putenv")
-                    || (on_environ && matches!(method, "setdefault" | "__setitem__"))
-                {
+                if putenv || (on_environ && matches!(method, "setdefault" | "__setitem__")) {
                     bare = false;
                     match positional.first().and_then(|k| self.literal(*k).ok()) {
                         Some(name) => names.push(name),
@@ -2292,6 +2303,96 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// `exec`, `eval`, `compile`, `globals`, `locals`, `vars` or
+    /// `__import__` used as a value (`run = exec`, `g = globals`), which a
+    /// call through another name may then run; and `__builtins__`, through
+    /// which any of them can be reached. A name the file binds itself (a
+    /// parameter `eval`) is not the builtin: that is checked once every
+    /// binding is known ([`Ctx::settle_builtin_values`]).
+    fn note_builtin_value(&mut self, node: Node<'t>, frame: &Frame<'t>) {
+        let name = self.text(node);
+        if !is_namespace_builtin(name) && name != "__builtins__" {
+            return;
+        }
+        let Some(parent) = frame.parent else {
+            return;
+        };
+        let called = parent.kind() == "call" && frame.field == Some("function");
+        if (called && name != "__builtins__") || is_declaration(parent.kind(), frame.field) {
+            return;
+        }
+        self.builtin_values.entry(name).or_insert(Self::feature(
+            "a builtin that reads or rebinds names (`exec`, `eval`, `globals`...) used as a value",
+            node,
+        ));
+    }
+
+    /// Whole-file features from [`Ctx::note_builtin_value`] whose name the
+    /// file does not bind anywhere itself.
+    fn settle_builtin_values(&mut self) {
+        if self.builtin_values.is_empty() {
+            return;
+        }
+        let bound: HashSet<&str> = self
+            .assigns
+            .keys()
+            .chain(self.params.keys())
+            .chain(self.functions.keys())
+            .chain(self.imports.keys())
+            .chain(self.other_imports.keys())
+            .map(|(_, name)| name.as_str())
+            .collect();
+        let mut found: Vec<Feature> = self
+            .builtin_values
+            .iter()
+            .filter(|(name, _)| !bound.contains(**name))
+            .map(|(_, feature)| *feature)
+            .collect();
+        found.sort_by_key(|f| f.line);
+        if let Some(feature) = found.first() {
+            self.file_dynamic.get_or_insert(*feature);
+        }
+    }
+
+    /// Imports that hand out a dynamic feature under another name:
+    /// `from sys import modules`, `from builtins import exec` (and the other
+    /// namespace builtins), and `os.environ` or `os.putenv` imported under
+    /// another name (`from os import environ as E`), which is an alias of
+    /// the process environment.
+    fn note_dynamic_import(&mut self, module: &str, name: &str, local: &str, node: Node<'t>) {
+        match (module, name) {
+            ("sys", "modules") => self.note_file_dynamic("`sys.modules` imported by name", node),
+            ("builtins", name) if is_namespace_builtin(name) => self.note_file_dynamic(
+                "a builtin that reads or rebinds names (`exec`, `eval`, `globals`...) imported by name",
+                node,
+            ),
+            ("os", "environ" | "putenv") if local != name => {
+                self.env_wild.get_or_insert(Self::feature(
+                    "`os.environ` or `os.putenv` imported under another name",
+                    node,
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    /// The file's own module name (its stem), when other modules can import
+    /// it by that name: not a package `__init__`, a `__main__` or a script.
+    fn own_module_name(&self) -> Option<&str> {
+        let stem = std::path::Path::new(&self.file).file_stem()?.to_str()?;
+        (!self.script && !matches!(stem, "__init__" | "__main__")).then_some(stem)
+    }
+
+    /// `import app` in `app.py`: the module importing itself, through which
+    /// it may rebind its own names or call its private functions. A tracked
+    /// SDK's name is left alone (`import openai` in an `openai.py` example).
+    fn note_self_import(&mut self, written: &str, node: Node<'t>) {
+        let last = written.rsplit('.').next().unwrap_or(written);
+        if Pkg::of_module(written).is_none() && self.own_module_name() == Some(last) {
+            self.note_file_dynamic("the module importing itself", node);
+        }
+    }
+
     /// `x.__dict__`, `sys.modules`, `x.__class__` and uses of `os.environ`.
     fn note_dynamic_attribute(&mut self, node: Node<'t>, frame: &Frame<'t>) {
         let Some(attr) = node.child_by_field_name("attribute") else {
@@ -2307,7 +2408,14 @@ impl<'t> Ctx<'t> {
                 self.dynamic_constructors
                     .get_or_insert(Self::feature("`__class__`", node));
             }
-            "environ" if on("os") => self.note_environ_use(node, frame, false),
+            // `os.environ`, or through an alias of `os`.
+            "environ" => self.note_environ_use(node, frame, false),
+            name if is_namespace_builtin(name) && (on("builtins") || on("__builtins__")) => {
+                self.note_file_dynamic(
+                    "a builtin that reads or rebinds names (`exec`, `eval`, `globals`...) reached through `builtins`",
+                    node,
+                );
+            }
             _ => {}
         }
     }
@@ -3362,6 +3470,18 @@ impl<'t> Ctx<'t> {
                 Some((_, Some(name))) => {
                     self.attr_uses.entry(name).or_default().escapes = true;
                     self.name_uses.entry(name).or_default().escapes = true;
+                    // `getattr(os, "environ")`, `getattr(builtins, "exec")`.
+                    if matches!(name, "environ" | "putenv") {
+                        self.env_wild.get_or_insert(Self::feature(
+                            "`os.environ` or `os.putenv` looked up by name",
+                            call,
+                        ));
+                    } else if is_namespace_builtin(name) || name == "modules" {
+                        self.note_file_dynamic(
+                            "a builtin that reads or rebinds names (`exec`, `eval`, `globals`...) looked up by name",
+                            call,
+                        );
+                    }
                 }
                 Some((_, None)) => {
                     self.dynamic_method_calls = true;
@@ -3555,6 +3675,7 @@ impl<'t> Ctx<'t> {
                 // The running script's namespace, which may be this one.
                 self.note_file_dynamic("`import __main__`", node);
             }
+            self.note_self_import(written, node);
             let module = clip(written);
             let Some((pkg, rest)) = Pkg::of_module(written) else {
                 let local = match alias {
@@ -3619,6 +3740,9 @@ impl<'t> Ctx<'t> {
         } else {
             Pkg::of_module(written)
         };
+        if !relative {
+            self.note_self_import(written, node);
+        }
 
         if wildcard {
             if target.is_none() {
@@ -3674,6 +3798,9 @@ impl<'t> Ctx<'t> {
             let local = alias
                 .map(|a| self.text(a).to_string())
                 .unwrap_or_else(|| name.clone());
+            if !relative {
+                self.note_dynamic_import(written, &name, &local, node);
+            }
 
             // `from google import genai` / `from google import generativeai`.
             if !relative && written == "google" {
@@ -5570,6 +5697,7 @@ impl<'t> Ctx<'t> {
             });
             return;
         }
+        self.settle_builtin_values();
         // A bare `environ` is the process environment only when imported
         // from `os`.
         let environ_from_os = self
@@ -8287,6 +8415,14 @@ const SHALLOW_CALLS: &[&str] = &["dict", "copy.copy", "copy"];
 /// Whether a field of a node of kind `parent` names a binding rather than
 /// using one: a definition's name, a parameter, an import, a keyword
 /// argument's name, an attribute name or an assignment target.
+/// Builtins that read or rebind a namespace by name.
+fn is_namespace_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "exec" | "eval" | "compile" | "globals" | "locals" | "vars" | "__import__"
+    )
+}
+
 /// Whether the node of `frame` is a statement of its own directly in the
 /// module body: an expression statement there, not a branch, loop, `try`,
 /// `with`, class body or function, nor part of a larger expression.
