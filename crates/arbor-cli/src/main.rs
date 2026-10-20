@@ -15,6 +15,7 @@ mod hook;
 mod hunk_lines;
 mod install_check;
 mod receipt;
+mod retirements;
 mod usages;
 
 #[derive(Parser)]
@@ -370,6 +371,53 @@ enum Commands {
         json: bool,
     },
 
+    /// Find direct SDK calls to AI models their provider has retired or is retiring, with the replacement, the argument changes and the choices it needs (Python today). Runs locally. Exit 0: nothing failing, 1: a confirmed call uses a retired model (or one retiring within --fail-within days), 2: error
+    Retirements {
+        /// Directory or file to scan (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: String,
+
+        /// Output as JSON; errors are printed as {"version", "error"} on stdout
+        #[arg(long, conflicts_with_all = ["markdown", "annotations"])]
+        json: bool,
+
+        /// Output a Markdown report (for a GitHub job summary)
+        #[arg(long, conflicts_with = "annotations")]
+        markdown: bool,
+
+        /// Output GitHub Actions annotations: one warning per affected call, up to --max-annotations, then one notice for the rest
+        #[arg(long)]
+        annotations: bool,
+
+        /// With --annotations: the most warnings to print (GitHub shows 10 per step)
+        #[arg(long, value_name = "N", requires = "annotations")]
+        max_annotations: Option<usize>,
+
+        /// Also write the Markdown report to this file, from the same scan
+        #[arg(long, value_name = "FILE")]
+        markdown_out: Option<String>,
+
+        /// Also fail (exit 1) when a model retires within this many days; by default only already-retired models fail
+        #[arg(long, value_name = "DAYS", value_parser = clap::value_parser!(i64).range(0..=36500))]
+        fail_within: Option<i64>,
+
+        /// List calls that go through Azure, another host in base_url or another cloud (the provider's dates may not apply) and let them fail the check
+        #[arg(long)]
+        include_routed: bool,
+
+        /// Also let unconfirmed calls fail the check: environment or config fallbacks, parameter defaults, possible values, unresolved clients and unknown routing
+        #[arg(long)]
+        count_unconfirmed: bool,
+
+        /// Print only the calls and the summary
+        #[arg(short, long)]
+        quiet: bool,
+
+        /// Count days from this date (YYYY-MM-DD) instead of today
+        #[arg(long, hide = true)]
+        today: Option<String>,
+    },
+
     /// Show direct callers of a symbol (who calls this?)
     Callers {
         /// The symbol to look up (function name, class name, or qualified path)
@@ -677,6 +725,11 @@ async fn run() {
                 usages::print_json_error(&error.render().to_string());
                 std::process::exit(error.exit_code());
             }
+            if !informational && retirements::wants_json(std::env::args_os().skip(1)) {
+                let _ = error.print();
+                retirements::print_json_error(&error.render().to_string());
+                std::process::exit(2);
+            }
             error.exit()
         }
     };
@@ -809,6 +862,31 @@ async fn run() {
             path,
         } => commands::audit(&sink, depth, &format, &path),
         Commands::Usages { path, sdk, json } => usages::run(&path, sdk.as_deref(), json),
+        Commands::Retirements {
+            path,
+            json,
+            markdown,
+            annotations,
+            max_annotations,
+            markdown_out,
+            fail_within,
+            include_routed,
+            count_unconfirmed,
+            quiet,
+            today,
+        } => std::process::exit(retirements::run(&retirements::Args {
+            path,
+            json,
+            markdown,
+            annotations,
+            markdown_out,
+            max_annotations,
+            fail_within,
+            include_routed,
+            count_unconfirmed,
+            quiet,
+            today,
+        })),
         Commands::Callers { symbol, path, json } => commands::callers(&symbol, &path, json),
         Commands::Callees { symbol, path, json } => commands::callees(&symbol, &path, json),
         Commands::EntryPoints { path, json } => commands::entry_points(&path, json),

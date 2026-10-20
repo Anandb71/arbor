@@ -253,6 +253,25 @@ pub struct ClientConstruction {
     pub span: Span,
     /// Enclosing function or method (`Bot.__init__`), `None` at module level.
     pub symbol: Option<String>,
+    /// For `google.genai.Client(vertexai=...)`: how the argument reads.
+    /// Only this class is recorded, never the expression. `None` when the
+    /// constructor passes no `vertexai=`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertexai: Option<VertexAi>,
+}
+
+/// How a `google.genai.Client(vertexai=...)` argument reads. The Gemini API
+/// and Vertex AI retire models on different schedules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VertexAi {
+    /// `vertexai=True`: requests go to Vertex AI.
+    On,
+    /// `vertexai=False` or `vertexai=None`: requests go to the Gemini API.
+    Off,
+    /// Decided at run time (`vertexai=use_vertex`,
+    /// `vertexai=os.getenv(...) == "true"`).
+    Unknown,
 }
 
 /// What a call's chain is rooted at.
