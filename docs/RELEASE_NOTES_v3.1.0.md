@@ -2,7 +2,8 @@
 
 A feature release with two new commands for Python code that calls AI model
 APIs: `arbor retirements` and `arbor usages`. No breaking changes. Graph
-extraction and the cache are unchanged, so saved graphs are not rebuilt.
+extraction is unchanged; as after every upgrade, a saved graph is rebuilt once
+on first use.
 
 ## `arbor retirements`: find code that calls retiring AI models
 

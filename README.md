@@ -60,7 +60,8 @@ locally, with no account, API key or telemetry.
 | **GitHub Action `mode: retirements`** | The same check in CI: a job summary that lists every affected call, and warnings on the most urgent lines. It warns by default and fails the build only when you set `retirements-fail-on`, or when the check cannot run. |
 | **`arbor usages` and `find_api_usages`** | Every OpenAI, Anthropic and Gemini SDK call with its file and line, client routing (direct, Azure, custom `base_url`, Bedrock, Vertex) and model IDs, for people and agents. A value is confirmed only inside a small supported grammar; everything else carries a typed gap. [What a report confirms](docs/SDK_USAGES.md) |
 
-Python only for now; graph extraction and the cache are unchanged. See the
+Python only for now; graph extraction is unchanged (a saved graph is rebuilt
+once on first use, as after every upgrade). See the
 [3.0.5 release notes](docs/RELEASE_NOTES_v3.0.5.md) for the previous release.
 
 <details>

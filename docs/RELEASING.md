@@ -91,7 +91,7 @@ Also enable **Settings → Actions → General → Allow GitHub Actions to creat
    Exit 2 means a recipe uses a rule, option or condition the generator cannot
    translate yet: extend the generator rather than editing the JSON by hand (the
    digest test fails on any hand edit).
-3. Bump the workspace version, the internal crate dependency versions, `Cargo.lock`, `agent-card.json`, `packaging/npm/package.json` and `extensions/arbor-vscode/package.json` (and its lockfile). Leave `packaging/homebrew` and `packaging/scoop` alone: the release workflow writes them once the assets and their checksums exist.
+3. Bump the workspace version, the internal crate dependency versions, `Cargo.lock`, `agent-card.json`, `packaging/npm/package.json` and `extensions/arbor-vscode/package.json` (and its lockfile), plus `version` and `date-released` in `CITATION.cff`. Leave `packaging/homebrew` and `packaging/scoop` alone: the release workflow writes them once the assets and their checksums exist.
 4. Create and push a release tag on the release pull request's merge commit:
    - `vX.Y.Z`
 5. Wait for all workflows to complete:
