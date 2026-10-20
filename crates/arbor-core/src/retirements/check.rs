@@ -1725,8 +1725,16 @@ impl RuleContext<'_> {
         out
     }
 
+    /// `text` for this call: `{target}` filled in, and on the Responses API
+    /// its output limit, `max_output_tokens`, where recipe text written for
+    /// Chat Completions names `max_completion_tokens`.
     fn message(&self, text: &str) -> String {
-        text.replace("{target}", self.target)
+        let text = text.replace("{target}", self.target);
+        if self.endpoint == Some("responses") {
+            text.replace("max_completion_tokens", "max_output_tokens")
+        } else {
+            text
+        }
     }
 
     /// Sorts argument names into the order the call passes them.
@@ -2634,6 +2642,37 @@ mod tests {
             .effects
             .iter()
             .any(|e| e.rule == "G6-REASONING-DEFAULT" && e.status == OptionStatus::Unverified));
+    }
+
+    #[test]
+    fn the_responses_api_names_its_own_output_limit() {
+        // rv6 nit: "max_completion_tokens also has to cover them" was shown
+        // for Responses calls, whose limit is max_output_tokens.
+        let effects = |chain: &str| -> Vec<String> {
+            let mut call = openai("gpt-4o", &["input"]);
+            call.chain = chain.into();
+            call.member = chain.split_once('.').unwrap().1.into();
+            let finding = one(&[call]);
+            option(&finding, "model_default")
+                .effects
+                .iter()
+                .map(|e| e.text.clone())
+                .collect()
+        };
+        let responses = effects("client.responses.create");
+        assert!(
+            responses
+                .iter()
+                .any(|t| t.contains("max_output_tokens also has to cover them")),
+            "{responses:#?}"
+        );
+        assert!(responses
+            .iter()
+            .all(|t| !t.contains("max_completion_tokens")));
+        let chat = effects("client.chat.completions.create");
+        assert!(chat
+            .iter()
+            .any(|t| t.contains("max_completion_tokens also has to cover them")));
     }
 
     #[test]
