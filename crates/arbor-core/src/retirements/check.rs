@@ -520,7 +520,7 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
             continue;
         };
         let here = at_call(call);
-        let class = call_routing(call, input.clients, &here);
+        let class = call_routing(call, kind, input.clients, &here);
         for value in &call.values {
             // A gap for this key (or for none) leaves the value unconfirmed,
             // whatever its origin.
@@ -566,7 +566,7 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
                 };
                 (
                     Site::Call(call, kind),
-                    call_routing(call, input.clients, &at_call(call)),
+                    call_routing(call, kind, input.clients, &at_call(call)),
                     Confidence::ConfirmFirst,
                 )
             }
@@ -763,10 +763,13 @@ struct CallRouting {
 /// its host there (the provider's own host is direct; an environment-only or
 /// unresolved value is unknown), so it is followed as it is and only named.
 /// Any client gap at the call (`at_call`) makes the routing unknown: the
-/// scan could not confirm where the call goes. The provider's schedule is
-/// still the one looked up.
+/// scan could not confirm where the call goes. So does a request parameter
+/// object: it is built from an imported type, not a client, and the request
+/// that sends it decides where it goes. The provider's schedule is still the
+/// one looked up.
 fn call_routing(
     call: &SdkCall,
+    kind: CallKind,
     clients: &[ClientConstruction],
     at_call: &[&UsageGap],
 ) -> CallRouting {
@@ -793,7 +796,7 @@ fn call_routing(
     };
     let gap = at_call.iter().find(|g| gaps::holds_routing(g));
     CallRouting {
-        class: if gap.is_some() {
+        class: if gap.is_some() || kind == CallKind::RequestParam {
             RoutingClass::Unknown
         } else {
             class
@@ -2571,6 +2574,10 @@ mod tests {
         assert_eq!(finding.call_kind, CallKind::RequestParam);
         assert_eq!(finding.endpoint, None);
         assert_eq!(finding.fix, FixKind::Manual);
+        // Built from an imported type: the request that sends it decides
+        // where it goes, so its routing is not confirmed.
+        assert_eq!(finding.routing_class, RoutingClass::Unknown);
+        assert!(!finding.fails);
         assert!(finding
             .review
             .iter()

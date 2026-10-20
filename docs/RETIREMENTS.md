@@ -81,7 +81,9 @@ Objects built from SDK types in code that sends nothing, such as
 and other request parameter objects (`ImageGeneration(model=...)`, and types named
 `...Param`, `...Params`, `...Config` or `...Request` such as
 `RealtimeSessionCreateRequest(model=...)`) are checked, since their model is sent with
-a request.
+a request. Where it goes is decided by the request that sends the object, which Arbor
+does not follow, so these are listed with *routing not confirmed* and count toward
+exit 1 only with `--count-unconfirmed`.
 
 ## Options and exit codes
 

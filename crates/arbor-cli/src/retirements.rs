@@ -20,9 +20,9 @@
 //! `--include-routed`.
 
 use arbor_core::retirements::{
-    bundled, check, python_literal, routing_gap_text, value_gap_text, BaseUrl, Change, ChangeKind,
-    CheckOptions, Confidence, Date, DateKind, Decision, Finding, MatchKind, OptionStatus,
-    RetirementReport, RoutingClass, ScanInput, State, REPORT_VERSION,
+    bundled, check, python_literal, routing_gap_text, value_gap_text, BaseUrl, CallKind, Change,
+    ChangeKind, CheckOptions, Confidence, Date, DateKind, Decision, Finding, MatchKind,
+    OptionStatus, RetirementReport, RoutingClass, ScanInput, State, REPORT_VERSION,
 };
 use arbor_core::usages::{is_unsafe_char, ValueOrigin};
 use arbor_watcher::usages::{scan_usages, UsageScanOptions};
@@ -432,16 +432,24 @@ fn routing_caveat(finding: &Finding) -> Option<String> {
                     "the base_url is read from the environment and falls back to another host"
                         .to_string(),
                 ),
-                _ => finding
-                    .routing_gap
-                    .as_deref()
-                    .map(|reason| routing_gap_text(reason).unwrap_or(reason).to_string()),
+                _ => match finding.routing_gap.as_deref() {
+                    Some(reason) => Some(routing_gap_text(reason).unwrap_or(reason).to_string()),
+                    None if finding.call_kind == CallKind::RequestParam => {
+                        Some("the request that sends this object decides where it goes".to_string())
+                    }
+                    None => None,
+                },
+            };
+            let subject = if finding.call_kind == CallKind::RequestParam {
+                "that request"
+            } else {
+                "this call"
             };
             match why {
                 Some(why) => format!(
-                    "routing not confirmed ({why}): confirm this call reaches {provider} directly"
+                    "routing not confirmed ({why}): confirm {subject} reaches {provider} directly"
                 ),
-                None => format!("routing unknown: confirm this call reaches {provider} directly"),
+                None => format!("routing unknown: confirm {subject} reaches {provider} directly"),
             }
         }
     };

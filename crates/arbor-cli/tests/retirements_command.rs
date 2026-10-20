@@ -520,6 +520,9 @@ fn response_and_type_objects_are_not_reported() {
     let tool = findings.iter().find(|f| f["model"] == "dall-e-2").unwrap();
     assert_eq!(tool["call_kind"], "request_param");
     assert_eq!(tool["fix"], "manual");
+    // The request that sends it decides where it goes: listed, not counted.
+    assert_eq!(tool["routing_class"], "unknown");
+    assert_eq!(tool["fails"], false);
     // ChatCompletion(...) and from_cache's .model_validate carry a model and
     // are skipped. In from_partial the later `**raw` may replace the model,
     // so the usage scan reads no value there: nothing to skip or report.
