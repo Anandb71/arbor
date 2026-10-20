@@ -22,7 +22,7 @@
 use arbor_core::retirements::{
     bundled, check, python_literal, routing_gap_text, value_gap_text, BaseUrl, CallKind, Change,
     ChangeKind, CheckOptions, Confidence, Date, DateKind, Decision, Finding, MatchKind,
-    OptionStatus, RetirementReport, RoutingClass, ScanInput, State, REPORT_VERSION,
+    OptionStatus, RetirementReport, RoutingClass, ScanInput, State, FINE_TUNING, REPORT_VERSION,
 };
 use arbor_core::usages::{is_unsafe_char, ValueOrigin};
 use arbor_watcher::usages::{scan_usages, UsageScanOptions};
@@ -463,7 +463,8 @@ fn target_text(finding: &Finding) -> (String, bool) {
         .replacement_chain
         .first()
         .is_some_and(|step| step.status.is_some());
-    if finding.match_kind == MatchKind::FineTuned {
+    // A fine-tune, or a fine-tuning job: only a fine-tunable base helps.
+    if finding.match_kind == MatchKind::FineTuned || finding.endpoint == Some(FINE_TUNING) {
         let text = finding
             .replacement_text
             .clone()

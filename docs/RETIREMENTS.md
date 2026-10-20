@@ -73,7 +73,9 @@ and nothing more.
 Fine-tuned models (`ft:<base>:...`) follow their base model's schedule. Arbor names a
 base model to retrain on only when the provider lists one that supports fine-tuning;
 today none does (gpt-6-luna and the GPT-5.6 models do not support fine-tuning), so the
-report says that no fine-tunable replacement is listed.
+report says that no fine-tunable replacement is listed. A fine-tuning job on a retiring
+base (`client.fine_tuning.jobs.create(model="gpt-4o-mini-2024-07-18", ...)`) gets the
+same advice, never the base's listed replacement, and always needs a manual check.
 
 Objects built from SDK types in code that sends nothing, such as
 `ChatCompletion(model=...)` in a test fixture, Anthropic's `Message(...)`, or

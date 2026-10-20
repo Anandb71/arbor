@@ -942,32 +942,48 @@ fn lookup<'d>(data: &'d Retirements, table: Table, value: &str) -> Option<Hit<'d
     None
 }
 
+const NONE_LISTED: &str = "no fine-tunable replacement is listed";
+
+/// What to tell people about fine-tunes of `base`, from the data's fine-tune
+/// row: `subject` is what the call is (`Fine-tuned model`, `Fine-tuning
+/// job`) and `retrain` what to do on a listed base that can be fine-tuned.
+/// Returns the advice and the replacement text (`retrain on X`, or that no
+/// fine-tunable replacement is listed).
+fn fine_tune_advice(
+    fine: &super::FineTuneEntry,
+    base: &str,
+    subject: &str,
+    retrain: &str,
+) -> (String, String) {
+    let note = fine.note.as_deref().unwrap_or_default();
+    let advice = match (&fine.replacement_base, fine.fine_tunable) {
+        (Some(listed), true) => format!(
+            "{subject}: {retrain} {listed}, the base model OpenAI lists for fine-tunes of {base}."
+        ),
+        (Some(listed), false) => format!(
+            "{subject}: OpenAI lists {listed} for fine-tunes of {base}, so {NONE_LISTED}. {note}"
+        ),
+        (None, _) => format!(
+            "{subject}: {} for fine-tunes of {base}. {note}",
+            capitalize(NONE_LISTED)
+        ),
+    };
+    let text = fine
+        .replacement_base
+        .as_ref()
+        .filter(|_| fine.fine_tunable)
+        .map(|b| format!("retrain on {b}"))
+        .unwrap_or_else(|| NONE_LISTED.to_string());
+    (advice.trim_end().to_string(), text)
+}
+
 /// A fine-tune of `base`. Advice to retrain names a base model only when the
 /// data lists one for these fine-tunes and it can itself be fine-tuned;
 /// otherwise the report says no fine-tunable replacement is listed.
 fn fine_tune_hit<'d>(data: &'d Retirements, table: Table, base: &str) -> Option<Hit<'d>> {
-    const NONE_LISTED: &str = "no fine-tunable replacement is listed";
     if let Some(fine) = data.fine_tune(table, base) {
         let recipe = data.recipe(&fine.recipe)?;
-        let advice = match (&fine.replacement_base, fine.fine_tunable) {
-            (Some(listed), true) => format!(
-                "Fine-tuned model: retrain it on {listed}, the base model OpenAI lists for fine-tunes of {base}."
-            ),
-            (Some(listed), false) => format!(
-                "Fine-tuned model: OpenAI lists {listed} for fine-tunes of {base}, so {NONE_LISTED}. {}",
-                fine.note.as_deref().unwrap_or_default()
-            ),
-            (None, _) => format!(
-                "Fine-tuned model: {} for fine-tunes of {base}. {}",
-                capitalize(NONE_LISTED),
-                fine.note.as_deref().unwrap_or_default()
-            ),
-        };
-        let retrain = fine
-            .replacement_base
-            .as_ref()
-            .filter(|_| fine.fine_tunable)
-            .map(|b| format!("retrain on {b}"));
+        let (advice, text) = fine_tune_advice(fine, base, "Fine-tuned model", "retrain it on");
         return Some(Hit {
             matched: base.to_string(),
             match_kind: MatchKind::FineTuned,
@@ -976,7 +992,7 @@ fn fine_tune_hit<'d>(data: &'d Retirements, table: Table, base: &str) -> Option<
             status: fine.status,
             date: Date::parse(&fine.date),
             replacement: None,
-            replacement_text: Some(retrain.unwrap_or_else(|| NONE_LISTED.to_string())),
+            replacement_text: Some(text),
             action: Action::ReportOnly,
             rule_set: None,
             entry: None,
@@ -984,7 +1000,7 @@ fn fine_tune_hit<'d>(data: &'d Retirements, table: Table, base: &str) -> Option<
             notes: vec![format!(
                 "OpenAI retires fine-tunes of {base} with their base model's schedule."
             )],
-            fine_tune_advice: Some(advice.trim_end().to_string()),
+            fine_tune_advice: Some(advice),
             schedule_unconfirmed: false,
         });
     }
@@ -1003,6 +1019,42 @@ fn fine_tune_hit<'d>(data: &'d Retirements, table: Table, base: &str) -> Option<
         "Fine-tuned model: OpenAI lists no replacement for fine-tunes of {base}, so {NONE_LISTED}."
     ));
     Some(hit)
+}
+
+/// `hit` for a fine-tuning job (`client.fine_tuning.jobs.create(model=...)`):
+/// the model is the base the job trains on, so the advice comes from the
+/// data's fine-tune rows, never from the base's listed replacement, which
+/// may not support fine-tuning. The job keeps its base model's status and
+/// date, takes no argument rules and always needs a person.
+fn fine_tuning_job_hit<'d>(data: &'d Retirements, mut hit: Hit<'d>) -> Hit<'d> {
+    if hit.match_kind == MatchKind::FineTuned {
+        // An `ft:` model as the job's base: the fine-tune advice already
+        // says what to do with it.
+        return hit;
+    }
+    let base = hit.matched.clone();
+    let provider = hit.table.provider();
+    let (advice, text) = match data.fine_tune(hit.table, &base) {
+        Some(fine) => fine_tune_advice(fine, &base, "Fine-tuning job", "start new jobs on"),
+        None => {
+            let listed = match &hit.replacement {
+                Some(listed) => format!(
+                    "{provider} lists {listed} as the replacement for {base}, not as a base for fine-tuning"
+                ),
+                None => format!("{provider} lists no replacement for {base}"),
+            };
+            (
+                format!("Fine-tuning job: {listed}, so {NONE_LISTED}."),
+                NONE_LISTED.to_string(),
+            )
+        }
+    };
+    hit.replacement = None;
+    hit.replacement_text = Some(text);
+    hit.action = Action::ReportOnly;
+    hit.rule_set = None;
+    hit.fine_tune_advice = Some(advice);
+    hit
 }
 
 /// Resolves a value for a call, deciding which schedule applies.
@@ -1228,10 +1280,6 @@ fn finding_for(
     confidence: Confidence,
 ) -> Option<Finding> {
     let (hit, class) = resolve(data, routing, &value.value)?;
-    let today = options.today;
-    let date_kind = hit.recipe.date_kind;
-    let status = effective_state(hit.status, hit.date, date_kind, today);
-    let days_left = hit.date.map(|d| today.days_until(d));
 
     let (file, span, symbol, chain, kwargs, splat, endpoint, call_kind) = match site {
         Site::Call(call, kind) => (
@@ -1266,6 +1314,16 @@ fn finding_for(
         Site::Call(..) => None,
     };
     let span = span.unwrap_or(value.span);
+    // A fine-tuning job trains on the model: only a fine-tunable base helps.
+    let hit = if endpoint == Some(FINE_TUNING) {
+        fine_tuning_job_hit(data, hit)
+    } else {
+        hit
+    };
+    let today = options.today;
+    let date_kind = hit.recipe.date_kind;
+    let status = effective_state(hit.status, hit.date, date_kind, today);
+    let days_left = hit.date.map(|d| today.days_until(d));
 
     // The listed replacement, followed to the first one that still works.
     let replacement_chain = hit
@@ -1455,37 +1513,44 @@ fn effective_state(status: EntryStatus, date: Option<Date>, kind: DateKind, toda
     }
 }
 
+/// The endpoint of a fine-tuning job (`fine_tuning.jobs.create`, and the
+/// pre-1.0 `FineTuningJob.create` and `FineTune.create`).
+pub const FINE_TUNING: &str = "fine_tuning";
+
 /// Which API a call uses, from its callee.
 fn endpoint_of(chain: &str, member: &str) -> Option<&'static str> {
     let text = if member.contains('.') { member } else { chain };
     let has = |needle: &str| text.contains(needle);
-    let endpoint = if has("chat.completions") || has("ChatCompletion") {
-        "chat.completions"
-    } else if has("responses.") {
-        "responses"
-    } else if has("assistants.") || has("threads.") {
-        "assistants"
-    } else if has("completions.") || has("Completion.") {
-        "completions_legacy"
-    } else if has("messages.") {
-        "messages"
-    } else if has("generate_content")
-        || has("GenerativeModel")
-        || has("chats.")
-        || has("send_message")
-    {
-        "generate_content"
-    } else if has("interactions.") {
-        "interactions"
-    } else if has("embeddings.") || has("embed_content") || has("Embedding.") {
-        "embeddings"
-    } else if has("images.") || has("generate_images") {
-        "images"
-    } else if has("audio.") {
-        "audio"
-    } else {
-        return None;
-    };
+    let endpoint =
+        if has("fine_tuning.") || has("fine_tunes.") || has("FineTuningJob.") || has("FineTune.") {
+            FINE_TUNING
+        } else if has("chat.completions") || has("ChatCompletion") {
+            "chat.completions"
+        } else if has("responses.") {
+            "responses"
+        } else if has("assistants.") || has("threads.") {
+            "assistants"
+        } else if has("completions.") || has("Completion.") {
+            "completions_legacy"
+        } else if has("messages.") {
+            "messages"
+        } else if has("generate_content")
+            || has("GenerativeModel")
+            || has("chats.")
+            || has("send_message")
+        {
+            "generate_content"
+        } else if has("interactions.") {
+            "interactions"
+        } else if has("embeddings.") || has("embed_content") || has("Embedding.") {
+            "embeddings"
+        } else if has("images.") || has("generate_images") {
+            "images"
+        } else if has("audio.") {
+            "audio"
+        } else {
+            return None;
+        };
     Some(endpoint)
 }
 
@@ -1505,10 +1570,13 @@ fn model_reasons(
         || hit.entry.and_then(|e| e.kind.as_deref()) == Some("fine_tune_label");
     let category = hit.entry.map(|e| e.category.as_str()).unwrap_or("text");
     let mut messages = Vec::new();
-    if fine_tuned {
-        messages.push(hit.fine_tune_advice.clone().unwrap_or_else(|| {
-            "Fine-tuned model: retrain it on a base model that supports fine-tuning.".to_string()
-        }));
+    if let Some(advice) = &hit.fine_tune_advice {
+        // A fine-tuned model, or a fine-tuning job on this base.
+        messages.push(advice.clone());
+    } else if fine_tuned {
+        messages.push(
+            "Fine-tuned model: retrain it on a base model that supports fine-tuning.".to_string(),
+        );
     } else if hit.replacement.is_none() {
         messages.push(match &hit.replacement_text {
             Some(text) => format!("{provider} lists more than one way forward: {text}."),
@@ -2798,6 +2866,85 @@ mod tests {
         assert!(finding.review[0]
             .message
             .contains("OpenAI lists gpt-5.6-terra for fine-tunes of gpt-3.5-turbo"));
+    }
+
+    #[test]
+    fn fine_tuning_jobs_never_get_a_base_that_cannot_be_fine_tuned() {
+        // rv6 should-fix 2: `fine_tuning.jobs.create(model=<retiring base>)`
+        // read as a swap to gpt-6-luna, which does not support fine-tuning.
+        let job = |model: &str| {
+            call(
+                Sdk::Openai,
+                Routing::OpenaiDirect,
+                "client.fine_tuning.jobs.create",
+                model,
+                &["training_file", "hyperparameters"],
+                30,
+            )
+        };
+        for model in ["gpt-4o-mini-2024-07-18", "gpt-4o-mini", "gpt-3.5-turbo"] {
+            let finding = one(&[job(model)]);
+            assert_eq!(finding.endpoint, Some(FINE_TUNING), "{model}");
+            assert_eq!(finding.status, State::Retiring, "{model}");
+            assert_eq!(finding.replacement, None, "{model}");
+            assert_eq!(finding.live_replacement, None, "{model}");
+            assert!(finding.replacement_chain.is_empty(), "{model}");
+            assert_eq!(
+                finding.replacement_text.as_deref(),
+                Some("no fine-tunable replacement is listed"),
+                "{model}"
+            );
+            assert_eq!(finding.fix, FixKind::Manual, "{model}");
+            // No argument rule of the base's replacement applies to a job.
+            assert!(
+                finding.changes.is_empty() && finding.decisions.is_empty(),
+                "{model}: {finding:#?}"
+            );
+            let advice = &finding.review[0].message;
+            assert!(advice.starts_with("Fine-tuning job:"), "{advice}");
+            assert!(!advice.contains("start new jobs on"), "{advice}");
+        }
+        // The snapshot's fine-tune row says why.
+        let finding = one(&[job("gpt-4o-mini-2024-07-18")]);
+        assert_eq!(finding.date.unwrap().iso(), "2027-01-14");
+        assert!(
+            finding.review[0]
+                .message
+                .contains("gpt-6-luna, the replacement OpenAI lists for these models, does not support fine-tuning"),
+            "{:#?}",
+            finding.review
+        );
+        // The alias has no fine-tune row: its listed replacement is named as
+        // a replacement, not as a base to fine-tune.
+        let finding = one(&[job("gpt-4o-mini")]);
+        assert!(
+            finding.review[0].message.contains(
+                "OpenAI lists gpt-6-luna as the replacement for gpt-4o-mini, not as a base for fine-tuning"
+            ),
+            "{:#?}",
+            finding.review
+        );
+        // A listed fine-tune base that cannot be fine-tuned is named, not
+        // recommended.
+        let finding = one(&[job("gpt-3.5-turbo")]);
+        assert!(finding.review[0]
+            .message
+            .contains("OpenAI lists gpt-5.6-terra for fine-tunes of gpt-3.5-turbo"));
+        // An `ft:` model continued in a job keeps the fine-tune advice.
+        let finding = one(&[job("ft:gpt-4o-mini-2024-07-18:acme::abc123")]);
+        assert_eq!(finding.match_kind, MatchKind::FineTuned);
+        assert!(finding.review[0].message.starts_with("Fine-tuned model:"));
+        // The pre-1.0 module-level calls are fine-tuning jobs too.
+        assert_eq!(
+            endpoint_of("openai.FineTuningJob.create", "FineTuningJob.create"),
+            Some(FINE_TUNING)
+        );
+        assert_eq!(
+            endpoint_of("openai.FineTune.create", "FineTune.create"),
+            Some(FINE_TUNING)
+        );
+        let report = run(&[job("gpt-4o-mini")], &[], &options("2026-10-18"));
+        assert_eq!((report.summary.swap, report.summary.manual), (0, 1));
     }
 
     #[test]

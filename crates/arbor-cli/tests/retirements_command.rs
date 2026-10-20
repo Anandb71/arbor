@@ -148,8 +148,8 @@ def four():
     return proxy.chat.completions.create(model="gpt-4-0314", messages=[])
 "#;
 
-/// A replacement that retires too, and a fine-tune whose replacement cannot
-/// be fine-tuned.
+/// A replacement that retires too, and a fine-tune and a fine-tuning job
+/// whose base's replacement cannot be fine-tuned.
 const CHAINS: &str = r#"from openai import OpenAI
 
 client = OpenAI()
@@ -161,6 +161,10 @@ def vision():
 
 def tuned():
     return client.chat.completions.create(model="ft:gpt-4o-mini-2024-07-18:acme::abc123", messages=[])
+
+
+def train(file_id):
+    return client.fine_tuning.jobs.create(model="gpt-4o-mini-2024-07-18", training_file=file_id)
 "#;
 
 fn arbor(dir: &Path, args: &[&str]) -> Output {
@@ -562,6 +566,30 @@ fn chained_replacements_and_fine_tunes_read_plainly() {
         "{text}"
     );
     assert!(!text.contains("retrain on gpt-6-luna"), "{text}");
+    // A fine-tuning job on a retiring base is never told to swap to a model
+    // that cannot be fine-tuned (rv6 should-fix 2).
+    let job = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["model"] == "gpt-4o-mini-2024-07-18")
+        .expect("the fine-tuning job");
+    assert_eq!(job["endpoint"], "fine_tuning");
+    assert_eq!(job["replacement"], Value::Null);
+    assert_eq!(job["fix"], "manual");
+    assert!(
+        text.contains("gpt-4o-mini-2024-07-18 → no fine-tunable replacement is listed"),
+        "{text}"
+    );
+    assert!(text.contains("check: Fine-tuning job:"), "{text}");
+    assert!(
+        !text.contains("gpt-4o-mini-2024-07-18 → gpt-6-luna"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("can move to the listed replacement"),
+        "{text}"
+    );
     let markdown = stdout(&arbor(
         dir.path(),
         &["retirements", ".", "--markdown", "--today", TODAY],
