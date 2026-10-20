@@ -132,7 +132,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: Anandb71/arbor@vX.Y.Z   # the first release that includes arbor retirements
+      - uses: Anandb71/arbor@v3.1.0
         with:
           mode: retirements
           # retirements-fail-on: retired   # or a number of days, e.g. 90
@@ -197,7 +197,7 @@ checks, not changes, and a decision option whose effect is not verified says so.
 The data is bundled into Arbor at build time, so it changes only when you update Arbor.
 When the data is more than 90 days old, the report reminds you to update. It is built by
 [`scripts/retirements/generate_model_retirements.py`](../scripts/retirements/generate_model_retirements.py)
-from Arbor's retirement recipes, which live in a private research repository. The
+from Arbor's retirement recipes, which live in a private repository. The
 generator keeps provenance with the data: the provider pages, each recipe's version,
 the date its pages were read and the SHA-256 of the recipe file. Every fact names the
 provider page it came from, so you can check it there. A test fails `cargo test` if
