@@ -1358,6 +1358,11 @@ fn finding_for(
         }),
         _ => None,
     };
+    // A model nested in the call's arguments (`requests[].params.model` in a
+    // Message Batch, a tool's `model` in `tools=[...]`) belongs to a request
+    // or an object of its own: the call's argument names and endpoint say
+    // nothing about it, so only the rules about the model itself apply.
+    let nested = value.key.rsplit_once('.').map(|(container, _)| container);
     let mut outcome = Outcome::default();
     if call_kind != CallKind::RequestParam {
         if let Some((rule_set, target, source_model, source_family)) = source {
@@ -1365,11 +1370,18 @@ fn finding_for(
                 target,
                 source_model,
                 source_family,
-                endpoint,
+                endpoint: if nested.is_some() { None } else { endpoint },
                 routing: &routing.routing,
-                kwargs: &kwargs,
+                kwargs: if nested.is_some() {
+                    &[]
+                } else {
+                    kwargs.as_slice()
+                },
             };
-            outcome = apply_rules(data.rules(rule_set), &context);
+            let rules = data
+                .rules(rule_set)
+                .filter(|rule| nested.is_none() || about_the_model(rule));
+            outcome = apply_rules(rules, &context);
         }
     }
 
@@ -1396,6 +1408,20 @@ fn finding_for(
         reasons.push(ReviewItem {
             rule: None,
             message,
+            because: Vec::new(),
+            verified: None,
+        });
+    }
+    if let Some(container) = nested {
+        let against = live
+            .as_deref()
+            .map(|m| format!(" against {m}"))
+            .unwrap_or_default();
+        reasons.push(ReviewItem {
+            rule: None,
+            message: format!(
+                "The model is set in {container}, nested in this call's arguments: Arbor checked only the model there, not the parameters set next to it, so check those{against} by hand."
+            ),
             because: Vec::new(),
             verified: None,
         });
@@ -1492,6 +1518,18 @@ fn finding_for(
         verified: hit.verified,
         source_url: hit.recipe.source_urls.first().cloned(),
     })
+}
+
+/// A rule about the model itself rather than the request that sends it: a
+/// check or a note with no endpoint and no argument condition. Only these
+/// apply to a model nested in a call's arguments, whose own request the
+/// call's argument names do not describe.
+fn about_the_model(rule: &ParamRule) -> bool {
+    matches!(rule.effect, RuleEffect::Review | RuleEffect::Note)
+        && rule.endpoints.is_empty()
+        && rule.any_kwargs.is_empty()
+        && rule.all_kwargs.is_empty()
+        && rule.lacks_kwargs.is_empty()
 }
 
 /// The state on `today`. A hard date counts as retired from that day on (the
@@ -2945,6 +2983,95 @@ mod tests {
         );
         let report = run(&[job("gpt-4o-mini")], &[], &options("2026-10-18"));
         assert_eq!((report.summary.swap, report.summary.manual), (0, 1));
+    }
+
+    #[test]
+    fn nested_models_get_only_the_rules_about_the_model() {
+        // rv6 should-fix 3: a Message Batch's `requests[].params.model` got
+        // the outer call's argument rules ("add thinking=..." on
+        // `batches.create`, which takes no such argument), and the nested
+        // request's own parameters were never looked at.
+        let source = r#"from anthropic import Anthropic
+from openai import OpenAI
+
+claude = Anthropic()
+client = OpenAI()
+
+
+def batch():
+    return claude.messages.batches.create(
+        requests=[{"custom_id": "a", "params": {"model": "claude-3-5-sonnet-20241022", "max_tokens": 10, "messages": [], "temperature": 0.2}}]
+    )
+
+
+def plain():
+    return claude.messages.create(model="claude-3-5-sonnet-20241022", max_tokens=10, messages=[], temperature=0.2)
+
+
+def tool_model(tools):
+    return client.chat.completions.create(model="gpt-4o", messages=[], max_tokens=10, tools=[{"type": "x", "model": "gpt-4o-mini"}])
+"#;
+        let report = check_source(source, &options("2026-10-20"));
+        let at = |needle: &str, key: &str| -> Finding {
+            let line = line_of(source, needle);
+            let found: Vec<&Finding> = report
+                .findings
+                .iter()
+                .filter(|f| f.line == line && f.key == key)
+                .collect();
+            assert_eq!(found.len(), 1, "{needle} {key}: {:#?}", report.findings);
+            found[0].clone()
+        };
+        let nested = at("batches.create", "requests.params.model");
+        assert!(nested.changes.is_empty(), "{:#?}", nested.changes);
+        assert!(nested.decisions.is_empty(), "{:#?}", nested.decisions);
+        assert_eq!(nested.fix, FixKind::Manual);
+        let check = nested
+            .review
+            .iter()
+            .find(|r| r.message.contains("requests.params"))
+            .expect("a check naming the nested request");
+        assert!(
+            check
+                .message
+                .contains("check those against claude-sonnet-5-5 by hand"),
+            "{}",
+            check.message
+        );
+        // No rule about arguments or an endpoint: only the model's own.
+        let data = bundled().unwrap();
+        for item in &nested.review {
+            if let Some(id) = &item.rule {
+                let rule = data.data.rules.iter().find(|r| &r.id == id).unwrap();
+                assert!(about_the_model(rule), "{id} is about the request");
+            }
+        }
+        assert!(nested
+            .review
+            .iter()
+            .map(|r| r.message.as_str())
+            .chain(nested.notes.iter().map(String::as_str))
+            .all(|m| !m.contains("temperature")));
+        // The same model at the request itself still gets its rules.
+        let plain = at("claude.messages.create(", "model");
+        assert!(plain
+            .review
+            .iter()
+            .any(|r| r.rule.as_deref() == Some("ANT-SAMPLING")));
+
+        // A tool's model in a Chat Completions call: the call's tools,
+        // max_tokens and reasoning rules are about the call, not the tool.
+        if let Some(tool) = report.findings.iter().find(|f| f.key == "tools.model") {
+            assert!(
+                tool.changes.is_empty() && tool.decisions.is_empty(),
+                "{tool:#?}"
+            );
+            assert_eq!(tool.fix, FixKind::Manual);
+            assert!(tool.review.iter().any(|r| r.message.contains("in tools,")));
+        }
+        let call = at("client.chat.completions.create(", "model");
+        assert!(change(&call, "max_tokens").is_some(), "{call:#?}");
+        assert_eq!(call.decisions.len(), 1);
     }
 
     #[test]
