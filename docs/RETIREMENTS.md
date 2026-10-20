@@ -150,7 +150,8 @@ it too. The check runs on the runner and sends nothing anywhere.
 
 - **Python only.** `.py` files and Python scripts. TypeScript and JavaScript are coming.
 - **Providers:** OpenAI, Anthropic, the Gemini API and Gemini on Google Cloud (Vertex AI):
-  283 model IDs from their deprecation pages, plus aliases and changelog entries those
+  283 entries (276 model IDs; 7 listed by both the Gemini API and Vertex; aliases
+  included) from their deprecation pages, with the aliases and changelog entries those
   pages leave out, such as the four OpenAI aliases above.
 - **Direct SDK calls only.** It reads the `openai`, `anthropic`, `google-genai` and
   `google-generativeai` SDKs. Framework wrappers (LangChain, LlamaIndex, LiteLLM's own

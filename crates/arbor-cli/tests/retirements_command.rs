@@ -1079,3 +1079,48 @@ def turned_off():
     );
     assert!(text.contains("decide once for this repo (Arbor does not choose): claude-sonnet-5-5 thinks by default"), "{text}");
 }
+
+#[test]
+fn the_docs_count_the_bundled_data() {
+    // docs/RETIREMENTS.md said "283 model IDs", but 7 of the 283 entries are
+    // the same ID on the Gemini API and on Vertex (rv6 should-fix 5).
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let data: Value = serde_json::from_str(
+        &fs::read_to_string(root.join("crates/arbor-core/data/model-retirements.json")).unwrap(),
+    )
+    .unwrap();
+    let entries = data["entries"].as_array().unwrap();
+    let mut tables: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+    for entry in entries {
+        tables
+            .entry(entry["model"].as_str().unwrap())
+            .or_default()
+            .push(entry["table"].as_str().unwrap());
+    }
+    let both = tables
+        .values()
+        .filter(|t| t.len() > 1)
+        .inspect(|t| {
+            let mut t = (*t).clone();
+            t.sort_unstable();
+            assert_eq!(t, ["gemini_api", "vertex"]);
+        })
+        .count();
+    let sentence = format!(
+        "{} entries ({} model IDs; {} listed by both the Gemini API and Vertex; aliases included)",
+        entries.len(),
+        tables.len(),
+        both
+    );
+    // The sentence may wrap anywhere.
+    let docs = fs::read_to_string(root.join("docs/RETIREMENTS.md"))
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        docs.contains(&sentence),
+        "docs/RETIREMENTS.md lacks {sentence:?}"
+    );
+    assert!(!docs.contains("283 model IDs"));
+}
