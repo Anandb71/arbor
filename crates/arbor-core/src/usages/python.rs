@@ -104,7 +104,7 @@
 use super::{
     is_capturable_value, is_credential_value, is_identifier_key, is_secret_key, is_value_key,
     model_family, BindingKind, CapturedValue, ClientConstruction, ClientScope, FileUsages, GapKind,
-    Receiver, Routing, Sdk, SdkCall, SdkImport, Span, UsageGap, ValueOrigin,
+    Receiver, Routing, Sdk, SdkCall, SdkImport, Span, UsageGap, ValueOrigin, VertexAi,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -6072,6 +6072,16 @@ impl<'t> Ctx<'t> {
             .map(|f| self.render(f))
             .unwrap_or_default();
         let span = self.span(call);
+        // Only the class of the value: `True`, `False`/`None`, or anything
+        // decided at run time.
+        let vertexai = (class.family == Family::Genai)
+            .then(|| keyword_value(call, |n| self.text(n), |k| k == "vertexai"))
+            .flatten()
+            .map(|value| match value.kind() {
+                "true" => VertexAi::On,
+                "false" | "none" => VertexAi::Off,
+                _ => VertexAi::Unknown,
+            });
         let record = ClientConstruction {
             sdk: class.pkg.sdk(),
             package: class.pkg.package().to_string(),
@@ -6086,6 +6096,7 @@ impl<'t> Ctx<'t> {
             file: self.file.clone(),
             span,
             symbol: self.symbol(scope),
+            vertexai,
         };
         self.constructions
             .insert(call.id(), (self.out.clients.len(), caveat.clone()));

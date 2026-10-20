@@ -44,7 +44,7 @@ use super::{
 use super::{Date, ModelEntry};
 use crate::usages::{
     model_family, CapturedValue, ClientConstruction, GapKind, Routing, Sdk, SdkCall, UsageGap,
-    ValueOrigin,
+    ValueOrigin, VertexAi,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -576,7 +576,7 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
                     class: RoutingClass::Unknown,
                     routing: "unresolved_client".to_string(),
                     sdk: gap.sdk,
-                    table: None,
+                    schedule: Schedule::Guess,
                     base_url: None,
                     gap: None,
                 },
@@ -752,11 +752,24 @@ struct CallRouting {
     class: RoutingClass,
     routing: String,
     sdk: Option<Sdk>,
-    /// The schedule a direct client follows.
-    table: Option<Table>,
+    /// Which provider schedule applies.
+    schedule: Schedule,
     base_url: Option<BaseUrl>,
     /// The client gap at the call that leaves its routing unknown.
     gap: Option<String>,
+}
+
+/// Which provider schedule a call's model is looked up on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Schedule {
+    /// The client's provider: a direct client follows its schedule only.
+    One(Table),
+    /// A Gemini client whose `vertexai=` is decided at run time: Vertex AI
+    /// first, then the Gemini API. Which one applies is not confirmed.
+    VertexOrGeminiApi,
+    /// Routed or unknown: a router prefix names the schedule, else the
+    /// model ID's shape, else the SDK's own provider.
+    Guess,
 }
 
 /// The routing [`crate::usages`] decided. A `base_url` is already routed by
@@ -767,6 +780,12 @@ struct CallRouting {
 /// object: it is built from an imported type, not a client, and the request
 /// that sends it decides where it goes. The provider's schedule is still the
 /// one looked up.
+///
+/// A Gemini client follows Vertex AI's schedule only when its constructor
+/// says `vertexai=True`. `vertexai=False` or `None` is the Gemini API (the
+/// usage scan routes it `google_genai`, with no gap), and a value decided at
+/// run time could be either, so both schedules are looked up and the finding
+/// says which one it used.
 fn call_routing(
     call: &SdkCall,
     kind: CallKind,
@@ -774,25 +793,31 @@ fn call_routing(
     at_call: &[&UsageGap],
 ) -> CallRouting {
     let base_url = base_url_of(call, at_call, clients);
-    let vertex = vertex_client(call, clients);
-    let (class, table) = match call.routing {
-        Routing::OpenaiDirect => (RoutingClass::Direct, Some(Table::Openai)),
-        Routing::AnthropicDirect => (RoutingClass::Direct, Some(Table::Anthropic)),
-        Routing::GoogleGenai if vertex => (RoutingClass::Direct, Some(Table::Vertex)),
-        Routing::GoogleGenai | Routing::GoogleGenerativeaiLegacy => {
-            (RoutingClass::Direct, Some(Table::GeminiApi))
+    let google = || match vertexai_of(call, clients) {
+        Some(VertexAi::On) => Schedule::One(Table::Vertex),
+        Some(VertexAi::Off) => Schedule::One(Table::GeminiApi),
+        Some(VertexAi::Unknown) => Schedule::VertexOrGeminiApi,
+        None => Schedule::Guess,
+    };
+    let (class, schedule) = match call.routing {
+        Routing::OpenaiDirect => (RoutingClass::Direct, Schedule::One(Table::Openai)),
+        Routing::AnthropicDirect => (RoutingClass::Direct, Schedule::One(Table::Anthropic)),
+        Routing::GoogleGenai => match google() {
+            Schedule::Guess => (RoutingClass::Direct, Schedule::One(Table::GeminiApi)),
+            schedule => (RoutingClass::Direct, schedule),
+        },
+        Routing::GoogleGenerativeaiLegacy => {
+            (RoutingClass::Direct, Schedule::One(Table::GeminiApi))
         }
         Routing::AzureOpenai
         | Routing::CustomBaseUrl
         | Routing::AnthropicBedrock
-        | Routing::AnthropicVertex => (RoutingClass::Routed, None),
-        // The usage scan leaves a client built with `vertexai=` unrouted (an
-        // `endpoint_option` gap); Vertex AI's schedule is still the one its
-        // constructor names.
-        Routing::Unknown if call.sdk == Sdk::Google && vertex => {
-            (RoutingClass::Unknown, Some(Table::Vertex))
-        }
-        Routing::Unknown => (RoutingClass::Unknown, None),
+        | Routing::AnthropicVertex => (RoutingClass::Routed, Schedule::Guess),
+        // The usage scan leaves a client built with `vertexai=True` or a
+        // run-time value unrouted (an `endpoint_option` gap); the schedule
+        // still follows what its constructor says.
+        Routing::Unknown if call.sdk == Sdk::Google => (RoutingClass::Unknown, google()),
+        Routing::Unknown => (RoutingClass::Unknown, Schedule::Guess),
     };
     let gap = at_call.iter().find(|g| gaps::holds_routing(g));
     CallRouting {
@@ -803,19 +828,26 @@ fn call_routing(
         },
         routing: call.routing.as_str().to_string(),
         sdk: Some(call.sdk),
-        table,
+        schedule,
         base_url,
         gap: gap.map(|g| g.reason.clone()),
     }
 }
 
-/// A `genai.Client(vertexai=...)` construction in the same file.
-fn vertex_client(call: &SdkCall, clients: &[ClientConstruction]) -> bool {
-    let Some(line) = call.client_line else {
-        return false;
-    };
-    clients.iter().any(|c| {
-        c.file == call.file && c.span.line == line && c.kwargs.iter().any(|k| k == "vertexai")
+/// How the `vertexai=` argument of the `genai.Client(...)` behind `call`
+/// reads, when its constructor passes one. Two constructions on the client's
+/// line that disagree read as decided at run time.
+fn vertexai_of(call: &SdkCall, clients: &[ClientConstruction]) -> Option<VertexAi> {
+    let line = call.client_line?;
+    let mut found = clients
+        .iter()
+        .filter(|c| c.sdk == Sdk::Google && c.file == call.file && c.span.line == line)
+        .filter_map(|c| c.vertexai);
+    let first = found.next()?;
+    Some(if found.all(|v| v == first) {
+        first
+    } else {
+        VertexAi::Unknown
     })
 }
 
@@ -857,6 +889,9 @@ struct Hit<'d> {
     notes: Vec<String>,
     /// For a fine-tune: what to tell people about moving it.
     fine_tune_advice: Option<String>,
+    /// Looked up on Vertex AI's schedule, then the Gemini API's, because the
+    /// client's `vertexai=` is decided at run time.
+    schedule_unconfirmed: bool,
 }
 
 fn entry_hit<'d>(data: &'d Retirements, entry: &'d ModelEntry, kind: MatchKind) -> Option<Hit<'d>> {
@@ -876,6 +911,7 @@ fn entry_hit<'d>(data: &'d Retirements, entry: &'d ModelEntry, kind: MatchKind) 
         verified: entry.verified,
         notes: entry.notes.clone(),
         fine_tune_advice: None,
+        schedule_unconfirmed: false,
     })
 }
 
@@ -949,6 +985,7 @@ fn fine_tune_hit<'d>(data: &'d Retirements, table: Table, base: &str) -> Option<
                 "OpenAI retires fine-tunes of {base} with their base model's schedule."
             )],
             fine_tune_advice: Some(advice.trim_end().to_string()),
+            schedule_unconfirmed: false,
         });
     }
     // A base the data lists as a model but not for fine-tunes: its listed
@@ -974,9 +1011,16 @@ fn resolve<'d>(
     routing: &CallRouting,
     value: &str,
 ) -> Option<(Hit<'d>, RoutingClass)> {
-    if let Some(table) = routing.table {
+    match routing.schedule {
         // A direct client follows its provider's schedule only.
-        return lookup(data, table, value).map(|hit| (hit, routing.class));
+        Schedule::One(table) => return lookup(data, table, value).map(|hit| (hit, routing.class)),
+        Schedule::VertexOrGeminiApi => {
+            let mut hit = lookup(data, Table::Vertex, value)
+                .or_else(|| lookup(data, Table::GeminiApi, value))?;
+            hit.schedule_unconfirmed = true;
+            return Some((hit, RoutingClass::Unknown));
+        }
+        Schedule::Guess => {}
     }
     // Routed or unknown: a router prefix names the schedule, else the model
     // ID's shape, else the SDK's own provider.
@@ -1276,6 +1320,24 @@ fn finding_for(
         reasons.push(ReviewItem {
             rule: None,
             message: chain_message(hit.table.provider(), chain, today, source.is_some()),
+            because: Vec::new(),
+            verified: None,
+        });
+    }
+    if hit.schedule_unconfirmed {
+        let message = match hit.table {
+            Table::Vertex => format!(
+                "This client's vertexai= is decided at run time, so Arbor used Google Cloud's (Vertex AI) schedule for {}. If the client uses the Gemini API, Google's schedule applies instead, with its own date and replacement.",
+                hit.matched
+            ),
+            _ => format!(
+                "This client's vertexai= is decided at run time. Google Cloud (Vertex AI) does not list {}, so this is the Gemini API's schedule: confirm which API the client uses.",
+                hit.matched
+            ),
+        };
+        reasons.push(ReviewItem {
+            rule: None,
+            message,
             because: Vec::new(),
             verified: None,
         });
@@ -2666,9 +2728,10 @@ mod tests {
 
         // A dead end: Vertex text-bison → gemini-2.5-flash-lite, which retires
         // too and has several replacements.
+        // (`genai.Client(vertexai=True)`, which the usage scan leaves unrouted.)
         let bison = call(
             Sdk::Google,
-            Routing::GoogleGenai,
+            Routing::Unknown,
             "client.models.generate_content",
             "text-bison",
             &["contents"],
@@ -2681,13 +2744,14 @@ mod tests {
             chain: "genai.Client".into(),
             binding: Some("client".into()),
             scope: crate::usages::ClientScope::Module,
-            routing: Routing::GoogleGenai,
+            routing: Routing::Unknown,
             is_async: false,
             kwargs: vec!["vertexai".into()],
             splat: false,
             file: "app.py".into(),
             span: span(1),
             symbol: None,
+            vertexai: Some(VertexAi::On),
         };
         let input = ScanInput {
             calls: std::slice::from_ref(&bison),
@@ -2825,6 +2889,7 @@ mod tests {
             file: "app.py".into(),
             span: span(line),
             symbol: None,
+            vertexai: None,
         };
         let clients: Vec<ClientConstruction> = (1..=6).map(client).collect();
         let gap = |line: u32, reason: &str| UsageGap {
@@ -3018,60 +3083,176 @@ mod tests {
         );
     }
 
-    #[test]
-    fn vertex_clients_follow_the_cloud_schedule() {
-        let gemini = call(
-            Sdk::Google,
-            Routing::GoogleGenai,
-            "client.models.generate_content",
-            "gemini-2.5-flash",
-            &["contents"],
-            70,
-        );
-        let vertex = ClientConstruction {
-            sdk: Sdk::Google,
-            package: "google.genai".into(),
-            constructor: "google.genai.Client".into(),
-            chain: "genai.Client".into(),
-            binding: Some("client".into()),
-            scope: crate::usages::ClientScope::Module,
-            routing: Routing::GoogleGenai,
-            is_async: false,
-            kwargs: vec!["vertexai".into(), "project".into()],
-            splat: false,
-            file: "app.py".into(),
-            span: span(1),
-            symbol: None,
-        };
-        // The Gemini API lists no date for gemini-2.5-flash; Vertex retires it.
-        let report = run(std::slice::from_ref(&gemini), &[], &options("2026-10-18"));
-        assert!(report.findings.is_empty());
-        let input = ScanInput {
-            calls: std::slice::from_ref(&gemini),
-            gaps: &[],
-            clients: std::slice::from_ref(&vertex),
-        };
-        let report = check(input, bundled().unwrap(), &options("2026-10-18"));
-        let finding = &report.findings[0];
-        assert_eq!(finding.provider, Table::Vertex);
-        assert_eq!(finding.date.unwrap().iso(), "2026-10-20");
-        assert_eq!(finding.date_kind, DateKind::Earliest);
-        assert_eq!(finding.days_left, Some(2));
+    /// The usage scan of one Python file, `app.py`.
+    fn scan(source: &str) -> crate::usages::FileUsages {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::language())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        crate::usages::python::extract(&tree, source, "app.py")
+    }
 
-        // From the "earliest" date on, Google may have shut it down.
+    /// The usage scan of `source`, checked.
+    fn check_source(source: &str, opts: &CheckOptions) -> RetirementReport {
+        let found = scan(source);
         let input = ScanInput {
-            calls: std::slice::from_ref(&gemini),
-            gaps: &[],
-            clients: std::slice::from_ref(&vertex),
+            calls: &found.calls,
+            gaps: &found.gaps,
+            clients: &found.clients,
         };
-        let report = check(input, bundled().unwrap(), &options("2026-10-20"));
-        assert_eq!(report.findings[0].status, State::Unconfirmed);
-        assert_eq!(report.exit_code, 0);
+        check(input, bundled().unwrap(), opts)
+    }
+
+    /// The 1-based line of the only line holding `needle`.
+    fn line_of(source: &str, needle: &str) -> u32 {
+        let lines: Vec<usize> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains(needle))
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert_eq!(lines.len(), 1, "{needle}");
+        lines[0] as u32
+    }
+
+    #[test]
+    fn the_vertexai_flag_picks_the_schedule() {
+        // `vertexai=False` or `None` is the Gemini API, `True` is Vertex AI,
+        // and a value decided at run time could be either (rv6 should-fix 1:
+        // every `vertexai=` was looked up on Vertex AI's schedule only).
+        let source = r#"import os
+
+from google import genai
+
+api = genai.Client(vertexai=False, api_key=os.environ["GEMINI_API_KEY"])
+nothing = genai.Client(vertexai=None)
+cloud = genai.Client(vertexai=True, project="p", location="us-central1")
+toggle = genai.Client(vertexai=os.getenv("USE_VERTEX", "false") == "true")
+plain = genai.Client()
+
+
+def run():
+    api.models.generate_content(model="gemini-1.5-flash", contents="api-retired")
+    api.models.generate_content(model="gemini-2.5-flash", contents="api-vertex-only")
+    api.models.generate_content(model="gemini-2.0-flash", contents="api-both")
+    nothing.models.generate_content(model="gemini-2.0-flash", contents="none-both")
+    cloud.models.generate_content(model="gemini-2.0-flash", contents="cloud-both")
+    cloud.models.generate_content(model="gemini-1.5-flash", contents="cloud-api-only")
+    cloud.models.generate_content(model="gemini-2.5-flash", contents="cloud-vertex-only")
+    toggle.models.generate_content(model="gemini-1.5-flash", contents="toggle-api-only")
+    toggle.models.generate_content(model="gemini-2.0-flash", contents="toggle-both")
+    plain.models.generate_content(model="gemini-2.5-flash", contents="plain-vertex-only")
+"#;
+        // The scan records the class of each `vertexai=`, never the value.
+        let found = scan(source);
+        let flags: Vec<(Option<&str>, Option<VertexAi>)> = found
+            .clients
+            .iter()
+            .map(|c| (c.binding.as_deref(), c.vertexai))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                (Some("api"), Some(VertexAi::Off)),
+                (Some("nothing"), Some(VertexAi::Off)),
+                (Some("cloud"), Some(VertexAi::On)),
+                (Some("toggle"), Some(VertexAi::Unknown)),
+                (Some("plain"), None),
+            ]
+        );
+        let plain = serde_json::to_value(&found.clients[4]).unwrap();
+        assert!(plain.get("vertexai").is_none(), "{plain}");
+
+        let data = bundled().unwrap();
+        let report = check_source(source, &options("2026-10-20"));
+        let at = |needle: &str| -> Vec<&Finding> {
+            let line = line_of(source, needle);
+            report.findings.iter().filter(|f| f.line == line).collect()
+        };
+        let one = |needle: &str| -> &Finding {
+            let found = at(needle);
+            assert_eq!(found.len(), 1, "{needle}: {found:#?}");
+            found[0]
+        };
+        let listed = |table: Table, model: &str| data.entry(table, model).unwrap();
+
+        // vertexai=False: the Gemini API, which shut gemini-1.5-flash down.
+        let retired = one("api-retired");
+        assert_eq!(retired.provider, Table::GeminiApi);
+        assert_eq!(retired.status, State::Retired);
+        assert_eq!(retired.routing_class, RoutingClass::Direct);
+        assert_eq!(retired.confidence, Confidence::Confirmed);
+        assert!(retired.fails);
+        assert_eq!(report.exit_code, 1);
+        // Never Vertex AI's schedule on a Gemini API client.
+        assert!(at("api-vertex-only")
+            .iter()
+            .all(|f| f.provider == Table::GeminiApi));
+        for needle in ["api-both", "none-both"] {
+            let both = one(needle);
+            assert_eq!(both.provider, Table::GeminiApi, "{needle}");
+            assert_eq!(
+                both.replacement,
+                listed(Table::GeminiApi, "gemini-2.0-flash").replacement,
+                "{needle}"
+            );
+            assert!(both.review.iter().all(|r| !r.message.contains("run time")));
+        }
+
+        // vertexai=True: Vertex AI only, routing not confirmed (the scan's
+        // `endpoint_option` gap).
+        let cloud = one("cloud-both");
+        assert_eq!(cloud.provider, Table::Vertex);
+        assert_eq!(
+            cloud.replacement,
+            listed(Table::Vertex, "gemini-2.0-flash").replacement
+        );
+        assert_eq!(cloud.routing_class, RoutingClass::Unknown);
+        assert_eq!(cloud.routing_gap.as_deref(), Some("endpoint_option"));
+        assert!(!cloud.fails);
+        assert!(at("cloud-api-only").is_empty(), "a Gemini API-only model");
+        // Google Cloud's dates are the earliest possible.
+        let earliest = one("cloud-vertex-only");
+        let entry = listed(Table::Vertex, "gemini-2.5-flash");
+        assert_eq!(earliest.date_kind, DateKind::Earliest);
+        assert_eq!(earliest.date.map(|d| d.iso()), entry.date.clone());
+
+        // A run-time toggle: Vertex AI first, then the Gemini API, never
+        // confirmed, and the check says which schedule was used.
+        let toggled = one("toggle-api-only");
+        assert_eq!(toggled.provider, Table::GeminiApi);
+        assert_eq!(toggled.status, State::Retired);
+        assert_eq!(toggled.routing_class, RoutingClass::Unknown);
+        assert!(!toggled.fails);
+        assert_eq!(toggled.fix, FixKind::Manual);
+        assert!(toggled
+            .review
+            .iter()
+            .any(|r| r.message.contains("decided at run time")
+                && r.message.contains("Gemini API's schedule")));
+        let toggled = one("toggle-both");
+        assert_eq!(toggled.provider, Table::Vertex);
+        assert!(toggled
+            .review
+            .iter()
+            .any(|r| r.message.contains("decided at run time")
+                && r.message.contains("Google's schedule applies instead")));
+        let mut opts = options("2026-10-20");
+        opts.count_unconfirmed = true;
+        let counted = check_source(source, &opts);
+        let line = line_of(source, "toggle-api-only");
+        assert!(counted.findings.iter().any(|f| f.line == line && f.fails));
+
+        // No flag at all: the Gemini API.
+        assert!(at("plain-vertex-only")
+            .iter()
+            .all(|f| f.provider == Table::GeminiApi));
     }
 
     #[test]
     fn an_unrouted_google_client_still_finds_vertex_models() {
-        // The usage scan routes a `vertexai=` client as unknown, with an
+        // The usage scan routes a `vertexai=True` client as unknown, with an
         // `endpoint_option` gap at each call: the Vertex schedule still
         // applies, and the routing reads as not confirmed.
         let mut gemini = call(
@@ -3096,6 +3277,7 @@ mod tests {
             file: "app.py".into(),
             span: span(1),
             symbol: None,
+            vertexai: Some(VertexAi::On),
         };
         let mut option = gap_at(GapKind::AmbiguousClient, "endpoint_option", 70, None);
         option.sdk = Some(Sdk::Google);
