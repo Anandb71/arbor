@@ -173,28 +173,13 @@ RULES = {
             "why": "recipe caveat: temperature and top_p sent together are unverified for this target",
         },
     ],
-    "ANT-THINKING-DEFAULT": [
-        {
-            "effect": "add",
-            "lacks_kwargs": ["thinking", "tools"],
-            "add": [{"endpoint": "*", "name": "thinking", "value": {"type": "between_tools"}}],
-            "message": "{target} thinks by default; thinking={\"type\": \"between_tools\"} keeps text-only responses when the call has no tools.",
-            "why": "add_param_or_report: the parameter is added only when the call has no tools",
-        },
-        {
-            "suffix": "tools",
-            "effect": "review",
-            "any_kwargs": ["tools"],
-            "lacks_kwargs": ["thinking"],
-            "message": "{target} thinks by default, and with tools its progress arrives as thinking blocks between tool calls: code that reads content[0].text may break.",
-            "why": "add_param_or_report: with tools the site is report-only",
-        },
-    ],
+    # report_choice rules (the lead's 20 Oct decision applies the founder's 18 Oct
+    # one to Claude's thinking): the options are read from the recipe.
+    "ANT-THINKING-DEFAULT": {"message": "{target} thinks by default (adaptive thinking) when the call sends no thinking; the model it replaces answered without thinking."},
     "ANT-THINKING-DISABLED": {
-        "effect": "review",
         "any_kwargs": ["thinking"],
-        "message": "Check thinking: {\"type\": \"disabled\"} returns 400 on {target}; send {\"type\": \"between_tools\"} instead.",
-        "why": "param_equals on thinking.type: the value is not visible, so the parameter's presence triggers a check",
+        "message": "This call sets thinking, and Arbor cannot read its value: if it is {\"type\": \"disabled\"}, the call returns 400 on {target}.",
+        "why": "param_equals on thinking.type: the value is not visible, so the parameter's presence brings up the choice",
     },
     "ANT-THINKING-BUDGET": {
         "any_kwargs": ["thinking"],
@@ -275,18 +260,25 @@ ACTION_EFFECTS = {
 KNOWN_ACTIONS = set(ACTION_EFFECTS) | {"add_param_or_report", "constraint"}
 
 # Actions that change a call without asking. The founder's 18 Oct decision makes the
-# reasoning effort a per-repository choice, so none of these may add or name it (the
-# recipe validator's rule C1 says the same; this keeps the data honest if it slips).
+# reasoning effort a per-repository choice, and the lead's 20 Oct decision does the
+# same for Claude's thinking, so none of these may add or name them (the recipe
+# validator's rules C1 and C2 say the same; this keeps the data honest if it slips).
 AUTOMATIC_ACTIONS = {"add_param", "add_param_or_report", "rewrite_param", "keep", "remove_param"}
 EFFORT_NAMES = ("reasoning_effort", "effort")
+PER_REPO_PARAMS = EFFORT_NAMES + ("thinking",)
+# Effects that edit a call in the data (a choice's options are never applied).
+AUTOMATIC_EFFECTS = {"add", "rename", "keep"}
 
 WHEN_KEYS = {"endpoint", "request_has_any", "request_lacks", "source_family", "target", "source_ids", "client"}
 
 # How each option of a report_choice reads to people. Option ids are the recipe's; a
-# new one stops generation until it has a label here.
+# new one stops generation until it has a label here. "<choice>/<id>" labels an option
+# of one choice only (Claude thinks, where OpenAI's models reason).
 OPTION_LABELS = {
     "reasoning_none": "keep reasoning off",
     "model_default": "let the model reason",
+    "thinking_between_tools": "think only between tools",
+    "ANT-THINKING-DEFAULT/model_default": "let the model think",
 }
 OPTION_KEYS = {"id", "edits", "effect", "evidence", "status"}
 EDIT_KINDS = {"add_param", "remove_param", "keep"}
@@ -846,7 +838,8 @@ def translate_options(rule: dict, endpoints: list) -> list:
                 f"{rid}: option {option.get('id')!r} has {sorted(unknown)} / lacks {sorted(missing)}"
             )
         oid = option["id"]
-        if oid not in OPTION_LABELS:
+        label = OPTION_LABELS.get(f"{rule.get('choice')}/{oid}") or OPTION_LABELS.get(oid)
+        if label is None:
             raise GenerationError(f"{rid}: option {oid!r} has no label in OPTION_LABELS")
         if option["status"] not in OPTION_STATUSES:
             raise GenerationError(f"{rid}: option {oid} has status {option['status']!r}")
@@ -865,7 +858,7 @@ def translate_options(rule: dict, endpoints: list) -> list:
                 keep += keyword_names(rid, f"option {oid} keep", value)
         out.append({
             "id": oid,
-            "label": OPTION_LABELS[oid],
+            "label": label,
             "add": add,
             "remove": remove,
             "keep": keep,
@@ -896,9 +889,10 @@ def check_rule_keys(rule: dict, specs: list) -> None:
     # (the recipe validator's rule C1; repeated here so the data cannot drift).
     if action in AUTOMATIC_ACTIONS:
         named = json.dumps([rule.get("param"), rule.get("requires")], default=str)
-        if any(f'"{name}"' in named for name in EFFORT_NAMES):
+        if any(f'"{name}"' in named for name in PER_REPO_PARAMS):
             raise GenerationError(
-                f"{rid}: automatic action {action} names the reasoning effort; it must be a report_choice"
+                f"{rid}: automatic action {action} names a per-repo parameter "
+                f"({', '.join(PER_REPO_PARAMS)}); it must be a report_choice"
             )
     if action == "report_choice":
         if not rule.get("choice"):
@@ -942,6 +936,10 @@ def translate_rule(rule: dict, rule_set: str) -> tuple[list, list]:
         effect = item.get("effect") or ACTION_EFFECTS.get(action)
         if effect is None:
             raise GenerationError(f"{rid}: action {action!r} needs an explicit effect")
+        if action == "report_choice" and effect != "choice":
+            raise GenerationError(
+                f"{rid}: a report_choice rule is a per-repo choice; RULES cannot make it {effect!r}"
+            )
         requires = rule.get("requires")
         if requires is not None and (
             effect != "rename" or not isinstance(requires, dict) or set(requires) - {"add_param"}
@@ -1167,6 +1165,16 @@ def validate(entries, fine_tunes, rules) -> None:
     for rule in rules:
         if rule["rule_set"] not in rule_sets:
             raise GenerationError(f"{rule['id']}: rule set {rule['rule_set']} has no entries")
+        if rule["effect"] in AUTOMATIC_EFFECTS:
+            names = [a["name"] for a in rule["add"]] + ([rule["rename"]["to"]] if rule["rename"] else [])
+            effort = any(
+                a["name"] == "reasoning" and isinstance(a["value"], dict) and "effort" in a["value"]
+                for a in rule["add"]
+            )
+            if effort or set(names) & set(PER_REPO_PARAMS):
+                raise GenerationError(
+                    f"{rule['id']}: an automatic {rule['effect']} sets a per-repo parameter; only a choice may"
+                )
     for fine in fine_tunes:
         if not fine["date"]:
             raise GenerationError(f"fine-tune {fine['base']} without a date")
