@@ -30,7 +30,7 @@ inputs:
     required: false
     default: "${{ github.token }}"
   mode:
-    description: "'command' (default) runs the command input. 'retirements' finds direct SDK calls to AI models their provider has retired or is retiring, writes a job summary and annotates the affected lines (up to GitHub's 10 warnings per step; the summary lists every call). It runs on the runner; no code is sent anywhere."
+    description: "'command' (default) runs the command input. Any other value fails the step before anything is installed. 'retirements' finds direct SDK calls to AI models their provider has retired or is retiring, writes a job summary and annotates the affected lines (up to GitHub's 10 warnings per step; the summary lists every call). It runs on the runner; no code is sent anywhere."
     required: false
     default: command
   retirements-path:
@@ -53,6 +53,21 @@ inputs:
 runs:
   using: composite
   steps:
+    # Before anything is installed: a typo such as `mode: retirement` would
+    # otherwise run command mode (and its PR comment) without a word.
+    - name: Check the mode input
+      shell: bash
+      env:
+        ARBOR_MODE: ${{ inputs.mode }}
+      run: |
+        case "$ARBOR_MODE" in
+          command|retirements) ;;
+          *)
+            echo "::error title=Arbor::mode must be 'command' or 'retirements', not '${ARBOR_MODE//[$'\r\n%']/}'"
+            exit 2
+            ;;
+        esac
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 

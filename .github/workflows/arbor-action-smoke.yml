@@ -77,6 +77,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: An unknown mode fails before anything is installed
+        id: typo
+        continue-on-error: true
+        uses: ./
+        with:
+          mode: retirement
+
+      - name: The unknown mode failed
+        shell: bash
+        run: test "${{ steps.typo.outcome }}" = "failure"
+
       - name: Write a project that calls a retired model
         shell: bash
         run: |

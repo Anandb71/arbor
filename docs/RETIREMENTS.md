@@ -142,7 +142,9 @@ step, so Arbor writes 10, the calls that fail the check first and then the most
 urgent, and one notice saying how many more the summary lists. The Action fails the build only if you set `retirements-fail-on` to
 `retired` or to a number of days, with one exception: when the check cannot run
 (exit 2: a missing path, a bad `retirements-fail-on` value), the step fails even with
-`retirements-fail-on: never`, so a missing report never passes quietly.
+`retirements-fail-on: never`, so a missing report never passes quietly. A `mode` other
+than `command` or `retirements` (a typo such as `retirement`) fails the step before
+anything is installed.
 `retirements-path` picks a subdirectory, `retirements-include-routed: "true"` adds the
 routed calls, and `retirements-count-unconfirmed: "true"` lets unconfirmed calls fail
 it too. The check runs on the runner and sends nothing anywhere.
