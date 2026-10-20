@@ -641,6 +641,15 @@ fn not_checked_lines(report: &RetirementReport, markdown: bool) -> Vec<String> {
             verb(s.not_analyzed, "it", "them")
         ));
     }
+    if s.unresolved_clients > 0 {
+        lines.push(format!(
+            "Not checked: {} through {} Arbor could not resolve (built by a factory or passed in), whose model it could not read either; {} lists {}.",
+            calls(s.unresolved_clients),
+            verb(s.unresolved_clients, "a client", "clients"),
+            tick("arbor usages", markdown),
+            verb(s.unresolved_clients, "it", "them")
+        ));
+    }
     if s.untracked_methods > 0 {
         lines.push(format!(
             "Not checked: calls through {} SDK {} reached with {} or stored or passed as a value.",

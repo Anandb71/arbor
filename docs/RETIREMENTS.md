@@ -164,7 +164,9 @@ it too. The check runs on the runner and sends nothing anywhere.
 - **What it did not read.** Every part of the scan that could hide a call gets its own
   "Not checked" line, so a clean result never claims more than was read: parts of files
   the usage scan did not analyze (scopes nested more than 64 deep, more records than it
-  reads in one file), SDK methods reached through `getattr` or passed as values, files
+  reads in one file), SDK calls through a client Arbor could not resolve (built by a
+  factory or passed in) whose model it could not read either, SDK methods reached
+  through `getattr` or passed as values, files
   with syntax errors (calls inside a broken region may be missing), files over the size
   limit or not readable as UTF-8, and calls in hidden directories such as `.github/`.
   Vendored and virtual-environment directories are not project code and are skipped.

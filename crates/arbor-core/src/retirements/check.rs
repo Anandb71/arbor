@@ -454,6 +454,11 @@ pub struct Summary {
     /// SDK methods reached through `getattr` or stored or passed as values:
     /// calls through them are not checked.
     pub untracked_methods: usize,
+    /// SDK-shaped calls through a client the usage scan could not resolve
+    /// (built by a factory, passed in), whose model it could not read either
+    /// (a parameter, `**params`, none passed): no finding or other count
+    /// shows them, so they are counted here.
+    pub unresolved_clients: usize,
     /// Files whose syntax errors the parser recovered from: calls inside a
     /// broken region may be missing (filled in by the caller).
     pub syntax_error_files: usize,
@@ -623,6 +628,7 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
         .iter()
         .filter(|g| g.kind == GapKind::DynamicDispatch)
         .count();
+    summary.unresolved_clients = unresolved_clients(input);
     let exit_code = i32::from(summary.failing > 0);
 
     RetirementReport {
@@ -2196,6 +2202,41 @@ fn unreadable(input: ScanInput<'_>) -> (Vec<Unreadable>, usize) {
     (out, no_model)
 }
 
+/// SDK-shaped calls the usage scan records only as a client gap: a client
+/// it could not resolve, and no call record, no captured value and no model
+/// gap at the same call. A finding, the unreadable list or the no-model
+/// count shows every other call; these would otherwise appear on no line.
+fn unresolved_clients(input: ScanInput<'_>) -> usize {
+    let shown: HashSet<(&str, u32)> = input
+        .calls
+        .iter()
+        .map(|c| (c.file.as_str(), c.span.start_byte))
+        .chain(
+            input
+                .gaps
+                .iter()
+                .filter(|g| {
+                    !gaps::is_region(g)
+                        && (g.kind == GapKind::UnresolvedModel || !g.values.is_empty())
+                })
+                .filter_map(|g| g.span.map(|s| (g.file.as_str(), s.start_byte))),
+        )
+        .collect();
+    input
+        .gaps
+        .iter()
+        // `getattr` methods are counted on their own; vendored code is not
+        // the project's.
+        .filter(|g| {
+            gaps::holds_routing(g)
+                && !matches!(g.kind, GapKind::DynamicDispatch | GapKind::VendoredPath)
+        })
+        .filter_map(|g| g.span.map(|s| (g.file.as_str(), s.start_byte)))
+        .filter(|at| !shown.contains(at))
+        .collect::<HashSet<_>>()
+        .len()
+}
+
 fn dedupe_findings(findings: &mut Vec<Finding>) {
     let mut seen = HashSet::new();
     findings.retain(|f| {
@@ -3072,6 +3113,72 @@ def tool_model(tools):
         let call = at("client.chat.completions.create(", "model");
         assert!(change(&call, "max_tokens").is_some(), "{call:#?}");
         assert_eq!(call.decisions.len(), 1);
+    }
+
+    #[test]
+    fn calls_through_unresolved_clients_with_unread_models_are_counted() {
+        // rv6 should-fix 4: a call through a client the usage scan could not
+        // resolve, whose model it could not read either, appeared on no line
+        // (openai/swarm's helper sends a shut-down default via `**params`).
+        let source = r#"from openai import OpenAI
+
+client = OpenAI()
+
+
+def helper(api, model, messages):
+    return api.chat.completions.create(model=model, messages=messages)
+
+
+def helper_dict(api, messages, model="gpt-4-0125-preview"):
+    params = {"model": model, "messages": messages}
+    return api.chat.completions.create(**params)
+
+
+def factory(make):
+    return make().chat.completions.create(messages=[])
+
+
+def factory_literal(make):
+    return make().chat.completions.create(model="gpt-4-0125-preview", messages=[])
+
+
+def known(model):
+    return client.chat.completions.create(model=model, messages=[])
+"#;
+        let report = check_source(source, &options("2026-10-20"));
+        // helper, helper_dict and factory: shown nowhere else.
+        assert_eq!(
+            report.summary.unresolved_clients, 3,
+            "{:#?}",
+            report.summary
+        );
+        // The factory call with a literal model is a finding (a gap), the
+        // known client's parameter is unreadable: neither is counted again.
+        let line = line_of(source, "make().chat.completions.create(model=");
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.line == line && f.confidence == Confidence::Gap));
+        assert_eq!(report.summary.unreadable_calls, 1);
+        // Every SDK-shaped call in the file is on some line of the report.
+        let found = scan(source);
+        let shown = report.findings.len()
+            + report.summary.unreadable_calls
+            + report.summary.no_model_calls
+            + report.summary.untracked_methods
+            + report.summary.unresolved_clients;
+        let sdk_calls: HashSet<u32> = found
+            .calls
+            .iter()
+            .map(|c| c.span.start_byte)
+            .chain(
+                found
+                    .gaps
+                    .iter()
+                    .filter_map(|g| g.span.map(|s| s.start_byte)),
+            )
+            .collect();
+        assert!(shown >= sdk_calls.len(), "{shown} < {}", sdk_calls.len());
     }
 
     #[test]

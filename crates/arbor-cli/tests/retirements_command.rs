@@ -1002,3 +1002,44 @@ fn usage_gaps_never_read_as_confirmed() {
     }
     assert!(!text.contains("Failing (exit 1)"), "{text}");
 }
+
+#[test]
+fn calls_through_unresolved_clients_get_a_not_checked_line() {
+    // A client passed in or built by a factory, with a model Arbor cannot
+    // read (a parameter, `**params`) or none: these calls appeared on no line
+    // although the docs say every gap gets a "Not checked" line (rv6
+    // should-fix 4; openai/swarm's helper).
+    let dir = project(
+        r#"def helper(api, model, messages):
+    return api.chat.completions.create(model=model, messages=messages)
+
+
+def helper_dict(api, messages, model="gpt-4-0125-preview"):
+    params = {"model": model, "messages": messages}
+    return api.chat.completions.create(**params)
+
+
+def factory(make):
+    return make().chat.completions.create(messages=[])
+"#,
+    );
+    let (code, report) = run_json(dir.path(), &[]);
+    assert_eq!(code, Some(0));
+    assert_eq!(report["summary"]["affected_calls"], 0);
+    assert_eq!(report["summary"]["unresolved_clients"], 3);
+    let line = "Not checked: 3 calls through clients Arbor could not resolve (built by a factory or passed in), whose model it could not read either; arbor usages lists them.";
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    assert!(
+        text.contains("No direct openai/anthropic/google SDK calls"),
+        "{text}"
+    );
+    assert!(text.contains(line), "{text}");
+    let markdown = stdout(&arbor(
+        dir.path(),
+        &["retirements", ".", "--markdown", "--today", TODAY],
+    ));
+    assert!(
+        markdown.contains("whose model it could not read either; `arbor usages` lists them."),
+        "{markdown}"
+    );
+}
