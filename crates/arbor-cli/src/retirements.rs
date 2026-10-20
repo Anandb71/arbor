@@ -268,13 +268,18 @@ fn status_phrase(finding: &Finding, today: Date) -> String {
                 }
             }
         }
-        (State::Unconfirmed, Some(d)) if d >= today => format!(
+        (State::Unconfirmed, Some(d)) if d > today => format!(
             "may stop working on {} ({}; not confirmed by {provider})",
             d.human(),
             days(today.days_until(d))
         ),
+        // From the date itself on, as for a replacement in a chain.
+        (State::Unconfirmed, Some(d)) if d == today => format!(
+            "may already be retired ({provider}'s date is today, {}; not confirmed)",
+            d.human()
+        ),
         (State::Unconfirmed, Some(d)) => format!(
-            "may already have stopped working ({provider}'s date was {}; not confirmed)",
+            "may already be retired ({provider}'s date was {}; not confirmed)",
             d.human()
         ),
         (State::Unconfirmed, None) => format!("{provider} may have retired (not confirmed)"),
@@ -496,10 +501,10 @@ fn target_text(finding: &Finding) -> (String, bool) {
         }
         (Some(listed), None) => {
             let state = finding.replacement_chain.first().and_then(|s| s.status);
-            let how = if state == Some(State::Retired) {
-                "is shut down too"
-            } else {
-                "retires too"
+            let how = match state {
+                Some(State::Retired) => "is shut down too",
+                Some(State::Unconfirmed) => "may already be retired",
+                _ => "retires too",
             };
             (
                 format!("no current replacement (the listed {listed} {how})"),

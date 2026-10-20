@@ -868,6 +868,57 @@ def failing():
     assert!(text.contains("2 more calls to retired or retiring models are not annotated"));
 }
 
+#[test]
+fn an_earliest_date_reads_may_already_be_retired_from_that_day_on() {
+    // On the day Google Cloud's earliest date for gemini-2.5-flash-lite is
+    // reached, text-bison's replacement read "retires too" while its check
+    // said "may already be retired" (rv6 nit).
+    let dir = project(
+        r#"from google import genai
+
+client = genai.Client(vertexai=True, project="p", location="us-central1")
+
+
+def legacy():
+    return client.models.generate_content(model="text-bison", contents="x")
+
+
+def current():
+    return client.models.generate_content(model="gemini-2.5-flash", contents="x")
+"#,
+    );
+    let run = |today: &str| stdout(&arbor(dir.path(), &["retirements", ".", "--today", today]));
+    let text = run("2026-10-20");
+    for line in [
+        "text-bison → no current replacement (the listed gemini-2.5-flash-lite may already be retired)",
+        "lists gemini-2.5-flash-lite as the replacement, and it may already be retired",
+        "1 call uses a model that may already be retired (Google Cloud's date is today, 20 Oct 2026; not confirmed)",
+    ] {
+        assert!(text.contains(line), "missing {line:?} in:
+{text}");
+    }
+    assert!(!text.contains("retires too"), "{text}");
+    assert!(!text.contains("may stop working"), "{text}");
+    // The day before, both still retire.
+    let text = run("2026-10-19");
+    assert!(
+        text.contains("(the listed gemini-2.5-flash-lite retires too)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("shuts down on or after 20 Oct 2026 (1 day)"),
+        "{text}"
+    );
+    // After it, the date is in the past.
+    let text = run("2026-10-21");
+    assert!(
+        text.contains(
+            "may already be retired (Google Cloud's date was 20 Oct 2026; not confirmed)"
+        ),
+        "{text}"
+    );
+}
+
 const LOOKUPS: &str = r#"from openai import OpenAI
 
 client = OpenAI()

@@ -116,7 +116,8 @@ A shutdown date counts in UTC, and **on the shutdown date itself the call counts
 retired**: the provider may switch the model off at any time that day. So a `gpt-4o`
 call fails the check from 14 January 2027 (UTC) on, and reads "OpenAI shuts down
 today" that day. Google's "earliest" dates are a possibility, not a
-shutdown: from that day on the call is listed as "may stop working" and does not fail.
+shutdown: from that day on the call, or a replacement in a chain, is listed as "may
+already be retired" and does not fail.
 
 ## In CI: GitHub Action
 
