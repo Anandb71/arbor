@@ -341,7 +341,8 @@ fn describe_changes(changes: &[Change], code: bool) -> String {
 }
 
 /// `keep reasoning off (add reasoning_effort="none"; keep tools) or let the
-/// model reason (remove tools)`.
+/// model reason (remove tools)`. A parameter an option removes and adds again
+/// reads as set: `set thinking={"type": "between_tools"}`.
 fn describe_decision(decision: &Decision, code: bool) -> String {
     decision
         .options
@@ -349,8 +350,13 @@ fn describe_decision(decision: &Decision, code: bool) -> String {
         .map(|option| {
             let mut edits = Vec::new();
             for add in &option.add {
+                let verb = if option.remove.contains(&add.name) {
+                    "set"
+                } else {
+                    "add"
+                };
                 edits.push(format!(
-                    "add {}",
+                    "{verb} {}",
                     tick(
                         &format!("{}={}", add.name, python_literal(&add.value)),
                         code
@@ -360,8 +366,14 @@ fn describe_decision(decision: &Decision, code: bool) -> String {
             if !option.keep.is_empty() {
                 edits.push(format!("keep {}", option.keep.join(", ")));
             }
-            if !option.remove.is_empty() {
-                edits.push(format!("remove {}", option.remove.join(", ")));
+            let removed: Vec<&str> = option
+                .remove
+                .iter()
+                .filter(|name| !option.add.iter().any(|a| &a.name == *name))
+                .map(String::as_str)
+                .collect();
+            if !removed.is_empty() {
+                edits.push(format!("remove {}", removed.join(", ")));
             }
             if edits.is_empty() {
                 edits.push("no change".to_string());

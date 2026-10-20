@@ -1043,3 +1043,39 @@ def factory(make):
         "{markdown}"
     );
 }
+
+#[test]
+fn claude_thinking_is_a_decision_never_a_change() {
+    // The lead's 20 Oct decision: whether Sonnet 5.5 thinks is the
+    // repository's choice, as the reasoning effort is on OpenAI's models.
+    let dir = project(
+        r#"from anthropic import Anthropic
+
+claude = Anthropic()
+
+
+def plain():
+    return claude.messages.create(model="claude-3-5-sonnet-20241022", max_tokens=512, messages=[])
+
+
+def turned_off():
+    return claude.messages.create(model="claude-3-7-sonnet-20250219", max_tokens=512, messages=[], thinking={"type": "disabled"})
+"#,
+    );
+    let (_, report) = run_json(dir.path(), &[]);
+    for finding in report["findings"].as_array().unwrap() {
+        assert_eq!(finding["changes"], serde_json::json!([]), "{finding:#}");
+        assert_eq!(finding["decisions"][0]["choice"], "ANT-THINKING-DEFAULT");
+    }
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    assert!(!text.contains("also change"), "{text}");
+    assert!(
+        text.contains("decide: think only between tools (add thinking={\"type\": \"between_tools\"}) or let the model think (no change)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("decide: think only between tools (set thinking={\"type\": \"between_tools\"}) or let the model think (remove thinking)"),
+        "{text}"
+    );
+    assert!(text.contains("decide once for this repo (Arbor does not choose): claude-sonnet-5-5 thinks by default"), "{text}");
+}

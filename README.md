@@ -253,7 +253,7 @@ npx @anandb71/arbor-cli retirements .
 
 - **Runs locally.** No account, no API key, no telemetry; no code leaves your machine.
 - **Honest about confidence.** A literal is confirmed only where the usage scan has no doubt about the call. `os.getenv("MODEL", "gpt-4o")` fallbacks, parameter defaults, class attributes a subclass may override and calls whose routing is not certain are marked *confirm first* with the reason, and fail the check only with `--count-unconfirmed`. Calls through Azure, OpenRouter or a proxy are listed apart (`--include-routed`), because the provider's dates may not apply there; a `base_url` on the provider's own host is a direct call. Models Arbor cannot read, and code it did not analyze, are counted, not hidden.
-- **Arbor does not decide for you.** When the replacement behaves differently by design (gpt-6-luna runs at medium reasoning effort by default, so it can reason; gpt-4o did not), the report shows both options and what each costs, and changes nothing until you choose.
+- **Arbor does not decide for you.** When the replacement behaves differently by design (gpt-6-luna runs at medium reasoning effort by default, so it can reason, where gpt-4o did not; claude-sonnet-5-5 thinks by default, where the Sonnet models it replaces did not), the report shows both options and what each costs, and changes nothing until you choose.
 - **CI ready.** `--json`, `--markdown`, `--annotations`, `--markdown-out <file>` and `--fail-within <days>`. Exit code 1 means a confirmed call uses a retired model, or one retiring inside your window; the shutdown day itself counts as retired (UTC).
 - **Scope today:** Python with the `openai`, `anthropic` and Google GenAI SDKs. TypeScript and JavaScript are coming.
 

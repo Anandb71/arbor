@@ -768,13 +768,15 @@ mod data_tests {
                 );
             }
         }
-        assert_eq!(anchors, 2, "one reasoning choice per OpenAI dated recipe");
+        // One reasoning choice per OpenAI dated recipe, and Claude's thinking.
+        assert_eq!(anchors, 3);
     }
 
     #[test]
     fn no_automatic_change_sets_the_reasoning_effort() {
         // The founder's 18 Oct decision: the reasoning effort is asked per
-        // repository. Only a choice's options may name it.
+        // repository; the lead's 20 Oct decision does the same for Claude's
+        // thinking. Only a choice's options may name them.
         for rule in &data().data.rules {
             if !matches!(
                 rule.effect,
@@ -784,9 +786,18 @@ mod data_tests {
             }
             for add in &rule.add {
                 let named = add.name.contains("effort")
+                    || add.name == "thinking"
                     || (add.name == "reasoning" && add.value.get("effort").is_some());
                 assert!(!named, "{} sets {} automatically", rule.id, add.name);
             }
+            if let Some(rename) = &rule.rename {
+                assert_ne!(rename.to, "thinking", "{}", rule.id);
+            }
+        }
+        for id in ["ANT-THINKING-DEFAULT", "ANT-THINKING-DISABLED"] {
+            let rule = data().data.rules.iter().find(|r| r.id == id).expect(id);
+            assert_eq!(rule.effect, RuleEffect::Choice, "{id}");
+            assert_eq!(rule.choice.as_deref(), Some("ANT-THINKING-DEFAULT"), "{id}");
         }
         for id in [
             "OAI-REASONING-DEFAULT",

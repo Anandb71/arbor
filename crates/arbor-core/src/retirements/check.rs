@@ -1895,7 +1895,9 @@ fn apply_rules<'r>(
 
 /// Adds a choice rule's options to the call's decision for that choice. A
 /// call that already sets a parameter an option adds has made the choice in
-/// code; its value is not visible, so it is a check instead.
+/// code; its value is not visible, so it is a check instead. An option that
+/// removes the parameter it adds replaces the call's value (Claude's
+/// `thinking={"type": "disabled"}`), so the call setting it has not chosen.
 fn add_choice(rule: &ParamRule, context: &RuleContext<'_>, out: &mut Outcome) {
     let Some(choice) = rule.choice.clone() else {
         return;
@@ -1904,7 +1906,7 @@ fn add_choice(rule: &ParamRule, context: &RuleContext<'_>, out: &mut Outcome) {
     let preset = rule
         .options
         .iter()
-        .flat_map(|o| &o.add)
+        .flat_map(|o| o.add.iter().filter(|a| !o.remove.contains(&a.name)))
         .filter(|a| context.endpoint_matches(&a.endpoint))
         .find(|a| context.has(&a.name));
     if let Some(add) = preset {
@@ -2516,12 +2518,74 @@ mod tests {
         assert!(finding.in_window && finding.fails);
         assert_eq!(report.exit_code, 1);
         assert_eq!(report.summary.retired, 1);
-        // Sonnet 5.5 thinks by default: without tools, between_tools is added.
-        let thinking = change(finding, "thinking").expect("thinking added");
+        // Sonnet 5.5 thinks by default. Whether to send between_tools is the
+        // repository's choice (the lead's 20 Oct decision), never a change.
+        assert!(
+            change(finding, "thinking").is_none(),
+            "{:#?}",
+            finding.changes
+        );
+        assert_eq!(finding.fix, FixKind::Decide);
+        assert_eq!(finding.decisions.len(), 1);
+        assert_eq!(finding.decisions[0].choice, "ANT-THINKING-DEFAULT");
+        let between = option(finding, "thinking_between_tools");
+        assert_eq!(between.label, "think only between tools");
+        assert_eq!(between.add.len(), 1);
+        assert_eq!(between.add[0].name, "thinking");
         assert_eq!(
-            python_literal(thinking.value.as_ref().unwrap()),
+            python_literal(&between.add[0].value),
             "{\"type\": \"between_tools\"}"
         );
+        let default = option(finding, "model_default");
+        assert!(default.add.is_empty() && default.remove.is_empty());
+        assert!(default
+            .effects
+            .iter()
+            .any(|e| e.text.contains("thinks adaptively")));
+    }
+
+    #[test]
+    fn claude_thinking_is_a_decision_never_a_change() {
+        let claude = |kwargs: &[&str]| {
+            call(
+                Sdk::Anthropic,
+                Routing::AnthropicDirect,
+                "claude.messages.create",
+                "claude-3-7-sonnet-20250219",
+                kwargs,
+                20,
+            )
+        };
+        // With tools: the same choice, and no check that hides it.
+        let finding = one(&[claude(&["max_tokens", "messages", "tools"])]);
+        assert!(finding.changes.is_empty(), "{:#?}", finding.changes);
+        assert_eq!(finding.decisions[0].choice, "ANT-THINKING-DEFAULT");
+        assert!(finding
+            .review
+            .iter()
+            .all(|r| r.rule.as_deref() != Some("ANT-THINKING-DEFAULT")));
+
+        // A call that sets thinking, whose value Arbor cannot read: the
+        // disabled case is the same choice (send between_tools instead, or
+        // drop thinking), not a check that it is already between_tools.
+        let finding = one(&[claude(&["max_tokens", "messages", "thinking"])]);
+        assert!(finding.changes.is_empty(), "{:#?}", finding.changes);
+        assert_eq!(finding.decisions.len(), 1, "{:#?}", finding.review);
+        let decision = &finding.decisions[0];
+        assert_eq!(decision.choice, "ANT-THINKING-DEFAULT");
+        assert_eq!(decision.rules, ["ANT-THINKING-DISABLED"]);
+        assert_eq!(decision.because, ["thinking"]);
+        assert!(decision.reasons[0].contains("if it is {\"type\": \"disabled\"}"));
+        let between = option(&finding, "thinking_between_tools");
+        assert_eq!(between.remove, ["thinking"]);
+        assert_eq!(between.add[0].name, "thinking");
+        assert_eq!(option(&finding, "model_default").remove, ["thinking"]);
+        // The budget check still applies, so a person looks at it.
+        assert!(finding
+            .review
+            .iter()
+            .any(|r| r.rule.as_deref() == Some("ANT-THINKING-BUDGET")));
+        assert_eq!(finding.fix, FixKind::Manual);
     }
 
     #[test]
