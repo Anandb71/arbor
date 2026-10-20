@@ -190,7 +190,9 @@ Anthropic and Google on 16 October 2026), and the data date in `--json` is the o
 of them. The argument rules come from the providers' migration guides and API
 references. A rule marked `live` in the JSON was confirmed with real API calls on
 18 October 2026; the label is shown only for the models those calls used and only on
-Chat Completions, the one API they called. Elsewhere the same rule reads `docs` (a
+Chat Completions, the one API they called. [Live checks, 18 October 2026](LIVE_CHECKS_2026-10-18.md)
+lists each of those calls with its request, status and error message, word for word,
+and what they did not check. Elsewhere the same rule reads `docs` (a
 provider page states it) or `unverified`. Rules marked `unverified` are reported as
 checks, not changes, and a decision option whose effect is not verified says so.
 
