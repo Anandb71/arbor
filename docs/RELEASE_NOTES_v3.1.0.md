@@ -30,9 +30,10 @@ Two dates from the bundled data:
   models API gives them that shutdown date (checked 18 October 2026).
 
 The data has 283 entries (276 model IDs) from the deprecation pages of OpenAI,
-Anthropic, the Gemini API and Gemini on Google Cloud (Vertex AI). OpenAI's pages
-were read on 18 October 2026, Anthropic's and Google's on 16 October 2026. Every
-entry names the provider page it came from. The data is bundled at build time,
+Anthropic, the Gemini API and Gemini on Google Cloud (Vertex AI), with the
+aliases and changelog entries those pages leave out, such as the four OpenAI
+aliases above. OpenAI's pages were read on 18 October 2026, Anthropic's and
+Google's on 16 October 2026. Every fact names the provider page it came from. The data is bundled at build time,
 so it changes only when you update Arbor, and the report says so once it is more
 than 90 days old.
 
