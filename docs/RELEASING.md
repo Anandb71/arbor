@@ -65,33 +65,42 @@ Also enable **Settings → Actions → General → Allow GitHub Actions to creat
 ## Recommended release sequence
 
 1. Ensure `CHANGELOG.md` and `docs/RELEASE_NOTES_vX.Y.Z.md` are updated.
-1. Regenerate the model retirement data, so the release ships the providers' latest
-   deprecation pages. It needs a checkout of the retirement recipes
-   (`getArbor-dev/arbor-cloud`, branch `docs/self-maintaining-apis-research` until they
-   merge, folder `recipes/`) and PyYAML:
+2. Regenerate the model retirement data, so the release ships the providers' latest
+   deprecation pages. It needs the retirement recipes, which live on
+   `getArbor-dev/arbor-cloud` `master` in the folder `recipes/`, and PyYAML. Read them
+   from a clean checkout of `origin/master`, such as a detached worktree, so recipes
+   from a local branch never reach a release:
 
    ```bash
+   git -C ../arbor-cloud fetch origin
+   git -C ../arbor-cloud worktree add --detach ../arbor-cloud-recipes origin/master
+   RECIPES=../arbor-cloud-recipes/recipes
    # Fails (exit 1) and names each recipe that changed when the data is stale.
-   python3 scripts/retirements/generate_model_retirements.py --recipes ../arbor-cloud/recipes --check
+   python3 scripts/retirements/generate_model_retirements.py --recipes "$RECIPES" --check
    # If it does: regenerate, review the diff, and commit it with the release.
-   python3 scripts/retirements/generate_model_retirements.py --recipes ../arbor-cloud/recipes \
-       --source "getArbor-dev/arbor-cloud@$(git -C ../arbor-cloud rev-parse HEAD):recipes/"
+   python3 scripts/retirements/generate_model_retirements.py --recipes "$RECIPES" \
+       --source "getArbor-dev/arbor-cloud@$(git -C ../arbor-cloud-recipes rev-parse HEAD):recipes/"
    cargo test -p arbor-core retirements
+   git -C ../arbor-cloud worktree remove ../arbor-cloud-recipes
    ```
+
+   `--check` compares what the recipes produce, not the commit they came from. When
+   it passes, leave the data as it is, even if its `source` names an older commit
+   with the same recipes.
 
    Exit 2 means a recipe uses a rule, option or condition the generator cannot
    translate yet: extend the generator rather than editing the JSON by hand (the
    digest test fails on any hand edit).
-2. Bump the workspace version, the internal crate dependency versions, `Cargo.lock`, `agent-card.json`, `packaging/npm/package.json` and `extensions/arbor-vscode/package.json` (and its lockfile). Leave `packaging/homebrew` and `packaging/scoop` alone: the release workflow writes them once the assets and their checksums exist.
-3. Create and push a release tag:
+3. Bump the workspace version, the internal crate dependency versions, `Cargo.lock`, `agent-card.json`, `packaging/npm/package.json` and `extensions/arbor-vscode/package.json` (and its lockfile). Leave `packaging/homebrew` and `packaging/scoop` alone: the release workflow writes them once the assets and their checksums exist.
+4. Create and push a release tag on the release pull request's merge commit:
    - `vX.Y.Z`
-4. Wait for all workflows to complete:
+5. Wait for all workflows to complete:
    - Release
    - GHCR
    - Publish NPM Wrapper
    - Publish VS Code Extension
    - MCP Release Adoption Notes
-5. Merge the `chore: update package manifests for vX.Y.Z` pull request.
+6. Merge the `chore: update package manifests for vX.Y.Z` pull request.
 
 A Release run whose crates.io or manifest job failed still concludes successfully, so the other channels publish. Check those two jobs for error annotations anyway: re-run `Publish crates to crates.io` after fixing the token, and open the manifest pull request by hand if the workflow could not.
 
