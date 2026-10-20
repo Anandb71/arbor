@@ -1084,11 +1084,15 @@ fn escape_property(text: &str) -> String {
     escape_data(text).replace(':', "%3A").replace(',', "%2C")
 }
 
-/// One warning per call, most urgent first, up to `limit` (GitHub drops
-/// warnings past its per-step limit); then one notice for the rest.
+/// One warning per call, up to `limit` (GitHub drops warnings past its
+/// per-step limit); then one notice for the rest. The calls that fail the
+/// check come first, so a failing step always annotates why; then the rest,
+/// most urgent first.
 fn annotations(report: &RetirementReport, limit: usize) -> String {
     let mut out = String::new();
-    let all: Vec<&Finding> = report.findings.iter().chain(&report.routed).collect();
+    let mut all: Vec<&Finding> = report.findings.iter().chain(&report.routed).collect();
+    // Stable: each part keeps the report's order.
+    all.sort_by_key(|finding| !finding.fails);
     for finding in all.iter().take(limit) {
         let status = status_phrase(finding, report.today);
         let title = format!("{}: {}", finding.model, status);

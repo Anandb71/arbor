@@ -819,6 +819,55 @@ fn annotations_stay_within_githubs_per_step_limit() {
     assert_eq!(text.lines().count(), 12);
 }
 
+#[test]
+fn failing_calls_are_annotated_first() {
+    // Eleven unconfirmed calls to a model retired earlier filled the ten
+    // warnings, and the one failing call got none while the step failed
+    // (rv6 nit).
+    let mut source = String::from(
+        "from openai import OpenAI
+
+client = OpenAI()
+
+",
+    );
+    for i in 0..11 {
+        source.push_str(&format!(
+            "
+def unconfirmed{i}(make):
+    return make().completions.create(model=\"text-davinci-003\", prompt=\"x\")
+"
+        ));
+    }
+    source.push_str(
+        "
+def failing():
+    return client.chat.completions.create(model=\"gpt-4-vision-preview\", messages=[])
+",
+    );
+    let dir = project(&source);
+    let output = arbor(
+        dir.path(),
+        &["retirements", ".", "--annotations", "--today", TODAY],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let text = stdout(&output);
+    let warnings: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("::warning "))
+        .collect();
+    assert_eq!(warnings.len(), 10, "{text}");
+    assert!(
+        warnings[0].contains("title=gpt-4-vision-preview%3A"),
+        "{}",
+        warnings[0]
+    );
+    assert!(warnings[1..]
+        .iter()
+        .all(|w| w.contains("title=text-davinci-003%3A")));
+    assert!(text.contains("2 more calls to retired or retiring models are not annotated"));
+}
+
 const LOOKUPS: &str = r#"from openai import OpenAI
 
 client = OpenAI()

@@ -93,7 +93,7 @@ exit 1 only with `--count-unconfirmed`.
 |---|---|
 | `--json` | One JSON object on stdout, errors included (`{"version", "error"}`) |
 | `--markdown` | A Markdown report, for a CI job summary |
-| `--annotations` | GitHub Actions annotations: one warning per affected call, most urgent first, up to `--max-annotations` (default 10, GitHub's limit per step), then one notice saying how many more there are |
+| `--annotations` | GitHub Actions annotations: one warning per affected call, the calls that fail the check first and then the most urgent, up to `--max-annotations` (default 10, GitHub's limit per step), then one notice saying how many more there are |
 | `--markdown-out <file>` | Also write the Markdown report to a file, from the same scan |
 | `--fail-within <days>` | Also fail when a model retires within this many days |
 | `--count-unconfirmed` | Also let unconfirmed calls fail the check (see below) |
@@ -137,8 +137,8 @@ jobs:
 
 The Action scans once. The job summary gets the Markdown report, which lists every
 call. Affected lines get warning annotations: GitHub shows at most 10 warnings per
-step, so Arbor writes the 10 most urgent and one notice saying how many more the
-summary lists. The Action fails the build only if you set `retirements-fail-on` to
+step, so Arbor writes 10, the calls that fail the check first and then the most
+urgent, and one notice saying how many more the summary lists. The Action fails the build only if you set `retirements-fail-on` to
 `retired` or to a number of days, with one exception: when the check cannot run
 (exit 2: a missing path, a bad `retirements-fail-on` value), the step fails even with
 `retirements-fail-on: never`, so a missing report never passes quietly.
