@@ -59,6 +59,39 @@ pub(crate) enum HttpReply {
 /// Caps on client-supplied sizes so one request cannot inflate a response
 /// unboundedly.
 const MAX_LIST_LIMIT: usize = 500;
+
+/// Entries of each `skipped` list (`too_large`, `unreadable`,
+/// `syntax_errors`, vendored and hidden roots) `find_api_usages` returns.
+const MAX_SKIPPED_LISTED: usize = 20;
+
+/// `find_api_usages`'s `skipped` for one page: every count, a `*_total` for
+/// each list, and the first [`MAX_SKIPPED_LISTED`] entries of each list on
+/// the first page only, so a large project's lists neither grow the
+/// response without bound nor repeat on every page.
+fn skipped_summary(skipped: &arbor_watcher::usages::Skipped, first_page: bool) -> Value {
+    fn head<T: serde::Serialize>(items: &[T], listed: usize) -> Value {
+        json!(items.iter().take(listed).collect::<Vec<_>>())
+    }
+    let listed = if first_page { MAX_SKIPPED_LISTED } else { 0 };
+    json!({
+        "vendored_files": skipped.vendored_files,
+        "vendored_files_with_usages": skipped.vendored_files_with_usages,
+        "vendored_calls": skipped.vendored_calls,
+        "vendored_roots": head(&skipped.vendored_roots, listed),
+        "vendored_roots_total": skipped.vendored_roots.len(),
+        "hidden_files": skipped.hidden_files,
+        "hidden_files_with_usages": skipped.hidden_files_with_usages,
+        "hidden_calls": skipped.hidden_calls,
+        "hidden_roots": head(&skipped.hidden_roots, listed),
+        "hidden_roots_total": skipped.hidden_roots.len(),
+        "too_large": head(&skipped.too_large, listed),
+        "too_large_total": skipped.too_large.len(),
+        "unreadable": head(&skipped.unreadable, listed),
+        "unreadable_total": skipped.unreadable.len(),
+        "syntax_errors": head(&skipped.syntax_errors, listed),
+        "syntax_errors_total": skipped.syntax_errors.len(),
+    })
+}
 const MAX_DEPTH: usize = 32;
 const MAX_TOKEN_BUDGET: usize = 64_000;
 
@@ -561,6 +594,132 @@ impl McpServer {
         })
     }
 
+    /// `find_api_usages`: the `arbor usages` scan, paginated, with every path
+    /// relative to the project root.
+    async fn find_api_usages(&self, args: &Value) -> Value {
+        const TOOL: &str = "find_api_usages";
+        let sdk = match args.get("sdk").and_then(|v| v.as_str()) {
+            None => None,
+            Some(name) => match arbor_core::usages::Sdk::parse(name) {
+                Some(sdk) => Some(sdk),
+                None => {
+                    return Self::err_envelope(
+                        TOOL,
+                        &format!("unknown sdk '{name}': use openai, anthropic or google"),
+                    )
+                }
+            },
+        };
+        let relative = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let relative_path = Path::new(relative);
+        let escapes = relative_path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        });
+        if escapes {
+            return Self::err_envelope(
+                TOOL,
+                "path must be relative to the project root and stay inside it",
+            );
+        }
+        let offset = bounded_usize(args, "offset", 0, usize::MAX);
+        let limit = bounded_usize(args, "limit", 100, MAX_LIST_LIMIT).max(1);
+        let clients_offset = bounded_usize(args, "clients_offset", 0, usize::MAX);
+        let gaps_offset = bounded_usize(args, "gaps_offset", 0, usize::MAX);
+
+        let target = self.project_root.join(relative_path);
+        let options = arbor_watcher::UsageScanOptions {
+            sdk,
+            display_root: Some(relative.to_string()),
+            ..arbor_watcher::UsageScanOptions::default()
+        };
+        let scanned =
+            tokio::task::spawn_blocking(move || arbor_watcher::scan_usages(&target, &options))
+                .await;
+        let mut report = match scanned {
+            Ok(Ok(report)) => report,
+            Ok(Err(error)) => {
+                let shown = if relative.is_empty() { "." } else { relative };
+                return Self::err_envelope(TOOL, &format!("cannot scan '{shown}': {error}"));
+            }
+            Err(error) => return Self::err_envelope(TOOL, &format!("scan failed: {error}")),
+        };
+        if relative.is_empty() {
+            report.root = ".".to_string();
+        }
+
+        let total = report.usages.len();
+        let page: Vec<_> = report
+            .usages
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect();
+        let has_more = offset.saturating_add(page.len()) < total;
+        // Clients and gaps page separately, at most MAX_LIST_LIMIT at a time.
+        let clients_total = report.clients.len();
+        let gaps_total = report.gaps.len();
+        let clients: Vec<_> = report
+            .clients
+            .drain(..)
+            .skip(clients_offset)
+            .take(MAX_LIST_LIMIT)
+            .collect();
+        let gaps: Vec<_> = report
+            .gaps
+            .drain(..)
+            .skip(gaps_offset)
+            .take(MAX_LIST_LIMIT)
+            .collect();
+        let clients_has_more = clients_offset.saturating_add(clients.len()) < clients_total;
+        let gaps_has_more = gaps_offset.saturating_add(gaps.len()) < gaps_total;
+
+        let next_symbol = page.iter().find_map(|call| call.symbol.clone());
+        let data = json!({
+            "root": report.root,
+            "sdk": report.sdk,
+            "summary": report.summary,
+            "usages": page,
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "hasMore": has_more,
+            "clients": clients,
+            "clients_offset": clients_offset,
+            "clients_total": clients_total,
+            "clients_hasMore": clients_has_more,
+            "gaps": gaps,
+            "gaps_offset": gaps_offset,
+            "gaps_total": gaps_total,
+            "gaps_hasMore": gaps_has_more,
+            "skipped": skipped_summary(
+                &report.skipped,
+                offset == 0 && clients_offset == 0 && gaps_offset == 0,
+            ),
+        });
+        let node_count = self.graph.read().await.node_count();
+        match next_symbol {
+            // Who reaches this SDK call? The graph answers from here.
+            Some(symbol) => Self::ok_envelope(
+                TOOL,
+                data,
+                node_count,
+                "get_callers",
+                json!({ "symbol": symbol }),
+            ),
+            None => Self::ok_envelope(TOOL, data, node_count, "get_map", json!({})),
+        }
+    }
+
     fn list_tools(&self) -> Result<Value, JsonRpcError> {
         Ok(json!({
             "tools": [
@@ -750,6 +909,22 @@ impl McpServer {
                     "_meta": apps::ui_meta(apps::UI_ARCHITECTURE_MAP)
                 },
                 {
+                    "name": "find_api_usages",
+                    "description": "Finds calls to the OpenAI, Anthropic and Gemini SDKs (Python files and Python shebang scripts today): each call with file, line, enclosing symbol, client routing (openai_direct, azure_openai, custom_base_url, anthropic_bedrock, anthropic_vertex, google_genai...) and the model IDs passed as string literals, same-file constants, dict literals or parameter defaults. A literal fallback of an env/config lookup is returned with origin env_default and the call keeps a gap: confirm it before acting. Also returns client constructions, typed gaps for what could not be resolved (models from env/config, unknown client factories, getattr) and what was skipped: counts on every page, and the first 20 vendored and hidden directories, oversized, unreadable and syntax-error files on the first page. Use INSTEAD of grep to find where a deprecated model or SDK is used. Reads files directly; does not need the graph. Never returns credential values: a value is refused when any name it flows through looks like a secret (key, token, secret, password, pwd, auth, credential, private) or the value itself is credential-shaped (sk-, AIza, ghp_, xox..., URLs with a user or password, long random tokens).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "sdk": { "type": "string", "enum": ["openai", "anthropic", "google"], "description": "Only this provider's SDK" },
+                            "path": { "type": "string", "description": "Project-relative directory or file to scan (default: the whole project)" },
+                            "offset": { "type": "integer", "description": "Pagination offset for usages (default: 0)", "default": 0 },
+                            "limit": { "type": "integer", "description": "Max usages per page (default: 100)", "default": 100 },
+                            "clients_offset": { "type": "integer", "description": "Pagination offset for clients, 500 per page (default: 0)", "default": 0 },
+                            "gaps_offset": { "type": "integer", "description": "Pagination offset for gaps, 500 per page (default: 0)", "default": 0 }
+                        }
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+                },
+                {
                     "name": "batch_query",
                     "description": "Query multiple symbols in a single call. Returns node details for all matched symbols, reducing round-trips. Optionally includes callers/callees for each.",
                     "inputSchema": {
@@ -778,6 +953,11 @@ impl McpServer {
             })?;
 
         let arguments = params.get("arguments").unwrap_or(&Value::Null);
+
+        // Reads source files directly, so it answers before indexing finishes.
+        if name == "find_api_usages" {
+            return Ok(self.find_api_usages(arguments).await);
+        }
 
         // If the graph is empty, return a task handle instead of erroring (Tasks extension)
         if self.graph.read().await.node_count() == 0 {
@@ -2219,6 +2399,196 @@ mod tool_tests {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
         McpServer::with_project(shared, project_root)
+    }
+
+    fn tool_envelope(result: Value) -> Value {
+        let text = result["content"][0]["text"].as_str().unwrap().to_string();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn find_api_usages_scans_files_without_waiting_for_the_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("svc")).unwrap();
+        std::fs::write(
+            dir.path().join("svc/llm.py"),
+            "from openai import OpenAI\nclient = OpenAI(api_key=\"sk-test-NOT-A-REAL-KEY\")\n\ndef ask():\n    return client.chat.completions.create(model=\"gpt-3.5-turbo\", messages=[])\n",
+        )
+        .unwrap();
+        // An empty graph: other tools would return a task handle.
+        let shared: SharedGraph = Arc::new(RwLock::new(ArborGraph::new()));
+        let server = McpServer::with_project(shared, dir.path().to_path_buf());
+
+        let result = server
+            .call_tool(json!({ "name": "find_api_usages", "arguments": {} }))
+            .await
+            .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("sk-test-NOT-A-REAL-KEY"));
+        assert!(!text.contains(&dir.path().display().to_string()));
+        let envelope = tool_envelope(result);
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["tool"], "find_api_usages");
+        let data = &envelope["data"];
+        assert_eq!(data["root"], ".");
+        assert_eq!(data["total"], 1);
+        assert_eq!(data["hasMore"], false);
+        let usage = &data["usages"][0];
+        assert_eq!(usage["file"], "svc/llm.py");
+        assert_eq!(usage["routing"], "openai_direct");
+        assert_eq!(usage["values"][0]["value"], "gpt-3.5-turbo");
+        assert_eq!(envelope["meta"]["suggested_next_tool"], "get_callers");
+        assert_eq!(envelope["meta"]["suggested_next_args"]["symbol"], "ask");
+
+        let scoped = tool_envelope(
+            server
+                .call_tool(json!({
+                    "name": "find_api_usages",
+                    "arguments": { "path": "svc", "sdk": "anthropic" }
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(scoped["data"]["root"], "svc");
+        assert_eq!(scoped["data"]["total"], 0);
+        assert_eq!(scoped["data"]["clients_hasMore"], false);
+        assert_eq!(scoped["data"]["gaps_hasMore"], false);
+
+        for (args, error) in [
+            (json!({ "path": "../elsewhere" }), "stay inside"),
+            (json!({ "sdk": "cohere" }), "unknown sdk"),
+            (json!({ "path": "missing" }), "cannot scan"),
+        ] {
+            let failed = tool_envelope(
+                server
+                    .call_tool(json!({ "name": "find_api_usages", "arguments": args }))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(failed["ok"], false);
+            assert!(
+                failed["error"].as_str().unwrap().contains(error),
+                "{failed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn find_api_usages_never_returns_credentials_and_pages_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        // The five leaks from the review of #276.
+        let mut source = String::from(
+            r#"import os
+from openai import OpenAI
+
+client = OpenAI()
+OPENAI_API_KEY = "sk-proj-LEAKONE0000000000000000"
+client.chat.completions.create(model=OPENAI_API_KEY, messages=[])
+client.chat.completions.create(model="sk-ant-api03-LEAKTWO00000000000", messages=[])
+
+def f(token="sk-LEAKTHREE000000000000000"):
+    return client.chat.completions.create(model=token, messages=[])
+
+class Bot:
+    def __init__(self):
+        self.secret = "sk-LEAKFOUR0000000000000000"
+
+    def go(self):
+        return client.chat.completions.create(model=self.secret, messages=[])
+
+client.chat.completions.create(model="gpt-4", messages=[], extra_body={"sk-proj-LEAKFIVE000000000": {"model": "gpt-4"}})
+"#,
+        );
+        // Enough unresolved models to need a second page of gaps.
+        for _ in 0..501 {
+            source
+                .push_str("client.chat.completions.create(model=os.getenv(\"M\"), messages=[])\n");
+        }
+        std::fs::write(dir.path().join("leaks.py"), source).unwrap();
+        let shared: SharedGraph = Arc::new(RwLock::new(ArborGraph::new()));
+        let server = McpServer::with_project(shared, dir.path().to_path_buf());
+
+        let result = server
+            .call_tool(json!({ "name": "find_api_usages", "arguments": {} }))
+            .await
+            .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("LEAK"), "a secret was returned");
+        assert!(!text.contains("sk-"), "a key prefix was returned");
+        let data = &tool_envelope(result)["data"];
+        assert_eq!(data["gaps_total"], 505);
+        assert_eq!(data["gaps"].as_array().unwrap().len(), 500);
+        assert_eq!(data["gaps_hasMore"], true);
+        let credential = data["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|g| g["reason"] == "credential")
+            .count();
+        assert_eq!(credential, 4);
+
+        let next = tool_envelope(
+            server
+                .call_tool(json!({
+                    "name": "find_api_usages",
+                    "arguments": { "gaps_offset": 500 }
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(next["data"]["gaps"].as_array().unwrap().len(), 5);
+        assert_eq!(next["data"]["gaps_offset"], 500);
+        assert_eq!(next["data"]["gaps_hasMore"], false);
+    }
+
+    #[tokio::test]
+    async fn find_api_usages_caps_skipped_lists_and_sends_them_once() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..30 {
+            std::fs::write(
+                dir.path().join(format!("broken_{i}.py")),
+                "from openai import OpenAI
+def broken(:
+    pass
+",
+            )
+            .unwrap();
+        }
+        let shared: SharedGraph = Arc::new(RwLock::new(ArborGraph::new()));
+        let server = McpServer::with_project(shared, dir.path().to_path_buf());
+        let first = tool_envelope(
+            server
+                .call_tool(json!({ "name": "find_api_usages", "arguments": {} }))
+                .await
+                .unwrap(),
+        );
+        let skipped = &first["data"]["skipped"];
+        assert_eq!(skipped["syntax_errors"].as_array().unwrap().len(), 20);
+        assert_eq!(skipped["syntax_errors_total"], 30);
+        let later = tool_envelope(
+            server
+                .call_tool(json!({ "name": "find_api_usages", "arguments": { "gaps_offset": 1 } }))
+                .await
+                .unwrap(),
+        );
+        let skipped = &later["data"]["skipped"];
+        assert!(skipped["syntax_errors"].as_array().unwrap().is_empty());
+        assert_eq!(skipped["syntax_errors_total"], 30);
+        assert_eq!(skipped["vendored_files"], 0);
+    }
+
+    #[tokio::test]
+    async fn tools_list_has_seventeen_tools_including_find_api_usages() {
+        let server = empty_server();
+        let tools = server.list_tools().unwrap();
+        let names: Vec<&str> = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 17);
+        assert!(names.contains(&"find_api_usages"));
     }
 
     #[tokio::test]

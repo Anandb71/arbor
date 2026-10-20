@@ -55,7 +55,7 @@ arbor-core  →  arbor-graph  →  arbor-watcher
 
 ### Crate Roles
 
-**`arbor-core`** — Tree-sitter AST parsing. Extracts functions, classes, structs, imports, and call edges for 9 production languages (Rust, TS/JS, Python, Go, Java, C/C++, C#, Dart) plus 5 fallback parsers. Each language lives in `crates/arbor-core/src/languages/`. `parser_v2.rs` is the active parser; `parser.rs` is legacy.
+**`arbor-core`** — Tree-sitter AST parsing. Extracts functions, classes, structs, imports, and call edges for 9 production languages (Rust, TS/JS, Python, Go, Java, C/C++, C#, Dart) plus 5 fallback parsers. Each language lives in `crates/arbor-core/src/languages/`. `parser.rs` (`parse_file` / `parse_source`) is the path the indexer, CLI and MCP use; `parser_v2.rs` (`ArborParser`) is used only by the WebSocket server's background re-indexer (`arbor-server/src/sync_server.rs`). `usages/` extracts SDK usages (OpenAI, Anthropic, Gemini; Python today) from the same tree-sitter tree through `LanguageParser::extract_usages`; it adds no graph nodes or edges.
 
 **`arbor-graph`** — In-memory petgraph + sled persistence. Key modules:
 - `builder.rs` — converts parsed nodes/edges into the graph, builds per-file import maps for cross-module edge filtering
@@ -67,18 +67,18 @@ arbor-core  →  arbor-graph  →  arbor-watcher
 - `confidence.rs` — edge confidence scoring
 - `store.rs` — sled-backed persistence
 
-**`arbor-watcher`** — `notify`-based file watcher. Debounces at 100ms, respects `.gitignore`, triggers incremental re-parse of changed files only. Two-tier cache: file-level AST + node-level byte ranges.
+**`arbor-watcher`** — `notify`-based file watcher. Debounces at 100ms, respects `.gitignore`, triggers incremental re-parse of changed files only. Two-tier cache: file-level AST + node-level byte ranges. `usages.rs` is the repository-wide SDK usage scan behind `arbor usages` and `find_api_usages`: vendored and virtual-environment directories are excluded and counted, never reported as usages.
 
 **`arbor-server`** — Tokio WebSocket server on `ws://localhost:7432`. JSON-RPC methods: `discover`, `impact`, `context`, `graph.subscribe`, `spotlight`. RwLock-protected shared graph state.
 
-**`arbor-mcp`** — MCP bridge for AI agents (stdio by default, stateless HTTP via `arbor bridge --http --port 3333`). Speaks MCP `2026-07-28` with fallback for `2025-03-26` clients. Sixteen tools:
+**`arbor-mcp`** — MCP bridge for AI agents (stdio by default, stateless HTTP via `arbor bridge --http --port 3333`). Speaks MCP `2026-07-28` with fallback for `2025-03-26` clients. Seventeen tools:
 - **Orientation**: `get_map` — ranked, token-budgeted skeleton of the codebase (recommended first call), `get_architecture_overview`
-- **Surgical**: `list_entry_points`, `get_callers`, `get_callees`, `search_symbols`, `get_file_graph`, `get_node_detail`, `explain_symbol`
+- **Surgical**: `list_entry_points`, `get_callers`, `get_callees`, `search_symbols`, `get_file_graph`, `get_node_detail`, `explain_symbol`, `find_api_usages` (OpenAI/Anthropic/Gemini SDK call sites with routing and model IDs; reads files, no graph needed)
 - **Broad**: `get_logic_path`, `get_knowledge_path`, `find_path`, `analyze_impact`, `get_blast_radius` (git-diff based), `audit_security`, `batch_query`
 
 Module layout: `lib.rs` (tool dispatch + `tools/list`), `protocol.rs` (version negotiation, caching metadata), `tasks.rs` (Tasks extension — background indexing returns task handles agents can poll during cold start), `apps.rs` (MCP Apps — interactive blast-radius and architecture-map UIs via `ui://arbor/*` resources), `http.rs` (HTTP transport with `Mcp-Method`/`Mcp-Name` header routing), `git.rs`.
 
-All tools emit a standard JSON envelope: `{ok, tool, arbor_version, data, meta: {node_count, suggested_next_tool, suggested_next_args}}`. Error responses use `{ok: false, error}`. `search_symbols` and `get_map` support pagination (`offset`, `limit`, `hasMore`).
+All tools emit a standard JSON envelope: `{ok, tool, arbor_version, data, meta: {node_count, suggested_next_tool, suggested_next_args}}`. Error responses use `{ok: false, error}`. `search_symbols`, `get_map` and `find_api_usages` support pagination (`offset`, `limit`, `hasMore`).
 
 **`arbor-cli`** — Clap CLI with ~30 subcommands. Most command logic lives in `src/commands.rs`; `src/changes.rs` collects the git change set that `diff`, `check`, `summary` and the agent workflows analyze (working tree, `--staged`, or `--base <ref>` against the merge base) and splits it into modified and new symbols; `src/audit/` implements the security audit and `src/hook/` implements agent-harness installation (`arbor hook claude`), and `src/receipt/` builds the per-turn receipts those hooks print (`arbor receipt`, see docs/RECEIPTS.md). Entry point: `src/main.rs`. Dispatches to the other crates. Binary name: `arbor` (crate name: `arbor-graph-cli`).
 Key features:
@@ -90,6 +90,7 @@ Key features:
 - `summary .`: auto-generates structured Pull Request descriptions based on graph diff analysis.
 - `agent review`/`agent onboard`/`agent guard`: built-in autonomous workflows (PR risk review, contributor onboarding guide, architecture violation check with `--max-blast-radius`).
 - `audit "sink"`: traces call paths to sensitive sinks (e.g. `db_query`, `exec`).
+- `usages [--sdk openai|anthropic|google] [path] [--json]`: OpenAI, Anthropic and Gemini SDK call sites in Python with client routing (direct, Azure, custom `base_url`, Bedrock, Vertex...), model IDs from literals, same-file constants, dict literals and parameter defaults (env/config fallbacks flagged `env_default`), and typed gaps for everything unresolved (`src/usages.rs`; never prints credential values, refusing secret-named bindings and credential-shaped values).
 - `explain "question"`: graph-backed context slicing for a question (`--tokens`, `--why`).
 - `hook claude [--global]`: installs Arbor directives + hooks into Claude Code settings.
 
@@ -108,7 +109,7 @@ Key features:
 
 - **Import-aware edge filtering**: Cross-file edges are dropped if the caller's file has explicit imports but does not import the callee's name. Prevents cross-module false positives.
 - **Test-file-aware PageRank**: Callers from `test/spec/fixture/mock` files contribute 10% weight, not 100%, to avoid test-inflated centrality scores.
-- **No dotted method calls in JS/TS**: `obj.method()` calls are excluded from edges (requires type inference we don't have); only bare `foo()` and `this./super.` calls are recorded.
+- **Unknown-receiver calls in JS/TS**: `this.method()`, `super.method()` and `Capitalised.method()` keep their receiver; any other `obj.method()` is emitted as an unknown-receiver `.method` marker (`classify_callee` in `typescript.rs`). The builder resolves a marker by method name only, at reduced confidence (`UNKNOWN_RECEIVER_PENALTY`) and with a tighter fan-out cap (`MAX_UNKNOWN_RECEIVER_FANOUT`).
 - **Stack overflow prevention**: `stacker::maybe_grow` wraps recursive AST traversal in all parsers; `collect_calls` uses iterative `TreeCursor` to avoid deep call stacks.
 - **Import nodes excluded from graph**: Import/import-from AST nodes are processed for import map data but never added as vertices (prevents false centrality).
 - **Centrality persistence**: `arbor map` computes PageRank on first call and saves it to the binary cache. Subsequent calls skip recomputation (~0.5s vs ~1.5s).
@@ -140,6 +141,7 @@ Local cache created by `arbor init`/`arbor setup`. Contains `config.json` with d
 | `refactor "sym" .` | Blast radius of changing a symbol |
 | `summary .` | Auto-generate PR description |
 | `audit "sink" .` | Trace call paths to a sensitive sink |
+| `usages .` | OpenAI/Anthropic/Gemini SDK call sites, routing, model IDs and gaps (`--sdk`, `--json`) |
 | `explain "question" .` | Graph-backed context for a question |
 | `agent review .` | Autonomous PR risk review |
 | `agent onboard .` | Generate contributor onboarding guide |

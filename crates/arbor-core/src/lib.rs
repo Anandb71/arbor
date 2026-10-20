@@ -22,6 +22,7 @@ pub mod languages;
 pub mod node;
 pub mod parser;
 pub mod parser_v2;
+pub mod usages;
 
 pub use error::{ParseError, Result};
 pub use languages::LanguageParser;
@@ -29,5 +30,9 @@ pub use node::{
     clean_type_name, field_ref, field_type_ref, return_type_ref, returns_ref, type_relation_ref,
     typed_receiver, typed_receiver_ref, CodeNode, NodeKind, TypeRelationKind, Visibility,
 };
-pub use parser::{detect_language, parse_file, parse_source};
+pub use parser::{
+    detect_language, parse_file, parse_file_usages, parse_source, parse_source_usages,
+    parse_source_with_usages,
+};
 pub use parser_v2::{ArborParser, ParseResult, RelationType, SymbolRelation};
+pub use usages::{FileUsages, Routing, Sdk};

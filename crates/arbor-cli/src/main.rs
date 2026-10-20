@@ -15,6 +15,7 @@ mod hook;
 mod hunk_lines;
 mod install_check;
 mod receipt;
+mod usages;
 
 #[derive(Parser)]
 #[command(name = "arbor")]
@@ -354,6 +355,21 @@ enum Commands {
         path: PathBuf,
     },
 
+    /// Find OpenAI, Anthropic and Gemini SDK calls (Python today): routing, model IDs and gaps. Never prints credential values
+    Usages {
+        /// Directory or file to scan (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: String,
+
+        /// Only this provider's SDK: openai, anthropic or google (alias: gemini)
+        #[arg(long)]
+        sdk: Option<String>,
+
+        /// Output as JSON; errors are printed as {"version", "error"} on stdout
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show direct callers of a symbol (who calls this?)
     Callers {
         /// The symbol to look up (function name, class name, or qualified path)
@@ -644,7 +660,26 @@ fn log_filter(verbose: bool, long_running: bool, env: Option<String>) -> String 
 }
 
 async fn run() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            use clap::error::ErrorKind;
+            let informational = matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            );
+            // `arbor usages --json` promises JSON on stdout, argument
+            // errors included.
+            if !informational && usages::wants_json(std::env::args_os().skip(1)) {
+                let _ = error.print();
+                usages::print_json_error(&error.render().to_string());
+                std::process::exit(error.exit_code());
+            }
+            error.exit()
+        }
+    };
 
     // Logs go to stderr and never mix with a report on stdout. A one-shot
     // command already says what it did on stdout, so by default it logs only
@@ -773,6 +808,7 @@ async fn run() {
             format,
             path,
         } => commands::audit(&sink, depth, &format, &path),
+        Commands::Usages { path, sdk, json } => usages::run(&path, sdk.as_deref(), json),
         Commands::Callers { symbol, path, json } => commands::callers(&symbol, &path, json),
         Commands::Callees { symbol, path, json } => commands::callees(&symbol, &path, json),
         Commands::EntryPoints { path, json } => commands::entry_points(&path, json),

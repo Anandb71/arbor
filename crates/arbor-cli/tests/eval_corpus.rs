@@ -220,10 +220,12 @@ fn corpus_graphs_match_recorded_truth() {
         &fs::read_to_string(eval_dir.join("manifest.json")).expect("eval/manifest.json"),
     )
     .unwrap();
+    // SDK-usage fixtures ("suite": "usages") are checked by eval_usages.rs.
     let fixtures: Vec<String> = manifest["fixtures"]
         .as_array()
         .unwrap()
         .iter()
+        .filter(|f| f["suite"].as_str().unwrap_or("graph") == "graph")
         .filter_map(|f| f["name"].as_str().map(str::to_string))
         .collect();
     assert!(!fixtures.is_empty(), "corpus manifest lists no fixtures");
