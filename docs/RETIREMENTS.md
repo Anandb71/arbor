@@ -23,7 +23,9 @@ Model retirements in . (1 Python file checked)
 
 1 call uses a model Anthropic shut down on 28 Oct 2025
   app/chat.py:33  claude-3-5-sonnet-20241022 → claude-sonnet-5-5
-                  also change: add thinking={"type": "between_tools"}
+                  decide: think only between tools (add thinking={"type": "between_tools"}) or let the model think (no change)
+  decide once for this repo (Arbor does not choose): claude-sonnet-5-5 thinks by default (adaptive thinking) when the call sends no thinking; the model it replaces answered without thinking.
+    ...
   note: A request that ends with an assistant turn (prefill) returns 400 on claude-sonnet-5-5.
   ...
 
@@ -47,7 +49,7 @@ Model retirements in . (1 Python file checked)
 Not checked: 1 call takes the model from somewhere Arbor cannot read (an environment variable, a function argument, another module); arbor usages lists it.
 Not listed: 1 call reaches these models through Azure, another host in base_url or another cloud, where the provider's dates may not apply. Add --include-routed to list it.
 Summary: 4 calls in 1 file use retired or retiring models: 1 already retired, 3 retiring (next: 14 Jan 2027, 88 days).
-1 can move to the listed replacement with the changes shown; 2 can move once this repo makes the choice shown under decide; 1 needs a manual check.
+3 can move once this repo makes the choice shown under decide; 1 needs a manual check.
 Failing (exit 1): 1 call uses a model that is already retired.
 ```
 
