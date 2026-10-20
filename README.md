@@ -28,7 +28,7 @@
   <sub>Simulated replay — the <code>arbor</code> commands and their output are real (tokio @ 178k LOC). Methodology: <a href="docs/BENCHMARKS.md">BENCHMARKS.md</a></sub>
 </p>
 
-> **v3.0.5** · Tests in TypeScript and JavaScript count: calls inside `describe`/`it`/`test` callbacks now belong to the test, so `arbor callers`, `diff` and `check` see Jest, Vitest and Mocha tests. MCP tool output uses project-relative paths. [Release notes](docs/RELEASE_NOTES_v3.0.5.md)
+> **v3.1.0** · Find code that calls retiring AI models: `arbor retirements` lists the direct OpenAI, Anthropic and Google SDK calls in a Python project that use a retired or retiring model, with the listed replacement and what has to change, locally or as a GitHub Action. `arbor usages` and the MCP tool `find_api_usages` list every such SDK call with its routing and model. [Release notes](docs/RELEASE_NOTES_v3.1.0.md)
 
 ---
 
@@ -49,17 +49,20 @@ Where the graph is *unsure*, it says so — edges carry a confidence, and ambigu
 
 ---
 
-## What's new in v3.0.5
+## What's new in v3.1.0
 
-A fix release: tests written in TypeScript and JavaScript now count.
+A feature release: two commands for Python code that calls AI model APIs. Both run
+locally, with no account, API key or telemetry.
 
-| Fix | What was wrong |
-|-----|----------------|
-| **Jest, Vitest and Mocha tests are callers** | Calls inside `describe`/`it`/`test` callbacks belonged to no symbol, so `arbor callers` missed every test and `diff`/`check` reported that nothing tested a change. Each test and hook is now a function named after it, such as `it: accepts two`, that owns the calls in its callback. On the repro in #235, `arbor callers decide` went from 2 callers to 4. |
-| **Project-relative MCP paths** | Tool output could include absolute paths from your machine. Every file path is now relative to the project, and the namespaced `io.modelcontextprotocol/protocolVersion` request key is read first. |
+| New | What it does |
+|-----|--------------|
+| **`arbor retirements`** | Lists the direct `openai`, `anthropic` and Google SDK calls that use a model its provider has retired or is retiring: the date, the replacement the provider lists, the arguments that change with it and the choices your repo makes first. OpenAI shuts down `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` on 14 January 2027. [More below](#find-code-that-calls-retiring-ai-models) |
+| **GitHub Action `mode: retirements`** | The same check in CI: a job summary that lists every affected call, and warnings on the most urgent lines. It warns by default and fails the build only when you set `retirements-fail-on`, or when the check cannot run. |
+| **`arbor usages` and `find_api_usages`** | Every OpenAI, Anthropic and Gemini SDK call with its file and line, client routing (direct, Azure, custom `base_url`, Bedrock, Vertex) and model IDs, for people and agents. A value is confirmed only inside a small supported grammar; everything else carries a typed gap. [What a report confirms](docs/SDK_USAGES.md) |
 
-Cached graphs rebuild once on first use (`extract-4`). See the
-[3.0.4 release notes](docs/RELEASE_NOTES_v3.0.4.md) for the previous release.
+Python only for now; graph extraction is unchanged (a saved graph is rebuilt
+once on first use, as after every upgrade). See the
+[3.0.5 release notes](docs/RELEASE_NOTES_v3.0.5.md) for the previous release.
 
 <details>
 <summary><strong>v3.0.3</strong> (Rust calls through paths and macros, per-symbol diff, <code>--base</code>)</summary>
@@ -260,7 +263,7 @@ npx @anandb71/arbor-cli retirements .
 GitHub Action (warns by default; it fails the build only if you ask it to):
 
 ```yaml
-      - uses: Anandb71/arbor@vX.Y.Z   # the first release that includes arbor retirements
+      - uses: Anandb71/arbor@v3.1.0
         with:
           mode: retirements
           retirements-fail-on: never   # or: retired, or a number of days such as 90
@@ -411,7 +414,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: Anandb71/arbor@v3.0.5
+      - uses: Anandb71/arbor@v3.1.0
         with:
           command: check . --max-blast-radius 30 --markdown
           comment-on-pr: true
