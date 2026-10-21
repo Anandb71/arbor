@@ -4572,6 +4572,230 @@ _helper(plain)
         assert!(report.summary.untracked_methods >= 1, "the getattr call");
     }
 
+    /// TypeScript files that give the usage scan each gap the retirement
+    /// check must hold, each calling a retired model.
+    const TS_GAP_FIXTURES: &[(&str, &str)] = &[
+        (
+            "gaps/routes.ts",
+            r#"import OpenAI from "openai";
+import { GoogleGenAI } from "@google/genai";
+process.env.OPENAI_BASE_URL = proxy;
+const fromEnv = new OpenAI({ baseURL: process.env.GATEWAY ?? "https://api.openai.com/v1" });
+const unread = new OpenAI({ baseURL: `${host}/v1` });
+const moved = new OpenAI({ baseURL: "https://api.openai.com/v1" });
+moved.baseURL = elsewhere;
+let either = new OpenAI({ baseURL: "https://api.openai.com/v1" });
+if (flag) either = makeClient();
+const cloud = new GoogleGenAI({ vertexai: true, project: "p" });
+export async function run(typed: OpenAI) {
+  await fromEnv.chat.completions.create({ model: "gpt-3.5-turbo", messages: [] });
+  await unread.chat.completions.create({ model: "gpt-3.5-turbo", messages: [] });
+  await moved.chat.completions.create({ model: "gpt-3.5-turbo", messages: [] });
+  await either.chat.completions.create({ model: "gpt-3.5-turbo", messages: [] });
+  await typed.chat.completions.create({ model: "gpt-3.5-turbo", messages: [] });
+  await cloud.models.generateContent({ model: "gemini-1.5-flash", contents: "x" });
+  await new OpenAI().chat.completions.create({ model: "gpt-4", messages: [] });
+}
+"#,
+        ),
+        (
+            "gaps/values.ts",
+            r#"import OpenAI from "openai";
+import { MODEL } from "./config";
+const client = new OpenAI();
+export class Bot {
+  model = "gpt-3.5-turbo";
+  ask() {
+    return client.chat.completions.create({ model: this.model, messages: [] });
+  }
+}
+function overridden(model = "gpt-3.5-turbo") {
+  return client.chat.completions.create({ model, messages: [] });
+}
+overridden("gpt-4");
+export function exported(model = "gpt-3.5-turbo") {
+  return client.chat.completions.create({ model, messages: [] });
+}
+function passed(model = "gpt-3.5-turbo") {
+  return client.chat.completions.create({ model, messages: [] });
+}
+app.use(passed);
+export function rest(options: object) {
+  client.chat.completions.create({ model: "gpt-3.5-turbo", ...options, messages: [] });
+  client.chat.completions.create({ messages: [] });
+  client.chat.completions.create({ model: process.env.MODEL ?? "gpt-3.5-turbo", messages: [] });
+  client.chat.completions.create({ model: MODEL, messages: [] });
+  client.chat.completions[method]({ model: "gpt-3.5-turbo", messages: [] });
+  return client.chat.completions.create;
+}
+export function helper(llm: OpenAI) {
+  return llm.chat.completions.create({ model: "gpt-3.5-turbo", messages: [] });
+}
+helper(client);
+"#,
+        ),
+        (
+            "gaps/dynamic.ts",
+            r#"import OpenAI from "openai";
+eval(code);
+const MODEL = "gpt-3.5-turbo";
+const client = new OpenAI();
+client.chat.completions.create({ model: MODEL, messages: [] });
+"#,
+        ),
+    ];
+
+    /// The TypeScript and JavaScript files under `dir`, declaration files
+    /// left out, keyed by their path under `root`.
+    fn typescript_files(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut Vec<(String, String)>,
+    ) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            let name = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if path.is_dir() {
+                typescript_files(root, &path, out);
+            } else if crate::usages::is_usage_extension(
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or_default(),
+            ) && !name.ends_with(".py")
+                && !crate::usages::is_declaration_file(&name)
+            {
+                out.push((name, std::fs::read_to_string(&path).unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn no_gap_from_the_typescript_scan_reads_as_confirmed() {
+        let mut files: Vec<(String, String)> = TS_GAP_FIXTURES
+            .iter()
+            .map(|(name, source)| (name.to_string(), source.to_string()))
+            .collect();
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval/corpus");
+        let mut corpora = 0;
+        for entry in std::fs::read_dir(&corpus).expect("the eval corpus is in the workspace") {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("ts-sdk-"))
+            {
+                corpora += 1;
+                typescript_files(&corpus, &path, &mut files);
+            }
+        }
+        assert!(corpora >= 2, "the TypeScript SDK eval corpora moved");
+
+        let (mut calls, mut gaps_found, mut clients) = (Vec::new(), Vec::new(), Vec::new());
+        for (name, source) in &files {
+            let mut parser = tree_sitter::Parser::new();
+            let language =
+                if name.ends_with(".ts") || name.ends_with(".mts") || name.ends_with(".cts") {
+                    tree_sitter_typescript::language_typescript()
+                } else {
+                    tree_sitter_typescript::language_tsx()
+                };
+            parser.set_language(&language).unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            let found = crate::usages::typescript::extract(&tree, source, name);
+            calls.extend(found.calls);
+            gaps_found.extend(found.gaps);
+            clients.extend(found.clients);
+        }
+
+        let seen: BTreeSet<(GapKind, &str)> = gaps_found
+            .iter()
+            .map(|g| (g.kind, g.reason.as_str()))
+            .collect();
+        for (kind, reason) in &seen {
+            assert!(
+                gaps::gap_text(*kind, reason).is_some(),
+                "the TypeScript scan gave a {kind} gap with reason `{reason}`, which GAP_REASONS does not name"
+            );
+        }
+        let reasons: BTreeSet<&str> = seen.iter().map(|(_, r)| *r).collect();
+        for needed in [
+            "dynamic_feature",
+            "subclass_override",
+            "endpoint_option",
+            "endpoint_env",
+            "base_url_env",
+            "base_url_unresolved",
+            "base_url_assigned",
+            "multiple_assignments",
+            "in_file_callers",
+            "annotation",
+            "splat",
+            "unseen_callers",
+            "parameter_default",
+            "parameter_overridden",
+            "missing_model",
+            "env_var",
+            "imported_name",
+            "factory_call",
+            "computed_member",
+            "method_reference",
+        ] {
+            assert!(
+                reasons.contains(needed),
+                "no TypeScript fixture gives `{needed}`"
+            );
+        }
+
+        let opts = CheckOptions {
+            today: Date::parse("2026-10-24").unwrap(),
+            fail_within: Some(36_500),
+            include_routed: true,
+            count_unconfirmed: false,
+        };
+        let input = ScanInput {
+            calls: &calls,
+            gaps: &gaps_found,
+            clients: &clients,
+        };
+        let report = check(input, bundled().unwrap(), &opts);
+        assert!(report.findings.len() > 20, "{}", report.findings.len());
+        let mut held = 0;
+        for finding in report.findings.iter().chain(&report.routed) {
+            let here: Vec<&UsageGap> = gaps_found
+                .iter()
+                .filter(|g| {
+                    g.file == finding.file
+                        && g.chain.is_some()
+                        && g.span
+                            .is_some_and(|s| s.line == finding.line && s.column == finding.column)
+                })
+                .collect();
+            let value_gap = here.iter().any(|g| gaps::holds_value(g, &finding.key));
+            let routing_gap = here.iter().any(|g| gaps::holds_routing(g));
+            let at = format!("{}:{} {}", finding.file, finding.line, finding.model);
+            if value_gap {
+                assert_ne!(finding.confidence, Confidence::Confirmed, "{at}");
+            }
+            if routing_gap {
+                assert_ne!(finding.routing_class, RoutingClass::Direct, "{at}");
+            }
+            if value_gap || routing_gap {
+                held += 1;
+                assert!(!finding.fails, "{at} counts toward the exit code");
+                assert_ne!(finding.fix, FixKind::Swap, "{at}");
+                assert_ne!(finding.fix, FixKind::Decide, "{at}");
+            }
+        }
+        assert!(held >= 15, "only {held} findings had a gap at their call");
+    }
+
     #[test]
     fn python_literals() {
         assert_eq!(python_literal(&serde_json::json!("none")), "\"none\"");
