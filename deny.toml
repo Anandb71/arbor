@@ -24,6 +24,13 @@ ignore = [
     # Add an advisory ID here only with a comment explaining why it is not
     # reachable in this workspace, and a date to revisit. An empty list is the
     # goal state.
+    # RUSTSEC-2026-0381 (distrusted emSign roots in webpki-roots): fixed in
+    # webpki-roots 1.0.10, which Cargo.lock pins. The copy still flagged is
+    # webpki-roots 0.26.11 (ureq 2 <- ehttp <- egui_extras <- arbor-gui), a
+    # semver-trick shim whose only dependency is webpki-roots 1.0.10, so it ships
+    # the fixed roots; advisories match by version number. Revisit 2027-01-31 or
+    # when egui_extras moves to ureq 3, and keep webpki-roots 1.x at >= 1.0.10.
+    "RUSTSEC-2026-0381",
 ]
 
 # ── licences ─────────────────────────────────────────────────────────────────
