@@ -21,8 +21,8 @@
 use crate::indexer::IgnoreMatcher;
 use arbor_core::languages::get_parser;
 use arbor_core::usages::{
-    is_python_shebang, is_usage_extension, ClientConstruction, FileUsages, GapKind, Sdk, SdkCall,
-    SdkImport, UsageGap, USAGE_LANGUAGES,
+    is_declaration_file, is_python_shebang, is_usage_extension, ClientConstruction, FileUsages,
+    GapKind, Sdk, SdkCall, SdkImport, UsageGap, USAGE_LANGUAGES,
 };
 use arbor_core::{detect_language, parse_source_usages};
 use ignore::WalkBuilder;
@@ -337,7 +337,7 @@ fn under(prefix: Option<&str>, relative: &str) -> String {
 fn single_file(path: &Path, prefix: Option<&str>) -> Vec<Candidate> {
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let shebang = extension.is_empty();
-    if !shebang && !is_usage_extension(extension) {
+    if (!shebang && !is_usage_extension(extension)) || is_declaration(path) {
         return Vec::new();
     }
     let relative = match prefix {
@@ -387,7 +387,7 @@ fn walk(root: &Path, follow_symlinks: bool, prefix: Option<&str>) -> Vec<Candida
         let path = entry.path();
         let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let shebang = extension.is_empty();
-        if !shebang && !is_usage_extension(extension) {
+        if (!shebang && !is_usage_extension(extension)) || is_declaration(path) {
             continue;
         }
         let relative_path = path.strip_prefix(root).unwrap_or(path);
@@ -462,6 +462,13 @@ fn hidden_root(relative: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// A TypeScript declaration file (`*.d.ts`): types only, no requests.
+fn is_declaration(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_declaration_file)
 }
 
 fn slash_path(path: &Path) -> String {
