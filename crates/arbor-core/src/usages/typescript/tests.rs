@@ -1338,3 +1338,433 @@ fn a_name_imported_from_another_module_is_a_gap() {
     assert_eq!(got, None);
     assert_eq!(gaps, vec!["unresolved_model/imported_name"]);
 }
+
+// ---------------------------------------------------------------------------
+// Parameters and their callers
+// ---------------------------------------------------------------------------
+
+/// The model value, its origin and the gaps of the `create` call in a file
+/// built from `body`.
+fn model_row(body: &str) -> (Option<String>, Option<ValueOrigin>, Vec<String>) {
+    let found = usages(&with_client(body));
+    let c = found
+        .calls
+        .iter()
+        .find(|c| c.member == "chat.completions.create")
+        .unwrap_or_else(|| panic!("no create call: {:?} {:?}", found.calls, found.gaps));
+    (
+        value(c, "model").map(str::to_string),
+        c.values.first().map(|v| v.origin),
+        gaps_at(&found, c),
+    )
+}
+
+#[test]
+fn a_parameter_default_is_confirmed_only_when_every_call_is_seen() {
+    let ask = "async function ask(prompt: string, model = \"gpt-4o\") {\n  return client.chat.completions.create({ model, messages: [] });\n}\n";
+    // Every call is in the file and passes nothing for it.
+    let (got, origin, gaps) = model_row(&format!("{ask}ask(\"a\");\nask(\"b\", undefined);"));
+    assert_eq!(got.as_deref(), Some("gpt-4o"));
+    assert_eq!(origin, Some(ValueOrigin::ParameterDefault));
+    assert!(gaps.is_empty(), "{gaps:?}");
+    // A caller passes another value.
+    let (got, _, gaps) = model_row(&format!("{ask}ask(\"a\");\nask(\"b\", \"gpt-4o-mini\");"));
+    assert_eq!(got.as_deref(), Some("gpt-4o"));
+    assert_eq!(gaps, vec!["unresolved_model/parameter_overridden"]);
+    // Exported: other modules may pass another value.
+    let (got, _, gaps) = model_row(&format!("export {ask}"));
+    assert_eq!(got.as_deref(), Some("gpt-4o"));
+    assert_eq!(gaps, vec!["unresolved_model/parameter_default"]);
+    // Passed as a value: callers this file does not show.
+    let (got, _, gaps) = model_row(&format!("{ask}app.post(\"/\", ask);"));
+    assert_eq!(got.as_deref(), Some("gpt-4o"));
+    assert_eq!(gaps, vec!["unresolved_model/unseen_callers"]);
+    // CommonJS exports count as exports.
+    let (_, _, gaps) = model_row(&format!("{ask}module.exports = {{ ask }};"));
+    assert_eq!(gaps, vec!["unresolved_model/parameter_default"]);
+}
+
+#[test]
+fn parameter_overrides_are_listed() {
+    let found = usages(&with_client(
+        "function ask(model = \"gpt-4o\") {\n  return client.chat.completions.create({ model, messages: [] });\n}\nask(\"gpt-4o-mini\");\nask(\"o3-mini\");\n",
+    ));
+    let gap = &gaps(&found, GapKind::UnresolvedModel)[0];
+    assert_eq!(gap.reason, "parameter_overridden");
+    let listed: Vec<&str> = gap.values.iter().map(|v| v.value.as_str()).collect();
+    assert_eq!(listed, vec!["gpt-4o-mini", "o3-mini"]);
+    assert!(gap.values_complete);
+}
+
+#[test]
+fn a_parameter_with_no_default_lists_what_callers_pass() {
+    let found = usages(&with_client(
+        "const ask = async (model: string) => client.chat.completions.create({ model, messages: [] });\nask(\"gpt-4o\");\nask(\"gpt-4o-mini\");\n",
+    ));
+    let gap = &gaps(&found, GapKind::UnresolvedModel)[0];
+    assert_eq!(gap.reason, "parameter");
+    assert_eq!(gap.values.len(), 2);
+    assert!(gap.values_complete);
+    assert_eq!(found.calls[0].symbol.as_deref(), Some("ask"));
+}
+
+#[test]
+fn destructured_parameter_defaults() {
+    let body = "function ask({ model = \"gpt-4o\", prompt }: { model?: string; prompt: string } = { prompt: \"\" }) {\n  return client.chat.completions.create({ model, messages: [] });\n}\nask({ prompt: \"hi\" });\n";
+    let (got, origin, gaps) = model_row(body);
+    assert_eq!(got.as_deref(), Some("gpt-4o"));
+    assert_eq!(origin, Some(ValueOrigin::ParameterDefault));
+    assert!(gaps.is_empty(), "{gaps:?}");
+    let (_, _, gaps) = model_row(&format!("{body}ask({{ prompt: \"x\", model: \"o1\" }});\n"));
+    assert_eq!(gaps, vec!["unresolved_model/parameter_overridden"]);
+    let (_, _, gaps) = model_row(&format!("{body}ask(options);\n"));
+    assert_eq!(gaps, vec!["unresolved_model/parameter_overridden"]);
+}
+
+#[test]
+fn method_and_constructor_parameter_defaults() {
+    // A public method: other modules may call it with another value.
+    let (_, _, gaps) = model_row(
+        "class Bot {\n  ask(model = \"gpt-4o\") {\n    return client.chat.completions.create({ model, messages: [] });\n  }\n}\n",
+    );
+    assert_eq!(gaps, vec!["unresolved_model/parameter_default"]);
+    // A private method's calls are all in the class.
+    let (got, _, gaps) = model_row(
+        "class Bot {\n  run() { return this.ask(); }\n  private ask(model = \"gpt-4o\") {\n    return client.chat.completions.create({ model, messages: [] });\n  }\n}\n",
+    );
+    assert_eq!(got.as_deref(), Some("gpt-4o"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+    // A constructor's calls are the class's `new` expressions.
+    let ctor = "class Bot {\n  constructor(private model = \"gpt-4o\") {}\n  ask() {\n    return client.chat.completions.create({ model: this.model, messages: [] });\n  }\n}\n";
+    let (got, _, gaps) = model_row(&format!("{ctor}new Bot().ask();\n"));
+    assert_eq!(got.as_deref(), Some("gpt-4o"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+    let (_, _, gaps) = model_row(&format!("{ctor}new Bot(\"gpt-4o-mini\").ask();\n"));
+    assert_eq!(gaps, vec!["unresolved_model/parameter_overridden"]);
+    let (_, _, gaps) = model_row(&format!("export {ctor}"));
+    assert!(
+        gaps.contains(&"unresolved_model/parameter_default".to_string()),
+        "{gaps:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Class properties
+// ---------------------------------------------------------------------------
+
+#[test]
+fn class_properties_assigned_once() {
+    let field = "class Bot {\n  private model = \"gpt-4o\";\n  ask() {\n    return client.chat.completions.create({ model: this.model, messages: [] });\n  }\n}\nnew Bot().ask();\n";
+    let (got, origin, gaps) = model_row(field);
+    assert_eq!(got.as_deref(), Some("gpt-4o"));
+    assert_eq!(origin, Some(ValueOrigin::ClassConstant));
+    assert!(gaps.is_empty(), "{gaps:?}");
+    // Assigned in the constructor instead.
+    let (got, _, gaps) = model_row(
+        "class Bot {\n  model: string;\n  constructor() { this.model = \"gpt-4o\"; }\n  ask() {\n    return client.chat.completions.create({ model: this.model, messages: [] });\n  }\n}\n",
+    );
+    assert_eq!(got.as_deref(), Some("gpt-4o"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+    // Exported: a subclass in another module may override it.
+    let (got, _, gaps) = model_row(&format!("export {field}"));
+    assert_eq!(got.as_deref(), Some("gpt-4o"));
+    assert_eq!(gaps, vec!["unresolved_model/subclass_override"]);
+    // A static property read by class name is confirmed.
+    let (got, _, gaps) = model_row(
+        "export class Bot {\n  static MODEL = \"gpt-4o\";\n}\nclient.chat.completions.create({ model: Bot.MODEL, messages: [] });\n",
+    );
+    assert_eq!(got.as_deref(), Some("gpt-4o"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn class_properties_other_code_may_change_are_gaps() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "class Bot {\n  model = \"gpt-4o\";\n  fast() { this.model = \"gpt-4o-mini\"; }\n  ask() { return client.chat.completions.create({ model: this.model, messages: [] }); }\n}\n",
+            "unresolved_model/reassigned",
+        ),
+        (
+            "class Bot {\n  model = \"gpt-4o\";\n  ask() { return client.chat.completions.create({ model: this.model, messages: [] }); }\n}\nconst bot = new Bot();\nbot.model = other;\n",
+            "unresolved_model/dynamic_feature",
+        ),
+        (
+            "class Bot {\n  @observable model = \"gpt-4o\";\n  ask() { return client.chat.completions.create({ model: this.model, messages: [] }); }\n}\n",
+            "unresolved_model/dynamic_feature",
+        ),
+        (
+            "class Bot {\n  model = \"gpt-4o\";\n  constructor(options: object) { Object.assign(this, options); }\n  ask() { return client.chat.completions.create({ model: this.model, messages: [] }); }\n}\n",
+            "unresolved_model/dynamic_feature",
+        ),
+        (
+            "class Bot {\n  get model() { return pick(); }\n  ask() { return client.chat.completions.create({ model: this.model, messages: [] }); }\n}\n",
+            "unresolved_model/dynamic_feature",
+        ),
+        (
+            "class Bot {\n  model = \"gpt-4o\";\n  ask() { return client.chat.completions.create({ model: this.model, messages: [] }); }\n}\nclass Fast extends Bot {\n  model = \"gpt-4o-mini\";\n}\n",
+            "unresolved_model/reassigned",
+        ),
+        (
+            "class Bot {\n  ask() { return client.chat.completions.create({ model: this.model, messages: [] }); }\n}\n",
+            "unresolved_model/attribute",
+        ),
+    ];
+    for (body, expected) in cases {
+        let (got, _, gaps) = model_row(body);
+        assert_eq!(got, None, "{body}");
+        assert_eq!(gaps, vec![expected.to_string()], "{body}");
+    }
+}
+
+#[test]
+fn this_in_a_plain_function_is_not_the_class() {
+    let (got, _, gaps) = model_row(
+        "class Bot {\n  model = \"gpt-4o\";\n  ask() {\n    return [1].map(function () { return client.chat.completions.create({ model: this.model, messages: [] }); });\n  }\n}\n",
+    );
+    assert_eq!(got, None);
+    assert_eq!(gaps, vec!["unresolved_model/attribute"]);
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic features and secrets
+// ---------------------------------------------------------------------------
+
+#[test]
+fn eval_and_with_make_values_and_routes_dynamic() {
+    for feature in ["eval(code);", "with (scope) { run(); }"] {
+        let found = usages(&with_client(&format!(
+            "{feature}\nconst MODEL = \"gpt-4o\";\nclient.chat.completions.create({{ model: MODEL, messages: [] }});\nclient.chat.completions.create({{ model: \"gpt-4o-mini\", messages: [] }});"
+        )));
+        let calls: Vec<_> = found
+            .calls
+            .iter()
+            .filter(|c| c.member == "chat.completions.create")
+            .collect();
+        // The constant is kept, with a gap; the literal at the call is
+        // never downgraded.
+        assert_eq!(value(calls[0], "model"), Some("gpt-4o"), "{feature}");
+        assert_eq!(
+            gaps_at(&found, calls[0]),
+            vec![
+                "unresolved_model/dynamic_feature",
+                "ambiguous_client/dynamic_feature"
+            ],
+            "{feature}"
+        );
+        assert_eq!(value(calls[1], "model"), Some("gpt-4o-mini"));
+        assert_eq!(
+            gaps_at(&found, calls[1]),
+            vec!["ambiguous_client/dynamic_feature"],
+            "{feature}"
+        );
+    }
+    // A local function named `eval` is not the builtin.
+    let found = usages(&with_client(
+        "function evaluate() {}\nconst eval2 = 1;\nclient.chat.completions.create({ model: \"gpt-4o\", messages: [] });",
+    ));
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn credentials_are_never_captured() {
+    let found = usages(
+        r#"
+import OpenAI from "openai";
+const API_KEY = "sk-proj-AbCdEf0123456789xyzABCDEFGH";
+const client = new OpenAI({ apiKey: API_KEY, baseURL: "https://user:hunter2@gateway.example/v1" });
+const SECRET_MODEL = "gpt-4o";
+client.chat.completions.create({ model: SECRET_MODEL, messages: [] });
+client.chat.completions.create({ model: "sk-ant-api03-AbCdEf0123456789", messages: [] });
+client.chat.completions.create({ model: process.env.OPENAI_API_KEY, messages: [] });
+client.chat.completions.create({ model: config.apiKey, messages: [] });
+"#,
+    );
+    let json = serde_json::to_string(&found).unwrap();
+    for secret in [
+        "sk-proj",
+        "hunter2",
+        "sk-ant-api03",
+        "OPENAI_API_KEY",
+        "gateway.example",
+    ] {
+        assert!(!json.contains(secret), "{secret} leaked: {json}");
+    }
+    let reasons: Vec<&str> = gaps(&found, GapKind::UnresolvedModel)
+        .iter()
+        .map(|g| g.reason.as_str())
+        .collect();
+    assert_eq!(
+        reasons,
+        vec!["credential", "credential", "env_var", "credential"]
+    );
+    assert!(found.calls.iter().all(|c| c.values.is_empty()));
+}
+
+// ---------------------------------------------------------------------------
+// Symbols
+// ---------------------------------------------------------------------------
+
+#[test]
+fn records_name_the_graph_symbol() {
+    let found = usages(
+        r#"
+import OpenAI from "openai";
+const client = new OpenAI();
+function top() { return client.models.list(); }
+export const arrow = async () => client.models.list();
+class Bot {
+  ask() {
+    function inner() { return client.models.list(); }
+    const local = () => client.models.list();
+    return [inner, local];
+  }
+  static build() { return client.models.list(); }
+  field = client.models.list();
+}
+export default {
+  async fetch() { return client.models.list(); },
+};
+describe("bot", () => {
+  it("lists models", async () => { await client.models.list(); });
+  it("works", () => client.models.list());
+  it("works", () => client.models.list());
+});
+const handler = function () { return client.models.list(); };
+client.models.list();
+"#,
+    );
+    let symbols: Vec<Option<&str>> = found.calls.iter().map(|c| c.symbol.as_deref()).collect();
+    assert_eq!(
+        symbols,
+        vec![
+            Some("top"),
+            Some("arrow"),
+            Some("Bot.inner"),
+            Some("local"),
+            Some("Bot.build"),
+            Some("Bot"),
+            Some("fetch"),
+            Some("it: lists models"),
+            Some("it: works (line 20)"),
+            Some("it: works (line 21)"),
+            None,
+            None,
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bounds
+// ---------------------------------------------------------------------------
+
+fn usages_within(source: &str, limit_secs: u64) -> FileUsages {
+    let started = std::time::Instant::now();
+    let found = usages(source);
+    let took = started.elapsed();
+    assert!(
+        took.as_secs() < limit_secs,
+        "took {took:?} for {} bytes",
+        source.len()
+    );
+    found
+}
+
+#[test]
+fn a_file_with_too_many_records_is_truncated() {
+    let mut source = with_client("");
+    for _ in 0..25_000 {
+        source.push_str("client.models.list();\n");
+    }
+    let found = usages_within(&source, 30);
+    let records = found.imports.len() + found.calls.len() + found.gaps.len() + found.clients.len();
+    assert_eq!(records, 20_001);
+    let last = found.gaps.last().unwrap();
+    assert_eq!(last.reason, "truncated");
+    assert_eq!(last.chain, None);
+}
+
+#[test]
+fn deeply_nested_scopes_are_not_analyzed() {
+    let mut source = with_client("");
+    for _ in 0..80 {
+        source.push_str("{ ");
+    }
+    source.push_str("client.chat.completions.create({ model: \"gpt-4o\", messages: [] });");
+    for _ in 0..80 {
+        source.push_str(" }");
+    }
+    source.push('\n');
+    let found = usages_within(&source, 10);
+    let truncated: Vec<_> = found
+        .gaps
+        .iter()
+        .filter(|g| g.reason == "truncated")
+        .collect();
+    assert_eq!(truncated.len(), 1);
+    assert!(found
+        .calls
+        .iter()
+        .all(|c| c.member != "chat.completions.create"));
+}
+
+#[test]
+fn a_long_call_chain_is_linear() {
+    let mut source = with_client("let x = client");
+    for _ in 0..20_000 {
+        source.push_str(".m()");
+    }
+    source.push_str(";\n");
+    let found = usages_within(&source, 10);
+    assert!(found.calls.len() <= 20_000);
+}
+
+#[test]
+fn long_chains_of_names_are_linear() {
+    let mut source = with_client("const m0 = \"gpt-4o\";\n");
+    for i in 1..2_000 {
+        source.push_str(&format!("const m{i} = m{} || m{};\n", i - 1, i - 1));
+    }
+    source.push_str("client.chat.completions.create({ model: m1999, messages: [] });\n");
+    let found = usages_within(&source, 10);
+    assert_eq!(found.calls.len(), 1);
+}
+
+#[test]
+fn many_callers_and_large_objects_stay_bounded() {
+    let mut source = with_client(
+        "function ask(model = \"gpt-4o\") { return client.chat.completions.create({ model, messages: [] }); }\n",
+    );
+    for i in 0..5_000 {
+        source.push_str(&format!("ask(\"m{i}\");\n"));
+    }
+    source.push_str("const BIG = {");
+    for i in 0..50_000 {
+        source.push_str(&format!(" k{i}: \"v{i}\","));
+    }
+    source.push_str(" model: \"gpt-4o\" };\n");
+    for _ in 0..2_000 {
+        source.push_str("client.chat.completions.create({ ...BIG, messages: [] });\n");
+    }
+    let found = usages_within(&source, 30);
+    let json = serde_json::to_string(&found).unwrap();
+    assert!(json.len() < 8_000_000, "{} bytes", json.len());
+}
+
+#[test]
+fn a_key_late_in_a_large_object_is_still_found() {
+    let mut source = with_client("const BIG = {");
+    for i in 0..1_000 {
+        source.push_str(&format!(" k{i}: \"v{i}\","));
+    }
+    source.push_str(" model: \"gpt-4o\" };\nclient.chat.completions.create({ ...BIG, messages: [] });\nclient.chat.completions.create(BIG);\n");
+    let found = usages(&source);
+    for c in &found.calls {
+        assert_eq!(value(c, "model"), Some("gpt-4o"));
+        assert_eq!(c.values[0].name.as_deref(), Some("BIG.model"));
+    }
+    assert!(
+        found.gaps.iter().all(|g| g.reason != "missing_model"),
+        "{:?}",
+        found.gaps
+    );
+}

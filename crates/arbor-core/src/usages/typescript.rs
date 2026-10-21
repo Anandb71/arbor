@@ -304,6 +304,8 @@ const MAX_WRITES_READ: usize = 64;
 const MAX_LITERAL_BYTES: usize = 4096;
 /// Object and array entries a search for nested model keys reads per call.
 const MAX_NESTED_ENTRIES: usize = 256;
+/// Spreads expanded per object literal; past it, a spread is opaque.
+const MAX_SPREADS: usize = 64;
 /// Nesting of object literals a search for nested model keys descends.
 const MAX_NESTED_DEPTH: usize = 4;
 /// Nested model values listed per call and per file. Past either, the call
@@ -868,9 +870,10 @@ enum Origin {
     /// `undefined`, `null` or a literal: ignored next to a real value.
     Placeholder,
     /// The result of calling or constructing something that is not a
-    /// tracked constructor.
+    /// tracked constructor: the callee (by node id, rendered only when a
+    /// gap names it).
     Factory {
-        callee: String,
+        callee: usize,
     },
     /// A parameter with no tracked annotation and no in-file caller that
     /// passes a known client.
@@ -1566,6 +1569,11 @@ struct Ctx<'t> {
     constructions: HashMap<usize, Client>,
     nested_left: usize,
     candidates_left: usize,
+    /// Callees of untracked calls, by node id, for gap details.
+    factory_nodes: HashMap<usize, Node<'t>>,
+    /// Object literals read (by node id), and those being read.
+    object_memo: HashMap<usize, Rc<ObjectRead<'t>>>,
+    reading_objects: HashSet<usize>,
     /// Child buffer reused by the walk.
     kids: Vec<(Node<'t>, Option<&'static str>)>,
 
@@ -1640,6 +1648,9 @@ impl<'t> Ctx<'t> {
             constructions: HashMap::new(),
             nested_left: MAX_FILE_NESTED_VALUES,
             candidates_left: MAX_FILE_CANDIDATES,
+            factory_nodes: HashMap::new(),
+            object_memo: HashMap::new(),
+            reading_objects: HashSet::new(),
             kids: Vec::new(),
             out: FileUsages::new(file, language),
         }
@@ -3668,7 +3679,9 @@ fn first_argument(call: Node<'_>) -> Option<Node<'_>> {
 /// `test.skip`, `test.each(rows)` (mirrors the graph's `test_callee`).
 fn test_callee(callee: Node<'_>, src: &str) -> Option<&'static str> {
     let mut current = callee;
-    loop {
+    // Runner chains are short (`test.each(rows)`, `it.only.each`): a long
+    // chain is not a test, and is not walked to its root.
+    for _ in 0..16 {
         match current.kind() {
             "identifier" => {
                 let name = src.get(current.byte_range())?;
@@ -3679,6 +3692,7 @@ fn test_callee(callee: Node<'_>, src: &str) -> Option<&'static str> {
             _ => return None,
         }
     }
+    None
 }
 
 // ============================================================================
@@ -4599,9 +4613,12 @@ impl<'t> Ctx<'t> {
                     _ => Val::Result(Some(client.pkg)),
                 }
             }
-            Val::Untracked(_) => Val::Untracked(Origin::Factory {
-                callee: self.render(function),
-            }),
+            Val::Untracked(_) => {
+                self.factory_nodes.insert(function.id(), function);
+                Val::Untracked(Origin::Factory {
+                    callee: function.id(),
+                })
+            }
             other => Val::Result(other.pkg()),
         }
     }
@@ -4644,9 +4661,10 @@ impl<'t> Ctx<'t> {
                 None => Val::Result(Some(pkg)),
             },
             Val::V3ConfigClass => self.v3_config(node, scope),
-            Val::Untracked(_) => Val::Untracked(Origin::Factory {
-                callee: format!("new {}", self.render(constructor)),
-            }),
+            Val::Untracked(_) => {
+                self.factory_nodes.insert(node.id(), node);
+                Val::Untracked(Origin::Factory { callee: node.id() })
+            }
             other => Val::Result(other.pkg()),
         }
     }
@@ -5233,26 +5251,187 @@ fn nth_argument(call: Node<'_>, n: usize) -> Option<Node<'_>> {
 // Options objects, arguments and callers
 // ============================================================================
 
-/// One property of an options object as read.
+/// One entry of an object literal as read.
 #[derive(Debug, Clone)]
 enum Entry<'t> {
-    /// A property with its value, the scope the value is written in, and the
-    /// name of the object it came from when it was not written at the call
-    /// (`PARAMS` for `create(PARAMS)` or `{ ...PARAMS }`).
+    /// A property with its value and the scope the value is written in.
     Pair {
         key: &'t str,
         value: Node<'t>,
         scope: usize,
-        via: Option<(String, ValueOrigin)>,
     },
-    /// A spread or a computed key: it may set any property.
+    /// A spread or a computed key this file cannot read: it may set any
+    /// property.
     Opaque,
+    /// `...OTHER` where `OTHER` is a same-file object literal that is only
+    /// read: its entries (read once), and the name it is reached by.
+    Spread(Rc<ObjectRead<'t>>, Option<(String, ValueOrigin)>),
 }
 
-/// An options object as read.
+/// An object literal's entries, read once per literal.
+#[derive(Debug, Default)]
+struct ObjectRead<'t> {
+    entries: Vec<Entry<'t>>,
+    /// The index of the last entry of each key written in this literal.
+    last: HashMap<&'t str, usize>,
+    /// The indexes of the spreads that were expanded.
+    spreads: Vec<usize>,
+    /// The index of the last opaque entry.
+    last_opaque: Option<usize>,
+    /// An entry here or in an expanded spread is opaque.
+    opaque: bool,
+    /// A spread is written in it.
+    spread: bool,
+}
+
+/// A key an object literal sets, with its last entry.
+#[derive(Debug, Clone)]
+struct FlatEntry<'t> {
+    key: &'t str,
+    value: Node<'t>,
+    scope: usize,
+    /// The object it came from when that is not the literal itself.
+    via: Option<(String, ValueOrigin)>,
+    /// An opaque entry written after it may replace it.
+    overridden: bool,
+}
+
+/// What sets a key of an object literal.
+#[derive(Debug, Clone)]
+struct Found<'t> {
+    /// The entry's value, its scope, and the name of the object it came
+    /// from when that is not the literal itself (a spread of `PARAMS`).
+    pair: Option<ObjectRef<'t>>,
+    /// A spread or computed key written after it (or inside the spread that
+    /// sets it) may replace it.
+    overridden: bool,
+    /// Not set by a known entry, but an opaque entry may set it.
+    maybe: bool,
+}
+
+impl<'t> ObjectRead<'t> {
+    /// The entry that sets `key`: a key written twice counts by its last
+    /// entry, and a spread written after an entry replaces it when the
+    /// spread's object sets the key.
+    fn find(&self, key: &str) -> Found<'t> {
+        let direct = self.last.get(key).copied();
+        let mut overridden = false;
+        for &at in self.spreads.iter().rev() {
+            if direct.is_some_and(|d| d > at) {
+                break;
+            }
+            let Entry::Spread(layer, via) = &self.entries[at] else {
+                continue;
+            };
+            let inner = layer.find(key);
+            let after = self.last_opaque.is_some_and(|o| o > at);
+            match inner.pair {
+                Some((value, scope, inner_via)) => {
+                    return Found {
+                        pair: Some((value, scope, inner_via.or_else(|| via.clone()))),
+                        overridden: overridden || inner.overridden || after,
+                        maybe: false,
+                    }
+                }
+                // This spread may set it.
+                None if inner.maybe => overridden = true,
+                None => {}
+            }
+        }
+        match direct.map(|d| (d, &self.entries[d])) {
+            Some((d, Entry::Pair { value, scope, .. })) => Found {
+                pair: Some((*value, *scope, None)),
+                overridden: overridden || self.last_opaque.is_some_and(|o| o > d),
+                maybe: false,
+            },
+            _ => Found {
+                pair: None,
+                overridden: false,
+                maybe: overridden || self.last_opaque.is_some(),
+            },
+        }
+    }
+
+    fn lookup(&self, key: &str) -> Lookup<'t> {
+        let found = self.find(key);
+        match found.pair {
+            Some((value, scope, _)) => Lookup::Found(value, found.overridden, scope),
+            None if found.maybe => Lookup::Opaque,
+            None => Lookup::Missing,
+        }
+    }
+
+    /// Every key the literal sets with its last entry, spreads expanded, in
+    /// source order, at most `limit` of them; whether the limit cut the
+    /// list; and whether an opaque entry may set keys not listed.
+    fn flat(&self, limit: usize) -> (Vec<FlatEntry<'t>>, bool, bool) {
+        let mut found = Vec::new();
+        let mut seen: HashSet<&'t str> = HashSet::new();
+        let mut opaque = false;
+        let mut complete = true;
+        self.flat_into(
+            None,
+            limit,
+            &mut found,
+            &mut seen,
+            &mut opaque,
+            &mut complete,
+            0,
+        );
+        found.reverse();
+        (found, !complete, opaque)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn flat_into(
+        &self,
+        via: Option<&(String, ValueOrigin)>,
+        limit: usize,
+        found: &mut Vec<FlatEntry<'t>>,
+        seen: &mut HashSet<&'t str>,
+        opaque: &mut bool,
+        complete: &mut bool,
+        depth: usize,
+    ) {
+        for entry in self.entries.iter().rev() {
+            if found.len() >= limit {
+                *complete = false;
+                return;
+            }
+            match entry {
+                Entry::Pair { key, value, scope } => {
+                    if seen.insert(key) {
+                        found.push(FlatEntry {
+                            key,
+                            value: *value,
+                            scope: *scope,
+                            via: via.cloned(),
+                            overridden: *opaque,
+                        });
+                    }
+                }
+                Entry::Opaque => *opaque = true,
+                Entry::Spread(layer, layer_via) if depth < 4 => {
+                    let inner = layer_via.as_ref().or(via);
+                    layer.flat_into(inner, limit, found, seen, opaque, complete, depth + 1);
+                }
+                Entry::Spread(..) => *opaque = true,
+            }
+        }
+    }
+}
+
+/// Records an entry that may set any property.
+fn push_opaque(read: &mut ObjectRead<'_>) {
+    read.last_opaque = Some(read.entries.len());
+    read.opaque = true;
+    read.entries.push(Entry::Opaque);
+}
+
+/// An options object as a call passes it.
 #[derive(Debug, Default)]
 struct Options<'t> {
-    entries: Vec<Entry<'t>>,
+    read: Rc<ObjectRead<'t>>,
     /// Property names written at the call, in source order.
     keys: Vec<String>,
     /// A spread is written in it, or it is not written at the call
@@ -5267,9 +5446,37 @@ struct Options<'t> {
     literal: bool,
     /// How the object reads when it is shown in a gap.
     shape: String,
+    /// The name the object is reached by when it is not written at the
+    /// call (`create(PARAMS)`).
+    via: Option<(String, ValueOrigin)>,
 }
 
-/// A property looked up in an options object.
+impl<'t> Options<'t> {
+    /// What sets `key`, with the name of the object it came from.
+    fn find(&self, key: &str) -> Found<'t> {
+        let mut found = self.read.find(key);
+        if let Some((_, _, via)) = &mut found.pair {
+            if via.is_none() {
+                *via = self.via.clone();
+            }
+        }
+        if found.pair.is_none() && self.opaque && !self.literal && self.read.entries.is_empty() {
+            found.maybe = true;
+        }
+        found
+    }
+
+    fn lookup(&self, key: &str) -> Lookup<'t> {
+        let found = self.find(key);
+        match found.pair {
+            Some((value, scope, _)) => Lookup::Found(value, found.overridden, scope),
+            None if found.maybe => Lookup::Opaque,
+            None => Lookup::Missing,
+        }
+    }
+}
+
+/// A property looked up in an object.
 #[derive(Debug, Clone, Copy)]
 enum Lookup<'t> {
     /// Its value and scope, and whether a spread or computed key written
@@ -5279,30 +5486,6 @@ enum Lookup<'t> {
     Missing,
     /// Not written, but a spread or computed key may set it.
     Opaque,
-}
-
-impl<'t> Options<'t> {
-    /// The last entry for `key` (a key written twice counts by its last
-    /// entry), and whether an opaque entry follows it.
-    fn entry(&self, key: &str) -> (Option<&Entry<'t>>, bool) {
-        let mut after = false;
-        for entry in self.entries.iter().rev() {
-            match entry {
-                Entry::Pair { key: k, .. } if *k == key => return (Some(entry), after),
-                Entry::Opaque => after = true,
-                Entry::Pair { .. } => {}
-            }
-        }
-        (None, after)
-    }
-
-    fn lookup(&self, key: &str) -> Lookup<'t> {
-        match self.entry(key) {
-            (Some(Entry::Pair { value, scope, .. }), after) => Lookup::Found(*value, after, *scope),
-            (_, true) => Lookup::Opaque,
-            _ => Lookup::Missing,
-        }
-    }
 }
 
 /// An argument a call passes for a parameter.
@@ -5348,29 +5531,27 @@ const READ_ONLY_CALLS: &[&str] = &[
 ];
 
 impl<'t> Ctx<'t> {
-    /// The entries of an object literal. A spread of a same-file object
-    /// literal that is only read is expanded in place; any other spread or
-    /// computed key is opaque.
-    fn object_entries(&mut self, object: Node<'t>, scope: usize) -> Options<'t> {
-        self.object_entries_at(object, scope, None, 0)
-    }
-
-    fn object_entries_at(
-        &mut self,
-        object: Node<'t>,
-        scope: usize,
-        via: Option<(String, ValueOrigin)>,
-        depth: u32,
-    ) -> Options<'t> {
-        let mut options = Options {
-            present: true,
-            shape: "{...}".to_string(),
-            ..Options::default()
-        };
+    /// The entries of an object literal, read once per literal. A spread of
+    /// a same-file object literal that is only read is expanded; any other
+    /// spread, and a computed key that is not a literal, is opaque.
+    fn object_entries(&mut self, object: Node<'t>, scope: usize) -> Rc<ObjectRead<'t>> {
+        if let Some(read) = self.object_memo.get(&object.id()) {
+            return Rc::clone(read);
+        }
+        // A literal spread into itself (through names) is read as opaque.
+        if !self.reading_objects.insert(object.id()) {
+            return Rc::new(ObjectRead {
+                opaque: true,
+                last_opaque: Some(0),
+                entries: vec![Entry::Opaque],
+                ..ObjectRead::default()
+            });
+        }
+        let mut read = ObjectRead::default();
         let mut cursor = object.walk();
         let entries: Vec<Node<'t>> = object.named_children(&mut cursor).collect();
-        for entry in entries.into_iter().take(MAX_NESTED_ENTRIES) {
-            match entry.kind() {
+        for entry in entries {
+            let pair = match entry.kind() {
                 "pair" => {
                     let (Some(key), Some(value)) = (
                         entry.child_by_field_name("key"),
@@ -5387,77 +5568,57 @@ impl<'t> Ctx<'t> {
                         _ => None,
                     };
                     match key {
-                        Some(key) => {
-                            if via.is_none() {
-                                options.keys.push(clip(key));
-                            }
-                            options.entries.push(Entry::Pair {
-                                key,
-                                value,
-                                scope,
-                                via: via.clone(),
-                            });
-                        }
+                        Some(key) => Some((key, value)),
                         None => {
-                            options.opaque = true;
-                            options.entries.push(Entry::Opaque);
+                            push_opaque(&mut read);
+                            continue;
                         }
                     }
                 }
-                "shorthand_property_identifier" => {
-                    let key = self.text(entry);
-                    if via.is_none() {
-                        options.keys.push(clip(key));
-                    }
-                    options.entries.push(Entry::Pair {
-                        key,
-                        value: entry,
-                        scope,
-                        via: via.clone(),
-                    });
-                }
-                "method_definition" => {
-                    if let Some(name) = entry
-                        .child_by_field_name("name")
-                        .and_then(|n| self.member_name(n))
-                    {
-                        if via.is_none() {
-                            options.keys.push(clip(name));
-                        }
-                        options.entries.push(Entry::Pair {
-                            key: name,
-                            value: entry,
-                            scope,
-                            via: via.clone(),
-                        });
-                    }
-                }
+                "shorthand_property_identifier" => Some((self.text(entry), entry)),
+                "method_definition" => entry
+                    .child_by_field_name("name")
+                    .and_then(|n| self.member_name(n))
+                    .map(|name| (name, entry)),
                 "spread_element" => {
-                    options.spread = true;
-                    let expanded = entry
-                        .named_child(0)
-                        .filter(|_| depth < 4)
+                    read.spread = true;
+                    let expanded = (read.spreads.len() < MAX_SPREADS)
+                        .then(|| entry.named_child(0))
+                        .flatten()
                         .and_then(|target| self.object_node(target, scope));
                     match expanded {
                         Some((inner, inner_scope, name)) => {
-                            let via = match name {
-                                Some(name) => Some(name),
-                                None => via.clone(),
-                            };
-                            let read = self.object_entries_at(inner, inner_scope, via, depth + 1);
-                            options.opaque |= read.opaque;
-                            options.entries.extend(read.entries);
+                            let layer = self.object_entries(inner, inner_scope);
+                            read.opaque |= layer.opaque;
+                            read.spreads.push(read.entries.len());
+                            read.entries.push(Entry::Spread(layer, name));
                         }
-                        None => {
-                            options.opaque = true;
-                            options.entries.push(Entry::Opaque);
-                        }
+                        None => push_opaque(&mut read),
                     }
+                    None
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some((key, value)) = pair {
+                read.last.insert(key, read.entries.len());
+                read.entries.push(Entry::Pair { key, value, scope });
             }
         }
-        options
+        self.reading_objects.remove(&object.id());
+        let read = Rc::new(read);
+        self.object_memo.insert(object.id(), Rc::clone(&read));
+        read
+    }
+
+    /// The property names written in an object literal, in source order.
+    fn written_keys(read: &ObjectRead<'t>) -> Vec<String> {
+        read.entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Pair { key, .. } => Some(clip(key)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The options object a call passes at position `index`.
@@ -5485,10 +5646,19 @@ impl<'t> Ctx<'t> {
         };
         let expr = unwrap_expression(arg);
         match expr.kind() {
-            "object" => Options {
-                literal: true,
-                ..self.object_entries(expr, scope)
-            },
+            "object" => {
+                let read = self.object_entries(expr, scope);
+                Options {
+                    keys: Self::written_keys(&read),
+                    spread: read.spread,
+                    opaque: read.opaque,
+                    present: true,
+                    literal: true,
+                    shape: "{...}".to_string(),
+                    via: None,
+                    read,
+                }
+            }
             // A prompt, a file or a callback, not an options object.
             "string"
             | "template_string"
@@ -5502,10 +5672,17 @@ impl<'t> Ctx<'t> {
             | "undefined" => Options::default(),
             _ => match self.object_node(expr, scope) {
                 Some((object, object_scope, via)) => {
-                    let mut read = self.object_entries_at(object, object_scope, via, 0);
-                    read.spread = true;
-                    read.shape = self.render(expr);
-                    read
+                    let read = self.object_entries(object, object_scope);
+                    Options {
+                        spread: true,
+                        opaque: read.opaque,
+                        present: true,
+                        literal: false,
+                        shape: self.render(expr),
+                        via,
+                        keys: Vec::new(),
+                        read,
+                    }
                 }
                 None => Options {
                     spread: true,
@@ -5609,7 +5786,7 @@ impl<'t> Ctx<'t> {
                             unwrap_expression(*value).kind(),
                             "string" | "template_string" | "number" | "true" | "false" | "null"
                         ),
-                        Entry::Opaque => true,
+                        Entry::Opaque | Entry::Spread(..) => true,
                     });
             };
             let read = self.object_entries(unwrap_expression(current), current_scope);
@@ -6159,15 +6336,12 @@ impl<'t> Ctx<'t> {
                 return Err(Unresolved::new("credential", shape));
             }
             label = label.map(|l| clip(&format!("{l}.{key}")));
-            let (entry, overridden) = read.entry(key);
-            let (value, value_scope, entry_via) = match entry {
-                Some(Entry::Pair {
-                    value, scope, via, ..
-                }) => (*value, *scope, via.clone()),
-                Some(Entry::Opaque) | None if overridden => {
-                    return Err(Unresolved::new("splat", shape));
-                }
-                _ => return Err(Unresolved::new("missing", shape)),
+            let found = read.find(key);
+            let overridden = found.overridden;
+            let (value, value_scope, entry_via) = match found.pair {
+                Some(pair) => pair,
+                None if found.maybe => return Err(Unresolved::new("splat", shape)),
+                None => return Err(Unresolved::new("missing", shape)),
             };
             if let Some((name, _)) = &entry_via {
                 label = Some(clip(&format!("{name}.{key}")));
@@ -6372,28 +6546,16 @@ impl<'t> Ctx<'t> {
             }
         }
         let read = self.object_entries(current, current_scope);
+        // A key written twice counts by its last entry.
+        let (entries, cut, opaque) = read.flat(MAX_CANDIDATES + 1);
         let mut found = Vec::new();
-        let mut complete = !read.opaque;
-        let mut seen: HashSet<&str> = HashSet::new();
-        for entry in read.entries.iter().rev() {
-            let Entry::Pair {
-                key, value, scope, ..
-            } = entry
-            else {
-                continue;
-            };
-            // A key written twice counts by its last entry.
-            if !seen.insert(key) {
-                continue;
-            }
-            if found.len() > MAX_CANDIDATES {
-                complete = false;
-                break;
-            }
-            match self.resolve_value(*value, *scope, depth + 1) {
+        let mut complete = !cut && !opaque && entries.len() <= MAX_CANDIDATES;
+        for entry in entries.into_iter().take(MAX_CANDIDATES) {
+            match self.resolve_value(entry.value, entry.scope, depth + 1) {
                 Ok(resolved) => {
                     complete &= resolved.is_certain();
-                    let resolved = match &via {
+                    let name = entry.via.as_ref().or(via.as_ref());
+                    let resolved = match name {
                         Some((name, origin)) => resolved.constant(&format!("{name}[...]"), *origin),
                         None => resolved,
                     };
@@ -6402,7 +6564,6 @@ impl<'t> Ctx<'t> {
                 Err(_) => complete = false,
             }
         }
-        found.reverse();
         Err(Unresolved::new("subscript", shape.to_string()).with_candidates(found, complete))
     }
 
@@ -6961,14 +7122,9 @@ impl<'t> Ctx<'t> {
         }
 
         for key in super::VALUE_KEYS {
-            let (entry, overridden) = options.entry(key);
-            let Some(Entry::Pair {
-                value,
-                scope: value_scope,
-                via,
-                ..
-            }) = entry.cloned()
-            else {
+            let found = options.find(key);
+            let overridden = found.overridden;
+            let Some((value, value_scope, via)) = found.pair else {
                 continue;
             };
             if !is_value_key(key) {
@@ -7206,19 +7362,23 @@ impl<'t> Ctx<'t> {
         let mut cut = false;
         // (node, scope, path prefix, may be replaced, depth)
         let mut work: Vec<(Node<'t>, usize, String, bool, usize)> = Vec::new();
-        let mut seen: HashSet<&str> = HashSet::new();
-        for entry in options.entries.iter().rev() {
-            let Entry::Pair {
-                key, value, scope, ..
-            } = entry
-            else {
-                continue;
-            };
-            if !seen.insert(key) || !is_identifier_key(key) || is_value_key(key) {
+        let (entries, read_cut, _) = options.read.flat(left);
+        cut |= read_cut;
+        left -= entries.len();
+        for entry in entries.into_iter().rev() {
+            if !is_identifier_key(entry.key) || is_value_key(entry.key) {
                 continue;
             }
-            let (_, replaced) = options.entry(key);
-            work.push((*value, *scope, format!("{key}."), replaced, 1));
+            if matches!(unwrap_expression(entry.value).kind(), "object" | "array") {
+                let replaced = entry.overridden || options.read.find(entry.key).overridden;
+                work.push((
+                    entry.value,
+                    entry.scope,
+                    format!("{}.", entry.key),
+                    replaced,
+                    1,
+                ));
+            }
         }
         while let Some((node, scope, prefix, replaced, depth)) = work.pop() {
             if depth > MAX_NESTED_DEPTH {
@@ -7228,36 +7388,32 @@ impl<'t> Ctx<'t> {
             match node.kind() {
                 "object" => {
                     let read = self.object_entries(node, scope);
-                    let mut keys: HashSet<&str> = HashSet::new();
-                    for entry in read.entries.iter().rev() {
-                        if left == 0 {
-                            cut = true;
-                            break;
-                        }
-                        left -= 1;
-                        let Entry::Pair {
-                            key, value, scope, ..
-                        } = entry
-                        else {
-                            continue;
-                        };
-                        // A key written twice counts by its last entry, and
-                        // nothing under a secret-shaped key is read.
-                        if !keys.insert(key) || !is_identifier_key(key) {
+                    // A key written twice counts by its last entry.
+                    let (entries, read_cut, _) = read.flat(left);
+                    cut |= read_cut;
+                    left -= entries.len();
+                    for entry in entries {
+                        // Nothing under a secret-shaped key is read.
+                        if !is_identifier_key(entry.key) {
                             continue;
                         }
-                        let (_, after) = read.entry(key);
-                        let path = format!("{prefix}{key}");
-                        if is_value_key(key) {
+                        let after = entry.overridden || read.find(entry.key).overridden;
+                        let path = format!("{prefix}{}", entry.key);
+                        if is_value_key(entry.key) {
                             if replaced || after {
                                 overridden.push(path);
-                            } else if let Ok(resolved) = self.resolve_value(*value, *scope, 0) {
+                            } else if let Ok(resolved) =
+                                self.resolve_value(entry.value, entry.scope, 0)
+                            {
                                 found.push(NestedValue { path, resolved });
                             }
-                        } else {
+                        } else if matches!(
+                            unwrap_expression(entry.value).kind(),
+                            "object" | "array"
+                        ) {
                             work.push((
-                                *value,
-                                *scope,
+                                entry.value,
+                                entry.scope,
                                 format!("{path}."),
                                 replaced || after,
                                 depth + 1,
@@ -7537,11 +7693,20 @@ impl<'t> Ctx<'t> {
         }
         let root = chain_root(&chain);
         let (reason, detail, sdk) = match &origin {
-            Origin::Factory { callee } => (
-                "factory_call",
-                format!("`{root}` comes from `{callee}`, which is not a tracked SDK constructor"),
-                shape_sdk,
-            ),
+            Origin::Factory { callee } => {
+                let callee = self
+                    .factory_nodes
+                    .get(callee)
+                    .map(|node| self.render(*node))
+                    .unwrap_or_default();
+                (
+                    "factory_call",
+                    format!(
+                        "`{root}` comes from `{callee}`, which is not a tracked SDK constructor"
+                    ),
+                    shape_sdk,
+                )
+            }
             Origin::Parameter { name } => (
                 "parameter",
                 format!("`{root}` comes from parameter `{name}`, which has no SDK type annotation and no in-file caller that passes a known client"),
