@@ -1768,3 +1768,22 @@ fn a_key_late_in_a_large_object_is_still_found() {
         found.gaps
     );
 }
+
+#[test]
+fn model_keys_in_positional_literals_are_captured() {
+    let found = usages(
+        r#"
+import Anthropic, { betaRefusalFallbackMiddleware } from "@anthropic-ai/sdk";
+const client = new Anthropic({
+  middleware: [betaRefusalFallbackMiddleware([{ model: "claude-opus-4-8" }])],
+});
+await client.messages.create({ model: "claude-fable-5", max_tokens: 10, messages: [] }, { timeout: 5 });
+"#,
+    );
+    let middleware = call(&found, "betaRefusalFallbackMiddleware");
+    assert_eq!(value(middleware, "model"), Some("claude-opus-4-8"));
+    assert!(middleware.values[0].positional);
+    let create = call(&found, "client.messages.create");
+    assert_eq!(create.values.len(), 1);
+    assert_eq!(create.positional, 1);
+}

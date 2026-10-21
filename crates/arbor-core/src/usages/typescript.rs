@@ -130,6 +130,7 @@ const REQUEST_METHODS: &[&str] = &[
     "upload",
     "download",
     "content",
+    "listEvents",
     "compact",
     "count",
     "runTools",
@@ -6834,7 +6835,21 @@ struct Site<'a, 't> {
 /// A model value found inside a nested object or array of the options.
 struct NestedValue {
     path: String,
+    /// Found in a literal passed by position, not in the options object.
+    positional: bool,
     resolved: Resolved,
+}
+
+/// A container literal a search for nested model keys still has to read.
+struct NestedWork<'t> {
+    node: Node<'t>,
+    scope: usize,
+    /// The key path so far (`requests.params.`).
+    prefix: String,
+    /// A spread or computed key after an enclosing entry may replace it.
+    replaced: bool,
+    depth: usize,
+    positional: bool,
 }
 
 impl<'t> Ctx<'t> {
@@ -7142,7 +7157,9 @@ impl<'t> Ctx<'t> {
             self.take_value(&site, key, false, result, &mut values);
         }
 
-        let (nested, nested_overridden, nested_cut) = self.nested_values(&options);
+        let positional_literals = self.positional_literals(call, &options);
+        let (nested, nested_overridden, nested_cut) =
+            self.nested_values(&options, &positional_literals, scope);
         self.take_nested(&site, nested, nested_cut, &mut values);
         if site.gap_worthy {
             let mut seen = HashSet::new();
@@ -7343,16 +7360,21 @@ impl<'t> Ctx<'t> {
     }
 
     /// Model values nested in the options' object and array literals
-    /// (`requests: [{ params: { model } }]`): the values, the key paths a
-    /// later spread or computed key may replace, and whether a limit cut
-    /// the read.
-    fn nested_values(&mut self, options: &Options<'t>) -> (Vec<NestedValue>, Vec<String>, bool) {
+    /// (`requests: [{ params: { model } }]`) and in object and array
+    /// literals passed by position (`fallback([{ model }])`): the values,
+    /// the key paths a later spread or computed key may replace, and whether
+    /// a limit cut the read.
+    fn nested_values(
+        &mut self,
+        options: &Options<'t>,
+        positional: &[Node<'t>],
+        scope: usize,
+    ) -> (Vec<NestedValue>, Vec<String>, bool) {
         let mut found = Vec::new();
         let mut overridden = Vec::new();
         let mut left = MAX_NESTED_ENTRIES;
         let mut cut = false;
-        // (node, scope, path prefix, may be replaced, depth)
-        let mut work: Vec<(Node<'t>, usize, String, bool, usize)> = Vec::new();
+        let mut work: Vec<NestedWork<'t>> = Vec::new();
         let (entries, read_cut, _) = options.read.flat(left);
         cut |= read_cut;
         left -= entries.len();
@@ -7362,23 +7384,34 @@ impl<'t> Ctx<'t> {
             }
             if matches!(unwrap_expression(entry.value).kind(), "object" | "array") {
                 let replaced = entry.overridden || options.read.find(entry.key).overridden;
-                work.push((
-                    entry.value,
-                    entry.scope,
-                    format!("{}.", entry.key),
+                work.push(NestedWork {
+                    node: entry.value,
+                    scope: entry.scope,
+                    prefix: format!("{}.", entry.key),
                     replaced,
-                    1,
-                ));
+                    depth: 1,
+                    positional: false,
+                });
             }
         }
-        while let Some((node, scope, prefix, replaced, depth)) = work.pop() {
-            if depth > MAX_NESTED_DEPTH {
+        for node in positional.iter().rev() {
+            work.push(NestedWork {
+                node: *node,
+                scope,
+                prefix: String::new(),
+                replaced: false,
+                depth: 1,
+                positional: true,
+            });
+        }
+        while let Some(item) = work.pop() {
+            if item.depth > MAX_NESTED_DEPTH {
                 continue;
             }
-            let node = unwrap_expression(node);
+            let node = unwrap_expression(item.node);
             match node.kind() {
                 "object" => {
-                    let read = self.object_entries(node, scope);
+                    let read = self.object_entries(node, item.scope);
                     // A key written twice counts by its last entry.
                     let (entries, read_cut, _) = read.flat(left);
                     cut |= read_cut;
@@ -7389,40 +7422,52 @@ impl<'t> Ctx<'t> {
                             continue;
                         }
                         let after = entry.overridden || read.find(entry.key).overridden;
-                        let path = format!("{prefix}{}", entry.key);
+                        let path = format!("{}{}", item.prefix, entry.key);
                         if is_value_key(entry.key) {
-                            if replaced || after {
+                            if item.replaced || after {
                                 overridden.push(path);
                             } else if let Ok(resolved) =
                                 self.resolve_value(entry.value, entry.scope, 0)
                             {
-                                found.push(NestedValue { path, resolved });
+                                found.push(NestedValue {
+                                    path,
+                                    positional: item.positional,
+                                    resolved,
+                                });
                             }
                         } else if matches!(
                             unwrap_expression(entry.value).kind(),
                             "object" | "array"
                         ) {
-                            work.push((
-                                entry.value,
-                                entry.scope,
-                                format!("{path}."),
-                                replaced || after,
-                                depth + 1,
-                            ));
+                            work.push(NestedWork {
+                                node: entry.value,
+                                scope: entry.scope,
+                                prefix: format!("{path}."),
+                                replaced: item.replaced || after,
+                                depth: item.depth + 1,
+                                positional: item.positional,
+                            });
                         }
                     }
                 }
                 "array" => {
                     let mut cursor = node.walk();
                     let items: Vec<Node<'t>> = node.named_children(&mut cursor).collect();
-                    for item in items {
+                    for child in items {
                         if left == 0 {
                             cut = true;
                             break;
                         }
                         left -= 1;
-                        if matches!(item.kind(), "object" | "array") {
-                            work.push((item, scope, prefix.clone(), replaced, depth + 1));
+                        if matches!(child.kind(), "object" | "array") {
+                            work.push(NestedWork {
+                                node: child,
+                                scope: item.scope,
+                                prefix: item.prefix.clone(),
+                                replaced: item.replaced,
+                                depth: item.depth + 1,
+                                positional: item.positional,
+                            });
                         }
                     }
                 }
@@ -7431,6 +7476,27 @@ impl<'t> Ctx<'t> {
         }
         found.sort_by_key(|n| n.resolved.span.start_byte);
         (found, overridden, cut)
+    }
+
+    /// Object and array literals a call passes by position, other than its
+    /// options object.
+    fn positional_literals(&self, call: Node<'t>, options: &Options<'t>) -> Vec<Node<'t>> {
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            return Vec::new();
+        };
+        let mut cursor = arguments.walk();
+        let args: Vec<Node<'t>> = arguments
+            .named_children(&mut cursor)
+            .filter(|a| a.kind() != "comment")
+            .collect();
+        args.into_iter()
+            .enumerate()
+            .filter(|(index, arg)| {
+                let literal = matches!(unwrap_expression(*arg).kind(), "object" | "array");
+                literal && !(*index == 0 && options.literal)
+            })
+            .map(|(_, arg)| arg)
+            .collect()
     }
 
     /// Attaches a resolved value to `key`, or reports why it did not
@@ -7504,7 +7570,7 @@ impl<'t> Ctx<'t> {
             }
             listed += 1;
             self.nested_left -= 1;
-            self.take_value(site, &item.path, false, Ok(item.resolved), values);
+            self.take_value(site, &item.path, item.positional, Ok(item.resolved), values);
         }
         if (dropped || read_cut) && site.gap_worthy {
             let chain = site.chain;
