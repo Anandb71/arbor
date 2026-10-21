@@ -1,8 +1,8 @@
 # SDK usages: what a report confirms
 
-`arbor usages` and the MCP tool `find_api_usages` list where a Python project
-calls the OpenAI, Anthropic and Gemini SDKs, with each call's routing and model
-values. A consumer (a codemod, a reviewer) should treat the report this way:
+`arbor usages` and the MCP tool `find_api_usages` list where a Python,
+TypeScript or JavaScript project calls the OpenAI, Anthropic and Gemini SDKs,
+with each call's routing and model values. A consumer (a codemod, a reviewer) should treat the report this way:
 
 - **A value or route with no gap at its call is confirmed.** It comes from one
   of the shapes in the supported grammar below, and nothing in the file can
@@ -17,6 +17,10 @@ special case for each one, the extractor resolves a small grammar exactly, and
 turns everything outside it into a gap. That includes a list of dynamic
 features that can change a resolved name, class or dict. A wrong value with no
 gap inside this grammar is a bug. A shape outside it is reported as a gap.
+
+The sections up to [TypeScript and JavaScript](#typescript-and-javascript)
+describe the Python extractor; that section states the TypeScript one, which
+keeps the same contract.
 
 ## Supported grammar
 
@@ -408,3 +412,274 @@ generators of each later review:
   400,000-key dict expanded at 10,000 calls), and the 3 MB scale files about
   3.3 s and 780 MB, bound by the tree-sitter parse;
 - 4 MiB: about 5 s and 1 GB, bound by the parse.
+
+## TypeScript and JavaScript
+
+The same contract holds for `.ts`, `.tsx`, `.mts` and `.cts` files (language
+`typescript`) and `.js`, `.jsx`, `.mjs` and `.cjs` files (language
+`javascript`, parsed with the TSX grammar). Declaration files (`.d.ts`,
+`.d.mts`, `.d.cts`) declare types and send no request, so they are skipped like
+`.pyi` stubs. The records, routes and gap kinds are the ones above; this
+section states the grammar the TypeScript extractor
+(`crates/arbor-core/src/usages/typescript.rs`) confirms.
+
+JavaScript scopes names lexically, and nothing but an assignment written in the
+file rebinds one; `eval` and `with` are the exceptions (see
+[Dynamic features](#dynamic-features-1)). A binding is visible in all of its
+scope (hoisting and the temporal dead zone), so resolution is
+flow-insensitive: a name reads the same everywhere it is in scope, and a name
+written more than once is a `reassigned` gap that lists what it may hold.
+
+### Packages and imports
+
+The tracked packages are `openai`, `@anthropic-ai/sdk`,
+`@anthropic-ai/bedrock-sdk`, `@anthropic-ai/vertex-sdk`,
+`@anthropic-ai/foundry-sdk`, `@anthropic-ai/aws-sdk`, `@google/genai` and
+`@google/generative-ai`, with any version (`openai@4`), a Deno `npm:`
+specifier, `jsr:@openai/openai`, or a CDN URL (`esm.sh`, `cdn.skypack.dev`,
+`esm.run`, `unpkg.com`, `cdn.jsdelivr.net/npm/`, `deno.land/x/openai`). A
+subpath that exports the clients (`openai/index`, `openai/azure`,
+`@google/genai/node`) counts as the package; any other subpath
+(`openai/resources/chat`) binds types and helpers.
+
+Every way a file binds one of them is an import record:
+
+- ESM: `import OpenAI from`, `import { AzureOpenAI as Az } from`,
+  `import * as oa from`, `import OpenAI, { toFile } from`, and `import type`
+  (a type only: it names a class for an annotation, never a value);
+- TypeScript's `import OpenAI = require("openai")`;
+- CommonJS: `const OpenAI = require("openai")`, `const { OpenAI } =
+  require("openai")`, `const { default: OpenAI } = require("openai")`,
+  `require("openai").default`;
+- dynamic `import()`: `const { default: OpenAI } = await import("openai")`,
+  `const mod = await import("@anthropic-ai/sdk")`.
+
+`require("openai")` and `require("@anthropic-ai/sdk")` are the module object,
+which is also callable as the default client (`new (require("openai"))()`); a
+default import of `@google/genai` or `@google/generative-ai`, which have no
+default export, is the module object too.
+
+### Model values
+
+These are reported with no gap (`model`, and the other keys in `VALUE_KEYS`):
+
+1. **A string literal at the call**, or a template literal with no
+   substitution, with no escape sequence. TypeScript SDK methods take one
+   options object, so the value is a property of it
+   (`create({ model: "gpt-4o" })`), or of an object or array literal nested in
+   it under identifier-shaped keys (`requests: [{ params: { model } }]` is
+   `requests.params.model`). A literal written at the call is never
+   downgraded.
+   - A property counts only when no spread or computed key this file cannot
+     read is written after it in that literal: `{ model: "gpt-4o",
+     ...overrides }` is a `splat` gap that lists `gpt-4o`; `{ ...base, model:
+     "gpt-4o" }` is confirmed. A key written twice counts by its last entry.
+2. **A name bound once**: a `const`, or a `let` or `var` that the file assigns
+   only in its declaration, whose value resolves under these rules. A
+   destructured name reads the property it names (`const { model } = CONFIG`).
+3. **A property of a same-file object literal that is only read**:
+   `MODELS.fast`, `MODELS["fast"]`, `CONFIG.openai.model`, a spread of it
+   (`{ ...PARAMS, messages }`), or the options object itself
+   (`create(PARAMS)`). The object's name must be bound once to an object
+   literal (`as const` and `satisfies` are fine), and every use of the name
+   must read it: a static or computed member read, a spread, a
+   destructuring, or passing it to an SDK request or a read-only builtin
+   (`JSON.stringify`, `console.*`, `Object.keys`, `Object.values`,
+   `Object.entries`, `Object.freeze`, `structuredClone`, `String`...). A
+   write into it (`MODELS.fast = ...`, `delete MODELS.fast`,
+   `Object.assign(MODELS, ...)`), a method call on it, passing it anywhere else,
+   or reading a nested object or array of it into anything but such a call
+   makes every read of it an `attribute` gap. A spread of such an object is
+   read in place; a property it sets replaces the ones written before the
+   spread. A run-time key (`MODELS[tier]`) is a `subscript` gap that lists
+   every entry, with `values_complete` when the literal holds nothing else.
+4. **A member of a same-file `enum`** with a string value (`Model.Fast`).
+5. **A class property assigned once**, read through `this` in the class's own
+   code (a method, the constructor, a field initializer, a static block, and
+   the arrow functions inside them, but not a `function` nested in them) or by
+   class name for a static one (`Bot.MODEL`). The assignment is a field
+   initializer (`private model = "gpt-4o"`), one `this.model = ...` anywhere in
+   the class, or a constructor parameter property
+   (`constructor(private model = "gpt-4o")`, which then follows rule 6). It
+   holds when:
+   - no decorator is written on the class or any of its members;
+   - the class has no write of `this` under a name known only at run time
+     (`this[key] = v`, `Object.assign(this, ...)`, `Object.defineProperty(this,
+     ...)`), no computed member name, and no method, getter, setter or
+     `accessor` with the property's name;
+   - no other object in the file has a property of that name written
+     (`bot.model = ...`, `other.config.model = ...`);
+   - it has at most one same-file base, which has none of its own, and at
+     most 16 direct same-file subclasses, which have none of their own. A
+     subclass's own assignment is another write (`reassigned`), and so is a
+     field a subclass declares with no value, which resets the property.
+
+   Read through `this` in a class another module may extend (it is exported,
+   anonymous, or passed or stored), the value keeps a `subclass_override` gap.
+   Reads by class name are confirmed.
+6. **A parameter default, when every call of the function is in this file**
+   and none passes another value. The calls are all seen for:
+   - a function declaration, or a `const` bound to an arrow function or
+     function expression, that is not exported (`export`, `export default`,
+     `export { f }`, `module.exports`, `exports.f`) and whose name is only ever
+     called directly (`f(...)`; `f.call`, `f.bind`, `new f()` or passing `f`
+     anywhere make them unseen);
+   - a `private` or `#private` method or class-field function: every call of
+     its name in the file is listed;
+   - the constructor of a class that is not exported, is only constructed by
+     name (`new Bot(...)`), has no same-file subclass and no `new this()`.
+
+   A destructured parameter reads the property each call passes
+   (`function ask({ model = "gpt-4o" } = {})`). A call that passes nothing or
+   `undefined` takes the default; a spread argument at or before the position
+   is unknown. Otherwise the default is reported with a gap:
+   `parameter_overridden` (an in-file call passes another value, listed),
+   `parameter_default` (the function is exported, or is a public method) or
+   `unseen_callers` (it is passed, stored, used as a callback or a method of
+   an object literal).
+
+The literal fallback of an environment lookup (`process.env.MODEL ??
+"gpt-4o"`, `|| "gpt-4o"`) is captured with origin `env_default` and keeps its
+`env_var` gap. So is the fallback of a property or parameter lookup
+(`options.model ?? "gpt-4o"`, `const { model = "gpt-4o" } = options`), which
+keeps the lookup's own gap (`attribute`, `parameter`). An environment lookup
+is `process.env.X`, `process.env["X"]`, `import.meta.env.X`, `Bun.env.X`,
+`Deno.env.get("X")`, or a name destructured from or bound to `process.env`; the
+variable's name is never reported (`process.env[...]`).
+
+Anything else is a typed gap: `f_string` (a template literal with a
+substitution), `conditional` (a ternary, or `??`/`||` whose left side is not
+known, with the known sides listed), `function_call`, `attribute`,
+`subscript`, `reassigned` (a loop variable lists the items of a literal array
+it runs over), `imported_name`, `unbound`, `parameter`, `non_literal`
+(concatenation, an escape sequence), `credential`, `splat` and
+`missing_model`. A credential-shaped value, a secret-named binding or key, and
+anything reached through one are refused exactly as in Python.
+
+### Routes
+
+A call's routing is confirmed when its receiver reaches it through the value
+rules above (one kind of client per name; `null` and `undefined` assigned next
+to a client are ignored, so a lazily built client resolves), through `this` (a
+class property under rule 5, without the `subclass_override` gap, as in
+Python), or through a parameter that every in-file caller of a function whose
+calls are all seen passes. For an exported function the routing those callers
+pass keeps an `in_file_callers` gap. A parameter known only by a type
+annotation that names a tracked class (`client: OpenAI`,
+`private azure: AzureOpenAI`) routes by its class: Azure, Bedrock and Vertex
+are confirmed; a direct class is `unknown` with an `annotation` gap, since its
+options are not seen.
+
+The receiver must be one of these:
+
+- **A client from a tracked constructor**: `new OpenAI(...)` (and
+  `require("openai")`), `AzureOpenAI`, `Anthropic`, `AnthropicBedrock`,
+  `AnthropicVertex`, `GoogleGenAI`, `GoogleGenerativeAI`, and openai v3's
+  `new OpenAIApi(new Configuration({ basePath }))` or `new OpenAIApi(config,
+  basePath)`. `BedrockOpenAI`, `AnthropicBedrockMantle`, `AnthropicFoundry`,
+  `AnthropicAws` and `new OpenAI({ provider })` route `unknown`. `baseURL` (and
+  v3's `basePath`) routes by host with the table above; a spread or an options
+  object built elsewhere that may hold one is `base_url_unresolved`.
+  `client.withOptions({ baseURL })` re-routes the copy it returns.
+- **A Gemini client** also needs no `vertexai` or `enterprise` option other
+  than `false`, `null` or `undefined`, no `httpOptions` that names a
+  `baseUrl` (or is not an object literal), no spread, and no
+  `setDefaultBaseUrls(...)` call in the file: each routes `unknown` with an
+  `endpoint_option` gap, and `vertexai`/`enterprise` sets the construction's
+  `vertexai` field. OpenAI's `dataResidency` option gets the same gap.
+- **A model or chat built by a client**: `genAI.getGenerativeModel({ model },
+  requestOptions)` (an `endpoint_option` gap when the request options name a
+  `baseUrl`), `model.startChat()` and `ai.chats.create(...)` keep the client's
+  routing.
+
+The file must not:
+
+- set the SDK's endpoint variable through `process.env` (`endpoint_env`):
+  `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_PROFILE`,
+  `ANTHROPIC_CONFIG_DIR` (an Anthropic profile may name a `base_url`),
+  `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_GENAI_USE_ENTERPRISE`,
+  `GOOGLE_GEMINI_BASE_URL` or `GOOGLE_VERTEX_BASE_URL`;
+- write the environment under a name known only at run time
+  (`process.env[key] = v`, `Object.assign(process.env, ...)`, through an alias
+  of `process.env`): a `dynamic_feature` gap;
+- assign `baseURL` to the client after it is built (`base_url_assigned`), or to
+  an object it cannot identify (`dynamic_feature`);
+- replace an SDK member (`client.chat.completions.create = fn`,
+  `OpenAI.prototype.x = ...`) or mock the SDK in a test (`jest.mock("openai")`,
+  `vi.mock`, `vi.spyOn(client.chat.completions, "create")`): every route of
+  that package is a `dynamic_feature` gap. Settings such as `client.apiKey`,
+  `maxRetries` or `timeout` change nothing.
+
+### Calls
+
+A call's `member` is its path after the tracked root
+(`chat.completions.create`); optional chaining and `!` are dropped from it
+and kept in `chain`. `request` is true when the last member is a request
+method (`create`, `stream`, `parse`, `runTools`, `generateContent`,
+`sendMessage`, `countTokens`, openai v3's `createChatCompletion`...).
+`.withResponse()` and `.asResponse()` on a request's promise are not calls of
+their own. openai v3's `createTranscription(file, model)` and
+`createTranslation(file, model)` take the model by position.
+
+An SDK-shaped call on a receiver that is not a tracked client is an
+`unknown_client_factory` gap, with the values written at the call listed: a
+client imported from another module (`imported_name`, the common
+`import { openai } from "@/lib/openai"`), a parameter, a factory function
+(`factory_call`), a class property never assigned (`unassigned_attribute`)
+or an SDK call's result. `messages.create` counts only where the file imports
+an Anthropic package (Twilio and Slack use the same shape). An SDK member
+reached under a run-time name (`client[method](...)`) is a `dynamic_dispatch`
+gap (`computed_member`); a request method stored or passed as a value
+(`const create = client.chat.completions.create`, `retry(
+client.chat.completions.create)`, `create.bind(...)`) is `method_reference`.
+
+### Dynamic features
+
+A direct call of the global `eval`, a `with` statement, and scopes nested more
+than 64 deep (not analyzed, a `truncated` gap) make every value not written at
+its call, and every route, a `dynamic_feature` gap. `new Function(...)` sees
+only the global scope and changes no binding of a module.
+
+### Outside the file
+
+Resolution is per file. A client or constant imported from another module is
+a gap at the call. The report assumes the rest, in particular:
+
+- Other modules do not write this module's objects or the properties of its
+  class instances, except as rules 5 and 6 say (a subclass, an exported
+  function's callers).
+- A write under a computed key (`obj[key] = v`) on anything but `this` does not
+  set a class property, and an SDK request does not modify the options object
+  it is passed.
+- A client a class reads through `this` is confirmed although a subclass in
+  another module may replace it, as in Python.
+- The process environment, a `.env` file loaded at start-up and an Anthropic
+  profile file are not known: a direct client built without a `baseURL` is
+  reported direct.
+- TypeScript's `private` is checked by the compiler, not at run time: a
+  `private` method's callers are taken to be the calls of its name in the
+  file.
+- A `var` read before its declaration runs holds `undefined`; such a request
+  fails rather than using another model.
+- Bundled or minified code outside `dist/`, `build/`, `out/` and `*.min.js`
+  is scanned as project code.
+
+Not tracked yet: wrappers (LangChain JS, the Vercel AI SDK's `@ai-sdk/*`
+providers, LiteLLM clients), the realtime WebSocket clients
+(`new OpenAIRealtimeWS({ model })` is recorded as an SDK object with an
+`unknown` route), `@google-cloud/vertexai`, and a same-file function that
+returns a client (`factory_call`).
+
+### Bounds
+
+The TypeScript extractor's lookups are bounded the same way: expression depth
+64, nested name and property resolutions 64, scope nesting 64 (deeper scopes
+are a `truncated` gap and a whole-file dynamic feature), 64 writes read per
+name or property, 16 direct subclasses, 256 callers read per function, 64
+expanded spreads per object literal (past that a spread is opaque) and 256
+nested entries read per call (past that a `truncated` gap). Each object
+literal is read once, into an index of its keys, however many calls spread it.
+The output limits are the same as Python's: nested values (32 per call, 4,096
+per file), listed candidates (32 per gap, 4,096 per file), names (200 bytes),
+records including imports (20,000 per file, then a `truncated` gap) and
+imported names (20,000 per file).
