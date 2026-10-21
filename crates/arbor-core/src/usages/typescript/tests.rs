@@ -2248,3 +2248,154 @@ new Bot().ask();",
     assert_eq!(value.as_deref(), Some("gpt-4"));
     assert!(gaps.is_empty(), "{gaps:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Names bound to themselves, deep spreads, and the environment
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_name_bound_to_itself_is_no_environment_and_no_crash() {
+    for body in [
+        "var a = a;\na.x = 1;\n",
+        "const a = b;\nconst b = a;\nclient.chat.completions.create({ model: a.model, messages: [] });\n",
+        "let env = env;\nenv[k] = 1;\n",
+    ] {
+        let found = usages(&format!("{CLIENT}{body}"));
+        assert_eq!(routing_of(&found, "client"), Routing::OpenaiDirect, "{body}");
+    }
+    let mut source = String::from(CLIENT);
+    source.push_str("const a0 = process.env;\n");
+    for i in 1..15_000 {
+        source.push_str(&format!("const a{i} = a{};\n", i - 1));
+    }
+    source.push_str("client.chat.completions.create({ model: a14999.MODEL, messages: [] });\n");
+    let found = usages(&source);
+    let c = call(&found, "client.chat.completions.create");
+    assert!(!gaps_at(&found, c).is_empty());
+}
+
+#[test]
+fn spreads_nested_past_the_bound_are_opaque_not_a_crash() {
+    let mut inline = String::from("{ model: \"gpt-4\" }");
+    for _ in 0..2_000 {
+        inline = format!("{{ ...{inline} }}");
+    }
+    let found = usages(&format!(
+        "{CLIENT}client.chat.completions.create({{ ...{inline}, messages: [] }});\n"
+    ));
+    let c = call(&found, "client.chat.completions.create");
+    assert_eq!(value(c, "model"), None);
+    assert!(!gaps_at(&found, c).is_empty());
+
+    let mut named = String::from(CLIENT);
+    named.push_str("const a0 = { model: \"gpt-4\" };\n");
+    for i in 1..2_000 {
+        named.push_str(&format!("const a{i} = {{ ...a{} }};\n", i - 1));
+    }
+    named.push_str("client.chat.completions.create({ ...a1999, messages: [] });\n");
+    named.push_str("client.chat.completions.create({ model: a1999.model, messages: [] });\n");
+    named.push_str("new OpenAI({ ...a1999 });\n");
+    let found = usages(&named);
+    for c in found
+        .calls
+        .iter()
+        .filter(|c| c.member == "chat.completions.create")
+    {
+        assert_eq!(value(c, "model"), None);
+    }
+    // Within the bound, a spread chain still resolves.
+    let (value, gaps) = model_of(
+        "const a0 = { model: \"gpt-4\" };
+const a1 = { ...a0 };
+const a2 = { ...a1, temperature: 0 };
+client.chat.completions.create({ ...a2, messages: [] });",
+    );
+    assert_eq!(value.as_deref(), Some("gpt-4"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn an_object_read_under_many_paths_stays_read_only() {
+    let mut body = String::from("const CFG = {");
+    for i in 0..200 {
+        body.push_str(&format!(" k{i}: \"gpt-{i}\","));
+    }
+    body.push_str(" };\n");
+    for i in 0..199 {
+        body.push_str(&format!("console.log(CFG.k{i});\n"));
+    }
+    body.push_str("client.chat.completions.create({ model: CFG.k199, messages: [] });\n");
+    let (value, gaps) = model_of(&body);
+    assert_eq!(value.as_deref(), Some("gpt-199"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn no_environment_variable_name_is_reported() {
+    for body in [
+        "const { OPENAI_MODEL } = process.env;
+client.chat.completions.create({ model: OPENAI_MODEL, messages: [] });",
+        "const { env: { OPENAI_MODEL } } = process;
+client.chat.completions.create({ model: OPENAI_MODEL, messages: [] });",
+        "client.chat.completions.create({ model: globalThis.process.env.OPENAI_MODEL, messages: [] });",
+        "client.chat.completions.create({ model: process[\"env\"].OPENAI_MODEL, messages: [] });",
+        "client.chat.completions.create({ model: Deno.env.toObject().OPENAI_MODEL, messages: [] });",
+        "import process from \"node:process\";
+client.chat.completions.create({ model: process.env.OPENAI_MODEL, messages: [] });",
+    ] {
+        let found = usages(&format!("{CLIENT}{body}"));
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(gaps_at(&found, c), vec!["unresolved_model/env_var"], "{body}");
+        let json = serde_json::to_string(&found).unwrap();
+        assert!(!json.contains("OPENAI_MODEL"), "{body}\n{json}");
+    }
+    // A destructured default is the lookup's fallback.
+    let found = usages(&format!(
+        "{CLIENT}const {{ OPENAI_MODEL = \"gpt-4o\" }} = process.env;
+client.chat.completions.create({{ model: OPENAI_MODEL, messages: [] }});"
+    ));
+    let c = call(&found, "client.chat.completions.create");
+    assert_eq!(value(c, "model"), Some("gpt-4o"));
+    assert_eq!(c.values[0].origin, ValueOrigin::EnvDefault);
+    assert_eq!(gaps_at(&found, c), vec!["unresolved_model/env_var"]);
+    assert!(!serde_json::to_string(&found)
+        .unwrap()
+        .contains("OPENAI_MODEL"));
+}
+
+#[test]
+fn the_endpoint_variable_written_through_any_alias_of_process_is_seen() {
+    for write in [
+        "import process from \"node:process\";\nprocess.env.OPENAI_BASE_URL = proxy;",
+        "import * as proc from \"process\";\nproc.env.OPENAI_BASE_URL = proxy;",
+        "import { env } from \"node:process\";\nenv.OPENAI_BASE_URL = proxy;",
+        "const { env } = process;\nenv.OPENAI_BASE_URL = proxy;",
+        "const p = process;\np.env.OPENAI_BASE_URL = proxy;",
+        "globalThis.process.env.OPENAI_BASE_URL = proxy;",
+        "require(\"process\").env.OPENAI_BASE_URL = proxy;",
+        "process[\"env\"].OPENAI_BASE_URL = proxy;",
+        "Deno.env.set(\"OPENAI_BASE_URL\", proxy);",
+    ] {
+        let (routing, gaps) = route(
+            &format!(
+                "{OPENAI}{write}
+const client = new OpenAI();
+client.chat.completions.create({{ model: \"gpt-4\", messages: [] }});"
+            ),
+            "chat.completions.create",
+        );
+        assert_eq!(routing, Routing::Unknown, "{write}");
+        assert_eq!(gaps, vec!["ambiguous_client/endpoint_env"], "{write}");
+    }
+}
+
+#[test]
+fn a_mock_of_an_imported_module_mocks_the_sdk() {
+    let found = usages(
+        "import OpenAI from \"openai\";
+vi.mock(import(\"openai\"), () => ({ default: class {} }));
+const client = new OpenAI();
+",
+    );
+    assert_eq!(routing_of(&found, "client"), Routing::Unknown);
+}

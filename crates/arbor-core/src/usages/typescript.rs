@@ -300,6 +300,10 @@ const MAX_SUBCLASSES: usize = 16;
 /// Writes of one name or property read per lookup. More is a gap anyway
 /// (`reassigned`), so the rest are not read.
 const MAX_WRITES_READ: usize = 64;
+/// Distinct paths read off one name (`CONFIG.a`, `CONFIG.b.c`...) that are
+/// checked for a container they may hand out; past that every read of the
+/// name is a gap.
+const MAX_HANDED_OUT: usize = 4096;
 /// Longest string literal read, in source bytes. A captured value is at
 /// most 256 bytes, so a longer literal is refused without being copied.
 const MAX_LITERAL_BYTES: usize = 4096;
@@ -1219,7 +1223,7 @@ enum Decl {
 }
 
 /// One step into a destructured value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Step<'t> {
     Key(&'t str),
     Index(usize),
@@ -1472,6 +1476,8 @@ struct MemberWrite<'t> {
 enum MemberRoot<'t> {
     Name(&'t str),
     This,
+    /// `require("process")`.
+    Process,
     /// Any other expression (`getObj().x = v`).
     Other,
 }
@@ -1564,6 +1570,24 @@ struct Ctx<'t> {
     object_methods: HashMap<usize, usize>,
     /// Object literals (by node id) whose own methods write `this`.
     this_written_objects: HashSet<usize>,
+    /// Object and array literals (by node id) that are, or are nested in,
+    /// a call's arguments, and the call.
+    literal_calls: HashMap<usize, Node<'t>>,
+    /// Calls (by node id) that are a statement of their own: their result
+    /// is dropped.
+    dropped_calls: HashSet<usize>,
+    /// Paths already handed out, by binding, path and call (by node id).
+    handed_seen: HashSet<(usize, Rc<[Step<'t>]>, Option<usize>)>,
+    /// Object literals and member chains read inside one another: past
+    /// [`MAX_NAME_DEPTH`] a spread is opaque and a chain is not an object.
+    object_depth: u32,
+    /// Reads cut short by that bound: a result computed while this grew
+    /// is not memoized.
+    object_cuts: u32,
+    /// [`Ctx::readonly_object`], by binding.
+    readonly_memo: HashMap<usize, Option<(Node<'t>, usize)>>,
+    /// [`Ctx::holds_any_container`], by object literal (node id).
+    container_memo: HashMap<usize, bool>,
     /// Environment variables written by a literal name.
     env_writes: HashSet<String>,
     /// The environment written under a name known only at run time.
@@ -1666,6 +1690,13 @@ impl<'t> Ctx<'t> {
             namespace_of: HashMap::new(),
             object_methods: HashMap::new(),
             this_written_objects: HashSet::new(),
+            literal_calls: HashMap::new(),
+            dropped_calls: HashSet::new(),
+            handed_seen: HashSet::new(),
+            object_depth: 0,
+            object_cuts: 0,
+            readonly_memo: HashMap::new(),
+            container_memo: HashMap::new(),
             env_writes: HashSet::new(),
             env_wild: None,
             file_dynamic: None,
@@ -1882,6 +1913,41 @@ impl<'t> Ctx<'t> {
         self.kids = kids;
     }
 
+    /// Records the object and array literals a call's arguments are, and
+    /// those nested in them, so that a spread in one knows the call it is
+    /// handed to.
+    fn mark_call_literals(&mut self, call: Node<'t>) {
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            return;
+        };
+        let mut work: Vec<(Node<'t>, usize)> = Vec::new();
+        let mut cursor = arguments.walk();
+        for arg in arguments.named_children(&mut cursor) {
+            work.push((unwrap_expression(arg), 0));
+        }
+        while let Some((node, depth)) = work.pop() {
+            if depth > MAX_NESTED_DEPTH * 2 || !matches!(node.kind(), "object" | "array") {
+                continue;
+            }
+            self.literal_calls.insert(node.id(), call);
+            let mut cursor = node.walk();
+            for entry in node.named_children(&mut cursor) {
+                let value = match entry.kind() {
+                    "pair" => entry.child_by_field_name("value"),
+                    "object"
+                    | "array"
+                    | "parenthesized_expression"
+                    | "as_expression"
+                    | "satisfies_expression" => Some(entry),
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    work.push((unwrap_expression(value), depth + 1));
+                }
+            }
+        }
+    }
+
     fn add_ref(&mut self, scope: usize, node: Node<'t>, kind: RefKind<'t>) {
         let name = self.text(node);
         self.refs.push(NameRef { scope, name, kind });
@@ -1959,11 +2025,42 @@ impl<'t> Ctx<'t> {
             "call_expression" => {
                 self.calls.push((node, f.scope));
                 self.test_block(node);
-                self.push_children(stack, &f, f.scope);
+                self.mark_call_literals(node);
+                // `(f)(...)` calls `f` itself, and `(eval)(...)` is a direct
+                // eval.
+                let callee = node
+                    .child_by_field_name("function")
+                    .filter(|c| c.kind() == "parenthesized_expression")
+                    .map(unwrap_parens)
+                    .filter(|c| c.kind() == "identifier");
+                match callee {
+                    Some(callee) => {
+                        self.add_ref(f.scope, callee, RefKind::Call(node));
+                        let mut cursor = node.walk();
+                        let rest: Vec<Node<'t>> = node
+                            .named_children(&mut cursor)
+                            .filter(|c| node.child_by_field_name("function") != Some(*c))
+                            .collect();
+                        for child in rest.into_iter().rev() {
+                            stack.push(self.child(&f, child, f.scope, None));
+                        }
+                    }
+                    None => self.push_children(stack, &f, f.scope),
+                }
             }
             "new_expression" => {
                 self.calls.push((node, f.scope));
                 self.note_self_construction(node, f.scope);
+                self.mark_call_literals(node);
+                self.push_children(stack, &f, f.scope);
+            }
+            // A call whose result is dropped hands nothing back.
+            "expression_statement" => {
+                if let Some(expr) = node.named_child(0).map(unwrap_parens) {
+                    if expr.kind() == "call_expression" {
+                        self.dropped_calls.insert(expr.id());
+                    }
+                }
                 self.push_children(stack, &f, f.scope);
             }
             "member_expression" | "subscript_expression" => self.chain(&f, stack),
@@ -2279,23 +2376,6 @@ impl<'t> Ctx<'t> {
     /// An identifier used as a value.
     fn name_use(&mut self, f: &Frame<'t>) {
         let node = f.node;
-        // `(f)(...)` calls `f` itself, and `(eval)(...)` is a direct eval.
-        if parent_kind(node) == Some("parenthesized_expression") {
-            let mut outer = node;
-            while let Some(up) = outer
-                .parent()
-                .filter(|p| p.kind() == "parenthesized_expression")
-            {
-                outer = up;
-            }
-            if let Some(call) = outer.parent().filter(|p| {
-                p.kind() == "call_expression"
-                    && p.child_by_field_name("function").map(|c| c.id()) == Some(outer.id())
-            }) {
-                self.add_ref(f.scope, node, RefKind::Call(call));
-                return;
-            }
-        }
         let parent = f.parent;
         let grand = f.grand.map(|g| g.kind());
         let kind = match (parent.map(|p| p.kind()), f.field) {
@@ -2307,7 +2387,10 @@ impl<'t> Ctx<'t> {
                 f.grand.map_or(RefKind::Escape, RefKind::Arg)
             }
             (Some("spread_element"), _) if matches!(grand, Some("object" | "array")) => {
-                RefKind::Spread(parent.and_then(spread_call))
+                RefKind::Spread(
+                    f.grand
+                        .and_then(|g| self.literal_calls.get(&g.id()).copied()),
+                )
             }
             (Some("extends_clause"), _) => RefKind::Extends,
             (Some("export_statement"), _) | (Some("export_specifier"), _) => RefKind::Export,
@@ -2708,13 +2791,8 @@ impl<'t> Ctx<'t> {
             self.scopes[scope].method = self.scopes[f.scope].method;
         }
         // A function value of an object literal: its `this` is the object.
-        if kind == "function_expression" {
-            if let Some(object) = node
-                .parent()
-                .filter(|p| p.kind() == "pair")
-                .and_then(|p| p.parent())
-                .filter(|o| o.kind() == "object")
-            {
+        if kind == "function_expression" && f.parent.is_some_and(|p| p.kind() == "pair") {
+            if let Some(object) = f.grand.filter(|o| o.kind() == "object") {
                 self.object_methods.insert(scope, object.id());
             }
         }
@@ -2888,7 +2966,7 @@ impl<'t> Ctx<'t> {
         };
         if method.is_some() {
             self.scopes[scope].method = Some(func);
-        } else if let Some(object) = node.parent().filter(|p| p.kind() == "object") {
+        } else if let Some(object) = f.parent.filter(|p| p.kind() == "object") {
             // An object literal's method: its `this` is the object.
             self.object_methods.insert(scope, object.id());
         }
@@ -3452,9 +3530,10 @@ impl<'t> Ctx<'t> {
             ("arguments", _) if matches!(grand, Some("call_expression" | "new_expression")) => {
                 f.grand.map_or(ChainUse::Read, ChainUse::Arg)
             }
-            ("spread_element", _) if matches!(grand, Some("object" | "array")) => {
-                ChainUse::Spread(spread_call(parent))
-            }
+            ("spread_element", _) if matches!(grand, Some("object" | "array")) => ChainUse::Spread(
+                f.grand
+                    .and_then(|g| self.literal_calls.get(&g.id()).copied()),
+            ),
             ("assignment_pattern" | "object_assignment_pattern", Some("left"))
             | ("object_pattern" | "array_pattern" | "rest_pattern", _)
             | ("pair_pattern", Some("value")) => write(None),
@@ -3576,6 +3655,7 @@ impl<'t> Ctx<'t> {
             let root = match root.kind() {
                 "identifier" => MemberRoot::Name(self.text(root)),
                 "this" => MemberRoot::This,
+                "call_expression" if self.process_object(root, f.scope) => MemberRoot::Process,
                 _ => MemberRoot::Other,
             };
             self.member_writes.push(MemberWrite {
@@ -3732,32 +3812,20 @@ fn has_field(node: Node<'_>, field: &str) -> bool {
     node.child_by_field_name(field).is_some()
 }
 
-fn parent_kind(node: Node<'_>) -> Option<&'static str> {
-    node.parent().map(|p| p.kind())
-}
-
-/// The call a spread's object or array literal is passed to, through
-/// enclosing literals (`create({ ...PARAMS })`, `f({ a: [...xs] })`).
-fn spread_call(spread: Node<'_>) -> Option<Node<'_>> {
-    let mut node = spread.parent()?;
-    for _ in 0..MAX_NESTED_DEPTH * 2 + 2 {
-        let parent = node.parent()?;
-        match parent.kind() {
-            "object"
-            | "array"
-            | "pair"
-            | "parenthesized_expression"
-            | "as_expression"
-            | "satisfies_expression" => node = parent,
-            "arguments" => {
-                return parent
-                    .parent()
-                    .filter(|c| matches!(c.kind(), "call_expression" | "new_expression"))
-            }
-            _ => return None,
+/// `expr` without the parentheses around it.
+fn unwrap_parens(mut node: Node<'_>) -> Node<'_> {
+    for _ in 0..16 {
+        match node.named_child(0) {
+            Some(inner) if node.kind() == "parenthesized_expression" => node = inner,
+            _ => break,
         }
     }
-    None
+    node
+}
+
+/// `process` or `node:process`.
+fn is_process_module(module: &str) -> bool {
+    matches!(module, "process" | "node:process")
 }
 
 /// Whether a member has the `private` accessibility modifier.
@@ -3898,7 +3966,7 @@ impl<'t> Ctx<'t> {
                 }
                 RefKind::Member { path, does, .. } => {
                     let uses = &mut self.bindings[b].uses;
-                    let handed = match does {
+                    let handed: Option<HandedOut<'t>> = match does {
                         ChainUse::Call => {
                             uses.member_calls = true;
                             None
@@ -3918,13 +3986,7 @@ impl<'t> Ctx<'t> {
                         ChainUse::Arg(call) => Some((path, Some((call, r.scope)))),
                     };
                     if let Some(handed) = handed {
-                        if !uses.handed_out.contains(&handed) {
-                            if uses.handed_out.len() >= MAX_WRITES_READ {
-                                uses.handed_out_cut = true;
-                            } else {
-                                uses.handed_out.push(handed);
-                            }
-                        }
+                        self.hand_out(b, handed);
                     }
                 }
                 RefKind::Export => self.bindings[b].uses.exported = true,
@@ -3932,16 +3994,7 @@ impl<'t> Ctx<'t> {
                 // `{ ...CONFIG }` copies the entries, and shares the
                 // containers they hold.
                 RefKind::Spread(call) => {
-                    let handed: HandedOut<'t> =
-                        (Rc::from([Step::Other]), call.map(|c| (c, r.scope)));
-                    let uses = &mut self.bindings[b].uses;
-                    if !uses.handed_out.contains(&handed) {
-                        if uses.handed_out.len() >= MAX_WRITES_READ {
-                            uses.handed_out_cut = true;
-                        } else {
-                            uses.handed_out.push(handed);
-                        }
-                    }
+                    self.hand_out(b, (Rc::from([Step::Other]), call.map(|c| (c, r.scope))));
                 }
                 RefKind::Harmless => {}
                 RefKind::Escape => self.bindings[b].uses.escapes = true,
@@ -3990,6 +4043,20 @@ impl<'t> Ctx<'t> {
             }
         }
         self.alias_arguments();
+    }
+
+    /// Records a path read off binding `b` that may hand out a container.
+    fn hand_out(&mut self, b: usize, handed: HandedOut<'t>) {
+        let key = (b, Rc::clone(&handed.0), handed.1.map(|(call, _)| call.id()));
+        if !self.handed_seen.insert(key) {
+            return;
+        }
+        let uses = &mut self.bindings[b].uses;
+        if uses.handed_out.len() >= MAX_HANDED_OUT {
+            uses.handed_out_cut = true;
+        } else {
+            uses.handed_out.push(handed);
+        }
     }
 
     /// A sloppy-mode function with a simple parameter list whose
@@ -4058,22 +4125,99 @@ impl<'t> Ctx<'t> {
         (init.kind() == "object").then_some((init, binding.init_scope))
     }
 
-    /// Whether a binding holds `process.env` (`const env = process.env`).
+    /// Whether a binding holds the process environment (`const env =
+    /// process.env`, `const { env } = process`, `import { env } from
+    /// "node:process"`).
     fn is_env_object(&self, b: usize) -> bool {
-        let binding = &self.bindings[b];
-        matches!(binding.decl, Decl::Const | Decl::Let | Decl::Var)
-            && binding.path.is_empty()
-            && binding.writes.is_empty()
-            && binding
-                .init
-                .is_some_and(|init| self.env_object(unwrap_expression(init), binding.init_scope))
+        self.binding_is_env(b, &mut Vec::new())
     }
 
     /// Whether `node` is the process environment: `process.env`,
-    /// `import.meta.env`, `Bun.env`, or a name bound to one of them.
+    /// `process["env"]`, `import.meta.env`, `Bun.env`,
+    /// `Deno.env.toObject()`, the `env` of a name bound to `process`
+    /// (`import process from "node:process"`, `globalThis.process`,
+    /// `require("process")`), or a name bound to one of them.
     fn env_object(&self, node: Node<'t>, scope: usize) -> bool {
+        self.env_object_at(node, scope, &mut Vec::new())
+    }
+
+    /// Whether `node` is the `process` object.
+    fn process_object(&self, node: Node<'t>, scope: usize) -> bool {
+        self.process_object_at(node, scope, &mut Vec::new())
+    }
+
+    /// The bindings followed so far are in `seen`: a name bound to itself
+    /// through others holds `undefined`, and a longer chain than
+    /// [`MAX_NAME_DEPTH`] is taken to be the environment, so that no write
+    /// through it is missed.
+    fn binding_is_env(&self, b: usize, seen: &mut Vec<usize>) -> bool {
+        if seen.contains(&b) {
+            return false;
+        }
+        if seen.len() >= MAX_NAME_DEPTH as usize {
+            return true;
+        }
+        seen.push(b);
+        let binding = &self.bindings[b];
+        let env = match binding.decl {
+            Decl::Import => binding.import.as_ref().is_some_and(|def| {
+                is_process_module(&def.module) && def.kind == ImportKind::Named("env".to_string())
+            }),
+            Decl::Const | Decl::Let | Decl::Var
+                if binding.writes.is_empty() && !binding.writes_cut && !binding.each =>
+            {
+                match (binding.init, binding.path.as_ref()) {
+                    (Some(init), []) => self.env_object_at(init, binding.init_scope, seen),
+                    (Some(init), [Step::Key("env")]) => {
+                        self.process_object_at(init, binding.init_scope, seen)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        seen.pop();
+        env
+    }
+
+    fn binding_is_process(&self, b: usize, seen: &mut Vec<usize>) -> bool {
+        if seen.contains(&b) {
+            return false;
+        }
+        if seen.len() >= MAX_NAME_DEPTH as usize {
+            return true;
+        }
+        seen.push(b);
+        let binding = &self.bindings[b];
+        let process = match binding.decl {
+            Decl::Import => binding.import.as_ref().is_some_and(|def| {
+                is_process_module(&def.module)
+                    && matches!(def.kind, ImportKind::Default | ImportKind::Namespace)
+            }),
+            Decl::Const | Decl::Let | Decl::Var
+                if binding.writes.is_empty()
+                    && !binding.writes_cut
+                    && !binding.each
+                    && binding.path.is_empty() =>
+            {
+                binding
+                    .init
+                    .is_some_and(|init| self.process_object_at(init, binding.init_scope, seen))
+            }
+            _ => false,
+        };
+        seen.pop();
+        process
+    }
+
+    fn process_object_at(&self, node: Node<'t>, scope: usize, seen: &mut Vec<usize>) -> bool {
         let node = unwrap_expression(node);
         match node.kind() {
+            "identifier" => match self.lookup(scope, self.text(node)) {
+                None => self.text(node) == "process",
+                Some(b) => self.binding_is_process(b, seen),
+            },
+            // `globalThis.process`, `global.process`, `window.process`
             "member_expression" => {
                 let (Some(object), Some(property)) = (
                     node.child_by_field_name("object"),
@@ -4081,30 +4225,87 @@ impl<'t> Ctx<'t> {
                 ) else {
                     return false;
                 };
-                if self.text(property) != "env" {
+                self.text(property) == "process"
+                    && object.kind() == "identifier"
+                    && matches!(
+                        self.text(object),
+                        "globalThis" | "global" | "window" | "self"
+                    )
+                    && self.lookup(scope, self.text(object)).is_none()
+            }
+            // `require("process")`, `require("node:process")`
+            "call_expression" => {
+                let required = node.child_by_field_name("function").is_some_and(|f| {
+                    f.kind() == "identifier"
+                        && self.text(f) == "require"
+                        && self.lookup(scope, "require").is_none()
+                });
+                required
+                    && first_argument(node)
+                        .and_then(|a| string_content(a, self.src))
+                        .is_some_and(is_process_module)
+            }
+            _ => false,
+        }
+    }
+
+    fn env_object_at(&self, node: Node<'t>, scope: usize, seen: &mut Vec<usize>) -> bool {
+        let node = unwrap_expression(node);
+        match node.kind() {
+            "member_expression" | "subscript_expression" => {
+                let Some(object) = node.child_by_field_name("object") else {
+                    return false;
+                };
+                let key = match node.kind() {
+                    "member_expression" => {
+                        node.child_by_field_name("property").map(|p| self.text(p))
+                    }
+                    _ => node
+                        .child_by_field_name("index")
+                        .and_then(|i| static_key(i, self.src)),
+                };
+                if key != Some("env") {
                     return false;
                 }
+                let object = unwrap_expression(object);
                 match object.kind() {
-                    "identifier" => {
-                        matches!(self.text(object), "process" | "Bun")
-                            && self.lookup(scope, self.text(object)).is_none()
+                    "identifier" if self.text(object) == "Bun" => {
+                        self.lookup(scope, "Bun").is_none()
                     }
                     // `import.meta`
-                    "member_expression" => {
-                        object
+                    "member_expression"
+                        if object
                             .child_by_field_name("object")
-                            .is_some_and(|o| o.kind() == "import")
-                            && object
-                                .child_by_field_name("property")
-                                .is_some_and(|p| self.text(p) == "meta")
+                            .is_some_and(|o| o.kind() == "import") =>
+                    {
+                        object
+                            .child_by_field_name("property")
+                            .is_some_and(|p| self.text(p) == "meta")
                     }
-                    _ => false,
+                    _ => self.process_object_at(object, scope, seen),
                 }
+            }
+            // `Deno.env.toObject()`
+            "call_expression" => {
+                node.child_by_field_name("function")
+                    .is_some_and(|f| self.render(f) == "Deno.env.toObject")
+                    && self.lookup(scope, "Deno").is_none()
             }
             "identifier" => self
                 .lookup(scope, self.text(node))
-                .is_some_and(|b| self.is_env_object(b)),
+                .is_some_and(|b| self.binding_is_env(b, seen)),
             _ => false,
+        }
+    }
+
+    /// Whether `init` destructured along `path` reads an environment
+    /// variable: `const { MODEL } = process.env`, `const { env: { MODEL } }
+    /// = process`.
+    fn env_path(&self, init: Node<'t>, scope: usize, path: &[Step<'t>]) -> bool {
+        match path {
+            [] => false,
+            [Step::Key("env"), _, ..] if self.process_object(init, scope) => true,
+            _ => self.env_object(init, scope),
         }
     }
 
@@ -4170,7 +4371,19 @@ impl<'t> Ctx<'t> {
                     {
                         self.env_write(w, 1)
                     }
+                    // `globalThis.process.env.X = ...`
+                    None if matches!(name, "globalThis" | "global" | "window" | "self")
+                        && w.path.get(..2) == Some(&[Step::Key("process"), Step::Key("env")]) =>
+                    {
+                        self.env_write(w, 2)
+                    }
                     Some(b) if self.is_env_object(b) => self.env_write(w, 0),
+                    Some(b)
+                        if first == Some(Step::Key("env"))
+                            && self.binding_is_process(b, &mut Vec::new()) =>
+                    {
+                        self.env_write(w, 1)
+                    }
                     Some(b) => {
                         if let (Some(class), 1, Some(Step::Key(prop))) =
                             (self.bindings[b].class, w.path.len(), first)
@@ -4192,6 +4405,13 @@ impl<'t> Ctx<'t> {
                     }
                     None => self.note_property_write(w),
                 },
+                MemberRoot::Process => {
+                    if first == Some(Step::Key("env")) {
+                        self.env_write(w, 1);
+                    } else {
+                        self.note_property_write(w);
+                    }
+                }
                 MemberRoot::Other => self.note_property_write(w),
             }
         }
@@ -4428,8 +4648,31 @@ impl<'t> Ctx<'t> {
                     "object" | "array" => {}
                     _ => self.note_reflective_write(&keys, line),
                 }
+            } else if matches!(callee.as_str(), "Deno.env.set" | "Deno.env.delete") {
+                match first_argument(*call).and_then(|a| string_content(a, self.src)) {
+                    Some(var) => {
+                        self.env_writes.insert(var.to_string());
+                    }
+                    None => {
+                        self.env_wild.get_or_insert(Feature {
+                            what: "a write of the environment under a name known only at run time",
+                            line,
+                        });
+                    }
+                }
             } else if MODULE_MOCKS.contains(&callee.as_str()) {
+                // `vi.mock("openai")`, `vi.mock(import("openai"))`
                 let mocked = first_argument(*call)
+                    .map(unwrap_expression)
+                    .and_then(|a| match a.kind() {
+                        "call_expression"
+                            if a.child_by_field_name("function")
+                                .is_some_and(|f| f.kind() == "import") =>
+                        {
+                            first_argument(a)
+                        }
+                        _ => Some(a),
+                    })
                     .and_then(|a| string_content(a, self.src))
                     .and_then(Pkg::of_source);
                 if let Some((pkg, _)) = mocked {
@@ -6017,8 +6260,13 @@ impl<'t> Ctx<'t> {
         if let Some(read) = self.object_memo.get(&object.id()) {
             return Rc::clone(read);
         }
-        // A literal spread into itself (through names) is read as opaque.
-        if !self.reading_objects.insert(object.id()) {
+        // A literal spread into itself (through names), or nested past the
+        // bound, is read as opaque.
+        let deep = self.object_depth >= MAX_NAME_DEPTH;
+        if deep || !self.reading_objects.insert(object.id()) {
+            if deep {
+                self.object_cuts += 1;
+            }
             return Rc::new(ObjectRead {
                 opaque: true,
                 last_opaque: Some(0),
@@ -6026,6 +6274,7 @@ impl<'t> Ctx<'t> {
                 ..ObjectRead::default()
             });
         }
+        self.object_depth += 1;
         let mut read = ObjectRead::default();
         let mut cursor = object.walk();
         let entries: Vec<Node<'t>> = object.named_children(&mut cursor).collect();
@@ -6094,6 +6343,7 @@ impl<'t> Ctx<'t> {
         if self.this_written_objects.contains(&object.id()) {
             push_opaque(&mut read);
         }
+        self.object_depth -= 1;
         self.reading_objects.remove(&object.id());
         let read = Rc::new(read);
         self.object_memo.insert(object.id(), Rc::clone(&read));
@@ -6205,7 +6455,14 @@ impl<'t> Ctx<'t> {
                     "member_expression" => self.text(expr.child_by_field_name("property")?),
                     _ => static_key(expr.child_by_field_name("index")?, self.src)?,
                 };
-                let (parent, parent_scope, via) = self.object_node(object, scope)?;
+                if self.object_depth >= MAX_NAME_DEPTH {
+                    self.object_cuts += 1;
+                    return None;
+                }
+                self.object_depth += 1;
+                let parent = self.object_node(object, scope);
+                self.object_depth -= 1;
+                let (parent, parent_scope, via) = parent?;
                 let read = self.object_entries(parent, parent_scope);
                 match read.lookup(key) {
                     Lookup::Found(value, false, value_scope) => {
@@ -6229,6 +6486,19 @@ impl<'t> Ctx<'t> {
     /// into it, a method call on it, or passing it (or a nested container
     /// of it) anywhere else means another value may be read.
     fn readonly_object(&mut self, b: usize) -> Option<(Node<'t>, usize)> {
+        if let Some(found) = self.readonly_memo.get(&b) {
+            return *found;
+        }
+        let cuts = self.object_cuts;
+        let found = self.readonly_object_inner(b);
+        // A read cut short by the nesting bound is not kept.
+        if self.object_cuts == cuts {
+            self.readonly_memo.insert(b, found);
+        }
+        found
+    }
+
+    fn readonly_object_inner(&mut self, b: usize) -> Option<(Node<'t>, usize)> {
         let (object, scope) = self.object_literal_of(b)?;
         let uses = self.bindings[b].uses.clone();
         if uses.escapes
@@ -6278,7 +6548,7 @@ impl<'t> Ctx<'t> {
     /// `Object.values(x)` its entries, `Object.freeze(x)` the argument
     /// itself, unless the result is dropped.
     fn hands_back(&self, call: Node<'t>, scope: usize) -> HandBack {
-        if parent_kind(call) == Some("expression_statement") {
+        if self.dropped_calls.contains(&call.id()) {
             return HandBack::Nothing;
         }
         let callee = call
@@ -6306,15 +6576,7 @@ impl<'t> Ctx<'t> {
                 if at + 1 < path.len() {
                     return true;
                 }
-                let read = self.object_entries(unwrap_expression(current), current_scope);
-                return read.opaque
-                    || read.entries.iter().any(|entry| match entry {
-                        Entry::Pair { value, .. } => !matches!(
-                            unwrap_expression(*value).kind(),
-                            "string" | "template_string" | "number" | "true" | "false" | "null"
-                        ),
-                        Entry::Opaque | Entry::Spread(..) => true,
-                    });
+                return self.holds_any_container(unwrap_expression(current), current_scope);
             };
             let read = self.object_entries(unwrap_expression(current), current_scope);
             match read.lookup(key) {
@@ -6330,6 +6592,27 @@ impl<'t> Ctx<'t> {
             unwrap_expression(current).kind(),
             "object" | "array" | "identifier" | "member_expression" | "call_expression"
         )
+    }
+
+    /// Whether an entry of the object literal, spreads expanded, is anything
+    /// but a primitive literal (or may be: an opaque entry). Read once per
+    /// literal.
+    fn holds_any_container(&mut self, object: Node<'t>, scope: usize) -> bool {
+        if let Some(holds) = self.container_memo.get(&object.id()) {
+            return *holds;
+        }
+        let read = self.object_entries(object, scope);
+        let (entries, cut, opaque) = read.flat(usize::MAX);
+        let holds = cut
+            || opaque
+            || entries.iter().any(|entry| {
+                !matches!(
+                    unwrap_expression(entry.value).kind(),
+                    "string" | "template_string" | "number" | "true" | "false" | "null"
+                )
+            });
+        self.container_memo.insert(object.id(), holds);
+        holds
     }
 
     /// Whether a call writes nothing into its arguments: a read-only
@@ -6698,6 +6981,11 @@ impl<'t> Ctx<'t> {
             }
             Decl::Const | Decl::Let | Decl::Var if writes.is_empty() && !writes_cut => match init {
                 Some(init) => {
+                    // A name destructured from the environment is the
+                    // variable's name, which is never reported.
+                    if !path.is_empty() && self.env_path(init, init_scope, &path) {
+                        return self.path_value(init, init_scope, &path, fallback, depth + 1);
+                    }
                     let result = if path.is_empty() {
                         self.resolve_value(init, init_scope, depth + 1)
                     } else {
@@ -6817,8 +7105,20 @@ impl<'t> Ctx<'t> {
         fallback: Option<Node<'t>>,
         depth: u32,
     ) -> Result<Resolved, Unresolved> {
-        if self.env_object(init, scope) {
-            return Err(Unresolved::new("env_var", self.env_shape(init)));
+        // `const { MODEL = "gpt-4o" } = process.env`: an environment lookup,
+        // with the pattern's default as its fallback. The variable's name is
+        // never reported.
+        if self.env_path(init, scope, path) {
+            let env = Unresolved::new("env_var", "process.env[...]".to_string());
+            return match fallback.map(|f| self.resolve_value(f, scope, depth + 1)) {
+                Some(Ok(mut resolved)) => {
+                    resolved.origin = ValueOrigin::EnvDefault;
+                    resolved.caveats.push(env);
+                    Ok(resolved)
+                }
+                Some(Err(unresolved)) if unresolved.reason == "credential" => Err(unresolved),
+                _ => Err(env),
+            };
         }
         let shape = self.render(init);
         let found = match self.object_node(init, scope) {
@@ -6934,11 +7234,11 @@ impl<'t> Ctx<'t> {
             "identifier" => {
                 let b = self.lookup(scope, self.text(node))?;
                 let binding = &self.bindings[b];
-                (binding.path.len() == 1
-                    && binding.writes.is_empty()
+                (binding.writes.is_empty()
+                    && !binding.writes_cut
                     && binding
                         .init
-                        .is_some_and(|init| self.env_object(init, binding.init_scope)))
+                        .is_some_and(|init| self.env_path(init, binding.init_scope, &binding.path)))
                 .then(|| "process.env[...]".to_string())
             }
             _ => None,
@@ -6949,11 +7249,23 @@ impl<'t> Ctx<'t> {
     fn env_shape(&self, object: Node<'t>) -> String {
         let object = unwrap_expression(object);
         match object.kind() {
-            "member_expression" => match object.child_by_field_name("object") {
-                Some(root) if root.kind() == "member_expression" => "import.meta.env".to_string(),
-                Some(root) => format!("{}.env", self.text(root)),
-                None => "process.env".to_string(),
-            },
+            "member_expression" | "subscript_expression" => {
+                match object.child_by_field_name("object").map(unwrap_expression) {
+                    Some(root)
+                        if root.kind() == "member_expression"
+                            && root
+                                .child_by_field_name("object")
+                                .is_some_and(|o| o.kind() == "import") =>
+                    {
+                        "import.meta.env".to_string()
+                    }
+                    Some(root) if root.kind() == "identifier" && self.text(root) == "Bun" => {
+                        "Bun.env".to_string()
+                    }
+                    _ => "process.env".to_string(),
+                }
+            }
+            "call_expression" => "Deno.env.toObject()".to_string(),
             _ => clip(self.text(object)),
         }
     }
