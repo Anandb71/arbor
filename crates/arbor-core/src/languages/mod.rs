@@ -56,9 +56,10 @@ pub trait LanguageParser: Send + Sync {
         None
     }
 
-    /// The language name usage records carry, for a language that
-    /// implements [`Self::extract_usages`].
-    fn usages_language(&self) -> Option<&'static str> {
+    /// The language name usage records for `file_path` carry, for a
+    /// language that implements [`Self::extract_usages`]. One parser may
+    /// serve several languages (the TSX grammar parses JavaScript too).
+    fn usages_language(&self, _file_path: &str) -> Option<&'static str> {
         None
     }
 

@@ -114,14 +114,14 @@ pub fn parse_source_with_usages(
 }
 
 /// SDK usages for in-memory source. `Ok(None)` when the language has no
-/// usage extractor (today: every language except Python). A file that
-/// mentions no tracked SDK is not parsed at all.
+/// usage extractor (today: every language except Python, TypeScript and
+/// JavaScript). A file that mentions no tracked SDK is not parsed at all.
 pub fn parse_source_usages(
     source: &str,
     file_path: &str,
     lang_parser: &dyn LanguageParser,
 ) -> Result<Option<FileUsages>> {
-    let Some(language) = lang_parser.usages_language() else {
+    let Some(language) = lang_parser.usages_language(file_path) else {
         return Ok(None);
     };
     if !lang_parser.may_have_usages(source) {
@@ -134,12 +134,21 @@ pub fn parse_source_usages(
 /// SDK usages for a file on disk, with the path as written used in records.
 /// `Ok(None)` when the file has no usage extractor: its extension is not in
 /// [`crate::usages::is_usage_extension`] and, for a file without one, its
-/// first line is not a Python shebang. Other files are not read past that.
+/// first line is not a Python shebang, or it is a TypeScript declaration
+/// file ([`crate::usages::is_declaration_file`]). Other files are not read
+/// past that.
 pub fn parse_file_usages(path: &Path) -> Result<Option<FileUsages>> {
     let extension = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or_default();
+    let declaration = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(crate::usages::is_declaration_file);
+    if declaration {
+        return Ok(None);
+    }
     let parser = if extension.is_empty() {
         let mut head = [0u8; 256];
         let read = fs::File::open(path)
@@ -239,10 +248,43 @@ mod tests {
         // The enclosing symbol is the graph's own name for that function.
         assert!(nodes.iter().any(|n| n.qualified_name == "ask"));
 
+        // TypeScript has an extractor too; Rust has none.
         let ts = get_parser("ts").unwrap();
-        assert!(parse_source_usages("const x = 1;", "x.ts", ts.as_ref())
+        let found = parse_source_usages("const x = 1;", "x.ts", ts.as_ref())
+            .unwrap()
+            .expect("typescript has a usage extractor");
+        assert!(found.is_empty());
+        assert_eq!(found.language, "typescript");
+        let rs = get_parser("rs").unwrap();
+        assert!(parse_source_usages("fn main() {}", "main.rs", rs.as_ref())
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn typescript_usages_share_the_parse_and_name_the_graph_symbol() {
+        let source = "import OpenAI from \"openai\";\nconst client = new OpenAI();\n\nexport class Bot {\n  ask() {\n    return client.chat.completions.create({ model: \"gpt-4\", messages: [] });\n  }\n}\n";
+        for file in ["ask.ts", "ask.tsx", "ask.js", "ask.mjs"] {
+            let extension = file.rsplit('.').next().unwrap();
+            let parser = get_parser(extension).unwrap();
+            let plain = parse_source(source, file, parser.as_ref()).unwrap();
+            let (nodes, usages) = parse_source_with_usages(source, file, parser.as_ref()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&nodes).unwrap(),
+                serde_json::to_value(&plain).unwrap(),
+                "usage extraction must not change graph nodes"
+            );
+            let usages = usages.expect("typescript has a usage extractor");
+            let call = &usages.calls[0];
+            assert_eq!(call.symbol.as_deref(), Some("Bot.ask"), "{file}");
+            assert!(nodes.iter().any(|n| n.qualified_name == "Bot.ask"));
+            let language = if file.ends_with(".ts") || file.ends_with(".tsx") {
+                "typescript"
+            } else {
+                "javascript"
+            };
+            assert_eq!(usages.language, language, "{file}");
+        }
     }
 
     #[test]
@@ -272,6 +314,23 @@ mod tests {
         let shell = dir.path().join("deploy");
         std::fs::write(&shell, "#!/bin/sh\necho openai\n").unwrap();
         assert!(parse_file_usages(&shell).unwrap().is_none());
+
+        // TypeScript and JavaScript sources count; declaration files do not.
+        let ts = dir.path().join("llm.ts");
+        std::fs::write(&ts, "import OpenAI from \"openai\";\nnew OpenAI().chat.completions.create({ model: \"gpt-4\", messages: [] });\n").unwrap();
+        assert_eq!(parse_file_usages(&ts).unwrap().unwrap().calls.len(), 1);
+        let cjs = dir.path().join("llm.cjs");
+        std::fs::write(&cjs, "const OpenAI = require(\"openai\");\nnew OpenAI().chat.completions.create({ model: \"gpt-4\", messages: [] });\n").unwrap();
+        let found = parse_file_usages(&cjs).unwrap().unwrap();
+        assert_eq!(found.calls.len(), 1);
+        assert_eq!(found.language, "javascript");
+        let declaration = dir.path().join("openai.d.ts");
+        std::fs::write(
+            &declaration,
+            "import OpenAI from \"openai\";\ndeclare const client: OpenAI;\n",
+        )
+        .unwrap();
+        assert!(parse_file_usages(&declaration).unwrap().is_none());
     }
 
     #[test]

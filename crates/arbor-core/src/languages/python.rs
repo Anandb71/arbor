@@ -30,7 +30,7 @@ impl LanguageParser for PythonParser {
         Some(crate::usages::python::extract(tree, source, file_path))
     }
 
-    fn usages_language(&self) -> Option<&'static str> {
+    fn usages_language(&self, _file_path: &str) -> Option<&'static str> {
         Some("python")
     }
 

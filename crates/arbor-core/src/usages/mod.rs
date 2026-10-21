@@ -66,6 +66,7 @@
 //! another module is a gap, not a usage.
 
 pub mod python;
+pub mod typescript;
 
 use serde::{Deserialize, Serialize};
 
@@ -542,18 +543,29 @@ impl FileUsages {
 }
 
 /// Languages that have a usage extractor.
-pub const USAGE_LANGUAGES: &[&str] = &["python"];
+pub const USAGE_LANGUAGES: &[&str] = &["python", "typescript", "javascript"];
 
-/// File extensions that have a usage extractor. `.pyi` stubs are excluded:
+/// File extensions that have a usage extractor. `.pyi` stubs and TypeScript
+/// declaration files (`.d.ts`, see [`is_declaration_file`]) are excluded:
 /// they declare types, they do not make requests. Extensionless scripts are
 /// scanned when [`is_python_shebang`] accepts their first line.
-pub const USAGE_EXTENSIONS: &[&str] = &["py"];
+pub const USAGE_EXTENSIONS: &[&str] = &["py", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
 /// Whether files with this extension have a usage extractor.
 pub fn is_usage_extension(extension: &str) -> bool {
     USAGE_EXTENSIONS
         .iter()
         .any(|e| e.eq_ignore_ascii_case(extension))
+}
+
+/// Whether a file name is a TypeScript declaration file (`index.d.ts`,
+/// `globals.d.mts`, `types.d.cts`), which declares types and makes no
+/// requests.
+pub fn is_declaration_file(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    [".d.ts", ".d.mts", ".d.cts"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
 }
 
 /// Whether the start of an extensionless file is a Python shebang
