@@ -1376,6 +1376,7 @@ fn finding_for(
                 target,
                 source_model,
                 source_family,
+                syntax: Syntax::of_file(&file),
                 endpoint: if nested.is_some() { None } else { endpoint },
                 routing: &routing.routing,
                 kwargs: if nested.is_some() {
@@ -1565,36 +1566,55 @@ pub const FINE_TUNING: &str = "fine_tuning";
 fn endpoint_of(chain: &str, member: &str) -> Option<&'static str> {
     let text = if member.contains('.') { member } else { chain };
     let has = |needle: &str| text.contains(needle);
-    let endpoint =
-        if has("fine_tuning.") || has("fine_tunes.") || has("FineTuningJob.") || has("FineTune.") {
-            FINE_TUNING
-        } else if has("chat.completions") || has("ChatCompletion") {
-            "chat.completions"
-        } else if has("responses.") {
-            "responses"
-        } else if has("assistants.") || has("threads.") {
-            "assistants"
-        } else if has("completions.") || has("Completion.") {
-            "completions_legacy"
-        } else if has("messages.") {
-            "messages"
-        } else if has("generate_content")
-            || has("GenerativeModel")
-            || has("chats.")
-            || has("send_message")
-        {
-            "generate_content"
-        } else if has("interactions.") {
-            "interactions"
-        } else if has("embeddings.") || has("embed_content") || has("Embedding.") {
-            "embeddings"
-        } else if has("images.") || has("generate_images") {
-            "images"
-        } else if has("audio.") {
-            "audio"
-        } else {
-            return None;
-        };
+    // Python's snake_case and the JavaScript SDKs' camelCase names
+    // (`fineTuning.jobs.create`, `models.generateContent`), and openai v3's
+    // `OpenAIApi` methods (`createChatCompletion`).
+    let endpoint = if has("fine_tuning.")
+        || has("fineTuning.")
+        || has("fine_tunes.")
+        || has("FineTuningJob.")
+        || has("FineTune.")
+        || has("createFineTune")
+    {
+        FINE_TUNING
+    } else if has("chat.completions") || has("ChatCompletion") {
+        "chat.completions"
+    } else if has("responses.") {
+        "responses"
+    } else if has("assistants.") || has("threads.") {
+        "assistants"
+    } else if has("completions.") || has("Completion.") || has("createCompletion") {
+        "completions_legacy"
+    } else if has("messages.") {
+        "messages"
+    } else if has("generate_content")
+        || has("generateContent")
+        || has("GenerativeModel")
+        || has("chats.")
+        || has("send_message")
+        || has("sendMessage")
+    {
+        "generate_content"
+    } else if has("interactions.") {
+        "interactions"
+    } else if has("embeddings.")
+        || has("embed_content")
+        || has("embedContent")
+        || has("Embedding.")
+        || has("createEmbedding")
+    {
+        "embeddings"
+    } else if has("images.")
+        || has("generate_images")
+        || has("generateImages")
+        || has("createImage")
+    {
+        "images"
+    } else if has("audio.") || has("createTranscription") || has("createTranslation") {
+        "audio"
+    } else {
+        return None;
+    };
     Some(endpoint)
 }
 
@@ -1683,6 +1703,8 @@ struct RuleContext<'a> {
     endpoint: Option<&'static str>,
     routing: &'a str,
     kwargs: &'a [String],
+    /// How the call's arguments are written, for values named in messages.
+    syntax: Syntax,
 }
 
 impl RuleContext<'_> {
@@ -1924,7 +1946,7 @@ fn add_choice(rule: &ParamRule, context: &RuleContext<'_>, out: &mut Outcome) {
                 "{} This call already sets {}; check that it is {}.",
                 context.message(&rule.message),
                 add.name,
-                python_literal(&add.value)
+                source_literal(&add.value, context.syntax)
             ),
             because,
             verified: Some(context.verified(rule)),
@@ -2046,7 +2068,7 @@ fn apply_adds(
                 "This call already sets {}; on {} it must be {}.",
                 spec.name,
                 context.target,
-                python_literal(&spec.value)
+                source_literal(&spec.value, context.syntax)
             ),
             because: because.to_vec(),
             verified: Some(context.verified(rule)),
@@ -2113,6 +2135,79 @@ fn effort_none(changes: &[Change]) -> bool {
                 _ => false,
             }
     })
+}
+
+/// The language a call's arguments are written in, from its file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Syntax {
+    /// Keyword arguments: `reasoning_effort="none"`, `None`, `True`.
+    Python,
+    /// An options object: `reasoning_effort: "none"`, `null`, `true`.
+    JavaScript,
+}
+
+impl Syntax {
+    /// JavaScript for `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.mts`
+    /// and `.cts` files; Python for the rest.
+    pub fn of_file(file: &str) -> Self {
+        let extension = std::path::Path::new(file)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default();
+        let javascript = ["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"]
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(extension));
+        if javascript {
+            Syntax::JavaScript
+        } else {
+            Syntax::Python
+        }
+    }
+}
+
+/// A JSON value as the call's language writes it: [`python_literal`] for
+/// Python; for JavaScript the JSON text itself, which is a valid literal
+/// there (`"none"`, `{"type": "between_tools"}`, `null`).
+pub fn source_literal(value: &serde_json::Value, syntax: Syntax) -> String {
+    match syntax {
+        Syntax::Python => python_literal(value),
+        Syntax::JavaScript => javascript_literal(value),
+    }
+}
+
+/// An argument as the call's language passes it: `name=value` (a keyword
+/// argument) or `name: value` (a property of the options object).
+pub fn source_argument(name: &str, value: &serde_json::Value, syntax: Syntax) -> String {
+    match syntax {
+        Syntax::Python => format!("{name}={}", python_literal(value)),
+        Syntax::JavaScript => format!("{name}: {}", javascript_literal(value)),
+    }
+}
+
+/// A JSON value as a JavaScript literal, spaced like [`python_literal`].
+fn javascript_literal(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Array(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(javascript_literal)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        serde_json::Value::Object(map) => format!(
+            "{{{}}}",
+            map.iter()
+                .map(|(k, v)| format!(
+                    "{}: {}",
+                    serde_json::Value::String(k.clone()),
+                    javascript_literal(v)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        other => other.to_string(),
+    }
 }
 
 /// A JSON value as a Python literal (`"none"`, `{"effort": "none"}`).
@@ -3586,6 +3681,133 @@ def known(model):
             clients: &found.clients,
         };
         check(input, bundled().unwrap(), opts)
+    }
+
+    /// The usage scan of one TypeScript file, `app.ts`, checked.
+    fn check_typescript(source: &str, opts: &CheckOptions) -> RetirementReport {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::language_typescript())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let found = crate::usages::typescript::extract(&tree, source, "app.ts");
+        let input = ScanInput {
+            calls: &found.calls,
+            gaps: &found.gaps,
+            clients: &found.clients,
+        };
+        check(input, bundled().unwrap(), opts)
+    }
+
+    #[test]
+    fn typescript_calls_are_checked_like_python_ones() {
+        let source = r#"import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenAI } from "@google/genai";
+import { Configuration, OpenAIApi } from "openai";
+const openai = new OpenAI();
+const proxied = new OpenAI({ baseURL: "https://api.openai.com/v1" });
+const anthropic = new Anthropic();
+const ai = new GoogleGenAI({ vertexai: false });
+const legacy = new OpenAIApi(new Configuration({ apiKey: key }));
+export async function run() {
+  await openai.chat.completions.create({ model: "gpt-3.5-turbo", messages: [], max_tokens: 10 });
+  await proxied.chat.completions.create({ model: "gpt-4", messages: [] });
+  await anthropic.messages.create({ model: "claude-3-opus-20240229", max_tokens: 10, messages: [] });
+  await ai.models.generateContent({ model: "gemini-1.5-flash", contents: "x" });
+  await openai.fineTuning.jobs.create({ model: "gpt-3.5-turbo", training_file: "f" });
+  await legacy.createChatCompletion({ model: "gpt-4o", messages: [], max_tokens: 5 });
+  await anthropic.messages.create({ model: "claude-sonnet-4-5", max_tokens: 10, messages: [] });
+}
+"#;
+        let report = check_typescript(source, &options("2026-10-24"));
+        let at = |needle: &str| -> &Finding {
+            let line = line_of(source, needle);
+            let found: Vec<&Finding> = report.findings.iter().filter(|f| f.line == line).collect();
+            assert_eq!(found.len(), 1, "{needle}: {:#?}", report.findings);
+            found[0]
+        };
+        for needle in [
+            "\"gpt-3.5-turbo\", messages",
+            "\"gpt-4\"",
+            "claude-3-opus-20240229",
+            "gemini-1.5-flash",
+            "training_file",
+        ] {
+            let finding = at(needle);
+            assert_eq!(finding.status, State::Retired, "{needle}");
+            assert_eq!(finding.confidence, Confidence::Confirmed, "{needle}");
+            assert_eq!(finding.routing_class, RoutingClass::Direct, "{needle}");
+        }
+        // Endpoints read the JavaScript SDKs' camelCase members and openai
+        // v3's methods.
+        assert_eq!(at("gemini-1.5-flash").endpoint, Some("generate_content"));
+        assert_eq!(at("training_file").endpoint, Some(FINE_TUNING));
+        assert_eq!(
+            at("createChatCompletion").endpoint,
+            Some("chat.completions")
+        );
+        assert_eq!(at("createChatCompletion").status, State::Retiring);
+        // `baseURL` is the JavaScript SDKs' base URL option.
+        assert_eq!(at("\"gpt-4\"").base_url, Some(BaseUrl::ProviderHost));
+        // The argument rules read the options object's property names.
+        let swap = at("\"gpt-3.5-turbo\", messages");
+        assert_eq!(swap.changes[0].param, "max_tokens");
+        assert_eq!(swap.changes[0].to.as_deref(), Some("max_completion_tokens"));
+        // A decision's options are written the way the call passes them.
+        let thinking = at("claude-sonnet-4-5");
+        let between = &thinking.decisions[0].options[0].add[0];
+        assert_eq!(
+            source_argument(
+                &between.name,
+                &between.value,
+                Syntax::of_file(&thinking.file)
+            ),
+            "thinking: {\"type\": \"between_tools\"}"
+        );
+        assert_eq!(
+            source_argument(&between.name, &between.value, Syntax::Python),
+            "thinking={\"type\": \"between_tools\"}"
+        );
+    }
+
+    #[test]
+    fn literals_follow_the_call_language() {
+        let value = serde_json::json!([true, null, 2, {"effort": "none"}]);
+        assert_eq!(
+            source_literal(&value, Syntax::Python),
+            "[True, None, 2, {\"effort\": \"none\"}]"
+        );
+        assert_eq!(
+            source_literal(&value, Syntax::JavaScript),
+            "[true, null, 2, {\"effort\": \"none\"}]"
+        );
+        for (file, syntax) in [
+            ("app.py", Syntax::Python),
+            ("scripts/run", Syntax::Python),
+            ("src/app.ts", Syntax::JavaScript),
+            ("pages/chat.tsx", Syntax::JavaScript),
+            ("lib/ai.MJS", Syntax::JavaScript),
+            ("server.cjs", Syntax::JavaScript),
+        ] {
+            assert_eq!(Syntax::of_file(file), syntax, "{file}");
+        }
+        assert_eq!(
+            endpoint_of("ai.models.embedContent", "models.embedContent"),
+            Some("embeddings")
+        );
+        assert_eq!(
+            endpoint_of("chat.sendMessage", "sendMessage"),
+            Some("generate_content")
+        );
+        assert_eq!(
+            endpoint_of("openai.createCompletion", "createCompletion"),
+            Some("completions_legacy")
+        );
+        assert_eq!(
+            endpoint_of("openai.createTranscription", "createTranscription"),
+            Some("audio")
+        );
     }
 
     /// The 1-based line of the only line holding `needle`.

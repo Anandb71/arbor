@@ -68,9 +68,17 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
         "env_var",
         "the model is read from the environment or a config lookup",
     ),
-    (GapKind::UnresolvedModel, "f_string", "the model is built with an f-string"),
+    (
+        GapKind::UnresolvedModel,
+        "f_string",
+        "the model is built with an f-string or a template literal",
+    ),
     (GapKind::UnresolvedModel, "function_call", "the model is returned by a function call"),
-    (GapKind::UnresolvedModel, "attribute", "the model is an attribute of another object"),
+    (
+        GapKind::UnresolvedModel,
+        "attribute",
+        "the model is an attribute or property of another object",
+    ),
     (
         GapKind::UnresolvedModel,
         "subscript",
@@ -83,7 +91,11 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     (GapKind::UnresolvedModel, "unbound", "the model is not defined in this file"),
     (GapKind::UnresolvedModel, "non_literal", "the model is not a plain string literal"),
     (GapKind::UnresolvedModel, "credential", "the value is credential-shaped, so it is never read"),
-    (GapKind::UnresolvedModel, "splat", "a `**` expansion may replace the model"),
+    (
+        GapKind::UnresolvedModel,
+        "splat",
+        "a `**` expansion, a spread or an options object built elsewhere may hold or replace the model",
+    ),
     (
         GapKind::UnresolvedModel,
         "parameter_default",
@@ -107,7 +119,7 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     (
         GapKind::UnresolvedModel,
         "dynamic_feature",
-        "this file may change the model at run time (exec, globals(), setattr...)",
+        "this file may change the model at run time (exec, eval, globals(), setattr...)",
     ),
     (
         GapKind::UnresolvedModel,
@@ -139,7 +151,12 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     (
         GapKind::AmbiguousClient,
         "base_url_assigned",
-        "the client is given a base_url after it is built",
+        "the client is given a base_url or baseURL after it is built",
+    ),
+    (
+        GapKind::AmbiguousClient,
+        "annotation",
+        "the client is a parameter known only by its type annotation, so its options are not seen",
     ),
     (GapKind::AmbiguousClient, "endpoint_env", "this file sets the SDK's endpoint variable"),
     (GapKind::AmbiguousClient, "base_url_env", "the base_url is read from the environment"),
@@ -182,6 +199,11 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     // Calls the scan does not follow.
     (GapKind::DynamicDispatch, "getattr", "the SDK method is reached through getattr"),
     (GapKind::DynamicDispatch, "method_reference", "the SDK method is stored or passed as a value"),
+    (
+        GapKind::DynamicDispatch,
+        "computed_member",
+        "the SDK method is reached under a name known only at run time",
+    ),
     (
         GapKind::VendoredPath,
         "vendored",
@@ -277,7 +299,33 @@ mod tests {
     #[test]
     fn every_reason_the_usage_scan_emits_is_named() {
         // `vendored` is the scan's own (arbor-watcher) and is listed by hand.
-        let emitted = emitted_reasons(include_str!("../usages/python.rs"));
+        let mut emitted = emitted_reasons(include_str!("../usages/python.rs"));
+        let typescript = emitted_reasons(include_str!("../usages/typescript.rs"));
+        // The TypeScript slice is scanned the same way, and gives the
+        // reasons it is known to emit in the same shapes.
+        for known in [
+            "truncated",
+            "dynamic_feature",
+            "subclass_override",
+            "endpoint_option",
+            "endpoint_env",
+            "base_url_env",
+            "base_url_unresolved",
+            "splat",
+            "unseen_callers",
+            "missing_model",
+            "factory_call",
+            "env_var",
+            "annotation",
+            "computed_member",
+            "method_reference",
+        ] {
+            assert!(
+                typescript.contains(known),
+                "the reason scan no longer finds `{known}` in typescript.rs: update emitted_reasons"
+            );
+        }
+        emitted.extend(typescript);
         // The scan itself still finds the reasons it is known to emit, so a
         // change to how the usage scan writes them cannot hide new ones.
         for known in [

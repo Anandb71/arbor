@@ -651,7 +651,7 @@ fn exit_codes_follow_the_window() {
     let output = arbor(clean.path(), &["retirements", ".", "--today", TODAY]);
     assert_eq!(output.status.code(), Some(0));
     assert!(stdout(&output).contains(
-        "No direct openai/anthropic/google SDK calls to retired or retiring models in 1 Python file. Calls through LangChain, LiteLLM or other wrappers are not checked yet."
+        "No direct openai/anthropic/google SDK calls to retired or retiring models in 1 Python, TypeScript or JavaScript file. Calls through LangChain, LiteLLM, the Vercel AI SDK or other wrappers are not checked yet."
     ));
 }
 
@@ -1093,7 +1093,7 @@ fn usage_gaps_never_read_as_confirmed() {
     let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
     for line in [
         "the model is a class attribute that a subclass in another module may override: confirm the model this call uses",
-        "this file may change the model at run time (exec, globals(), setattr...): confirm the model this call uses; routing not confirmed (this file may rebind the client or the SDK's configuration at run time): confirm this call reaches OpenAI directly",
+        "this file may change the model at run time (exec, eval, globals(), setattr...): confirm the model this call uses; routing not confirmed (this file may rebind the client or the SDK's configuration at run time): confirm this call reaches OpenAI directly",
         "Not checked: 1 part of a file Arbor did not analyze",
         "Not checked: calls through 1 SDK method reached with getattr or stored or passed as a value.",
         "Not counted toward the exit code: 2 calls",

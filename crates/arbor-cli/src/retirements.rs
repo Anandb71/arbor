@@ -2,7 +2,8 @@
 //! provider has retired or is about to retire, what replaces each, and which
 //! other arguments have to change with it.
 //!
-//! The scan is [`arbor_watcher::usages::scan_usages`] (Python today); the
+//! The scan is [`arbor_watcher::usages::scan_usages`] (Python, TypeScript
+//! and JavaScript); the
 //! matching is [`arbor_core::retirements::check`] against data bundled at
 //! build time. Everything runs locally: no code, path or result leaves the
 //! machine, and nothing is sent anywhere.
@@ -20,9 +21,10 @@
 //! `--include-routed`.
 
 use arbor_core::retirements::{
-    bundled, check, python_literal, routing_gap_text, value_gap_text, BaseUrl, CallKind, Change,
+    bundled, check, routing_gap_text, source_argument, value_gap_text, BaseUrl, CallKind, Change,
     ChangeKind, CheckOptions, Confidence, Date, DateKind, Decision, Finding, MatchKind,
-    OptionStatus, RetirementReport, RoutingClass, ScanInput, State, FINE_TUNING, REPORT_VERSION,
+    OptionStatus, RetirementReport, RoutingClass, ScanInput, State, Syntax, FINE_TUNING,
+    REPORT_VERSION,
 };
 use arbor_core::usages::{is_unsafe_char, ValueOrigin};
 use arbor_watcher::usages::{scan_usages, UsageScanOptions};
@@ -315,7 +317,7 @@ fn tick(text: &str, code: bool) -> String {
 }
 
 /// `max_tokens → max_completion_tokens, add thinking={"type": "between_tools"} (for messages)`.
-fn describe_changes(changes: &[Change], code: bool) -> String {
+fn describe_changes(changes: &[Change], syntax: Syntax, code: bool) -> String {
     changes
         .iter()
         .map(|change| match change.kind {
@@ -325,20 +327,16 @@ fn describe_changes(changes: &[Change], code: bool) -> String {
                 tick(change.to.as_deref().unwrap_or_default(), code)
             ),
             ChangeKind::Add => {
-                let value = change
-                    .value
-                    .as_ref()
-                    .map(python_literal)
-                    .unwrap_or_default();
                 let reason = if change.because.is_empty() {
                     String::new()
                 } else {
                     format!(" (for {})", change.because.join(", "))
                 };
-                format!(
-                    "add {}{reason}",
-                    tick(&format!("{}={value}", change.param), code)
-                )
+                let argument = match &change.value {
+                    Some(value) => source_argument(&change.param, value, syntax),
+                    None => change.param.clone(),
+                };
+                format!("add {}{reason}", tick(&argument, code))
             }
         })
         .collect::<Vec<_>>()
@@ -348,7 +346,7 @@ fn describe_changes(changes: &[Change], code: bool) -> String {
 /// `keep reasoning off (add reasoning_effort="none"; keep tools) or let the
 /// model reason (remove tools)`. A parameter an option removes and adds again
 /// reads as set: `set thinking={"type": "between_tools"}`.
-fn describe_decision(decision: &Decision, code: bool) -> String {
+fn describe_decision(decision: &Decision, syntax: Syntax, code: bool) -> String {
     decision
         .options
         .iter()
@@ -362,10 +360,7 @@ fn describe_decision(decision: &Decision, code: bool) -> String {
                 };
                 edits.push(format!(
                     "{verb} {}",
-                    tick(
-                        &format!("{}={}", add.name, python_literal(&add.value)),
-                        code
-                    )
+                    tick(&source_argument(&add.name, &add.value, syntax), code)
                 ));
             }
             if !option.keep.is_empty() {
@@ -549,7 +544,7 @@ fn summary_lines(report: &RetirementReport, markdown: bool) -> Vec<String> {
     let mut lines = Vec::new();
     if s.affected_calls == 0 {
         lines.push(format!(
-            "No direct openai/anthropic/google SDK calls to retired or retiring models in {} Python file{}. Calls through LangChain, LiteLLM or other wrappers are not checked yet.",
+            "No direct openai/anthropic/google SDK calls to retired or retiring models in {} Python, TypeScript or JavaScript file{}. Calls through LangChain, LiteLLM, the Vercel AI SDK or other wrappers are not checked yet.",
             s.files_scanned,
             if s.files_scanned == 1 { "" } else { "s" }
         ));
@@ -736,7 +731,7 @@ fn join_and(names: &[&str]) -> String {
 
 fn data_line(report: &RetirementReport) -> String {
     format!(
-        "Retirement data from the providers' deprecation pages: {}. Days are counted in UTC. Python and direct SDK calls only for now. Runs locally: no code leaves this machine.",
+        "Retirement data from the providers' deprecation pages: {}. Days are counted in UTC. Python, TypeScript and JavaScript, direct SDK calls only for now. Runs locally: no code leaves this machine.",
         provider_dates(report)
     )
 }
@@ -836,7 +831,7 @@ fn print_human(report: &RetirementReport, quiet: bool, offer: bool) {
         "Model retirements in".bold(),
         clean(&report.root).bold(),
         format!(
-            "({} Python file{} checked)",
+            "({} file{} checked)",
             report.summary.files_scanned,
             if report.summary.files_scanned == 1 {
                 ""
@@ -922,14 +917,22 @@ fn print_group(group: &[Finding], today: Date) {
             println!(
                 "{indent}{} {}",
                 "also change:".bold(),
-                clean(&describe_changes(&finding.changes, false))
+                clean(&describe_changes(
+                    &finding.changes,
+                    Syntax::of_file(&finding.file),
+                    false
+                ))
             );
         }
         for decision in &finding.decisions {
             println!(
                 "{indent}{} {}",
                 "decide:".bold(),
-                clean(&describe_decision(decision, false))
+                clean(&describe_decision(
+                    decision,
+                    Syntax::of_file(&finding.file),
+                    false
+                ))
             );
         }
         for item in &finding.review {
@@ -1020,7 +1023,7 @@ fn markdown(report: &RetirementReport) -> String {
                 let decide = finding
                     .decisions
                     .iter()
-                    .map(|d| cell(&describe_decision(d, true)))
+                    .map(|d| cell(&describe_decision(d, Syntax::of_file(&finding.file), true)))
                     .collect::<Vec<_>>()
                     .join("<br>");
                 let checks = finding
@@ -1034,7 +1037,11 @@ fn markdown(report: &RetirementReport) -> String {
                     code(&location(finding)),
                     model,
                     replacement,
-                    cell(&describe_changes(&finding.changes, true)),
+                    cell(&describe_changes(
+                        &finding.changes,
+                        Syntax::of_file(&finding.file),
+                        true,
+                    )),
                     decide,
                     checks
                 ));
@@ -1107,13 +1114,13 @@ fn annotations(report: &RetirementReport, limit: usize) -> String {
         if !finding.changes.is_empty() {
             message.push_str(&format!(
                 " Also change: {}.",
-                describe_changes(&finding.changes, false)
+                describe_changes(&finding.changes, Syntax::of_file(&finding.file), false)
             ));
         }
         for decision in &finding.decisions {
             message.push_str(&format!(
                 " Decide (per repo): {}.",
-                describe_decision(decision, false)
+                describe_decision(decision, Syntax::of_file(&finding.file), false)
             ));
         }
         for item in &finding.review {
