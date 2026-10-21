@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`arbor refactor` exited 0 for a missing symbol (#195):** it now exits 1 and prints `error: Symbol '<name>' not found` to stderr after the "Did you mean" suggestions, matching `inspect` and `callers`.
+
 ## [3.1.0] - 2026-10-20
 
 A feature release: two commands for Python code that calls AI model APIs. See [docs/RELEASE_NOTES_v3.1.0.md](docs/RELEASE_NOTES_v3.1.0.md).
