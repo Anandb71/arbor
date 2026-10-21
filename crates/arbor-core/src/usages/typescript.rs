@@ -6281,13 +6281,13 @@ impl<'t> Ctx<'t> {
             Some((object, object_scope, via)) => {
                 self.object_path_value(object, object_scope, path, via, depth)
             }
-            None => Err(Unresolved::new("attribute", shape.clone())),
+            None => Some(Err(Unresolved::new("attribute", shape.clone()))),
         };
         match (found, fallback) {
-            (Err(unresolved), Some(fallback)) if unresolved.reason == "missing" => {
-                self.resolve_value(fallback, scope, depth + 1)
-            }
-            (Err(unresolved), Some(fallback)) if unresolved.reason != "credential" => {
+            // Not set: the pattern's default applies.
+            (None, Some(fallback)) => self.resolve_value(fallback, scope, depth + 1),
+            (None, None) => Err(Unresolved::new("attribute", shape)),
+            (Some(Err(unresolved)), Some(fallback)) if unresolved.reason != "credential" => {
                 // `const { model = "gpt-4o" } = options`: the default of a
                 // lookup this file cannot read.
                 match self.resolve_value(fallback, scope, depth + 1) {
@@ -6299,15 +6299,12 @@ impl<'t> Ctx<'t> {
                     Err(_) => Err(unresolved),
                 }
             }
-            (Err(unresolved), _) if unresolved.reason == "missing" => {
-                Err(Unresolved::new("attribute", shape))
-            }
-            (result, _) => result,
+            (Some(result), _) => result,
         }
     }
 
-    /// The value at `path` in an object literal. `Err` with reason
-    /// `missing` when the property is not set (a default may apply).
+    /// The value at `path` in an object literal, or `None` when the
+    /// property is not set (a default may apply).
     fn object_path_value(
         &mut self,
         object: Node<'t>,
@@ -6315,7 +6312,7 @@ impl<'t> Ctx<'t> {
         path: &[Step<'t>],
         via: Option<(String, ValueOrigin)>,
         depth: u32,
-    ) -> Result<Resolved, Unresolved> {
+    ) -> Option<Result<Resolved, Unresolved>> {
         let mut current = object;
         let mut current_scope = scope;
         let mut label = via.as_ref().map(|(name, _)| name.clone());
@@ -6329,36 +6326,36 @@ impl<'t> Ctx<'t> {
             let key = match step {
                 Step::Key(key) => *key,
                 Step::Index(_) | Step::Other => {
-                    return Err(Unresolved::new("subscript", shape));
+                    return Some(Err(Unresolved::new("subscript", shape)));
                 }
             };
             if is_secret_key(key) {
-                return Err(Unresolved::new("credential", shape));
+                return Some(Err(Unresolved::new("credential", shape)));
             }
             label = label.map(|l| clip(&format!("{l}.{key}")));
             let found = read.find(key);
             let overridden = found.overridden;
             let (value, value_scope, entry_via) = match found.pair {
                 Some(pair) => pair,
-                None if found.maybe => return Err(Unresolved::new("splat", shape)),
-                None => return Err(Unresolved::new("missing", shape)),
+                None if found.maybe => return Some(Err(Unresolved::new("splat", shape))),
+                None => return None,
             };
             if let Some((name, _)) = &entry_via {
                 label = Some(clip(&format!("{name}.{key}")));
             }
             if overridden {
                 let candidate = self.resolve_value(value, value_scope, depth + 1).ok();
-                return Err(Unresolved::new("splat", shape)
-                    .with_candidates(candidate.into_iter().collect(), false));
+                return Some(Err(Unresolved::new("splat", shape)
+                    .with_candidates(candidate.into_iter().collect(), false)));
             }
             if last {
                 let result = self.resolve_value(value, value_scope, depth + 1);
-                return match &label {
+                return Some(match &label {
                     Some(label) => result
                         .map(|r| r.constant(label, origin))
                         .map_err(|u| u.via(label)),
                     None => result,
-                };
+                });
             }
             let inner = unwrap_expression(value);
             match self.object_node(inner, value_scope) {
@@ -6366,10 +6363,10 @@ impl<'t> Ctx<'t> {
                     current = nested;
                     current_scope = nested_scope;
                 }
-                None => return Err(Unresolved::new("attribute", self.render(value))),
+                None => return Some(Err(Unresolved::new("attribute", self.render(value)))),
             }
         }
-        Err(Unresolved::new("attribute", label.unwrap_or_default()))
+        Some(Err(Unresolved::new("attribute", label.unwrap_or_default())))
     }
 
     /// `process.env.MODEL`, `import.meta.env.MODEL`, `Bun.env.MODEL`,
@@ -6504,12 +6501,9 @@ impl<'t> Ctx<'t> {
                             depth,
                         );
                     }
-                    return match self.object_path_value(object, object_scope, &steps, via, depth) {
-                        Err(unresolved) if unresolved.reason == "missing" => {
-                            Err(Unresolved::new("attribute", shape))
-                        }
-                        result => result,
-                    };
+                    return self
+                        .object_path_value(object, object_scope, &steps, via, depth)
+                        .unwrap_or_else(|| Err(Unresolved::new("attribute", shape)));
                 }
                 Err(Unresolved::new("attribute", shape))
             }
@@ -6746,10 +6740,7 @@ impl<'t> Ctx<'t> {
         } else {
             let from_object = match default.and_then(|d| self.object_node(d, init_scope)) {
                 Some((object, object_scope, _)) => {
-                    match self.object_path_value(object, object_scope, &path, None, depth + 1) {
-                        Err(unresolved) if unresolved.reason == "missing" => None,
-                        result => Some(result),
-                    }
+                    self.object_path_value(object, object_scope, &path, None, depth + 1)
                 }
                 None => None,
             };
