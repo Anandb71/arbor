@@ -1787,3 +1787,24 @@ await client.messages.create({ model: "claude-fable-5", max_tokens: 10, messages
     assert_eq!(create.values.len(), 1);
     assert_eq!(create.positional, 1);
 }
+
+#[test]
+fn a_mocked_sdk_builds_no_real_client_and_v3_configuration_is_an_sdk_object() {
+    let found = usages(
+        "import OpenAI from \"openai\";
+jest.mock(\"openai\");
+const client = new OpenAI();
+",
+    );
+    assert_eq!(routing_of(&found, "client"), Routing::Unknown);
+    let found = usages_js(
+        "const { Configuration, OpenAIApi } = require(\"openai\");
+const openai = new OpenAIApi(new Configuration({ apiKey: key }));
+",
+    );
+    let configuration = call(&found, "Configuration");
+    assert_eq!(configuration.receiver, Receiver::Symbol);
+    assert_eq!(configuration.routing, Routing::Unknown);
+    assert_eq!(configuration.kwargs, vec!["apiKey"]);
+    assert_eq!(routing_of(&found, "openai"), Routing::OpenaiDirect);
+}

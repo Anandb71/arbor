@@ -6940,8 +6940,19 @@ impl<'t> Ctx<'t> {
             };
             match self.eval(constructor, scope, 0) {
                 // Records the construction.
-                Val::Class(_) | Val::Module { entry: true, .. } | Val::V3ConfigClass => {
+                Val::Class(_) | Val::Module { entry: true, .. } => {
                     self.eval(call, scope, 0);
+                }
+                // openai v3's `new Configuration({ basePath })`: an SDK
+                // object (it routes the `OpenAIApi` built from it).
+                Val::V3ConfigClass => {
+                    let target = Target {
+                        pkg: Pkg::Openai,
+                        member: V3_CONFIGURATION.to_string(),
+                        receiver: Receiver::Symbol,
+                        client: None,
+                    };
+                    self.record_call(call, constructor, scope, target);
                 }
                 // `new OpenAIRealtimeWS({ model })`: an SDK object built from
                 // a model.
@@ -7968,6 +7979,16 @@ impl<'t> Ctx<'t> {
     }
 
     fn finish(mut self) -> FileUsages {
+        // A client built from a mocked or replaced SDK is not the SDK's.
+        for client in &mut self.out.clients {
+            if self
+                .sdk_patched
+                .keys()
+                .any(|pkg| pkg.package() == client.package)
+            {
+                client.routing = Routing::Unknown;
+            }
+        }
         self.out.imports.sort_by_key(|i| i.span.start_byte);
         self.out
             .clients
