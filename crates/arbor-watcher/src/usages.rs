@@ -8,15 +8,17 @@
 //! never touches the graph cache.
 //!
 //! Vendored and virtual-environment directories (`site-packages`, `venv`,
-//! `.venv`, `node_modules`, any directory holding a `pyvenv.cfg`...) are not
+//! `.venv`, `node_modules`, `bower_components`, any directory holding a
+//! `pyvenv.cfg`...) are not
 //! project code. They are walked only to count what is skipped: their usages
 //! are excluded from the report and summarised as `vendored_path` gaps.
 //! Other hidden directories (`.github`, `.circleci`...) are counted the same
 //! way, without a gap; version-control, Arbor and tool-cache directories are
 //! not walked at all.
 //!
-//! Extensionless files are scanned when their first line is a Python
-//! shebang (`#!/usr/bin/env python3`).
+//! Python, TypeScript and JavaScript files are scanned; TypeScript
+//! declaration files (`*.d.ts`) are not. Extensionless files are scanned
+//! when their first line is a Python shebang (`#!/usr/bin/env python3`).
 
 use crate::indexer::IgnoreMatcher;
 use arbor_core::languages::get_parser;
@@ -40,6 +42,8 @@ pub const VENDORED_DIRS: &[&str] = &[
     "site-packages",
     "dist-packages",
     "node_modules",
+    "bower_components",
+    "jspm_packages",
     "venv",
     ".venv",
     "virtualenv",
@@ -587,6 +591,33 @@ mod tests {
         assert_eq!(report.summary.by_routing.get("openai_direct"), Some(&1));
         assert_eq!(report.summary.calls_with_model, 1);
         assert!(report.gaps.is_empty());
+    }
+
+    #[test]
+    fn typescript_and_javascript_sources_are_scanned() {
+        let dir = tempdir().unwrap();
+        let ts = "import OpenAI from \"openai\";\nconst client = new OpenAI();\nclient.chat.completions.create({ model: \"gpt-4o\", messages: [] });\n";
+        let cjs = "const OpenAI = require(\"openai\");\nnew OpenAI().chat.completions.create({ model: \"gpt-4\", messages: [] });\n";
+        write(dir.path(), "src/chat.ts", ts);
+        write(dir.path(), "src/legacy.cjs", cjs);
+        write(
+            dir.path(),
+            "src/page.tsx",
+            "export const Page = () => <div />;\n",
+        );
+        // Declarations send no request: not scanned at all.
+        write(dir.path(), "src/types.d.ts", ts);
+        // Installed packages are vendored, whatever the language.
+        write(dir.path(), "node_modules/openai/index.js", cjs);
+        write(dir.path(), "web/bower_components/x/x.js", cjs);
+
+        let report = scan_usages(dir.path(), &UsageScanOptions::default()).unwrap();
+        let files: Vec<&str> = report.usages.iter().map(|u| u.file.as_str()).collect();
+        assert_eq!(files, vec!["src/chat.ts", "src/legacy.cjs"]);
+        assert_eq!(report.summary.files_scanned, 3);
+        assert_eq!(report.skipped.vendored_files, 2);
+        assert_eq!(report.skipped.vendored_calls, 2);
+        assert!(report.languages.iter().any(|l| l == "typescript"));
     }
 
     #[test]
