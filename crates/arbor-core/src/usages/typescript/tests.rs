@@ -1808,3 +1808,443 @@ const openai = new OpenAIApi(new Configuration({ apiKey: key }));
     assert_eq!(configuration.kwargs, vec!["apiKey"]);
     assert_eq!(routing_of(&found, "openai"), Routing::OpenaiDirect);
 }
+
+// ---------------------------------------------------------------------------
+// Values the review showed may differ at run time
+// ---------------------------------------------------------------------------
+
+const CLIENT: &str = "import OpenAI from \"openai\";\nconst client = new OpenAI();\n";
+
+/// The model value and gaps of the only `chat.completions.create` call in
+/// `body`, after a client named `client`.
+fn model_of(body: &str) -> (Option<String>, Vec<String>) {
+    model(&format!("{CLIENT}{body}"))
+}
+
+fn assert_held(body: &str, gap: &str) {
+    let (value, gaps) = model_of(body);
+    assert!(
+        gaps.iter().any(|g| g == gap),
+        "expected {gap} for {value:?}, got {gaps:?} in:\n{body}"
+    );
+}
+
+#[test]
+fn a_nested_object_handed_out_by_a_copy_or_a_builtin_is_not_read_only() {
+    for body in [
+        "const AGENTS = { writer: { model: \"gpt-4\" } };
+for (const a of Object.values(AGENTS)) a.model = \"gpt-4o\";
+client.chat.completions.create({ model: AGENTS.writer.model, messages: [] });",
+        "const AGENTS = { writer: { model: \"gpt-4\" } };
+Object.entries(AGENTS).forEach(([, v]) => { v.model = \"gpt-4o\"; });
+client.chat.completions.create({ model: AGENTS.writer.model, messages: [] });",
+        "const CONFIG = { chat: { model: \"gpt-4\" } };
+const local = { ...CONFIG };
+local.chat.model = \"gpt-4o\";
+client.chat.completions.create({ model: CONFIG.chat.model, messages: [] });",
+        "const CONFIG = { openai: { chat: { model: \"gpt-4\" } } };
+const o = { ...CONFIG.openai };
+o.chat.model = \"gpt-4o\";
+client.chat.completions.create({ model: CONFIG.openai.chat.model, messages: [] });",
+        "const CONFIG = { chat: { model: \"gpt-4\" } };
+const f = Object.freeze(CONFIG);
+f.chat.model = \"gpt-4o\";
+client.chat.completions.create({ model: CONFIG.chat.model, messages: [] });",
+    ] {
+        assert_held(body, "unresolved_model/attribute");
+    }
+    // A copy handed straight to a request, a freeze whose result is
+    // dropped, and the values of an object holding no container stay
+    // confirmed.
+    for body in [
+        "const PARAMS = { model: \"gpt-4\", response_format: { type: \"json_object\" } };
+client.chat.completions.create({ ...PARAMS, messages: [] });",
+        "const CONFIG = { chat: { model: \"gpt-4\" } };
+Object.freeze(CONFIG);
+client.chat.completions.create({ model: CONFIG.chat.model, messages: [] });",
+        "const MODELS = { fast: \"gpt-4\", smart: \"gpt-4o\" };
+console.log(Object.values(MODELS));
+client.chat.completions.create({ model: MODELS.fast, messages: [] });",
+    ] {
+        let (value, gaps) = model_of(body);
+        assert_eq!(value.as_deref(), Some("gpt-4"), "{body}");
+        assert!(gaps.is_empty(), "{gaps:?} in:\n{body}");
+    }
+}
+
+#[test]
+fn a_reflective_write_on_an_instance_writes_its_class_property() {
+    for write in [
+        "Object.assign(bot, { model: \"gpt-4o\" });",
+        "Object.defineProperty(bot, \"model\", { value: \"gpt-4o\" });",
+        "Reflect.set(bot, \"model\", \"gpt-4o\");",
+        "Object.assign(bots[0], { model: \"gpt-4o\" });",
+        "Object.assign(bot, overrides);",
+    ] {
+        assert_held(
+            &format!(
+                "class Bot {{ model = \"gpt-4\"; ask() {{ return client.chat.completions.create({{ model: this.model, messages: [] }}); }} }}
+const bot = new Bot();
+const bots = [bot];
+{write}
+bot.ask();"
+            ),
+            "unresolved_model/dynamic_feature",
+        );
+    }
+}
+
+#[test]
+fn a_static_property_read_through_this_sees_its_subclasses() {
+    assert_held(
+        "class Provider { static model = \"gpt-4\";
+  static complete() { return client.chat.completions.create({ model: this.model, messages: [] }); } }
+class FastProvider extends Provider { static model = \"gpt-4o\"; }
+FastProvider.complete();",
+        "unresolved_model/reassigned",
+    );
+    assert_held(
+        "class Provider { static model = \"gpt-4\";
+  static complete() { return client.chat.completions.create({ model: this.model, messages: [] }); } }
+class Sub extends Provider {}
+Sub.model = \"gpt-4o\";
+Sub.complete();",
+        "unresolved_model/reassigned",
+    );
+    // Read by class name, the subclass's own property is another one.
+    let (value, gaps) = model_of(
+        "class Provider { static model = \"gpt-4\";
+  static complete() { return client.chat.completions.create({ model: Provider.model, messages: [] }); } }
+class FastProvider extends Provider { static model = \"gpt-4o\"; }
+FastProvider.complete();",
+    );
+    assert_eq!(value.as_deref(), Some("gpt-4"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn a_base_class_arbor_cannot_identify_may_write_any_property() {
+    for base in ["holder.Base", "make()", "Tuned(Object)", "B"] {
+        let (value, gaps) = model_of(&format!(
+            "class Base {{ model = \"gpt-4o\"; }}
+const holder = {{ Base }};
+function make() {{ return Base; }}
+function Tuned(C: any) {{ return class extends C {{}}; }}
+const B = make();
+class Bot extends {base} {{ init() {{ this.model = \"gpt-4\"; }}
+  ask() {{ return client.chat.completions.create({{ model: this.model, messages: [] }}); }} }}
+new Bot().ask();"
+        ));
+        assert!(!gaps.is_empty(), "{base}: {value:?} with no gap");
+    }
+    // A same-file base in parentheses or a cast is that base.
+    for base in ["(Base)", "(Base as any)"] {
+        assert_held(
+            &format!(
+                "class Base {{ model = \"gpt-4o\"; }}
+class Bot extends {base} {{ init() {{ this.model = \"gpt-4\"; }}
+  ask() {{ return client.chat.completions.create({{ model: this.model, messages: [] }}); }} }}
+new Bot().ask();"
+            ),
+            "unresolved_model/reassigned",
+        );
+    }
+    // An imported or global base is outside the file, as documented.
+    for base in ["import { Base } from \"./base\";", "const Base = Error;"] {
+        let (value, gaps) = model_of(&format!(
+            "{base}
+class Bot extends Base {{ model = \"gpt-4\";
+  ask() {{ return client.chat.completions.create({{ model: this.model, messages: [] }}); }} }}
+new Bot().ask();"
+        ));
+        if base.starts_with("import") {
+            assert_eq!(value.as_deref(), Some("gpt-4"));
+            assert!(gaps.is_empty(), "{gaps:?}");
+        } else {
+            assert!(!gaps.is_empty(), "{base}: {value:?} with no gap");
+        }
+    }
+}
+
+#[test]
+fn a_method_called_with_another_this_reads_another_object() {
+    for call in [
+        "new Bot().ask.call({ model: \"gpt-4o\" });",
+        "Bot.prototype.ask.apply({ model: \"gpt-4o\" }, []);",
+        "const bound = new Bot().ask.bind({ model: \"gpt-4o\" }); bound();",
+        "({ model: \"gpt-4o\", ask: new Bot().ask }).ask();",
+    ] {
+        let (value, gaps) = model_of(&format!(
+            "class Bot {{ model = \"gpt-4\"; ask() {{ return client.chat.completions.create({{ model: this.model, messages: [] }}); }} }}
+{call}"
+        ));
+        assert_eq!(value.as_deref(), Some("gpt-4"), "{call}");
+        assert!(
+            gaps.iter().any(|g| g == "unresolved_model/attribute"),
+            "{call}: {gaps:?}"
+        );
+    }
+    // An arrow function keeps the `this` it was written in.
+    let (value, gaps) = model_of(
+        "class Bot { model = \"gpt-4\"; ask = () => client.chat.completions.create({ model: this.model, messages: [] }); }
+const b = new Bot();
+setTimeout(b.ask);",
+    );
+    assert_eq!(value.as_deref(), Some("gpt-4"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn an_enum_member_names_the_members_before_outer_names() {
+    let (value, gaps) = model_of(
+        "const Fast = \"gpt-4\";
+enum Model { Fast = \"gpt-4o\", Default = Fast }
+client.chat.completions.create({ model: Model.Default, messages: [] });",
+    );
+    assert_eq!(value.as_deref(), Some("gpt-4o"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+    let (value, gaps) = model_of(
+        "const Fast = \"gpt-4\";
+enum Model { Fast = \"gpt-4o\", Default = Fast || \"x\" }
+client.chat.completions.create({ model: Model.Default, messages: [] });",
+    );
+    assert_eq!(value, None);
+    assert!(!gaps.is_empty());
+}
+
+#[test]
+fn an_enum_written_through_a_cast_or_an_alias_is_not_read_only() {
+    for write in [
+        "(Model as any).Chat = \"gpt-4o\";",
+        "const alias: any = Model; alias.Chat = \"gpt-4o\";",
+        "mutate(Model);",
+    ] {
+        assert_held(
+            &format!(
+                "enum Model {{ Chat = \"gpt-4\" }}
+{write}
+client.chat.completions.create({{ model: Model.Chat, messages: [] }});"
+            ),
+            "unresolved_model/reassigned",
+        );
+    }
+    let (value, gaps) = model_of(
+        "enum Model { Chat = \"gpt-4\" }
+console.log(Model);
+client.chat.completions.create({ model: Model.Chat, messages: [] });",
+    );
+    assert_eq!(value.as_deref(), Some("gpt-4"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn a_namespace_export_written_from_outside_is_reassigned() {
+    for write in [
+        "Cfg.model = \"gpt-4o\";",
+        "(Cfg as any).model = \"gpt-4o\";",
+        "namespace Cfg { model = \"gpt-4o\"; }",
+    ] {
+        assert_held(
+            &format!(
+                "namespace Cfg {{ export let model = \"gpt-4\";
+  export function ask() {{ return client.chat.completions.create({{ model, messages: [] }}); }} }}
+{write}
+Cfg.ask();"
+            ),
+            "unresolved_model/reassigned",
+        );
+    }
+    let (value, gaps) = model_of(
+        "namespace Cfg { export const model = \"gpt-4\";
+  export function ask() { return client.chat.completions.create({ model, messages: [] }); } }
+Cfg.ask();",
+    );
+    assert_eq!(value.as_deref(), Some("gpt-4"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn a_parenthesized_eval_is_a_direct_eval() {
+    let found = usages_js(
+        "const OpenAI = require(\"openai\");
+const client = new OpenAI();
+let model = \"gpt-4\";
+(eval)(\"model = 'gpt-4o'\");
+client.chat.completions.create({ model, messages: [] });
+",
+    );
+    let c = call(&found, "client.chat.completions.create");
+    assert!(
+        gaps_at(&found, c)
+            .iter()
+            .any(|g| g == "unresolved_model/dynamic_feature"),
+        "{:?}",
+        found.gaps
+    );
+}
+
+#[test]
+fn an_object_whose_own_methods_write_this_is_not_read_only() {
+    for body in [
+        "const A = { model: \"gpt-4\", toJSON() { this.model = \"gpt-4o\"; return {}; } };
+JSON.stringify(A);
+client.chat.completions.create({ model: A.model, messages: [] });",
+        "const A = { model: \"gpt-4\", toString: function () { this.model = \"gpt-4o\"; return \"\"; } };
+console.log(A);
+client.chat.completions.create({ model: A.model, messages: [] });",
+        "const A = { inner: { model: \"gpt-4\", reset() { Object.assign(this, { model: \"gpt-4o\" }); } } };
+client.chat.completions.create({ model: A.inner.model, messages: [] });",
+    ] {
+        let (value, gaps) = model_of(body);
+        assert!(!gaps.is_empty(), "{value:?} with no gap in:\n{body}");
+    }
+    // A method that only reads `this` changes nothing.
+    let (value, gaps) = model_of(
+        "const A = { model: \"gpt-4\", describe() { return this.model; } };
+client.chat.completions.create({ model: A.model, messages: [] });",
+    );
+    assert_eq!(value.as_deref(), Some("gpt-4"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn a_parameter_written_in_its_function_lists_every_value() {
+    for body in [
+        "async function ask(model = \"gpt-4\") { model = \"gpt-4o\"; return client.chat.completions.create({ model, messages: [] }); }
+ask();",
+        "async function ask(model = \"gpt-4\") { if (Math.random() > 0.5) model = \"gpt-4o\"; return client.chat.completions.create({ model, messages: [] }); }
+ask();",
+        "async function ask(model = \"gpt-4\") { var model = \"gpt-4o\"; return client.chat.completions.create({ model, messages: [] }); }
+ask();",
+    ] {
+        let found = usages(&format!("{CLIENT}{body}"));
+        let gap = found
+            .gaps
+            .iter()
+            .find(|g| g.reason == "reassigned")
+            .unwrap_or_else(|| panic!("no reassigned gap: {:?}", found.gaps));
+        let values: Vec<&str> = gap.values.iter().map(|v| v.value.as_str()).collect();
+        assert!(values.contains(&"gpt-4") && values.contains(&"gpt-4o"), "{values:?}");
+        assert!(gap.values_complete, "{body}");
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(value(c, "model"), None);
+    }
+    // `??=` writes a value the scan does not read.
+    let found = usages(&format!(
+        "{CLIENT}function ask({{ model = \"gpt-4\" }}: {{ model?: string }} = {{}}) {{ model ??= other(); return client.chat.completions.create({{ model, messages: [] }}); }}
+ask();"
+    ));
+    let gap = found
+        .gaps
+        .iter()
+        .find(|g| g.reason == "reassigned")
+        .unwrap();
+    assert!(!gap.values_complete);
+}
+
+#[test]
+fn a_sloppy_function_reading_arguments_may_rewrite_its_parameters() {
+    let found = usages_js(
+        "const OpenAI = require(\"openai\");
+const client = new OpenAI();
+function ask(model) { arguments[0] = \"gpt-4o\"; return client.chat.completions.create({ model, messages: [] }); }
+ask(\"gpt-4\");
+",
+    );
+    let gap = found
+        .gaps
+        .iter()
+        .find(|g| g.key.as_deref() == Some("model"))
+        .unwrap_or_else(|| panic!("no gap: {:?}", found.gaps));
+    assert!(!gap.values_complete, "{gap:?}");
+    // A parameter with a default is never an alias of `arguments`.
+    let (value, gaps) = model_of(
+        "function ask(model = \"gpt-4\") { console.log(arguments.length); return client.chat.completions.create({ model, messages: [] }); }
+ask();",
+    );
+    assert_eq!(value.as_deref(), Some("gpt-4"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn calls_through_a_function_or_class_expression_s_own_name_are_callers() {
+    assert_held(
+        "const ask = function retry(model = \"gpt-4\", tries = 0): any {
+  if (tries === 0) return retry(\"gpt-4o\", 1);
+  return client.chat.completions.create({ model, messages: [] });
+};
+ask();",
+        "unresolved_model/parameter_overridden",
+    );
+    assert_held(
+        "const Bot = class Inner { constructor(private model = \"gpt-4\") {}
+  static fast() { return new Inner(\"gpt-4o\"); }
+  ask() { return client.chat.completions.create({ model: this.model, messages: [] }); } };
+new Bot().ask();
+Bot.fast().ask();",
+        "unresolved_model/parameter_overridden",
+    );
+}
+
+#[test]
+fn an_instance_built_through_its_constructor_property_has_unseen_callers() {
+    for build in [
+        "withModel(m: string) { return new (this.constructor as typeof Bot)(m); }",
+        "withModel(m: string) { return new (this.constructor)(m); }",
+        "withModel(m: string) { const C: any = this.constructor; return new C(m); }",
+    ] {
+        assert_held(
+            &format!(
+                "class Bot {{ constructor(private model = \"gpt-4\") {{}}
+  {build}
+  ask() {{ return client.chat.completions.create({{ model: this.model, messages: [] }}); }} }}
+new Bot().withModel(\"gpt-4o\").ask();"
+            ),
+            "unresolved_model/unseen_callers",
+        );
+    }
+    assert_held(
+        "class Bot { constructor(private model = \"gpt-4\") {}
+  ask() { return client.chat.completions.create({ model: this.model, messages: [] }); } }
+const b = new Bot();
+new (b.constructor as any)(\"gpt-4o\").ask();",
+        "unresolved_model/unseen_callers",
+    );
+    // Reading the constructor's name builds nothing.
+    let (value, gaps) = model_of(
+        "class Bot { constructor(private model = \"gpt-4\") {}
+  label() { return this.constructor.name; }
+  ask() { return client.chat.completions.create({ model: this.model, messages: [] }); } }
+new Bot().ask();",
+    );
+    assert_eq!(value.as_deref(), Some("gpt-4"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn a_proto_key_sets_the_prototype_not_a_property() {
+    let found = usages(&format!(
+        "{CLIENT}client.chat.completions.create({{ model: \"gpt-5\", __proto__: {{ model: \"gpt-3.5-turbo\" }}, messages: [] }});"
+    ));
+    let c = call(&found, "client.chat.completions.create");
+    assert_eq!(c.values.len(), 1, "{:?}", c.values);
+    assert_eq!(value(c, "model"), Some("gpt-5"));
+    // A property it does not set may come from the prototype.
+    let (value, gaps) = model_of(
+        "const A = { __proto__: { model: \"gpt-4\" } };
+client.chat.completions.create({ model: A.model, messages: [] });",
+    );
+    assert_eq!(value, None);
+    assert!(!gaps.is_empty());
+}
+
+#[test]
+fn a_declared_field_in_a_subclass_emits_nothing() {
+    let (value, gaps) = model_of(
+        "class Base { model = \"gpt-4\"; ask() { return client.chat.completions.create({ model: this.model, messages: [] }); } }
+class Bot extends Base { declare model: string; }
+new Bot().ask();",
+    );
+    assert_eq!(value.as_deref(), Some("gpt-4"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
