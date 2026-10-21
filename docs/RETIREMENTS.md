@@ -19,7 +19,7 @@ and it runs locally: no code leaves your machine.
 
 ```text
 $ arbor retirements .
-Model retirements in . (1 Python file checked)
+Model retirements in . (1 file checked)
 
 1 call uses a model Anthropic shut down on 28 Oct 2025
   app/chat.py:33  claude-3-5-sonnet-20241022 → claude-sonnet-5-5
@@ -63,13 +63,13 @@ For each affected call it reports:
 | **When** | Already retired, or the shutdown date and the days left. Google lists its Gemini dates as the earliest possible, so those read "on or after". |
 | **Replacement** | The model the provider's deprecation page lists. Arbor does not pick a "better" one. When the listed model is itself retired or retiring, Arbor follows what the provider lists for it in turn and shows the first one that still works: `gpt-4-vision-preview → gpt-6-luna (via gpt-4o)`. Such a call always needs a manual check, and `--json` has the whole chain. When the provider lists several models, or none, the report says so. |
 | **Also change** | Arguments that must change with the replacement, worked out from the arguments the call passes: for example `max_tokens` becomes `max_completion_tokens` on gpt-6-luna. Only changes the provider documents as required are listed here. |
-| **Decide** | Choices your repository makes once, which Arbor never makes for you. Today that is the reasoning effort on OpenAI's new models: gpt-6-luna and GPT-5.6 run at medium reasoning effort by default, so they can reason, while gpt-4o and gpt-4.1 did not. You can keep reasoning off (`reasoning_effort="none"`; parameters such as `temperature` and `tools` keep working) or let the model reason (when it does, the call is slower and reasoning tokens are billed; those parameters have to go). The same goes for Claude's thinking on claude-sonnet-5-5, which thinks by default where the Sonnet models it replaces did not: you can send `thinking={"type": "between_tools"}` (no thinking before the answer) or let the model think (slower and costlier when it does, and a response can begin with thinking blocks). The report shows both options with their effect and how well each effect is established. A call with a decision moves only once the repository has chosen: its *also change* edits, such as the `max_tokens` rename, go in together with the chosen option. |
+| **Decide** | Choices your repository makes once, which Arbor never makes for you. Today that is the reasoning effort on OpenAI's new models: gpt-6-luna and GPT-5.6 run at medium reasoning effort by default, so they can reason, while gpt-4o and gpt-4.1 did not. You can keep reasoning off (`reasoning_effort="none"`; parameters such as `temperature` and `tools` keep working) or let the model reason (when it does, the call is slower and reasoning tokens are billed; those parameters have to go). The same goes for Claude's thinking on claude-sonnet-5-5, which thinks by default where the Sonnet models it replaces did not: you can send `thinking={"type": "between_tools"}` (no thinking before the answer) or let the model think (slower and costlier when it does, and a response can begin with thinking blocks). In TypeScript and JavaScript files the report writes each argument as a property of the options object: `reasoning_effort: "none"`, `thinking: {"type": "between_tools"}`. The report shows both options with their effect and how well each effect is established. A call with a decision moves only once the repository has chosen: its *also change* edits, such as the `max_tokens` rename, go in together with the chosen option. |
 | **Check** | What needs a person: parameters the replacement rejects (`stop`, `logit_bias`), fine-tuned models, embedding models (new vectors), several listed replacements, a model set in a request parameter object such as a tool config, and a model nested in a call's arguments, such as a Message Batch's `requests[].params` or a tool's `model` in `tools=[...]`. The call's own argument checks do not apply to a nested model: only the checks about the model itself do, and the report says to check the parameters next to it by hand. |
-| **Confidence** | *Confirmed*: a literal or a constant in the same file, at a call where the usage scan (`arbor usages`) left no gap for it. *Confirm first*: the fallback of `os.getenv(...)`, a parameter default, one of the values a dict lookup, a branch or an in-file caller may give, or any value the usage scan put a gap on: a class attribute a subclass in another module may override, a name something in the file may change at run time (`exec`, `globals()`, `setattr`...), a call that passes more nested model values than the scan reads. The value at run time may differ, and the report says why. *Gap*: an SDK-shaped call whose client Arbor could not resolve (built by a factory, passed in). |
-| **Routing** | A provider's dates apply to its own API. A client whose `base_url` is the provider's own host (`https://api.openai.com/v1`) or `None` is a direct call. When the usage scan cannot confirm where a call goes, it is listed with *routing not confirmed* and the reason: a `base_url` read from the environment (even one that falls back to the provider's host, since the deployment may set the variable) or from code Arbor cannot read, a client assigned more than one way or passed in by callers in other modules, a file that sets `OPENAI_BASE_URL`, module-level configuration outside the file's setup block, a Gemini client given `http_options` or `vertexai=True`, or a file that may rebind it at run time. A Gemini client follows Google Cloud's (Vertex AI) schedule only when it is built with `vertexai=True`; with `vertexai=False`, `None` or no flag it follows the Gemini API's. When `vertexai=` is decided at run time, Arbor looks the model up on Vertex AI first, then on the Gemini API, and the check says which schedule it used. Calls through Azure OpenAI, another host in `base_url` (OpenRouter, LiteLLM, a proxy), Bedrock or Vertex for Claude are counted separately; `--include-routed` lists them. |
+| **Confidence** | *Confirmed*: a literal or a constant in the same file, at a call where the usage scan (`arbor usages`) left no gap for it. *Confirm first*: the fallback of `os.getenv(...)` or `process.env.MODEL ?? "..."`, a parameter default, one of the values a dict lookup, a branch or an in-file caller may give, or any value the usage scan put a gap on: a class attribute a subclass in another module may override, a name something in the file may change at run time (`exec`, `globals()`, `setattr`..., or `eval` and `with` in JavaScript), a call that passes more nested model values than the scan reads. The value at run time may differ, and the report says why. *Gap*: an SDK-shaped call whose client Arbor could not resolve (built by a factory, passed in). |
+| **Routing** | A provider's dates apply to its own API. A client whose `base_url` (`baseURL` in TypeScript and JavaScript) is the provider's own host (`https://api.openai.com/v1`) or `None` is a direct call. When the usage scan cannot confirm where a call goes, it is listed with *routing not confirmed* and the reason: a `base_url` read from the environment (even one that falls back to the provider's host, since the deployment may set the variable) or from code Arbor cannot read, a client assigned more than one way or passed in by callers in other modules, a file that sets `OPENAI_BASE_URL`, module-level configuration outside the file's setup block, a Gemini client given `http_options` or `vertexai=True` (`httpOptions`, `vertexai: true`), an SDK the file mocks (`jest.mock("openai")`), or a file that may rebind it at run time. A Gemini client follows Google Cloud's (Vertex AI) schedule only when it is built with `vertexai=True`; with `vertexai=False`, `None` or no flag it follows the Gemini API's. When `vertexai=` is decided at run time, Arbor looks the model up on Vertex AI first, then on the Gemini API, and the check says which schedule it used. Calls through Azure OpenAI, another host in `base_url` (OpenRouter, LiteLLM, a proxy), Bedrock or Vertex for Claude are counted separately; `--include-routed` lists them. |
 
-Calls through LangChain, LiteLLM's own API, LlamaIndex or other wrappers are not
-checked yet, so a clean result says "No direct openai/anthropic/google SDK calls"
+Calls through LangChain, LiteLLM's own API, LlamaIndex, the Vercel AI SDK or other
+wrappers are not checked yet, so a clean result says "No direct openai/anthropic/google SDK calls"
 and nothing more.
 
 Fine-tuned models (`ft:<base>:...`) follow their base model's schedule. Arbor names a
@@ -153,26 +153,32 @@ it too. The check runs on the runner and sends nothing anywhere.
 
 ## Scope today
 
-- **Python only.** `.py` files and Python scripts. TypeScript and JavaScript are coming.
+- **Python, TypeScript and JavaScript.** `.py` files and Python scripts, and `.ts`,
+  `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs` and `.cjs` files. Declaration files
+  (`.d.ts`) send no request and are skipped. What the usage scan confirms in each
+  language is in [SDK_USAGES.md](SDK_USAGES.md).
 - **Providers:** OpenAI, Anthropic, the Gemini API and Gemini on Google Cloud (Vertex AI):
   283 entries (276 model IDs; 7 listed by both the Gemini API and Vertex; aliases
   included) from their deprecation pages, with the aliases and changelog entries those
   pages leave out, such as the four OpenAI aliases above.
 - **Direct SDK calls only.** It reads the `openai`, `anthropic`, `google-genai` and
-  `google-generativeai` SDKs. Framework wrappers (LangChain, LlamaIndex, LiteLLM's own
-  API) are not checked yet. Model IDs in `.env`, YAML, JSON or notebooks are not read.
+  `google-generativeai` SDKs in Python, and the `openai`, `@anthropic-ai/sdk` (with
+  its Bedrock, Vertex, Foundry and AWS packages), `@google/genai` and
+  `@google/generative-ai` packages in TypeScript and JavaScript. Framework wrappers
+  (LangChain, LlamaIndex, LiteLLM's own API, the Vercel AI SDK) are not checked yet. Model IDs in `.env`, YAML, JSON or notebooks are not read.
 - **Values it can see.** A model passed in from an environment variable, a function
   argument or another module is counted under "Not checked"; `arbor usages` lists those
   calls. So is a call that passes no model, where the SDK's or the server's default
   applies. Argument checks look at the argument *names* a call passes, not their values,
   and not at parameters nested in config objects such as Gemini's
-  `GenerateContentConfig`.
+  `GenerateContentConfig` (`config: {...}` in TypeScript).
 - **What it did not read.** Every part of the scan that could hide a call gets its own
   "Not checked" line, so a clean result never claims more than was read: parts of files
   the usage scan did not analyze (scopes nested more than 64 deep, more records than it
   reads in one file), SDK calls through a client Arbor could not resolve (built by a
   factory or passed in) whose model it could not read either, SDK methods reached
-  through `getattr` or passed as values, files
+  through `getattr` or a computed member (`client.chat.completions[method]`) or passed
+  as values, files
   with syntax errors (calls inside a broken region may be missing), files over the size
   limit or not readable as UTF-8, and calls in hidden directories such as `.github/`.
   Vendored and virtual-environment directories are not project code and are skipped.
@@ -211,7 +217,7 @@ it (see [RELEASING.md](RELEASING.md)).
 `arbor retirements` reads source files on your machine and prints a report. It makes no
 network requests and has no telemetry. Model values are captured only for model
 arguments, and credential-shaped strings are never captured or printed. For a client
-given a `base_url`, Arbor reads that argument to tell the provider's own host from a
+given a `base_url` (`baseURL`), Arbor reads that argument to tell the provider's own host from a
 proxy; it reports only that class, never the URL.
 
 The human report ends with one line offering automated fix pull requests. That line is
