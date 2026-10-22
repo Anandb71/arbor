@@ -34,7 +34,11 @@ impl LanguageParser for TypeScriptParser {
         Some(crate::usages::typescript::extract(tree, source, file_path))
     }
 
-    fn usages_language(&self, file_path: &str) -> Option<&'static str> {
+    fn usages_language(&self) -> Option<&'static str> {
+        Some("typescript")
+    }
+
+    fn usages_language_of(&self, file_path: &str) -> Option<&'static str> {
         Some(crate::usages::typescript::language_of(file_path))
     }
 
@@ -90,8 +94,12 @@ impl LanguageParser for TsxParser {
         TypeScriptParser.extract_usages(tree, source, file_path)
     }
 
-    fn usages_language(&self, file_path: &str) -> Option<&'static str> {
-        TypeScriptParser.usages_language(file_path)
+    fn usages_language(&self) -> Option<&'static str> {
+        TypeScriptParser.usages_language()
+    }
+
+    fn usages_language_of(&self, file_path: &str) -> Option<&'static str> {
+        TypeScriptParser.usages_language_of(file_path)
     }
 
     fn may_have_usages(&self, source: &str) -> bool {

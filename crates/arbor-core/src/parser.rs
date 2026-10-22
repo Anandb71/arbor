@@ -121,7 +121,7 @@ pub fn parse_source_usages(
     file_path: &str,
     lang_parser: &dyn LanguageParser,
 ) -> Result<Option<FileUsages>> {
-    let Some(language) = lang_parser.usages_language(file_path) else {
+    let Some(language) = lang_parser.usages_language_of(file_path) else {
         return Ok(None);
     };
     if !lang_parser.may_have_usages(source) {
