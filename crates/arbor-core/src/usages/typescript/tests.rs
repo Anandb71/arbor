@@ -2756,3 +2756,19 @@ client.chat.completions.create({{ model: \"gpt-4\", messages: [] }});"
     assert_eq!(routing, Routing::OpenaiDirect);
     assert!(gaps.is_empty(), "{gaps:?}");
 }
+
+#[test]
+fn nested_model_keys_are_read_as_deep_as_in_python() {
+    let found = usages(&format!(
+        "{CLIENT}client.batches.create({{ requests: [{{ p2: {{ p1: {{ p0: {{ model: \"gpt-4\" }} }} }} }}] }});
+client.batches.create({{ requests: [{{ p3: {{ p2: {{ p1: {{ p0: {{ model: \"gpt-4\" }} }} }} }} }}] }});"
+    ));
+    let calls: Vec<&SdkCall> = found
+        .calls
+        .iter()
+        .filter(|c| c.member == "batches.create")
+        .collect();
+    assert_eq!(calls[0].values.len(), 1, "{:?}", calls[0].values);
+    assert_eq!(calls[0].values[0].key, "requests.p2.p1.p0.model");
+    assert!(calls[1].values.is_empty());
+}

@@ -342,7 +342,8 @@ const MAX_LITERAL_BYTES: usize = 4096;
 const MAX_NESTED_ENTRIES: usize = 256;
 /// Spreads expanded per object literal; past it, a spread is opaque.
 const MAX_SPREADS: usize = 64;
-/// Nesting of object literals a search for nested model keys descends.
+/// Literals below an option's value a search for nested model keys
+/// descends, as in Python (`requests: [{ params: { model } }]` is 2).
 const MAX_NESTED_DEPTH: usize = 4;
 /// Nested model values listed per call and per file. Past either, the call
 /// gets a `truncated` gap instead.
@@ -8653,7 +8654,8 @@ impl<'t> Ctx<'t> {
                     scope: entry.scope,
                     prefix: format!("{}.", entry.key),
                     replaced,
-                    depth: 1,
+                    // As in Python, an option's value is depth 0.
+                    depth: 0,
                     positional: false,
                 });
             }
@@ -8664,7 +8666,7 @@ impl<'t> Ctx<'t> {
                 scope,
                 prefix: String::new(),
                 replaced: false,
-                depth: 1,
+                depth: 0,
                 positional: true,
             });
         }
