@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "description": "Versioned evaluation corpus. expected/<name>.json is hand-audited truth for the fixture in corpus/<name>; known_missing/known_extra record the engine's current deltas so regressions fail and fixes must retire entries. Fixtures with before/ and after/ subdirectories are controlled changes — each state is indexed and compared independently (renames, deletions, removed exports, base-only code). Fixtures with \"suite\": \"usages\" are SDK-usage fixtures: `arbor usages . --json` is run on them and compared against expected/<name>.json (usages, clients, captured values, typed gaps, skipped vendored files, and strings that must never be output).",
+  "description": "Versioned evaluation corpus. expected/<name>.json is hand-audited truth for the fixture in corpus/<name>; known_missing/known_extra record the engine's current deltas so regressions fail and fixes must retire entries. Fixtures with before/ and after/ subdirectories are controlled changes \u2014 each state is indexed and compared independently (renames, deletions, removed exports, base-only code). Fixtures with \"suite\": \"usages\" are SDK-usage fixtures: `arbor usages . --json` is run on them and compared against expected/<name>.json (usages, clients, captured values, typed gaps, skipped vendored files, and strings that must never be output).",
   "fixtures": [
     {
       "name": "py-crossfile",
