@@ -234,6 +234,29 @@ const MODEL_BEARING: &[&str] = &[
 /// (`client.chat.completions.with_raw_response.create`).
 const RESPONSE_WRAPPERS: &[&str] = &["with_raw_response", "with_streaming_response"];
 
+/// The API resources of the v0 OpenAI SDK (`openai<1.0`). Their methods take
+/// `api_base` and `api_type` per call, which route that call whatever the
+/// module's settings are (`openai.ChatCompletion.create(api_base=...)`).
+const LEGACY_RESOURCES: &[&str] = &[
+    "Audio",
+    "ChatCompletion",
+    "Completion",
+    "Customer",
+    "Deployment",
+    "Edit",
+    "Embedding",
+    "Engine",
+    "File",
+    "FineTune",
+    "FineTuningJob",
+    "Image",
+    "Model",
+    "Moderation",
+];
+
+/// The arguments with which a v0 resource method routes its own call.
+const CALL_ROUTING_KEYS: &[&str] = &["api_base", "api_type"];
+
 /// Legacy `google.generativeai` functions whose first positional argument is
 /// the model (`genai.embed_content("models/embedding-001", text)`).
 const LEGACY_POSITIONAL_MODEL: &[&str] = &[
@@ -633,6 +656,10 @@ enum ClientCaveat {
     /// decide: `openai.api_type` set to a value that is not a string
     /// literal, or an `openai.bedrock_*` setting.
     ModuleRouting(Feature),
+    /// A v0 resource call (`openai.ChatCompletion.create`) passes its own
+    /// `api_base` or `api_type`, or a `**` expansion that may hold one
+    /// (`what`), which routes it whatever the module's settings are.
+    CallRouting { what: &'static str },
     /// A direct client (`OpenAI`, `Anthropic`, `genai.Client`) known only
     /// from a type annotation (`def ask(client: OpenAI)`): how it was built,
     /// and so whether it was given a `base_url` or another endpoint, is not
@@ -6803,17 +6830,26 @@ impl<'t> Ctx<'t> {
     }
 
     /// Routing of a module-level API call (`openai.ChatCompletion.create`)
-    /// and why it may not hold: the file's configuration (see
-    /// [`Self::module_openai_routing`]), a configuration written after a
-    /// call that runs at import, or (with no configuration in the file) an
+    /// and why it may not hold: a v0 resource call's own `api_base` or
+    /// `api_type` (see [`Self::call_routing`]), the file's configuration
+    /// (see [`Self::module_openai_routing`]), a configuration written after
+    /// a call that runs at import, or (with no configuration in the file) an
     /// `engine`/`deployment_id` argument, which another module's Azure
-    /// configuration would serve.
+    /// configuration would serve. `path` is the member path below the
+    /// package.
     fn module_target(
         &mut self,
         pkg: Pkg,
+        path: &[String],
         call: Node<'t>,
         scope: usize,
     ) -> (Routing, Option<ClientCaveat>) {
+        // The call's own routing arguments decide over the module's.
+        if pkg == Pkg::Openai && is_legacy_resource_call(path) {
+            if let Some(what) = self.call_routing(call, scope) {
+                return (Routing::Unknown, Some(ClientCaveat::CallRouting { what }));
+            }
+        }
         let mut routing = self.module_routing(pkg);
         let mut caveat = self.module_caveat(pkg);
         if caveat.is_none() {
@@ -6870,6 +6906,35 @@ impl<'t> Ctx<'t> {
             s = current.parent.unwrap_or(0);
         }
         true
+    }
+
+    /// What a v0 resource call passes that routes it on its own: `api_base`
+    /// or `api_type` by keyword (`None` routes nothing), or a `**` expansion
+    /// that may hold either. Two lookups per expansion, however many keys
+    /// its dict has. A routing argument passed by position
+    /// (`create(key, base)`) is not read: v0 code passes them by name.
+    fn call_routing(&mut self, call: Node<'t>, scope: usize) -> Option<&'static str> {
+        for (key, what) in [("api_base", "`api_base`"), ("api_type", "`api_type`")] {
+            if keyword_value(call, |n| self.text(n), |k| k == key)
+                .is_some_and(|v| v.kind() != "none")
+            {
+                return Some(what);
+            }
+        }
+        let args = self.arguments(call);
+        let expands = args
+            .splats
+            .iter()
+            .any(|splat| match self.expand_splat(*splat, scope) {
+                Some(expansion) => {
+                    expansion.opaque()
+                        || CALL_ROUTING_KEYS
+                            .iter()
+                            .any(|key| expansion.summary.last.contains_key(*key))
+                }
+                None => true,
+            });
+        expands.then_some("a `**` expansion that may hold `api_base` or `api_type`")
     }
 
     /// Whether `call` passes `engine` or `deployment_id`, by keyword or
@@ -6931,7 +6996,7 @@ impl<'t> Ctx<'t> {
                 }
             }
             Val::Module { pkg, path } if !path.is_empty() => {
-                let (routing, caveat) = self.module_target(pkg, call, scope);
+                let (routing, caveat) = self.module_target(pkg, &path, call, scope);
                 let target = CallTarget {
                     pkg,
                     member: path.join("."),
@@ -6944,7 +7009,7 @@ impl<'t> Ctx<'t> {
                 self.record_call(call, function, scope, target);
             }
             Val::Symbol { pkg, path } => {
-                let (routing, caveat) = self.module_target(pkg, call, scope);
+                let (routing, caveat) = self.module_target(pkg, &path, call, scope);
                 let target = CallTarget {
                     pkg,
                     member: path.join("."),
@@ -7278,6 +7343,12 @@ impl<'t> Ctx<'t> {
                     format!(
                         "the module-level API is routed by a setting this version does not decide ({}), so where `{chain}` sends its requests is not known",
                         feature.describe()
+                    ),
+                ),
+                ClientCaveat::CallRouting { what } => (
+                    "call_routing",
+                    format!(
+                        "`{chain}` passes {what}, which routes this call whatever the module's settings are, so where it sends its requests is not known"
                     ),
                 ),
                 ClientCaveat::Annotation => (
@@ -9365,6 +9436,23 @@ fn is_module_routing_attr(attr: &str) -> bool {
             | "azure_ad_token"
             | "azure_ad_token_provider"
     ) || attr.starts_with("bedrock_")
+}
+
+/// Whether `path`, below the `openai` package, is a method of a v0 API
+/// resource (`ChatCompletion.create`, `api_resources.Completion.acreate`):
+/// its first capitalized segment is one of [`LEGACY_RESOURCES`], a member
+/// follows it, and no `types` module comes before it (the v1 SDK's
+/// `openai.types.Model` is a response type).
+fn is_legacy_resource_call(path: &[String]) -> bool {
+    let Some(at) = path
+        .iter()
+        .position(|p| p.starts_with(|c: char| c.is_ascii_uppercase()))
+    else {
+        return false;
+    };
+    at + 1 < path.len()
+        && LEGACY_RESOURCES.contains(&path[at].as_str())
+        && !path[..at].iter().any(|p| p == "types")
 }
 
 fn is_top_statement(frame: &Frame<'_>) -> bool {

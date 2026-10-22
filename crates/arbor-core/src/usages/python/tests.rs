@@ -5146,6 +5146,101 @@ openai.chat.completions.create(model="gpt-4o", messages=[])
 }
 
 #[test]
+fn a_legacy_call_that_routes_itself_is_a_gap() {
+    // #278: a v0 resource call took its routing only from the module's
+    // settings, so `openai.ChatCompletion.create(..., api_base=...)`,
+    // `api_type=` or an opaque `**cfg` was `openai_direct` with no gap,
+    // while v0 sends the call where its own arguments say. Each now routes
+    // `unknown` with a `call_routing` gap.
+    let call_routing = || vec!["ambiguous_client/call_routing".to_string()];
+    let found = usages(
+        r#"import openai
+from openai import ChatCompletion
+
+openai.ChatCompletion.create(model="gpt-4", messages=[], api_base="https://gateway.internal/v1")
+openai.Completion.create(model="text-davinci-003", prompt="hi", api_type="azure")
+ChatCompletion.create(model="gpt-4", messages=[], api_base="https://gateway.internal/v1")
+openai.Audio.transcribe("whisper-1", open("a.mp3", "rb"), api_base="https://gateway.internal/v1")
+openai.Model.list(api_type="azure")
+openai.ChatCompletion.create(model="gpt-4", messages=[], **{"api_base": "https://gateway.internal/v1"})
+
+def ask(**cfg):
+    return openai.ChatCompletion.create(model="gpt-4", messages=[], **cfg)
+
+PARAMS = {"model": "gpt-4", "messages": []}
+openai.ChatCompletion.create(**PARAMS)
+openai.ChatCompletion.create(model="gpt-4", messages=[], api_base=None)
+openai.ChatCompletion.create(model="gpt-4", messages=[])
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (4, Routing::Unknown, call_routing()),
+            (5, Routing::Unknown, call_routing()),
+            (6, Routing::Unknown, call_routing()),
+            (7, Routing::Unknown, call_routing()),
+            (8, Routing::Unknown, call_routing()),
+            (9, Routing::Unknown, call_routing()),
+            (12, Routing::Unknown, call_routing()),
+            // A same-file dict with no routing key, `None`, and no routing
+            // argument at all leave the module's routing.
+            (15, Routing::OpenaiDirect, vec![]),
+            (16, Routing::OpenaiDirect, vec![]),
+            (17, Routing::OpenaiDirect, vec![]),
+        ]
+    );
+    let cases: Vec<(&str, Vec<RouteRow>)> = vec![
+        (
+            // The call's own route decides over the module's settings.
+            "import openai\nopenai.api_type = \"azure\"\nopenai.api_base = \"https://myco.openai.azure.com/\"\nopenai.ChatCompletion.create(engine=\"gpt35\", messages=[], api_base=\"https://other.openai.azure.com/\")\nopenai.ChatCompletion.create(engine=\"gpt35\", messages=[])\n",
+            vec![
+                (4, Routing::Unknown, call_routing()),
+                (5, Routing::AzureOpenai, vec![]),
+            ],
+        ),
+        (
+            // And over the `module_config` gap an Azure argument gives.
+            "import openai\nopenai.ChatCompletion.create(engine=\"gpt35\", messages=[], api_base=\"https://x.openai.azure.com/\")\n",
+            vec![(2, Routing::Unknown, call_routing())],
+        ),
+        (
+            // The v1 SDK takes no route per call (`api_base=` raises
+            // `TypeError` there), so its calls are not read for one.
+            "import openai\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[], api_base=\"https://x/\")\n",
+            vec![(2, Routing::OpenaiDirect, vec![])],
+        ),
+    ];
+    for (source, expected) in cases {
+        assert_eq!(routes_and_gaps(&usages(source)), expected, "{source}");
+    }
+}
+
+#[test]
+fn legacy_resource_calls_are_the_v0_resource_methods() {
+    let path = |p: &str| p.split('.').map(String::from).collect::<Vec<_>>();
+    for legacy in [
+        "ChatCompletion.create",
+        "Completion.acreate",
+        "api_resources.Embedding.create",
+        "Audio.transcribe",
+        "Model.list",
+    ] {
+        assert!(super::is_legacy_resource_call(&path(legacy)), "{legacy}");
+    }
+    for other in [
+        "chat.completions.create",
+        "ChatCompletion",
+        "types.Model.construct",
+        "types.chat.ChatCompletion.model_validate",
+        "OpenAI.with_options",
+        "error.RateLimitError",
+    ] {
+        assert!(!super::is_legacy_resource_call(&path(other)), "{other}");
+    }
+}
+
+#[test]
 fn every_way_a_name_or_attribute_is_rebound_counts() {
     // Should-fix 3: tree-sitter reads `type(self).model = v` as a type
     // alias statement, which was never handled, so the class attribute kept

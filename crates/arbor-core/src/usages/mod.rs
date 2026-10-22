@@ -143,15 +143,16 @@ pub enum Routing {
     /// after it is built or built in a file that sets `OPENAI_BASE_URL` /
     /// `ANTHROPIC_BASE_URL` or writes the environment with a run-time name,
     /// a `base_url` read from the environment with no fallback or one that
-    /// does not resolve to a string, and a module-level API routed by an
+    /// does not resolve to a string, a module-level API routed by an
     /// `openai.api_type` that is not a string literal or by an
-    /// `openai.bedrock_*` setting. With no gap, because the route is known to
-    /// be a platform this list does not name: a literal `openai.api_type`
-    /// other than Azure or OpenAI (`amazon-bedrock`), and a hosted-platform
-    /// client (`BedrockOpenAI`, `OpenAI(provider=...)`,
-    /// `AnthropicAWS`, `AnthropicFoundry`, `AnthropicGoogleCloud` and their
-    /// async variants). The construction's `constructor` field still names
-    /// the class.
+    /// `openai.bedrock_*` setting, and a v0 resource call
+    /// (`openai.ChatCompletion.create`) that passes its own `api_base` or
+    /// `api_type`. With no gap, because the route is known to be a platform
+    /// this list does not name: a literal `openai.api_type` other than Azure
+    /// or OpenAI (`amazon-bedrock`), and a hosted-platform client
+    /// (`BedrockOpenAI`, `OpenAI(provider=...)`, `AnthropicAWS`,
+    /// `AnthropicFoundry`, `AnthropicGoogleCloud` and their async variants).
+    /// The construction's `constructor` field still names the class.
     Unknown,
 }
 
@@ -438,7 +439,9 @@ pub enum GapKind {
     /// call in a file that configures it outside its top-of-file setup block
     /// (`module_config`), a module-level API routed by an `openai.api_type`
     /// that is not a string literal or by an `openai.bedrock_*` setting
-    /// (`module_routing`), a direct client known only from a type annotation
+    /// (`module_routing`), a v0 resource call that passes its own `api_base`
+    /// or `api_type`, or a `**` expansion that may hold one
+    /// (`call_routing`), a direct client known only from a type annotation
     /// (`annotation`), or a receiver or configuration a dynamic feature of
     /// the file may change (`dynamic_feature`).
     AmbiguousClient,

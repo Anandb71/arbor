@@ -161,6 +161,11 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     ),
     (
         GapKind::AmbiguousClient,
+        "call_routing",
+        "the call passes its own api_base or api_type, or an expansion that may hold one",
+    ),
+    (
+        GapKind::AmbiguousClient,
         "dynamic_feature",
         "this file may rebind the client or the SDK's configuration at run time",
     ),

@@ -190,6 +190,14 @@ these:
   a name bound to one), and any `openai.bedrock_*` setting, route `unknown`
   with a `module_routing` gap.
 
+  A v0 resource call (`openai<1.0`: `openai.ChatCompletion.create`,
+  `Completion`, `Embedding`, `Audio`, `Model` and the other resources) also
+  takes its own `api_base` and `api_type`, which route that call whatever
+  the settings say. A call that passes either (other than `None`), or a
+  `**` expansion that may hold one, routes `unknown` with a `call_routing`
+  gap. A routing argument passed by position is not read: v0 code passes
+  them by name.
+
   Anything else gives every module-level call of the file a `module_config`
   gap that keeps the routing the settings suggest: a setting in a function,
   in an `if`, loop, `try`, `with` or class body, after the setup block, by
