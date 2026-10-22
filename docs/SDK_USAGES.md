@@ -183,6 +183,21 @@ these:
   so none of its own code can run before the configuration is complete. The
   report does not follow import-time execution any further than that.
 
+  In the block, a string literal decides `openai.api_type`: `azure` or
+  `azure_ad` routes to Azure, `openai` or `open_ai` direct, and any other
+  (`amazon-bedrock`) `unknown` with no gap, a platform this version does
+  not name. An `api_type` that is not a string literal (`os.environ[...]`,
+  a name bound to one), and any `openai.bedrock_*` setting, route `unknown`
+  with a `module_routing` gap.
+
+  A v0 resource call (`openai<1.0`: `openai.ChatCompletion.create`,
+  `Completion`, `Embedding`, `Audio`, `Model` and the other resources) also
+  takes its own `api_base` and `api_type`, which route that call whatever
+  the settings say. A call that passes either (other than `None`), or a
+  `**` expansion that may hold one, routes `unknown` with a `call_routing`
+  gap. A routing argument passed by position is not read: v0 code passes
+  them by name.
+
   Anything else gives every module-level call of the file a `module_config`
   gap that keeps the routing the settings suggest: a setting in a function,
   in an `if`, loop, `try`, `with` or class body, after the setup block, by
@@ -198,6 +213,16 @@ A client read through `self` (`self.client`) is confirmed under rule 3
 without the `subclass_override` gap that a model value read the same way
 gets. That is an assumption of the report: a subclass in another module
 that replaces a public class's client is not seen.
+
+A client known only from a type annotation (`def ask(client: OpenAI)`,
+`client: OpenAI` in a class body), with no construction the file shows,
+routes by its class when the class alone decides the route
+(`AzureOpenAI`, `AnthropicBedrock`, `AnthropicVertex`). A direct class
+(`OpenAI`, `Anthropic`, `genai.Client`) may have been given a `base_url` or
+another endpoint, so its calls route `unknown` with an `annotation` gap. An
+annotation that names several classes (`AzureOpenAI | OpenAI`,
+`Union[AnthropicBedrock, Anthropic]`) decides the route only when every one
+of them does, and all the same way; otherwise its calls get the same gap.
 
 An OpenAI or Anthropic client's `base_url` routes by its host (a Gemini
 client's endpoint options are a gap, above). The URL itself is never
@@ -407,4 +432,14 @@ generators of each later review:
 - 2.6 MB to 4 MiB: the generated shapes at most 3.4 s and 660 MB (a
   400,000-key dict expanded at 10,000 calls), and the 3 MB scale files about
   3.3 s and 780 MB, bound by the tree-sitter parse;
-- 4 MiB: about 5 s and 1 GB, bound by the parse.
+- 4 MiB: about 5 s and 1 GB on ordinary code, bound by the parse.
+
+A file made of little but calls costs more at the same size: the scan
+indexes every call and evaluates each one's callee. Time and memory still
+grow linearly with the number of calls (half the file takes half the time
+and memory). Release builds on the same laptop:
+
+| 4 MiB of | Calls | Time | Peak memory |
+|---|---|---|---|
+| bare calls, `f()` on each line | about 1M | about 9 s, 4 s of it the parse | about 1.4 GB, 0.96 GB of it the parse |
+| chained calls, `f()()()...` 60 to a line | about 2M | about 20 s, over half of it naming each call's callee | about 1.8 GB |
