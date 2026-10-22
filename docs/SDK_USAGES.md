@@ -429,4 +429,14 @@ generators of each later review:
 - 2.6 MB to 4 MiB: the generated shapes at most 3.4 s and 660 MB (a
   400,000-key dict expanded at 10,000 calls), and the 3 MB scale files about
   3.3 s and 780 MB, bound by the tree-sitter parse;
-- 4 MiB: about 5 s and 1 GB, bound by the parse.
+- 4 MiB: about 5 s and 1 GB on ordinary code, bound by the parse.
+
+A file made of little but calls costs more at the same size: the scan
+indexes every call and evaluates each one's callee. Time and memory still
+grow linearly with the number of calls (half the file takes half the time
+and memory). Release builds on the same laptop:
+
+| 4 MiB of | Calls | Time | Peak memory |
+|---|---|---|---|
+| bare calls, `f()` on each line | about 1M | about 9 s, 4 s of it the parse | about 1.4 GB, 0.96 GB of it the parse |
+| chained calls, `f()()()...` 60 to a line | about 2M | about 20 s, over half of it naming each call's callee | about 1.8 GB |
