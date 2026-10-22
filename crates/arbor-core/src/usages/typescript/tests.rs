@@ -196,6 +196,8 @@ import OpenAI from "npm:openai@^4.20.0";
 import Anthropic from "npm:@anthropic-ai/sdk@0.20.1";
 import JsrOpenAI from "jsr:@openai/openai";
 import CdnOpenAI from "https://esm.sh/openai@4.28.0";
+import PinnedOpenAI from "https://esm.sh/v135/openai@4";
+import JsdOpenAI from "https://cdn.jsdelivr.net/npm/openai@4/+esm";
 import DenoOpenAI from "https://deno.land/x/openai@v4.24.0/mod.ts";
 "#,
     );
@@ -204,6 +206,8 @@ import DenoOpenAI from "https://deno.land/x/openai@v4.24.0/mod.ts";
         "Anthropic",
         "JsrOpenAI",
         "CdnOpenAI",
+        "PinnedOpenAI",
+        "JsdOpenAI",
         "DenoOpenAI",
     ] {
         let import = found
@@ -2398,4 +2402,357 @@ const client = new OpenAI();
 ",
     );
     assert_eq!(routing_of(&found, "client"), Routing::Unknown);
+}
+
+// ---------------------------------------------------------------------------
+// Routes the review showed may go elsewhere
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_spread_written_after_the_base_url_may_replace_it() {
+    for options in [
+        "{ baseURL: \"https://api.openai.com/v1\", ...overrides }",
+        "{ baseURL: \"https://api.openai.com/v1\", [key]: value }",
+        "{ baseURL: \"https://proxy.example.com/v1\", ...overrides }",
+    ] {
+        let (routing, gaps) = route(
+            &format!(
+                "{OPENAI}const client = new OpenAI({options});
+client.chat.completions.create({{ model: \"gpt-4\", messages: [] }});"
+            ),
+            "chat.completions.create",
+        );
+        assert_eq!(routing, Routing::Unknown, "{options}");
+        assert_eq!(
+            gaps,
+            vec!["ambiguous_client/base_url_unresolved"],
+            "{options}"
+        );
+    }
+    let (routing, gaps) = route(
+        &format!(
+            "{OPENAI}const client = new OpenAI().withOptions({{ baseURL: \"https://api.openai.com/v1\", ...extra }});
+client.chat.completions.create({{ model: \"gpt-4\", messages: [] }});"
+        ),
+        "chat.completions.create",
+    );
+    assert_eq!(routing, Routing::Unknown);
+    assert!(!gaps.is_empty());
+    // Written before the base URL, a spread is replaced by it.
+    let (routing, gaps) = route(
+        &format!(
+            "{OPENAI}const client = new OpenAI({{ ...overrides, baseURL: \"https://api.openai.com/v1\" }});
+client.chat.completions.create({{ model: \"gpt-4\", messages: [] }});"
+        ),
+        "chat.completions.create",
+    );
+    assert_eq!(routing, Routing::OpenaiDirect);
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn a_reflective_write_on_an_sdk_object_reroutes_or_patches_it() {
+    for write in [
+        "Object.assign(client, { baseURL: \"https://gateway.example.com\" });",
+        "Object.defineProperty(client, \"baseURL\", { value: \"https://gateway.example.com\" });",
+        "Reflect.set(client, \"baseURL\", \"https://gateway.example.com\");",
+    ] {
+        let (routing, gaps) = route(
+            &format!(
+                "import Anthropic from \"@anthropic-ai/sdk\";
+const client = new Anthropic();
+{write}
+client.messages.create({{ model: \"claude-3-5-sonnet-20241022\", max_tokens: 1, messages: [] }});"
+            ),
+            "messages.create",
+        );
+        assert_eq!(routing, Routing::Unknown, "{write}");
+        assert_eq!(gaps, vec!["ambiguous_client/base_url_assigned"], "{write}");
+    }
+    for write in [
+        "Object.assign(OpenAI.prototype, { buildURL() { return \"x\"; } });",
+        "Object.defineProperty(OpenAI.prototype, \"baseURL\", { get() { return \"x\"; } });",
+        "Object.assign(client.chat.completions, { create: fake });",
+        "Object.setPrototypeOf(client, other);",
+    ] {
+        let (routing, gaps) = route(
+            &format!(
+                "{OPENAI}const client = new OpenAI();
+{write}
+client.chat.completions.create({{ model: \"gpt-4\", messages: [] }});"
+            ),
+            "chat.completions.create",
+        );
+        assert_eq!(routing, Routing::Unknown, "{write}");
+        assert_eq!(gaps, vec!["ambiguous_client/dynamic_feature"], "{write}");
+    }
+    // Settings change nothing.
+    let (routing, gaps) = route(
+        &format!(
+            "{OPENAI}const client = new OpenAI();
+Object.assign(client, {{ maxRetries: 5 }});
+client.chat.completions.create({{ model: \"gpt-4\", messages: [] }});"
+        ),
+        "chat.completions.create",
+    );
+    assert_eq!(routing, Routing::OpenaiDirect);
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn gemini_request_options_may_name_an_endpoint() {
+    let found = usages(
+        "import { GoogleGenerativeAI } from \"@google/generative-ai\";
+const genAI = new GoogleGenerativeAI(key);
+const model = genAI.getGenerativeModel({ model: \"gemini-1.5-flash\" }, { baseUrl: \"https://gateway.example.com\" });
+model.generateContent(\"hi\");
+",
+    );
+    let routed = call(&found, "genAI.getGenerativeModel");
+    assert_eq!(routed.routing, Routing::Unknown);
+    assert_eq!(
+        gaps_at(&found, routed),
+        vec!["ambiguous_client/endpoint_option"]
+    );
+    let found = usages(
+        "import { GoogleGenerativeAI } from \"@google/generative-ai\";
+const genAI = new GoogleGenerativeAI(key);
+const model = genAI.getGenerativeModel({ model: \"gemini-1.5-flash\" });
+model.generateContent(\"hi\", { baseUrl: \"https://gateway.example.com\" });
+model.startChat().sendMessage(\"hi\", options);
+model.generateContent(\"hi\");
+",
+    );
+    let calls: Vec<&SdkCall> = found
+        .calls
+        .iter()
+        .filter(|c| c.member == "generateContent" || c.member == "sendMessage")
+        .collect();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0].routing, Routing::Unknown);
+    assert_eq!(calls[1].routing, Routing::Unknown);
+    assert_eq!(calls[2].routing, Routing::GoogleGenerativeaiLegacy);
+    assert!(gaps_at(&found, calls[2]).is_empty());
+
+    for config in [
+        "{ httpOptions: { baseUrl: \"https://gateway.example.com\" } }",
+        "{ httpOptions: opts }",
+        "settings",
+    ] {
+        let (routing, gaps) = route(
+            &format!(
+                "import {{ GoogleGenAI }} from \"@google/genai\";
+const ai = new GoogleGenAI({{ apiKey: key }});
+ai.models.generateContent({{ model: \"gemini-1.5-flash\", contents: \"hi\", config: {config} }});"
+            ),
+            "models.generateContent",
+        );
+        assert_eq!(routing, Routing::Unknown, "{config}");
+        assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"], "{config}");
+    }
+    let (routing, gaps) = route(
+        "import { GoogleGenAI } from \"@google/genai\";
+const ai = new GoogleGenAI({ apiKey: key });
+ai.models.generateContent({ model: \"gemini-1.5-flash\", contents: \"hi\", config: { temperature: 0 } });",
+        "models.generateContent",
+    );
+    assert_eq!(routing, Routing::GoogleGenai);
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn set_default_base_urls_through_require_or_an_alias_reroutes_gemini() {
+    for source in [
+        "const genai = require(\"@google/genai\");
+genai.setDefaultBaseUrls({ geminiUrl: \"https://proxy.example.com\" });
+const ai = new genai.GoogleGenAI({ apiKey: \"k\" });
+ai.models.generateContent({ model: \"gemini-1.5-flash\", contents: \"x\" });
+",
+        "import { GoogleGenAI, setDefaultBaseUrls } from \"@google/genai\";
+const configure = setDefaultBaseUrls;
+const ai = new GoogleGenAI({ apiKey: \"k\" });
+configure({ geminiUrl: \"https://proxy.example.com\" });
+ai.models.generateContent({ model: \"gemini-1.5-flash\", contents: \"x\" });
+",
+    ] {
+        let found = scan(source, "app.js");
+        let c = call(&found, "ai.models.generateContent");
+        assert_eq!(c.routing, Routing::Unknown, "{source}");
+        assert_eq!(gaps_at(&found, c), vec!["ambiguous_client/endpoint_option"]);
+        assert_eq!(routing_of(&found, "ai"), Routing::Unknown);
+    }
+}
+
+#[test]
+fn a_custom_fetch_or_an_empty_base_url() {
+    for source in [
+        "import Anthropic from \"@anthropic-ai/sdk\";
+const client = new Anthropic({ fetch: rewrite });
+client.messages.create({ model: \"claude-3-5-sonnet-20241022\", max_tokens: 1, messages: [] });",
+        "import Anthropic from \"@anthropic-ai/sdk\";
+const client = new Anthropic().withOptions({ fetch: rewrite });
+client.messages.create({ model: \"claude-3-5-sonnet-20241022\", max_tokens: 1, messages: [] });",
+    ] {
+        let (routing, gaps) = route(source, "messages.create");
+        assert_eq!(routing, Routing::Unknown, "{source}");
+        assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"], "{source}");
+    }
+    let (routing, gaps) = route(
+        &format!(
+            "{OPENAI}const client = new OpenAI({{ baseURL: \"\" }});
+client.chat.completions.create({{ model: \"gpt-4\", messages: [] }});"
+        ),
+        "chat.completions.create",
+    );
+    assert_eq!(routing, Routing::OpenaiDirect);
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn an_unresolved_client_on_any_model_bearing_member_is_a_gap() {
+    for (call_text, sdk) in [
+        (
+            "genAI.getGenerativeModel({ model: \"gemini-1.5-flash\" })",
+            Sdk::Google,
+        ),
+        (
+            "ai.chats.create({ model: \"gemini-1.5-flash\" })",
+            Sdk::Google,
+        ),
+        (
+            "ai.models.generateImages({ model: \"imagen-3.0-generate-002\", prompt })",
+            Sdk::Google,
+        ),
+        (
+            "openai.beta.assistants.create({ model: \"gpt-4\" })",
+            Sdk::Openai,
+        ),
+        (
+            "openai.fineTuning.jobs.create({ model: \"gpt-4o-mini-2024-07-18\", training_file })",
+            Sdk::Openai,
+        ),
+        (
+            "openai.moderations.create({ model: \"text-moderation-007\", input })",
+            Sdk::Openai,
+        ),
+        (
+            "anthropic.beta.messages.toolRunner({ model: \"claude-3-5-sonnet-20241022\" })",
+            Sdk::Anthropic,
+        ),
+    ] {
+        let found = usages(&format!(
+            "import {{ genAI, ai, openai, anthropic }} from \"@/lib/clients\";
+export async function run(prompt: string, input: string, training_file: string) {{
+  return {call_text};
+}}
+"
+        ));
+        let gap = found
+            .gaps
+            .iter()
+            .find(|g| g.kind == GapKind::UnknownClientFactory)
+            .unwrap_or_else(|| panic!("no gap for {call_text}: {:?}", found.gaps));
+        assert_eq!(gap.sdk, Some(sdk), "{call_text}");
+        assert_eq!(gap.reason, "imported_name");
+        assert_eq!(gap.values.len(), 1, "{call_text}");
+    }
+    // Without a model written, an unknown receiver's `chats.create` is not
+    // taken to be an SDK.
+    let found = usages(
+        "import { slack } from \"./slack\";
+import OpenAI from \"openai\";
+slack.chats.create({ channel: \"x\" });
+",
+    );
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn a_file_calling_only_images_or_audio_is_scanned() {
+    let found = usages(
+        "import { ai } from \"./lib/ai\";
+export async function speak(text: string) { return ai.audio.speech.create({ model: \"tts-1\", voice: \"alloy\", input: text }); }
+export async function draw(prompt: string) { return ai.images.generate({ model: \"dall-e-2\", prompt }); }
+",
+    );
+    assert_eq!(
+        gaps(&found, GapKind::UnknownClientFactory).len(),
+        2,
+        "{:?}",
+        found.gaps
+    );
+}
+
+#[test]
+fn a_request_body_after_a_path_parameter_holds_the_model() {
+    let found = usages(&format!(
+        "{CLIENT}client.beta.threads.runs.create(\"thread_abc\", {{ assistant_id: \"asst_abc\", model: \"gpt-4\" }});
+client.beta.threads.runs.createAndPoll(threadId, {{ assistant_id: \"asst_abc\" }});"
+    ));
+    let runs = call(&found, "client.beta.threads.runs.create");
+    assert_eq!(value(runs, "model"), Some("gpt-4"));
+    assert!(gaps_at(&found, runs).is_empty(), "{:?}", found.gaps);
+    assert_eq!(runs.kwargs, vec!["assistant_id", "model"]);
+    let poll = call(&found, "client.beta.threads.runs.createAndPoll");
+    assert_eq!(
+        gaps_at(&found, poll),
+        vec!["unresolved_model/missing_model"]
+    );
+}
+
+#[test]
+fn a_per_request_endpoint_unconfirms_where_the_model_was_given() {
+    let found = usages(
+        "import { GoogleGenerativeAI } from \"@google/generative-ai\";
+const genAI = new GoogleGenerativeAI(key);
+const model = genAI.getGenerativeModel({ model: \"gemini-1.5-flash\" });
+await model.generateContent(\"hi\", { baseUrl: \"https://proxy.example.com\" });
+",
+    );
+    let given = call(&found, "genAI.getGenerativeModel");
+    assert_eq!(value(given, "model"), Some("gemini-1.5-flash"));
+    assert_eq!(given.routing, Routing::Unknown);
+    assert_eq!(
+        gaps_at(&found, given),
+        vec!["ambiguous_client/endpoint_option"]
+    );
+    let found = usages(
+        "import { GoogleGenAI } from \"@google/genai\";
+const ai = new GoogleGenAI({ apiKey: key });
+const chat = ai.chats.create({ model: \"gemini-1.5-flash\" });
+await chat.sendMessage({ message: \"hi\", config: { httpOptions: { baseUrl: \"https://proxy.example.com\" } } });
+",
+    );
+    let given = call(&found, "ai.chats.create");
+    assert_eq!(given.routing, Routing::Unknown);
+    assert_eq!(
+        gaps_at(&found, given),
+        vec!["ambiguous_client/endpoint_option"]
+    );
+}
+
+#[test]
+fn the_environment_handed_to_code_that_may_write_it_is_unknown() {
+    let (routing, gaps) = route(
+        &format!(
+            "{OPENAI}function setup(env: NodeJS.ProcessEnv) {{ env.OPENAI_BASE_URL = \"https://proxy.example.com/v1\"; }}
+setup(process.env);
+const client = new OpenAI();
+client.chat.completions.create({{ model: \"gpt-4\", messages: [] }});"
+        ),
+        "chat.completions.create",
+    );
+    assert_eq!(routing, Routing::Unknown);
+    assert_eq!(gaps, vec!["ambiguous_client/dynamic_feature"]);
+    // Reading it changes nothing.
+    let (routing, gaps) = route(
+        &format!(
+            "{OPENAI}console.log(Object.keys(process.env), JSON.stringify(process.env));
+const client = new OpenAI();
+client.chat.completions.create({{ model: \"gpt-4\", messages: [] }});"
+        ),
+        "chat.completions.create",
+    );
+    assert_eq!(routing, Routing::OpenaiDirect);
+    assert!(gaps.is_empty(), "{gaps:?}");
 }

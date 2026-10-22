@@ -93,6 +93,7 @@ const PREFILTER: &[&str] = &[
 /// not reports nothing, so callers may skip parsing it.
 pub fn may_use_sdk(source: &str) -> bool {
     PREFILTER.iter().any(|needle| source.contains(needle))
+        || MODEL_BEARING.iter().any(|needle| source.contains(needle))
 }
 
 /// The language a file's records carry: `javascript` for `.js`, `.jsx`,
@@ -200,6 +201,18 @@ const REQUEST_METHODS: &[&str] = &[
     "listFineTuneEvents",
 ];
 
+/// Legacy Gemini model and chat methods that take request options as their
+/// second argument, which may name a `baseUrl`.
+const LEGACY_REQUEST_OPTIONS: &[&str] = &[
+    "generateContent",
+    "generateContentStream",
+    "countTokens",
+    "embedContent",
+    "batchEmbedContents",
+    "sendMessage",
+    "sendMessageStream",
+];
+
 /// Whether a call's member path ends in a request method.
 fn is_request(member: &str) -> bool {
     let last = member.rsplit('.').next().unwrap_or(member);
@@ -269,6 +282,24 @@ const MODEL_BEARING: &[&str] = &[
     "createTranscription",
     "createTranslation",
 ];
+
+/// OpenAI methods whose first argument is a path parameter and whose second
+/// is the request body (`runs.create(threadId, { model })`).
+const PATH_PARAM_METHODS: &[&str] = &[
+    "runs.create",
+    "runs.createAndPoll",
+    "runs.createAndStream",
+    "runs.stream",
+    "assistants.update",
+];
+
+/// Whether `member` is `name` or ends in `.name`.
+fn member_is(member: &str, name: &str) -> bool {
+    member == name
+        || member
+            .strip_suffix(name)
+            .is_some_and(|head| head.ends_with('.'))
+}
 
 /// Whether a call's member path takes a model.
 fn is_model_bearing(member: &str) -> bool {
@@ -432,10 +463,26 @@ impl Pkg {
             Some(url) => {
                 let (host, path) = url.split_once('/')?;
                 match host {
-                    "esm.sh" | "cdn.skypack.dev" | "esm.run" | "unpkg.com" => {
-                        path.trim_start_matches('/')
+                    // `https://esm.sh/v135/openai@4` pins a build version.
+                    "esm.sh" => {
+                        let path = path.trim_start_matches('/');
+                        match path.split_once('/') {
+                            Some((build, rest))
+                                if build.len() > 1
+                                    && build.starts_with('v')
+                                    && build[1..].bytes().all(|b| b.is_ascii_digit()) =>
+                            {
+                                rest
+                            }
+                            _ => path,
+                        }
                     }
-                    "cdn.jsdelivr.net" => path.strip_prefix("npm/")?,
+                    "cdn.skypack.dev" | "esm.run" | "unpkg.com" => path.trim_start_matches('/'),
+                    // `https://cdn.jsdelivr.net/npm/openai@4/+esm`
+                    "cdn.jsdelivr.net" => {
+                        let path = path.strip_prefix("npm/")?;
+                        path.strip_suffix("/+esm").unwrap_or(path)
+                    }
                     "deno.land" => {
                         let rest = path.strip_prefix("x/")?;
                         let (name, sub) = rest.split_once('/').unwrap_or((rest, ""));
@@ -672,6 +719,37 @@ fn sdk_shape(chain: &str) -> Option<(Sdk, bool)> {
     }
 }
 
+/// The SDK a chain's model-bearing member belongs to, and whether the shape
+/// is its own (`messages.create` is also Twilio's), for a receiver Arbor
+/// could not resolve.
+fn model_bearing_shape(chain: &str) -> Option<(Sdk, bool)> {
+    let chain = chain.replace("?.", ".").replace('!', "");
+    let (_, member) = chain.split_once('.')?;
+    if !is_model_bearing(member) {
+        return None;
+    }
+    const GOOGLE: &[&str] = &[
+        "models.",
+        "chats.create",
+        "live.connect",
+        "caches.create",
+        "getGenerativeModel",
+        "generateContent",
+        "generateContentStream",
+        "embedContent",
+    ];
+    if member.contains("messages.") {
+        let generic = ["messages.create", "messages.stream", "messages.parse"]
+            .iter()
+            .any(|m| member_is(member, m));
+        Some((Sdk::Anthropic, !generic))
+    } else if GOOGLE.iter().any(|g| member.contains(g)) {
+        Some((Sdk::Google, true))
+    } else {
+        Some((Sdk::Openai, true))
+    }
+}
+
 /// Environment variables an SDK reads its endpoint from when the
 /// constructor is not given one. An Anthropic profile (`ANTHROPIC_PROFILE`,
 /// `ANTHROPIC_CONFIG_DIR`) may name a `base_url` too.
@@ -860,7 +938,8 @@ fn url_host(url: &str) -> String {
 /// [`BaseUrl::Provider`] when `url` is the provider's own host, else
 /// [`BaseUrl::Custom`].
 fn host_kind(pkg: Pkg, url: &str) -> BaseUrl {
-    if url_host(url) == provider_host(pkg) {
+    // The SDKs build `baseURL || "https://api.openai.com/v1"`.
+    if url.is_empty() || url_host(url) == provider_host(pkg) {
         BaseUrl::Provider
     } else {
         BaseUrl::Custom
@@ -1268,6 +1347,9 @@ enum ImportKind {
 /// was passed to, if it was an argument.
 type HandedOut<'t> = (Rc<[Step<'t>]>, Option<(Node<'t>, usize)>);
 
+/// An enum's members by name, and the value each is given.
+type EnumMembers<'t> = Rc<HashMap<&'t str, Option<Node<'t>>>>;
+
 /// An object literal, the scope it is written in, and the name it was
 /// reached through with the origin a value read from it has.
 type ObjectRef<'t> = (Node<'t>, usize, Option<(String, ValueOrigin)>);
@@ -1588,6 +1670,8 @@ struct Ctx<'t> {
     readonly_memo: HashMap<usize, Option<(Node<'t>, usize)>>,
     /// [`Ctx::holds_any_container`], by object literal (node id).
     container_memo: HashMap<usize, bool>,
+    /// [`Ctx::enum_members`], by binding.
+    enum_memo: HashMap<usize, EnumMembers<'t>>,
     /// Environment variables written by a literal name.
     env_writes: HashSet<String>,
     /// The environment written under a name known only at run time.
@@ -1604,6 +1688,11 @@ struct Ctx<'t> {
     rerouted_any: Option<Feature>,
     /// `setDefaultBaseUrls(...)` from `@google/genai`.
     genai_base_urls: Option<Feature>,
+    /// A legacy Gemini request, or an `@google/genai` one, passes options that
+    /// may name another endpoint: the models and chats its model was given
+    /// to may be routed elsewhere.
+    legacy_request_endpoint: Option<Feature>,
+    genai_request_endpoint: Option<Feature>,
     sdk_imported: HashSet<Sdk>,
     import_bindings: usize,
     import_cut: Option<Node<'t>>,
@@ -1697,6 +1786,7 @@ impl<'t> Ctx<'t> {
             object_cuts: 0,
             readonly_memo: HashMap::new(),
             container_memo: HashMap::new(),
+            enum_memo: HashMap::new(),
             env_writes: HashSet::new(),
             env_wild: None,
             file_dynamic: None,
@@ -1704,6 +1794,8 @@ impl<'t> Ctx<'t> {
             rerouted: HashSet::new(),
             rerouted_any: None,
             genai_base_urls: None,
+            legacy_request_endpoint: None,
+            genai_request_endpoint: None,
             sdk_imported: HashSet::new(),
             import_bindings: 0,
             import_cut: None,
@@ -4562,6 +4654,15 @@ impl<'t> Ctx<'t> {
             let Some(function) = call.child_by_field_name("function") else {
                 continue;
             };
+            // `setup(process.env)`: the environment handed to code that may
+            // write it.
+            if self.env_writes_unknown_through(*call, function, *scope) {
+                let line = self.line(*call);
+                self.env_wild.get_or_insert(Feature {
+                    what: "the environment passed to code that may write it",
+                    line,
+                });
+            }
             let Some(callee) = self.global_callee(function, *scope) else {
                 if self.is_genai_symbol(function, *scope, "setDefaultBaseUrls") {
                     let line = self.line(*call);
@@ -4686,10 +4787,72 @@ impl<'t> Ctx<'t> {
         self.calls = calls;
     }
 
+    /// Whether a call passes the environment object to code that may write
+    /// it: anything but a read-only builtin or a reflective write (which
+    /// is decided on its own).
+    fn env_writes_unknown_through(&self, call: Node<'t>, function: Node<'t>, scope: usize) -> bool {
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            return false;
+        };
+        let mut cursor = arguments.walk();
+        let passes_env = arguments.named_children(&mut cursor).any(|a| {
+            let a = match a.kind() {
+                "spread_element" => a.named_child(0).unwrap_or(a),
+                _ => a,
+            };
+            self.env_object(a, scope)
+        });
+        if !passes_env {
+            return false;
+        }
+        !self.global_callee(function, scope).is_some_and(|callee| {
+            READ_ONLY_CALLS.contains(&callee.as_str())
+                || REFLECTIVE_WRITES.contains(&callee.as_str())
+        })
+    }
+
     /// Calls that need a value evaluated: a member of an SDK client or
     /// module replaced (`client.chat = ...`), a client given a `baseURL`
     /// after it is built, and a test spy on an SDK object.
     fn settle_sdk_writes(&mut self) {
+        // `genai.setDefaultBaseUrls(...)` through `require`, or under
+        // another name.
+        if self.genai_base_urls.is_none() {
+            let calls = std::mem::take(&mut self.calls);
+            for (call, scope) in &calls {
+                let Some(function) = call
+                    .child_by_field_name("function")
+                    .filter(|_| call.kind() == "call_expression")
+                else {
+                    continue;
+                };
+                let candidate = match function.kind() {
+                    "identifier" => self.lookup(*scope, self.text(function)).is_some(),
+                    "member_expression" => function
+                        .child_by_field_name("property")
+                        .is_some_and(|p| self.text(p) == "setDefaultBaseUrls"),
+                    _ => false,
+                };
+                if !candidate {
+                    continue;
+                }
+                if let Val::Symbol {
+                    pkg: Pkg::GoogleGenai,
+                    path,
+                } = self.eval(function, *scope, 0)
+                {
+                    if path.last().is_some_and(|m| m == "setDefaultBaseUrls") {
+                        let line = self.line(*call);
+                        self.genai_base_urls.get_or_insert(Feature {
+                            what: "`setDefaultBaseUrls`",
+                            line,
+                        });
+                        break;
+                    }
+                }
+            }
+            self.calls = calls;
+        }
         let writes = std::mem::take(&mut self.member_writes);
         for w in &writes {
             let MemberRoot::Name(name) = w.root else {
@@ -5388,11 +5551,12 @@ impl<'t> Ctx<'t> {
         if let Some(key) = base_url_key(client.family) {
             let options = self.options(call, scope, 0);
             let base_url = match options.lookup(key) {
-                Lookup::Found(value, _, value_scope) => {
+                // A spread written after it may replace it.
+                Lookup::Found(_, true, _) | Lookup::Opaque => BaseUrl::Unknown { env: false },
+                Lookup::Found(value, false, value_scope) => {
                     self.base_url_kind(client.pkg, value, value_scope)
                 }
                 Lookup::Missing => BaseUrl::Absent,
-                Lookup::Opaque => BaseUrl::Unknown { env: false },
             };
             if base_url != BaseUrl::Absent {
                 let routing = class.routing(&options.keys, options.opaque, base_url);
@@ -5406,6 +5570,13 @@ impl<'t> Ctx<'t> {
                 client.caveat = Some(ClientCaveat::BaseUrl {
                     env: false,
                     fallback: false,
+                });
+            }
+            // A custom `fetch` receives every request's URL.
+            if options.keys.iter().any(|k| k == "fetch") {
+                client.routing = Routing::Unknown;
+                client.caveat = Some(ClientCaveat::EndpointOption {
+                    option: "a custom `fetch`",
                 });
             }
         }
@@ -5446,11 +5617,11 @@ impl<'t> Ctx<'t> {
     fn v3_config(&mut self, node: Node<'t>, scope: usize) -> Val {
         let options = self.options(node, scope, 0);
         let base_url = match options.lookup("basePath") {
-            Lookup::Found(value, _, value_scope) => {
+            Lookup::Found(_, true, _) | Lookup::Opaque => BaseUrl::Unknown { env: false },
+            Lookup::Found(value, false, value_scope) => {
                 self.base_url_kind(Pkg::Openai, value, value_scope)
             }
             Lookup::Missing => BaseUrl::Absent,
-            Lookup::Opaque => BaseUrl::Unknown { env: false },
         };
         Val::V3Config {
             base_url,
@@ -5490,7 +5661,10 @@ impl<'t> Ctx<'t> {
                 let options = self.options(node, scope, 0);
                 let base_url = match base_url_key(class.family) {
                     Some(key) => match options.lookup(key) {
-                        Lookup::Found(value, _, value_scope) => {
+                        // A spread or computed key written after it may
+                        // replace it.
+                        Lookup::Found(_, true, _) => BaseUrl::Unknown { env: false },
+                        Lookup::Found(value, false, value_scope) => {
                             self.base_url_kind(class.pkg, value, value_scope)
                         }
                         Lookup::Missing | Lookup::Opaque => BaseUrl::Absent,
@@ -5562,13 +5736,16 @@ impl<'t> Ctx<'t> {
         scope: usize,
     ) -> (Option<&'static str>, Option<VertexAi>) {
         match class.family {
-            Family::OpenaiDirect => {
+            Family::OpenaiDirect | Family::AnthropicDirect => {
                 let options = self.options(node, scope, 0);
-                let option = options
-                    .keys
-                    .iter()
-                    .any(|k| k == "dataResidency")
-                    .then_some("`dataResidency`");
+                let option = options.keys.iter().find_map(|k| match k.as_str() {
+                    "dataResidency" if class.family == Family::OpenaiDirect => {
+                        Some("`dataResidency`")
+                    }
+                    // A custom `fetch` receives every request's URL.
+                    "fetch" => Some("a custom `fetch`"),
+                    _ => None,
+                });
                 (option, None)
             }
             Family::Genai => {
@@ -7450,32 +7627,15 @@ impl<'t> Ctx<'t> {
                 return Err(Unresolved::new("reassigned", name));
             }
         }
-        let binding = &self.bindings[b];
-        let Some(body) = binding.init else {
-            return Err(Unresolved::new("non_literal", name));
-        };
-        let init_scope = binding.init_scope;
-        let mut cursor = body.walk();
-        let members: Vec<Node<'t>> = body.named_children(&mut cursor).collect();
-        let key_of = |m: &Node<'t>| match m.kind() {
-            "enum_assignment" => m.child_by_field_name("name"),
-            "property_identifier" => Some(*m),
-            _ => None,
-        };
-        let names: HashSet<&'t str> = members
-            .iter()
-            .filter_map(|m| key_of(m).and_then(|k| self.member_name(k)))
-            .collect();
-        let found = members
-            .iter()
-            .find(|m| key_of(m).is_some_and(|k| self.member_name(k) == Some(member)));
-        let Some(value) = found.and_then(|m| m.child_by_field_name("value")) else {
+        let init_scope = self.bindings[b].init_scope;
+        let members = self.enum_members(b);
+        let Some(value) = members.get(member).copied().flatten() else {
             return Err(Unresolved::new("non_literal", name));
         };
         // Inside the enum, its members shadow outer names: `Default = Fast`
         // is the member `Fast`.
         let inner = unwrap_expression(value);
-        if inner.kind() == "identifier" && names.contains(self.text(inner)) {
+        if inner.kind() == "identifier" && members.contains_key(self.text(inner)) {
             if depth > MAX_DEPTH {
                 return Err(Unresolved::new("non_literal", name));
             }
@@ -7485,7 +7645,7 @@ impl<'t> Ctx<'t> {
                 .map(|r| r.constant(&name, origin))
                 .map_err(|u| u.via(&name));
         }
-        if self.names_any(value, &names) {
+        if self.names_any(value, &members) {
             return Err(Unresolved::new("non_literal", name));
         }
         self.resolve_value(value, init_scope, depth + 1)
@@ -7493,8 +7653,36 @@ impl<'t> Ctx<'t> {
             .map_err(|u| u.via(&name))
     }
 
+    /// An enum's members, by name, with the value each is given: read once
+    /// per enum.
+    fn enum_members(&mut self, b: usize) -> EnumMembers<'t> {
+        if let Some(members) = self.enum_memo.get(&b) {
+            return Rc::clone(members);
+        }
+        let mut members = HashMap::new();
+        if let Some(body) = self.bindings[b].init {
+            let mut cursor = body.walk();
+            for m in body.named_children(&mut cursor) {
+                let (key, value) = match m.kind() {
+                    "enum_assignment" => (
+                        m.child_by_field_name("name"),
+                        m.child_by_field_name("value"),
+                    ),
+                    "property_identifier" => (Some(m), None),
+                    _ => continue,
+                };
+                if let Some(key) = key.and_then(|k| self.member_name(k)) {
+                    members.insert(key, value);
+                }
+            }
+        }
+        let members = Rc::new(members);
+        self.enum_memo.insert(b, Rc::clone(&members));
+        members
+    }
+
     /// Whether an identifier in `node` is one of `names`.
-    fn names_any(&self, node: Node<'t>, names: &HashSet<&'t str>) -> bool {
+    fn names_any(&self, node: Node<'t>, names: &HashMap<&'t str, Option<Node<'t>>>) -> bool {
         let mut work = vec![node];
         let mut seen = 0;
         while let Some(n) = work.pop() {
@@ -7502,7 +7690,7 @@ impl<'t> Ctx<'t> {
             if seen > MAX_NESTED_ENTRIES {
                 return true;
             }
-            if n.kind() == "identifier" && names.contains(self.text(n)) {
+            if n.kind() == "identifier" && names.contains_key(self.text(n)) {
                 return true;
             }
             let mut cursor = n.walk();
@@ -7980,6 +8168,35 @@ impl<'t> Ctx<'t> {
                         return;
                     }
                 }
+                let mut client = client;
+                // `genAI.getGenerativeModel({ model }, { baseUrl })` builds a
+                // model routed by its request options.
+                if client.family == Family::LegacyRoot
+                    && matches!(
+                        path.as_slice(),
+                        [m] if m == "getGenerativeModel" || m == "getGenerativeModelFromCachedContent"
+                    )
+                {
+                    if let Val::Client { client: model, .. } =
+                        self.legacy_model(client.clone(), call, scope)
+                    {
+                        client = model;
+                    }
+                }
+                if let Some(option) = self.request_endpoint(call, scope, &client, &path) {
+                    // The model or chat it is sent through was reported where
+                    // it was built.
+                    let feature = Feature {
+                        what: "request options that may name another endpoint",
+                        line: self.line(call),
+                    };
+                    match client.family {
+                        Family::LegacyModel => self.legacy_request_endpoint.get_or_insert(feature),
+                        _ => self.genai_request_endpoint.get_or_insert(feature),
+                    };
+                    client.routing = Routing::Unknown;
+                    client.caveat = Some(ClientCaveat::EndpointOption { option });
+                }
                 let target = Target {
                     pkg: client.pkg,
                     member: path.join("."),
@@ -8014,6 +8231,70 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// An option of one request that may send it to another endpoint: the
+    /// legacy Gemini SDK's request options with a `baseUrl`
+    /// (`model.generateContent(request, { baseUrl })`), and
+    /// `@google/genai`'s `config.httpOptions`.
+    fn request_endpoint(
+        &mut self,
+        call: Node<'t>,
+        scope: usize,
+        client: &Client,
+        path: &[String],
+    ) -> Option<&'static str> {
+        let last = path.last()?.as_str();
+        // Whether an object (written at the call or bound to a name) may set
+        // `key`.
+        let may_set = |cx: &mut Self, value: Node<'t>, value_scope: usize, key: &str| {
+            let value = unwrap_expression(value);
+            if matches!(value.kind(), "null" | "undefined") {
+                return false;
+            }
+            match cx.object_node(value, value_scope) {
+                Some((object, object_scope, _)) => {
+                    let read = cx.object_entries(object, object_scope);
+                    !matches!(read.lookup(key), Lookup::Missing)
+                }
+                None => true,
+            }
+        };
+        match client.family {
+            Family::LegacyModel if LEGACY_REQUEST_OPTIONS.contains(&last) => {
+                let options = nth_argument(call, 1)?;
+                may_set(self, options, scope, "baseUrl")
+                    .then_some("request options with a `baseUrl`")
+            }
+            Family::Genai if is_request(last) => {
+                let options = self.options(call, scope, 0);
+                if !options.present {
+                    return None;
+                }
+                let (config, config_scope) = match options.lookup("config") {
+                    Lookup::Missing => return None,
+                    Lookup::Opaque => return Some("a request `config` built elsewhere"),
+                    Lookup::Found(value, _, value_scope) => (value, value_scope),
+                };
+                let config = unwrap_expression(config);
+                if matches!(config.kind(), "null" | "undefined") {
+                    return None;
+                }
+                let Some((object, object_scope, _)) = self.object_node(config, config_scope) else {
+                    return Some("a request `config` built elsewhere");
+                };
+                let read = self.object_entries(object, object_scope);
+                match read.lookup("httpOptions") {
+                    Lookup::Missing => None,
+                    Lookup::Opaque => Some("a request `config` built elsewhere"),
+                    Lookup::Found(http, _, http_scope) => {
+                        may_set(self, http, http_scope, "baseUrl")
+                            .then_some("a request's `httpOptions` that may name a `baseUrl`")
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// The client's routing as a call sees it: a member of the SDK replaced
     /// or mocked, or a `baseURL` assigned after the client was built, makes
     /// it unknown.
@@ -8032,6 +8313,12 @@ impl<'t> Ctx<'t> {
         } else if let (true, Some(feature)) = (direct, self.rerouted_any) {
             client.routing = Routing::Unknown;
             client.caveat.get_or_insert(ClientCaveat::Dynamic(feature));
+        } else if client.family == Family::Genai && self.genai_base_urls.is_some() {
+            // `setDefaultBaseUrls` found after the client was evaluated.
+            client.routing = Routing::Unknown;
+            client.caveat.get_or_insert(ClientCaveat::EndpointOption {
+                option: "`setDefaultBaseUrls`, which this file calls",
+            });
         }
         client
     }
@@ -8068,10 +8355,15 @@ impl<'t> Ctx<'t> {
             })
             .map(|(_, index)| *index)
             .filter(|_| target.pkg == Pkg::Openai);
+        let options_index = usize::from(
+            target.pkg == Pkg::Openai
+                && PATH_PARAM_METHODS.iter().any(|m| member_is(&member, m))
+                && nth_argument(call, 1).is_some(),
+        );
         let options = match positional_model {
             Some(_) => Options::default(),
             None => {
-                let options = self.options(call, scope, 0);
+                let options = self.options(call, scope, options_index);
                 // A call that takes no model (`model.generateContent(prompt)`,
                 // `chat.sendMessage(text)`) is passed content, not options,
                 // unless an object is written at the call.
@@ -8129,7 +8421,7 @@ impl<'t> Ctx<'t> {
             self.take_value(&site, key, false, result, &mut values);
         }
 
-        let positional_literals = self.positional_literals(call, &options);
+        let positional_literals = self.positional_literals(call, &options, options_index);
         let (nested, nested_overridden, nested_cut) =
             self.nested_values(&options, &positional_literals, scope);
         self.take_nested(&site, nested, nested_cut, &mut values);
@@ -8452,7 +8744,12 @@ impl<'t> Ctx<'t> {
 
     /// Object and array literals a call passes by position, other than its
     /// options object.
-    fn positional_literals(&self, call: Node<'t>, options: &Options<'t>) -> Vec<Node<'t>> {
+    fn positional_literals(
+        &self,
+        call: Node<'t>,
+        options: &Options<'t>,
+        options_index: usize,
+    ) -> Vec<Node<'t>> {
         let Some(arguments) = call.child_by_field_name("arguments") else {
             return Vec::new();
         };
@@ -8465,7 +8762,7 @@ impl<'t> Ctx<'t> {
             .enumerate()
             .filter(|(index, arg)| {
                 let literal = matches!(unwrap_expression(*arg).kind(), "object" | "array");
-                literal && !(*index == 0 && options.literal)
+                literal && !(*index == options_index && options.literal)
             })
             .map(|(_, arg)| arg)
             .collect()
@@ -8710,11 +9007,26 @@ impl<'t> Ctx<'t> {
         origin: Origin,
     ) {
         // Every SDK shape has a member: a bare name never matches.
-        if function.kind() == "identifier" || sdk_shape(&self.render_links(function, 8)).is_none() {
+        if function.kind() == "identifier" {
+            return;
+        }
+        let links = self.render_links(function, 8);
+        let model_shape = || model_bearing_shape(&links);
+        if sdk_shape(&links).is_none() && model_shape().is_none() {
             return;
         }
         let chain = self.render(function);
-        let Some((shape_sdk, strong)) = sdk_shape(&chain) else {
+        // A member that takes a model, called with one written at the call
+        // (`genAI.getGenerativeModel({ model })` on an imported client).
+        let shape = sdk_shape(&chain).or_else(|| {
+            model_bearing_shape(&chain).filter(|_| {
+                let options = self.options(call, scope, 0);
+                super::VALUE_KEYS
+                    .iter()
+                    .any(|key| matches!(options.lookup(key), Lookup::Found(..)))
+            })
+        });
+        let Some((shape_sdk, strong)) = shape else {
             return;
         };
         if !strong && !self.sdk_imported.contains(&shape_sdk) {
@@ -8940,15 +9252,70 @@ impl<'t> Ctx<'t> {
     }
 
     fn finish(mut self) -> FileUsages {
-        // A client built from a mocked or replaced SDK is not the SDK's.
+        // A client built from a mocked or replaced SDK is not the SDK's, and
+        // `setDefaultBaseUrls` re-routes every Gemini client.
         for client in &mut self.out.clients {
             if self
                 .sdk_patched
                 .keys()
                 .any(|pkg| pkg.package() == client.package)
+                || (self.genai_base_urls.is_some() && client.package == Pkg::GoogleGenai.package())
             {
                 client.routing = Routing::Unknown;
             }
+        }
+        // A request that names another endpoint is sent with the model of
+        // the model object or chat it goes through: where that model was
+        // given is not routed with no gap either.
+        let shapes: [(Option<Feature>, Pkg, &[&str]); 2] = [
+            (
+                self.legacy_request_endpoint,
+                Pkg::GoogleGenerativeai,
+                &[
+                    "getGenerativeModel",
+                    "getGenerativeModelFromCachedContent",
+                    "startChat",
+                ],
+            ),
+            (
+                self.genai_request_endpoint,
+                Pkg::GoogleGenai,
+                &["chats.create"],
+            ),
+        ];
+        for (feature, pkg, members) in shapes {
+            let Some(feature) = feature else {
+                continue;
+            };
+            let mut added = Vec::new();
+            for call in &mut self.out.calls {
+                if call.package != pkg.package()
+                    || call.routing == Routing::Unknown
+                    || !members.iter().any(|m| member_is(&call.member, m))
+                {
+                    continue;
+                }
+                call.routing = Routing::Unknown;
+                added.push(UsageGap {
+                    kind: GapKind::AmbiguousClient,
+                    sdk: Some(call.sdk),
+                    file: call.file.clone(),
+                    span: Some(call.span),
+                    symbol: call.symbol.clone(),
+                    chain: Some(call.chain.clone()),
+                    key: None,
+                    reason: "endpoint_option".to_string(),
+                    detail: format!(
+                        "a request in this file passes {} (line {}), so where `{}` sends its model is not confirmed",
+                        feature.what,
+                        feature.line,
+                        call.chain
+                    ),
+                    values: Vec::new(),
+                    values_complete: false,
+                });
+            }
+            self.out.gaps.extend(added);
         }
         self.out.imports.sort_by_key(|i| i.span.start_byte);
         self.out
