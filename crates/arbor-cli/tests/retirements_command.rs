@@ -651,7 +651,7 @@ fn exit_codes_follow_the_window() {
     let output = arbor(clean.path(), &["retirements", ".", "--today", TODAY]);
     assert_eq!(output.status.code(), Some(0));
     assert!(stdout(&output).contains(
-        "No direct openai/anthropic/google SDK calls to retired or retiring models in 1 Python file. Calls through LangChain, LiteLLM or other wrappers are not checked yet."
+        "No direct openai/anthropic/google SDK calls to retired or retiring models in 1 Python, TypeScript or JavaScript file. Calls through LangChain, LiteLLM, the Vercel AI SDK or other wrappers are not checked yet."
     ));
 }
 
@@ -1093,7 +1093,7 @@ fn usage_gaps_never_read_as_confirmed() {
     let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
     for line in [
         "the model is a class attribute that a subclass in another module may override: confirm the model this call uses",
-        "this file may change the model at run time (exec, globals(), setattr...): confirm the model this call uses; routing not confirmed (this file may rebind the client or the SDK's configuration at run time): confirm this call reaches OpenAI directly",
+        "this file may change the model at run time (exec, eval, globals(), setattr...): confirm the model this call uses; routing not confirmed (this file may rebind the client or the SDK's configuration at run time): confirm this call reaches OpenAI directly",
         "Not checked: 1 part of a file Arbor did not analyze",
         "Not checked: calls through 1 SDK method reached with getattr or stored or passed as a value.",
         "Not counted toward the exit code: 2 calls",
@@ -1223,4 +1223,81 @@ fn the_docs_count_the_bundled_data() {
         "docs/RETIREMENTS.md lacks {sentence:?}"
     );
     assert!(!docs.contains("283 model IDs"));
+}
+
+#[test]
+fn typescript_calls_are_checked_and_fixed_in_their_own_syntax() {
+    let dir = project(APP);
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src/chat.ts"),
+        r#"import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
+
+const openai = new OpenAI();
+const anthropic = new Anthropic();
+const MODEL = "gpt-4o";
+
+export async function ask(question: string) {
+  const answer = await openai.chat.completions.create({
+    model: MODEL,
+    max_tokens: 300,
+    messages: [{ role: "user", content: question }],
+  });
+  const review = await anthropic.messages.create({
+    model: "claude-3-5-sonnet-20241022",
+    max_tokens: 512,
+    messages: [{ role: "user", content: question }],
+  });
+  const fallback = await openai.chat.completions.create({
+    model: process.env.FALLBACK_MODEL ?? "gpt-4o-mini",
+    messages: [{ role: "user", content: question }],
+  });
+  return [answer, review, fallback];
+}
+"#,
+    )
+    .unwrap();
+    let (code, report) = run_json(dir.path(), &[]);
+    assert_eq!(code, Some(1), "{report:#}");
+    assert_eq!(report["summary"]["files_scanned"], 2);
+    let ts: Vec<&Value> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["file"] == "src/chat.ts")
+        .collect();
+    assert_eq!(ts.len(), 3, "{report:#}");
+    let claude = ts.iter().find(|f| f["line"] == 14).unwrap();
+    assert_eq!(claude["model"], "claude-3-5-sonnet-20241022");
+    assert_eq!(claude["routing_class"], "direct");
+    assert_eq!(claude["confidence"], "confirmed");
+    assert_eq!(claude["fails"], true);
+    let gpt4o = ts.iter().find(|f| f["line"] == 9).unwrap();
+    assert_eq!(gpt4o["value_from"], "MODEL");
+    assert_eq!(gpt4o["confidence"], "confirmed");
+    let fallback = ts.iter().find(|f| f["line"] == 19).unwrap();
+    assert_eq!(fallback["model"], "gpt-4o-mini");
+    assert_eq!(fallback["confidence"], "confirm_first");
+    assert_eq!(fallback["fails"], false);
+    // The environment variable's name is never printed.
+    assert!(!stdout(&arbor(
+        dir.path(),
+        &["retirements", ".", "--json", "--today", TODAY]
+    ))
+    .contains("FALLBACK_MODEL"));
+
+    // Each file's fixes are written in its own syntax.
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    assert!(text.contains("(2 files checked)"), "{text}");
+    assert!(text.contains("add reasoning_effort: \"none\""), "{text}");
+    assert!(
+        text.contains("add thinking: {\"type\": \"between_tools\"}"),
+        "{text}"
+    );
+    assert!(
+        text.contains("add thinking={\"type\": \"between_tools\"}"),
+        "{text}"
+    );
+    assert!(!text.contains("FALLBACK_MODEL"), "{text}");
 }

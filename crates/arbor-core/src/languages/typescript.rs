@@ -8,6 +8,7 @@
 
 use crate::languages::LanguageParser;
 use crate::node::{CodeNode, NodeKind, Visibility};
+use crate::usages::FileUsages;
 use tree_sitter::{Language, Node, Tree};
 
 pub struct TypeScriptParser;
@@ -27,6 +28,22 @@ impl LanguageParser for TypeScriptParser {
         extract_from_node(&root, source, file_path, &mut nodes, None);
         distinguish_repeated_tests(&mut nodes, file_path);
         nodes
+    }
+
+    fn extract_usages(&self, tree: &Tree, source: &str, file_path: &str) -> Option<FileUsages> {
+        Some(crate::usages::typescript::extract(tree, source, file_path))
+    }
+
+    fn usages_language(&self) -> Option<&'static str> {
+        Some("typescript")
+    }
+
+    fn usages_language_of(&self, file_path: &str) -> Option<&'static str> {
+        Some(crate::usages::typescript::language_of(file_path))
+    }
+
+    fn may_have_usages(&self, source: &str) -> bool {
+        crate::usages::typescript::may_use_sdk(source)
     }
 }
 
@@ -71,6 +88,22 @@ impl LanguageParser for TsxParser {
 
     fn extract_nodes(&self, tree: &Tree, source: &str, file_path: &str) -> Vec<CodeNode> {
         TypeScriptParser.extract_nodes(tree, source, file_path)
+    }
+
+    fn extract_usages(&self, tree: &Tree, source: &str, file_path: &str) -> Option<FileUsages> {
+        TypeScriptParser.extract_usages(tree, source, file_path)
+    }
+
+    fn usages_language(&self) -> Option<&'static str> {
+        TypeScriptParser.usages_language()
+    }
+
+    fn usages_language_of(&self, file_path: &str) -> Option<&'static str> {
+        TypeScriptParser.usages_language_of(file_path)
+    }
+
+    fn may_have_usages(&self, source: &str) -> bool {
+        TypeScriptParser.may_have_usages(source)
     }
 }
 

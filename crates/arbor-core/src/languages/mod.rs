@@ -62,6 +62,13 @@ pub trait LanguageParser: Send + Sync {
         None
     }
 
+    /// The language name the usage records of `file_path` carry. One parser
+    /// may serve several languages (the TSX grammar parses JavaScript too);
+    /// by default it is [`Self::usages_language`].
+    fn usages_language_of(&self, _file_path: &str) -> Option<&'static str> {
+        self.usages_language()
+    }
+
     /// Whether `source` can contain usages at all. A `false` answer lets
     /// [`crate::parse_source_usages`] skip the parse: most files of a large
     /// tree never mention an SDK.
