@@ -434,6 +434,30 @@ def foundry(c: AnthropicFoundry):
             (24, Routing::Unknown, vec![]),
         ]
     );
+    // An annotated assignment from a factory this file does not follow,
+    // on `self` or at module level, is the same.
+    let assigned = usages(
+        r#"from openai import OpenAI
+from mylib import make
+
+class Bot:
+    def __init__(self):
+        self.client: OpenAI = make()
+
+    def go(self):
+        return self.client.chat.completions.create(model="gpt-4o", messages=[])
+
+client: OpenAI = make()
+client.chat.completions.create(model="gpt-4o", messages=[])
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&assigned),
+        vec![
+            (9, Routing::Unknown, annotation()),
+            (12, Routing::Unknown, annotation()),
+        ]
+    );
     // A construction still decides the route over an annotation.
     let built = usages(
         r#"from openai import OpenAI
