@@ -219,7 +219,10 @@ A client known only from a type annotation (`def ask(client: OpenAI)`,
 routes by its class when the class alone decides the route
 (`AzureOpenAI`, `AnthropicBedrock`, `AnthropicVertex`). A direct class
 (`OpenAI`, `Anthropic`, `genai.Client`) may have been given a `base_url` or
-another endpoint, so its calls route `unknown` with an `annotation` gap.
+another endpoint, so its calls route `unknown` with an `annotation` gap. An
+annotation that names several classes (`AzureOpenAI | OpenAI`,
+`Union[AnthropicBedrock, Anthropic]`) decides the route only when every one
+of them does, and all the same way; otherwise its calls get the same gap.
 
 An OpenAI or Anthropic client's `base_url` routes by its host (a Gemini
 client's endpoint options are a gap, above). The URL itself is never

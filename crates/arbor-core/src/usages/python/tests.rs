@@ -458,6 +458,44 @@ client.chat.completions.create(model="gpt-4o", messages=[])
             (12, Routing::Unknown, annotation()),
         ]
     );
+    // A union decides the route only when every class in it does, and all
+    // the same way. `AzureOpenAI | OpenAI` took its first class's route,
+    // `azure_openai` with no gap, while `OpenAI | AzureOpenAI` was `unknown`.
+    let unions = usages(
+        r#"from typing import Optional, Union
+from anthropic import Anthropic, AnthropicBedrock
+from openai import AsyncAzureOpenAI, AzureOpenAI, OpenAI
+
+def one(c: Union[AzureOpenAI, OpenAI]):
+    return c.embeddings.create(model="text-embedding-3-small", input="x")
+
+def two(c: AzureOpenAI | OpenAI):
+    return c.embeddings.create(model="text-embedding-3-small", input="x")
+
+def three(c: OpenAI | AzureOpenAI):
+    return c.embeddings.create(model="text-embedding-3-small", input="x")
+
+def four(c: Union[AnthropicBedrock, Anthropic]):
+    return c.messages.create(model="claude-sonnet-5-5", max_tokens=1, messages=[])
+
+def five(c: Optional[AzureOpenAI]):
+    return c.embeddings.create(model="text-embedding-3-small", input="x")
+
+def six(c: Union[AzureOpenAI, AsyncAzureOpenAI]):
+    return c.embeddings.create(model="text-embedding-3-small", input="x")
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&unions),
+        vec![
+            (6, Routing::Unknown, annotation()),
+            (9, Routing::Unknown, annotation()),
+            (12, Routing::Unknown, annotation()),
+            (15, Routing::Unknown, annotation()),
+            (18, Routing::AzureOpenai, vec![]),
+            (21, Routing::AzureOpenai, vec![]),
+        ]
+    );
     // A construction still decides the route over an annotation.
     let built = usages(
         r#"from openai import OpenAI

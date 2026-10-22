@@ -660,10 +660,11 @@ enum ClientCaveat {
     /// `api_base` or `api_type`, or a `**` expansion that may hold one
     /// (`what`), which routes it whatever the module's settings are.
     CallRouting { what: &'static str },
-    /// A direct client (`OpenAI`, `Anthropic`, `genai.Client`) known only
-    /// from a type annotation (`def ask(client: OpenAI)`): how it was built,
-    /// and so whether it was given a `base_url` or another endpoint, is not
-    /// seen.
+    /// A client known only from a type annotation that names a direct class
+    /// (`def ask(client: OpenAI)`; also `Anthropic`, `genai.Client`) or
+    /// classes that route differently (`AzureOpenAI | OpenAI`): how it was
+    /// built, and so whether it was given a `base_url` or another endpoint,
+    /// is not seen.
     Annotation,
 }
 
@@ -5535,32 +5536,20 @@ impl<'t> Ctx<'t> {
     }
 
     /// A client typed by an annotation (`client: OpenAI`,
-    /// `Optional[AzureOpenAI]`).
+    /// `Optional[AzureOpenAI]`, `AzureOpenAI | OpenAI`).
     fn typed(&mut self, annotation: Node<'t>, scope: usize) -> Option<Val> {
+        // Every client class the annotation names, in order: a union may
+        // name several. There are only so many tracked classes.
+        let mut classes: Vec<ClientClass> = Vec::new();
         // Each entry: a node and whether its parent is an attribute.
         let mut stack = vec![(annotation, false)];
         while let Some((node, in_attribute)) = stack.pop() {
             let top_chain = matches!(node.kind(), "identifier" | "attribute") && !in_attribute;
             if top_chain {
                 if let Val::Class(class) = self.eval(node, scope, 0) {
-                    // A direct class's route depends on how the client was
-                    // built; a platform class routes the same however it was.
-                    let direct = matches!(
-                        class.family,
-                        Family::OpenaiDirect | Family::AnthropicDirect | Family::Genai
-                    );
-                    return Some(Val::Client {
-                        client: Client {
-                            pkg: class.pkg,
-                            routing: class.typed_routing(),
-                            line: None,
-                            site: None,
-                            ambiguous: false,
-                            typed: true,
-                            caveat: direct.then_some(ClientCaveat::Annotation),
-                        },
-                        path: Vec::new(),
-                    });
+                    if !classes.contains(&class) {
+                        classes.push(class);
+                    }
                 }
                 continue;
             }
@@ -5569,7 +5558,29 @@ impl<'t> Ctx<'t> {
                 stack.push((child, is_attribute));
             }
         }
-        None
+        let first = *classes.first()?;
+        // A direct class's route depends on how the client was built; a
+        // platform class routes the same however it was. A union decides
+        // the route only when every class in it does, and all the same way.
+        let routing = first.typed_routing();
+        let decided = classes.iter().all(|class| {
+            !matches!(
+                class.family,
+                Family::OpenaiDirect | Family::AnthropicDirect | Family::Genai
+            ) && class.typed_routing() == routing
+        });
+        Some(Val::Client {
+            client: Client {
+                pkg: first.pkg,
+                routing: if decided { routing } else { Routing::Unknown },
+                line: None,
+                site: None,
+                ambiguous: false,
+                typed: true,
+                caveat: (!decided).then_some(ClientCaveat::Annotation),
+            },
+            path: Vec::new(),
+        })
     }
 
     /// A class's own assignments of attribute `attr`: class-body names and

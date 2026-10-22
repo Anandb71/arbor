@@ -137,8 +137,9 @@ pub enum Routing {
     /// `google.generativeai` (the deprecated SDK).
     GoogleGenerativeaiLegacy,
     /// Not decided by this version. With an `ambiguous_client` gap at each
-    /// call: `**kwargs` passed to a direct constructor, a direct client
-    /// known only from a type annotation (`annotation`), a binding assigned
+    /// call: `**kwargs` passed to a direct constructor, a client known only
+    /// from a type annotation that names a direct class or classes that
+    /// route differently (`annotation`), a binding assigned
     /// more than one kind of client, a direct client given a `base_url`
     /// after it is built or built in a file that sets `OPENAI_BASE_URL` /
     /// `ANTHROPIC_BASE_URL` or writes the environment with a run-time name,
@@ -441,7 +442,8 @@ pub enum GapKind {
     /// that is not a string literal or by an `openai.bedrock_*` setting
     /// (`module_routing`), a v0 resource call that passes its own `api_base`
     /// or `api_type`, or a `**` expansion that may hold one
-    /// (`call_routing`), a direct client known only from a type annotation
+    /// (`call_routing`), a client known only from a type annotation that
+    /// names a direct class or classes that route differently
     /// (`annotation`), or a receiver or configuration a dynamic feature of
     /// the file may change (`dynamic_feature`).
     AmbiguousClient,
