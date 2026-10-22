@@ -7792,10 +7792,13 @@ impl<'t> Ctx<'t> {
         };
         match writes.as_slice() {
             [] => Err(Unresolved::new("attribute", shape)),
-            [write] if write.value.is_some() => {
-                let value = write.value.unwrap_or(write_node_fallback(write));
+            [PropWrite {
+                value: Some(value),
+                scope: write_scope,
+                ..
+            }] => {
                 let mut resolved = self
-                    .resolve_value(value, write.scope, depth + 1)
+                    .resolve_value(*value, *write_scope, depth + 1)
                     .map(|r| r.constant(&shape, ValueOrigin::ClassConstant))
                     .map_err(|u| u.via(&shape))?;
                 if through_this && self.class_public(class) {
@@ -7947,14 +7950,6 @@ impl<'t> Ctx<'t> {
             None => Err(Unresolved::new("parameter", name.to_string())
                 .with_candidates(overrides, callers.complete && complete && !omitted)),
         }
-    }
-}
-
-/// The node a property write's value is read from.
-fn write_node_fallback<'t>(write: &PropWrite<'t>) -> Node<'t> {
-    match write.value {
-        Some(value) => value,
-        None => unreachable!("only called for a write with a value"),
     }
 }
 
