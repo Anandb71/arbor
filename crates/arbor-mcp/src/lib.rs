@@ -2489,7 +2489,8 @@ mod tool_tests {
         .unwrap();
         std::fs::write(
             dir.path().join("web/lib/types.d.ts"),
-            "export declare const client: import(\"openai\").OpenAI;\n",
+            // A declaration file is never scanned, even with a call in it.
+            "import OpenAI from \"openai\";\nnew OpenAI().chat.completions.create({ model: \"gpt-4\", messages: [] });\n",
         )
         .unwrap();
         let shared: SharedGraph = Arc::new(RwLock::new(ArborGraph::new()));
