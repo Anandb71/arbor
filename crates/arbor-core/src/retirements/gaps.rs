@@ -141,6 +141,11 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
         "base_url_assigned",
         "the client is given a base_url after it is built",
     ),
+    (
+        GapKind::AmbiguousClient,
+        "annotation",
+        "the client is known only by its type annotation, so its options are not seen",
+    ),
     (GapKind::AmbiguousClient, "endpoint_env", "this file sets the SDK's endpoint variable"),
     (GapKind::AmbiguousClient, "base_url_env", "the base_url is read from the environment"),
     (GapKind::AmbiguousClient, "base_url_unresolved", "the base_url is not a value Arbor can read"),
@@ -168,11 +173,6 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
         GapKind::AmbiguousClient,
         "dynamic_feature",
         "this file may rebind the client or the SDK's configuration at run time",
-    ),
-    (
-        GapKind::AmbiguousClient,
-        "annotation",
-        "the client is known only by its type annotation, so its options are not seen",
     ),
     (
         GapKind::UnknownClientFactory,
