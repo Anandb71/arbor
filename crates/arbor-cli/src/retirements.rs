@@ -435,13 +435,13 @@ fn routing_caveat(finding: &Finding) -> Option<String> {
         RoutingClass::Unknown => {
             let why = match finding.base_url {
                 Some(BaseUrl::EnvProviderDefault) => Some(format!(
-                    "the base_url is read from the environment and falls back to {provider}'s host"
+                    "the base URL is read from the environment and falls back to {provider}'s host"
                 )),
                 Some(BaseUrl::EnvOnly) => {
-                    Some("the base_url is read from the environment with no fallback".to_string())
+                    Some("the base URL is read from the environment with no fallback".to_string())
                 }
                 Some(BaseUrl::OtherHost) if finding.routing_gap.is_some() => Some(
-                    "the base_url is read from the environment and falls back to another host"
+                    "the base URL is read from the environment and falls back to another host"
                         .to_string(),
                 ),
                 _ => match finding.routing_gap.as_deref() {

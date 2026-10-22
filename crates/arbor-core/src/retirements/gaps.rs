@@ -159,8 +159,8 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
         "the client is a parameter known only by its type annotation, so its options are not seen",
     ),
     (GapKind::AmbiguousClient, "endpoint_env", "this file sets the SDK's endpoint variable"),
-    (GapKind::AmbiguousClient, "base_url_env", "the base_url is read from the environment"),
-    (GapKind::AmbiguousClient, "base_url_unresolved", "the base_url is not a value Arbor can read"),
+    (GapKind::AmbiguousClient, "base_url_env", "the base_url or baseURL is read from the environment"),
+    (GapKind::AmbiguousClient, "base_url_unresolved", "the base_url or baseURL is not a value Arbor can read"),
     (
         GapKind::AmbiguousClient,
         "endpoint_option",
