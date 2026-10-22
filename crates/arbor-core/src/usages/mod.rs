@@ -142,10 +142,13 @@ pub enum Routing {
     /// more than one kind of client, a direct client given a `base_url`
     /// after it is built or built in a file that sets `OPENAI_BASE_URL` /
     /// `ANTHROPIC_BASE_URL` or writes the environment with a run-time name,
-    /// and a `base_url` read from the environment with no fallback or one
-    /// that does not resolve to a string. With no gap: a non-literal or
-    /// non-Azure `openai.api_type`, and a hosted-platform client this list
-    /// does not name (`BedrockOpenAI`, `OpenAI(provider=...)`,
+    /// a `base_url` read from the environment with no fallback or one that
+    /// does not resolve to a string, and a module-level API routed by an
+    /// `openai.api_type` that is not a string literal or by an
+    /// `openai.bedrock_*` setting. With no gap, because the route is known to
+    /// be a platform this list does not name: a literal `openai.api_type`
+    /// other than Azure or OpenAI (`amazon-bedrock`), and a hosted-platform
+    /// client (`BedrockOpenAI`, `OpenAI(provider=...)`,
     /// `AnthropicAWS`, `AnthropicFoundry`, `AnthropicGoogleCloud` and their
     /// async variants). The construction's `constructor` field still names
     /// the class.
@@ -433,7 +436,9 @@ pub enum GapKind {
     /// module-level call that passes `engine` or `deployment_id` in a file
     /// that does not configure the module-level API, or any module-level
     /// call in a file that configures it outside its top-of-file setup block
-    /// (`module_config`), a direct client known only from a type annotation
+    /// (`module_config`), a module-level API routed by an `openai.api_type`
+    /// that is not a string literal or by an `openai.bedrock_*` setting
+    /// (`module_routing`), a direct client known only from a type annotation
     /// (`annotation`), or a receiver or configuration a dynamic feature of
     /// the file may change (`dynamic_feature`).
     AmbiguousClient,

@@ -629,6 +629,10 @@ enum ClientCaveat {
     /// setup block (in a function, a branch, after a `def`...), so it may
     /// not hold when a call runs (see [`Ctx::module_openai_routing`]).
     ModuleSetup(Feature),
+    /// The module-level API is routed by a setting this version does not
+    /// decide: `openai.api_type` set to a value that is not a string
+    /// literal, or an `openai.bedrock_*` setting.
+    ModuleRouting(Feature),
     /// A direct client (`OpenAI`, `Anthropic`, `genai.Client`) known only
     /// from a type annotation (`def ask(client: OpenAI)`): how it was built,
     /// and so whether it was given a `base_url` or another endpoint, is not
@@ -6507,10 +6511,21 @@ impl<'t> Ctx<'t> {
                     Some(kind) => match kind.to_ascii_lowercase().as_str() {
                         "azure" | "azure_ad" | "azuread" => azure = true,
                         "openai" | "open_ai" => {}
-                        // `amazon-bedrock` and anything newer.
+                        // `amazon-bedrock` and anything newer: a platform
+                        // this version does not name, like a hosted-platform
+                        // client.
                         _ => unknown = true,
                     },
-                    None => unknown = true,
+                    // Read from the environment, a name or anything else:
+                    // any route at all.
+                    None => {
+                        unknown = true;
+                        self.openai_caveat
+                            .get_or_insert(ClientCaveat::ModuleRouting(Self::feature(
+                                "`openai.api_type` set to a value that is not a string literal",
+                                assign.object,
+                            )));
+                    }
                 },
                 "azure_endpoint" | "azure_ad_token" | "azure_ad_token_provider" => azure = true,
                 "api_base" | "base_url" => {
@@ -6543,7 +6558,14 @@ impl<'t> Ctx<'t> {
                         }
                     }
                 }
-                _ if attr.starts_with("bedrock_") => unknown = true,
+                _ if attr.starts_with("bedrock_") => {
+                    unknown = true;
+                    self.openai_caveat
+                        .get_or_insert(ClientCaveat::ModuleRouting(Self::feature(
+                        "an `openai.bedrock_*` setting, which may send requests to Amazon Bedrock",
+                        assign.object,
+                    )));
+                }
                 _ => {}
             }
         }
@@ -7249,6 +7271,13 @@ impl<'t> Ctx<'t> {
                     "module_config",
                     format!(
                         "`{chain}` passes `engine` or `deployment_id`, which Azure deployments take, but this file does not configure the module-level API, so another module may route it to Azure"
+                    ),
+                ),
+                ClientCaveat::ModuleRouting(feature) => (
+                    "module_routing",
+                    format!(
+                        "the module-level API is routed by a setting this version does not decide ({}), so where `{chain}` sends its requests is not known",
+                        feature.describe()
                     ),
                 ),
                 ClientCaveat::Annotation => (

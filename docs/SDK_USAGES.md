@@ -183,6 +183,13 @@ these:
   so none of its own code can run before the configuration is complete. The
   report does not follow import-time execution any further than that.
 
+  In the block, a string literal decides `openai.api_type`: `azure` or
+  `azure_ad` routes to Azure, `openai` or `open_ai` direct, and any other
+  (`amazon-bedrock`) `unknown` with no gap, a platform this version does
+  not name. An `api_type` that is not a string literal (`os.environ[...]`,
+  a name bound to one), and any `openai.bedrock_*` setting, route `unknown`
+  with a `module_routing` gap.
+
   Anything else gives every module-level call of the file a `module_config`
   gap that keeps the routing the settings suggest: a setting in a function,
   in an `if`, loop, `try`, `with` or class body, after the setup block, by

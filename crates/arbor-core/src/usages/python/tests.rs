@@ -805,6 +805,62 @@ openai.ChatCompletion.create(engine="gpt35", deployment_id="gpt35", messages=[])
         call(&unknown, "openai.chat.completions.create").routing,
         Routing::Unknown
     );
+    // #278: the route was `unknown` with no gap, so nothing said why.
+    assert_eq!(
+        routes_and_gaps(&unknown),
+        vec![(
+            3,
+            Routing::Unknown,
+            vec!["ambiguous_client/module_routing".to_string()]
+        )]
+    );
+}
+
+#[test]
+fn a_module_routing_setting_this_version_does_not_decide_is_a_gap() {
+    // #278: an `openai.api_type` that is not a string literal and an
+    // `openai.bedrock_*` setting routed every module-level call `unknown`
+    // with no gap. Both are now a `module_routing` gap. Only a string
+    // literal is read: a name bound to one is a gap too.
+    let gap = || vec!["ambiguous_client/module_routing".to_string()];
+    let cases: Vec<(&str, Vec<RouteRow>)> = vec![
+        (
+            "import os, openai\nopenai.api_type = os.getenv(\"OPENAI_API_TYPE\", \"azure\")\nopenai.ChatCompletion.create(engine=\"gpt35\", messages=[])\n",
+            vec![(3, Routing::Unknown, gap())],
+        ),
+        (
+            "import openai\nKIND = \"azure\"\nopenai.api_type = KIND\nopenai.ChatCompletion.create(engine=\"gpt35\", messages=[])\n",
+            vec![(4, Routing::Unknown, gap())],
+        ),
+        (
+            "import openai\nopenai.bedrock_region = \"us-east-1\"\nopenai.chat.completions.create(model=\"openai.gpt-5.4\", messages=[])\n",
+            vec![(3, Routing::Unknown, gap())],
+        ),
+        (
+            // Through an alias that only an import binds, the same.
+            "import openai as oai\noai.bedrock_region = \"us-east-1\"\noai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+            vec![(3, Routing::Unknown, gap())],
+        ),
+        (
+            // With Azure settings next to it, the Azure route is kept as the
+            // candidate, under the gap.
+            "import os, openai\nopenai.api_type = os.environ[\"OPENAI_API_TYPE\"]\nopenai.azure_endpoint = \"https://myco.openai.azure.com/\"\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+            vec![(4, Routing::AzureOpenai, gap())],
+        ),
+        (
+            // Set outside the setup block, the `module_config` gap says so
+            // first.
+            "import os, openai\ndef setup():\n    openai.api_type = os.environ[\"T\"]\nopenai.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+            vec![(
+                4,
+                Routing::Unknown,
+                vec!["ambiguous_client/module_config".to_string()],
+            )],
+        ),
+    ];
+    for (source, expected) in cases {
+        assert_eq!(routes_and_gaps(&usages(source)), expected, "{source}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,6 +1276,9 @@ fn module_api_type_other_than_openai_or_azure_is_unknown() {
         call(&bedrock, "openai.chat.completions.create").routing,
         Routing::Unknown
     );
+    // A literal names the platform, as a hosted-platform client's class
+    // does: `unknown` because this version does not name it, with no gap.
+    assert!(bedrock.gaps.is_empty(), "{:?}", bedrock.gaps);
     let explicit = usages(
         "import openai\nopenai.api_type = \"openai\"\nopenai.chat.completions.create(model=\"gpt-4\")\n",
     );

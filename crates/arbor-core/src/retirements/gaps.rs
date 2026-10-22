@@ -156,6 +156,11 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     ),
     (
         GapKind::AmbiguousClient,
+        "module_routing",
+        "a module-level routing setting is not one Arbor can decide",
+    ),
+    (
+        GapKind::AmbiguousClient,
         "dynamic_feature",
         "this file may rebind the client or the SDK's configuration at run time",
     ),
