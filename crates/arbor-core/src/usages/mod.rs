@@ -59,9 +59,10 @@
 //!
 //! # Scope of this version
 //!
-//! Python only ([`python`]): `.py` files and extensionless scripts with a
-//! Python shebang. The TypeScript/ESM slice will implement
-//! [`crate::LanguageParser::extract_usages`] for its parsers and reuse these
+//! Python ([`python`]): `.py` files and extensionless scripts with a Python
+//! shebang. TypeScript and JavaScript ([`typescript`]): `.ts`, `.tsx`, `.mts`,
+//! `.cts`, `.js`, `.jsx`, `.mjs` and `.cjs` files, declaration files left out.
+//! Both implement [`crate::LanguageParser::extract_usages`] and share these
 //! types. Resolution is per file: a client or model constant imported from
 //! another module is a gap, not a usage.
 

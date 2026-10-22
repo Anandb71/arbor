@@ -60,8 +60,9 @@ locally, with no account, API key or telemetry.
 | **GitHub Action `mode: retirements`** | The same check in CI: a job summary that lists every affected call, and warnings on the most urgent lines. It warns by default and fails the build only when you set `retirements-fail-on`, or when the check cannot run. |
 | **`arbor usages` and `find_api_usages`** | Every OpenAI, Anthropic and Gemini SDK call with its file and line, client routing (direct, Azure, custom `base_url`, Bedrock, Vertex) and model IDs, for people and agents. A value is confirmed only inside a small supported grammar; everything else carries a typed gap. [What a report confirms](docs/SDK_USAGES.md) |
 
-Python only for now; graph extraction is unchanged (a saved graph is rebuilt
-once on first use, as after every upgrade). See the
+v3.1.0 reads Python only; TypeScript and JavaScript are listed under
+Unreleased in the [changelog](CHANGELOG.md). Graph extraction is unchanged (a
+saved graph is rebuilt once on first use, as after every upgrade). See the
 [3.0.5 release notes](docs/RELEASE_NOTES_v3.0.5.md) for the previous release.
 
 <details>
@@ -258,7 +259,7 @@ npx @anandb71/arbor-cli retirements .
 - **Honest about confidence.** A literal is confirmed only where the usage scan has no doubt about the call. `os.getenv("MODEL", "gpt-4o")` fallbacks, parameter defaults, class attributes a subclass may override and calls whose routing is not certain are marked *confirm first* with the reason, and fail the check only with `--count-unconfirmed`. Calls through Azure, OpenRouter or a proxy are listed apart (`--include-routed`), because the provider's dates may not apply there; a `base_url` on the provider's own host is a direct call. Models Arbor cannot read, and code it did not analyze, are counted, not hidden.
 - **Arbor does not decide for you.** When the replacement behaves differently by design (gpt-6-luna runs at medium reasoning effort by default, so it can reason, where gpt-4o did not; claude-sonnet-5-5 thinks by default, where the Sonnet models it replaces did not), the report shows both options and what each costs, and changes nothing until you choose.
 - **CI ready.** `--json`, `--markdown`, `--annotations`, `--markdown-out <file>` and `--fail-within <days>`. Exit code 1 means a confirmed call uses a retired model, or one retiring inside your window; the shutdown day itself counts as retired (UTC).
-- **Scope today:** Python with the `openai`, `anthropic` and Google GenAI SDKs. TypeScript and JavaScript are coming.
+- **Scope today:** Python, TypeScript and JavaScript, with the `openai`, `anthropic` and Google GenAI SDKs (and their npm packages). Framework wrappers such as LangChain or the Vercel AI SDK are not checked yet.
 
 GitHub Action (warns by default; it fails the build only if you ask it to):
 
