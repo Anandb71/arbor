@@ -160,6 +160,11 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
         "this file may rebind the client or the SDK's configuration at run time",
     ),
     (
+        GapKind::AmbiguousClient,
+        "annotation",
+        "the client is known only by its type annotation, so its options are not seen",
+    ),
+    (
         GapKind::UnknownClientFactory,
         "factory_call",
         "the client comes from a function Arbor does not follow",

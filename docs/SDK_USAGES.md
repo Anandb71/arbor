@@ -199,6 +199,13 @@ without the `subclass_override` gap that a model value read the same way
 gets. That is an assumption of the report: a subclass in another module
 that replaces a public class's client is not seen.
 
+A client known only from a type annotation (`def ask(client: OpenAI)`,
+`client: OpenAI` in a class body), with no construction the file shows,
+routes by its class when the class alone decides the route
+(`AzureOpenAI`, `AnthropicBedrock`, `AnthropicVertex`). A direct class
+(`OpenAI`, `Anthropic`, `genai.Client`) may have been given a `base_url` or
+another endpoint, so its calls route `unknown` with an `annotation` gap.
+
 An OpenAI or Anthropic client's `base_url` routes by its host (a Gemini
 client's endpoint options are a gap, above). The URL itself is never
 reported.

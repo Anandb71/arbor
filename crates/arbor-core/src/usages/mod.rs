@@ -136,18 +136,19 @@ pub enum Routing {
     GoogleGenai,
     /// `google.generativeai` (the deprecated SDK).
     GoogleGenerativeaiLegacy,
-    /// Not decided by this version: `**kwargs` passed to a direct
-    /// constructor, a client typed only by annotation, a binding assigned
+    /// Not decided by this version. With an `ambiguous_client` gap at each
+    /// call: `**kwargs` passed to a direct constructor, a direct client
+    /// known only from a type annotation (`annotation`), a binding assigned
     /// more than one kind of client, a direct client given a `base_url`
     /// after it is built or built in a file that sets `OPENAI_BASE_URL` /
     /// `ANTHROPIC_BASE_URL` or writes the environment with a run-time name,
-    /// a `base_url` read from the environment with no fallback or one that
-    /// does not resolve to a string (each with an `ambiguous_client` gap at
-    /// each call), a non-literal or non-Azure
-    /// `openai.api_type`, or a hosted-platform client this list does not name
-    /// (`BedrockOpenAI`, `OpenAI(provider=...)`, `AnthropicAWS`,
-    /// `AnthropicFoundry`, `AnthropicGoogleCloud` and their async variants).
-    /// The construction's `constructor` field still names the class.
+    /// and a `base_url` read from the environment with no fallback or one
+    /// that does not resolve to a string. With no gap: a non-literal or
+    /// non-Azure `openai.api_type`, and a hosted-platform client this list
+    /// does not name (`BedrockOpenAI`, `OpenAI(provider=...)`,
+    /// `AnthropicAWS`, `AnthropicFoundry`, `AnthropicGoogleCloud` and their
+    /// async variants). The construction's `constructor` field still names
+    /// the class.
     Unknown,
 }
 
@@ -432,7 +433,8 @@ pub enum GapKind {
     /// module-level call that passes `engine` or `deployment_id` in a file
     /// that does not configure the module-level API, or any module-level
     /// call in a file that configures it outside its top-of-file setup block
-    /// (`module_config`), or a receiver or configuration a dynamic feature of
+    /// (`module_config`), a direct client known only from a type annotation
+    /// (`annotation`), or a receiver or configuration a dynamic feature of
     /// the file may change (`dynamic_feature`).
     AmbiguousClient,
     /// `getattr` on a tracked binding, or an SDK method stored or passed as a

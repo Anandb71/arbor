@@ -370,10 +370,88 @@ def direct(client: Optional[OpenAI] = None):
         .collect();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].routing, Routing::AzureOpenai);
-    // An annotation alone cannot rule out a base_url.
+    // An annotation alone cannot rule out a base_url, so the route is
+    // `unknown`, with a gap that says why (#278: it had none).
     assert_eq!(calls[1].routing, Routing::Unknown);
     assert_eq!(calls[1].client_line, None);
-    assert!(gaps(&found, GapKind::AmbiguousClient).is_empty());
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (6, Routing::AzureOpenai, vec![]),
+            (
+                9,
+                Routing::Unknown,
+                vec!["ambiguous_client/annotation".to_string()]
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_direct_client_known_only_by_annotation_is_a_gap() {
+    // #278: a client reached only through a type annotation routed `unknown`
+    // with no gap, so nothing said why. Every direct class (whose route
+    // depends on how the client was built) now gives an `annotation` gap; a
+    // class that routes the same however it is built does not.
+    let annotation = || vec!["ambiguous_client/annotation".to_string()];
+    let found = usages(
+        r#"from anthropic import Anthropic, AnthropicBedrock, AnthropicFoundry
+from google import genai
+from openai import OpenAI
+
+class Bot:
+    client: OpenAI
+
+    def __init__(self, client):
+        self.client = client
+
+    def go(self):
+        return self.client.chat.completions.create(model="gpt-4o", messages=[])
+
+def claude(c: Anthropic):
+    return c.messages.create(model="claude-sonnet-5-5", max_tokens=1, messages=[])
+
+def gemini(c: genai.Client):
+    return c.models.generate_content(model="gemini-2.5-flash", contents="hi")
+
+def bedrock(c: AnthropicBedrock):
+    return c.messages.create(model="anthropic.claude-3-haiku-20240307-v1:0", max_tokens=1, messages=[])
+
+def foundry(c: AnthropicFoundry):
+    return c.messages.create(model="claude-sonnet-5-5", max_tokens=1, messages=[])
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (12, Routing::Unknown, annotation()),
+            (15, Routing::Unknown, annotation()),
+            (18, Routing::Unknown, annotation()),
+            (21, Routing::AnthropicBedrock, vec![]),
+            // A hosted platform is `unknown` because this version does not
+            // name it, however the client was built: no gap, as when the
+            // file builds it.
+            (24, Routing::Unknown, vec![]),
+        ]
+    );
+    // A construction still decides the route over an annotation.
+    let built = usages(
+        r#"from openai import OpenAI
+
+class Bot:
+    client: OpenAI
+
+    def __init__(self):
+        self.client = OpenAI()
+
+    def go(self):
+        return self.client.chat.completions.create(model="gpt-4o", messages=[])
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&built),
+        vec![(10, Routing::OpenaiDirect, vec![])]
+    );
 }
 
 #[test]

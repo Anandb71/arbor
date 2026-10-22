@@ -629,6 +629,11 @@ enum ClientCaveat {
     /// setup block (in a function, a branch, after a `def`...), so it may
     /// not hold when a call runs (see [`Ctx::module_openai_routing`]).
     ModuleSetup(Feature),
+    /// A direct client (`OpenAI`, `Anthropic`, `genai.Client`) known only
+    /// from a type annotation (`def ask(client: OpenAI)`): how it was built,
+    /// and so whether it was given a `base_url` or another endpoint, is not
+    /// seen.
+    Annotation,
 }
 
 /// A Python feature that can change what a name, attribute, dict or the
@@ -5507,6 +5512,12 @@ impl<'t> Ctx<'t> {
             let top_chain = matches!(node.kind(), "identifier" | "attribute") && !in_attribute;
             if top_chain {
                 if let Val::Class(class) = self.eval(node, scope, 0) {
+                    // A direct class's route depends on how the client was
+                    // built; a platform class routes the same however it was.
+                    let direct = matches!(
+                        class.family,
+                        Family::OpenaiDirect | Family::AnthropicDirect | Family::Genai
+                    );
                     return Some(Val::Client {
                         client: Client {
                             pkg: class.pkg,
@@ -5515,7 +5526,7 @@ impl<'t> Ctx<'t> {
                             site: None,
                             ambiguous: false,
                             typed: true,
-                            caveat: None,
+                            caveat: direct.then_some(ClientCaveat::Annotation),
                         },
                         path: Vec::new(),
                     });
@@ -7238,6 +7249,12 @@ impl<'t> Ctx<'t> {
                     "module_config",
                     format!(
                         "`{chain}` passes `engine` or `deployment_id`, which Azure deployments take, but this file does not configure the module-level API, so another module may route it to Azure"
+                    ),
+                ),
+                ClientCaveat::Annotation => (
+                    "annotation",
+                    format!(
+                        "the client behind `{chain}` is known only by its type annotation, so whether it was given a `base_url` or another endpoint is not seen"
                     ),
                 ),
             };
