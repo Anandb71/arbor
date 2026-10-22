@@ -2772,3 +2772,18 @@ client.batches.create({{ requests: [{{ p3: {{ p2: {{ p1: {{ p0: {{ model: \"gpt-
     assert_eq!(calls[0].values[0].key, "requests.p2.p1.p0.model");
     assert!(calls[1].values.is_empty());
 }
+
+#[test]
+fn a_request_on_an_object_an_sdk_call_returned_lists_its_model() {
+    let found = usages(
+        "import { GoogleAICacheManager } from \"@google/generative-ai/server\";
+const cacheManager = new GoogleAICacheManager(key);
+const cache = await cacheManager.create({ model: \"models/gemini-1.5-flash\", contents: [] });
+await cacheManager.list();
+",
+    );
+    let gaps = gaps(&found, GapKind::UnknownClientFactory);
+    assert_eq!(gaps.len(), 1, "{:?}", found.gaps);
+    assert_eq!(gaps[0].reason, "sdk_call_result");
+    assert_eq!(gaps[0].values[0].value, "models/gemini-1.5-flash");
+}

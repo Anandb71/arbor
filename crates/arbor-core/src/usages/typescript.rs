@@ -9013,15 +9013,26 @@ impl<'t> Ctx<'t> {
             return;
         }
         let links = self.render_links(function, 8);
-        let model_shape = || model_bearing_shape(&links);
-        if sdk_shape(&links).is_none() && model_shape().is_none() {
+        // A request on an object an SDK call returned
+        // (`cacheManager.create({ model })` on `new GoogleAICacheManager()`).
+        let sdk_result = match origin {
+            Origin::SdkResult { pkg: Some(pkg) } => {
+                let last = links.rsplit('.').next().unwrap_or(&links);
+                is_request(last).then_some((pkg.sdk(), true))
+            }
+            _ => None,
+        };
+        if sdk_shape(&links).is_none()
+            && model_bearing_shape(&links).is_none()
+            && sdk_result.is_none()
+        {
             return;
         }
         let chain = self.render(function);
         // A member that takes a model, called with one written at the call
         // (`genAI.getGenerativeModel({ model })` on an imported client).
         let shape = sdk_shape(&chain).or_else(|| {
-            model_bearing_shape(&chain).filter(|_| {
+            model_bearing_shape(&chain).or(sdk_result).filter(|_| {
                 let options = self.options(call, scope, 0);
                 super::VALUE_KEYS
                     .iter()
