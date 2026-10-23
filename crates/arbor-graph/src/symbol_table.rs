@@ -627,9 +627,11 @@ fn module_is(entry: &SymbolEntry, module: &str) -> bool {
 /// `module_is` already matches `pkg/index.ts` and `pkg/mod.rs`, because
 /// `normalize_module_path` drops `index` and `mod`, but `pkg/__init__.py`
 /// normalizes to `pkg.__init__`. The package directory is compared the way
-/// `module_is` compares a file.
+/// `module_is` compares a file. Only `__init__.py` counts: an `__init__.pyi`
+/// is a type stub, not the module that runs, and the implementation it
+/// describes usually lives in a submodule.
 fn package_init_is(entry: &SymbolEntry, module: &str) -> bool {
-    entry.file.file_stem().and_then(|s| s.to_str()) == Some("__init__")
+    entry.file.file_name().and_then(|s| s.to_str()) == Some("__init__.py")
         && entry.file.parent().is_some_and(|dir| {
             let dir_norm = normalize_module_path(&dir.to_string_lossy());
             dir_norm == module || dir_norm.ends_with(&format!(".{module}"))
