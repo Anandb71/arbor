@@ -7,7 +7,10 @@
 //! files anyway.
 
 use crate::languages::LanguageParser;
-use crate::node::{CodeNode, NodeKind, Visibility};
+use crate::node::{
+    import_alias, import_alias_ref, local_binding_ref, runtime_binding, runtime_binding_ref,
+    CodeNode, NodeKind, Visibility,
+};
 use tree_sitter::{Language, Node, Tree};
 
 pub struct TypeScriptParser;
@@ -23,9 +26,12 @@ impl LanguageParser for TypeScriptParser {
 
     fn extract_nodes(&self, tree: &Tree, source: &str, file_path: &str) -> Vec<CodeNode> {
         let mut nodes = Vec::new();
+        let mut bindings = FileBindings::default();
         let root = tree.root_node();
-        extract_from_node(&root, source, file_path, &mut nodes, None);
+        extract_from_node(&root, source, file_path, &mut nodes, &mut bindings, None);
         distinguish_repeated_tests(&mut nodes, file_path);
+        let binding_nodes = bindings.into_nodes(&nodes, &root, file_path);
+        nodes.extend(binding_nodes);
         nodes
     }
 }
@@ -77,15 +83,17 @@ impl LanguageParser for TsxParser {
 /// Recursively extracts nodes from the AST.
 /// Uses stacker::maybe_grow to prevent stack overflow on deeply-nested files
 /// (e.g. TypeScript compiler's checker.ts which is 50k+ lines).
-fn extract_from_node(
+fn extract_from_node<'s>(
     node: &Node,
-    source: &str,
+    source: &'s str,
     file_path: &str,
     nodes: &mut Vec<CodeNode>,
+    bindings: &mut FileBindings<'s>,
     parent_name: Option<&str>,
 ) {
     stacker::maybe_grow(64 * 1024, 4 * 1024 * 1024, || {
         let kind = node.kind();
+        bindings.visit(node, source);
 
         match kind {
             "function_declaration" | "function" => {
@@ -98,6 +106,7 @@ fn extract_from_node(
                 if let Some(code_node) = extract_arrow_function(node, source, file_path) {
                     nodes.push(code_node);
                 }
+                nodes.extend(extract_require_bindings(node, source, file_path));
             }
 
             "class_declaration" | "class" => {
@@ -112,6 +121,7 @@ fn extract_from_node(
                                     source,
                                     file_path,
                                     nodes,
+                                    bindings,
                                     Some(&class_name),
                                 );
                             }
@@ -171,7 +181,7 @@ fn extract_from_node(
 
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
-                extract_from_node(&child, source, file_path, nodes, parent_name);
+                extract_from_node(&child, source, file_path, nodes, bindings, parent_name);
             }
         }
     });
@@ -433,9 +443,25 @@ fn extract_type_alias(node: &Node, source: &str, file_path: &str) -> Option<Code
 /// The imported names are stored in `references` so the graph builder can build an
 /// import map for import-aware edge resolution. Format:
 ///   - Named import  `{ X }`       → "X"
+///   - Aliased       `{ X as Y }`  → "alias:Y:X"
 ///   - Default import `import X`   → "X"
 ///   - Namespace     `* as X`      → "*as:X"  (graph builder resolves X.method() calls)
+///   - TypeScript    `import X = require('m')` → "X", "*as:X" (see [`extract_require_bindings`])
 fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
+    // TypeScript's CommonJS form keeps its module on the clause, not on the
+    // statement.
+    if let Some(clause) = named_child_of_kind(node, "import_require_clause") {
+        let local = named_child_of_kind(&clause, "identifier")?;
+        let module = string_literal(&clause.child_by_field_name("source")?, source)?;
+        let local = get_text(&local, source);
+        return Some(import_node(
+            &module,
+            vec![local.clone(), format!("*as:{local}")],
+            node,
+            file_path,
+        ));
+    }
+
     let source_node = node.child_by_field_name("source")?;
     let raw = get_text(&source_node, source);
     let module_path = raw.trim_matches(|c| c == '"' || c == '\'');
@@ -460,12 +486,7 @@ fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode
                             for k in 0..child.child_count() {
                                 if let Some(spec) = child.child(k) {
                                     if spec.kind() == "import_specifier" {
-                                        // Use the local alias if present, otherwise the original name
-                                        let local = spec
-                                            .child_by_field_name("alias")
-                                            .or_else(|| spec.child_by_field_name("name"))
-                                            .map(|n| get_text(&n, source));
-                                        if let Some(n) = local {
+                                        if let Some(n) = import_specifier(&spec, source) {
                                             imported_names.push(n);
                                         }
                                     }
@@ -492,15 +513,455 @@ fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode
         }
     }
 
-    Some(
-        CodeNode::new(module_path, module_path, NodeKind::Import, file_path)
-            .with_lines(
-                node.start_position().row as u32 + 1,
-                node.end_position().row as u32 + 1,
-            )
-            .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
-            .with_references(imported_names),
-    )
+    Some(import_node(module_path, imported_names, node, file_path))
+}
+
+/// An `Import` node for `module`, spanning `node`, with the names it binds.
+fn import_node(module: &str, names: Vec<String>, node: &Node, file_path: &str) -> CodeNode {
+    CodeNode::new(module, module, NodeKind::Import, file_path)
+        .with_lines(
+            node.start_position().row as u32 + 1,
+            node.end_position().row as u32 + 1,
+        )
+        .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
+        .with_references(names)
+}
+
+/// `A as B` in `import { A as B }`: calls use `B`, and the module exports
+/// `A`, so both are recorded (`alias:B:A`). `{ A }`, `{ A as A }` and
+/// `{ default as B }` record the local name, as a default import does.
+fn import_specifier(spec: &Node, source: &str) -> Option<String> {
+    let imported = spec
+        .child_by_field_name("name")
+        .map(|n| get_text(&n, source));
+    let local = spec
+        .child_by_field_name("alias")
+        .map(|n| get_text(&n, source));
+    match (local, imported) {
+        (Some(local), Some(imported)) => Some(import_binding(&local, &imported)),
+        (local, imported) => local.or(imported),
+    }
+}
+
+/// `local` bound to the module's export `exported`: `alias:local:exported`,
+/// or the local name alone when the two match or the export is `default`.
+fn import_binding(local: &str, exported: &str) -> String {
+    if local != exported && exported != "default" {
+        import_alias_ref(local, exported)
+    } else {
+        local.to_string()
+    }
+}
+
+/// CommonJS `require` and awaited `import()` bindings, recorded in the same
+/// format as `import` statements so the graph builder sees every name a file
+/// takes from another module. One `Import` node per declarator:
+///   - `const { A, B: C } = require('m')` → "A", "alias:C:B"
+///   - `const C = require('m').B`         → "alias:C:B"
+///   - `const M = require('m')`           → "M", "*as:M"
+///   - `const { A } = await import('m')`  → "A"
+///   - `const M = await import('m')`      → "*as:M"
+///   - `const { A } = require('./m').make(deps)`, `require('./m')(deps)` → "bound:A:A"
+///
+/// A required module is `module.exports`, which may be the function itself,
+/// so `M()` is a call to it as with a default import. An ES module namespace
+/// is never callable, so a dynamic import binds only the namespace. Names
+/// destructured from a value computed from a project module (a factory it
+/// exports, the module called, a property of an export) are run-time
+/// bindings of that module, see [`NameMode::RuntimeBinding`]. Only a
+/// string-literal module is read, and nested or `...rest` patterns bind
+/// objects rather than exports, so they record nothing here.
+fn extract_require_bindings(node: &Node, source: &str, file_path: &str) -> Vec<CodeNode> {
+    let mut imports = Vec::new();
+    for i in 0..node.named_child_count() {
+        let Some(declarator) = node.named_child(i) else {
+            continue;
+        };
+        let Some((pattern, value)) = declarator_parts(&declarator) else {
+            continue;
+        };
+        let Some(chain) = value_chain(&value, source) else {
+            continue;
+        };
+        let ChainRoot::Module { module, dynamic } = chain.root else {
+            continue;
+        };
+        let names = match (pattern.kind(), chain.steps, chain.outer_property) {
+            ("identifier", 0, _) => {
+                let local = get_text(&pattern, source);
+                if dynamic {
+                    vec![format!("*as:{local}")]
+                } else {
+                    vec![local.clone(), format!("*as:{local}")]
+                }
+            }
+            ("identifier", 1, Some(export)) => {
+                vec![import_binding(&get_text(&pattern, source), &export)]
+            }
+            ("object_pattern", 0, _) => destructured_names(&pattern, source, NameMode::Import),
+            ("object_pattern", _, _) if is_relative_module(&module) => {
+                destructured_names(&pattern, source, NameMode::RuntimeBinding)
+            }
+            _ => continue,
+        };
+        if !names.is_empty() {
+            imports.push(import_node(&module, names, &declarator, file_path));
+        }
+    }
+    imports
+}
+
+/// What the main pass learns about the names a file binds, turned into
+/// `Import` nodes by [`FileBindings::into_nodes`] once the file's imports are
+/// all known (a binding may come before the import it depends on).
+///
+/// - **Local bindings:** every name a variable declaration (any pattern), a
+///   parameter, a `catch` or `for` binding, or a function or class
+///   declaration introduces, as `local:name` on one `Import` node with an
+///   empty module. A call to one of these may reach whatever function the
+///   value holds; a call to any other name the file doesn't import can only
+///   reach a global.
+/// - **Run-time bindings:** names destructured from a value computed from an
+///   identifier the file binds from a project module (`./`, `../`):
+///   `const { setFilters } = useListFilters()` after
+///   `import { useListFilters } from './hooks'`, `const { load } =
+///   config.make()` after `const config = require('./config')`. One `Import`
+///   node per declarator, for that module (see [`NameMode::RuntimeBinding`]).
+#[derive(Default)]
+struct FileBindings<'s> {
+    locals: std::collections::BTreeSet<&'s str>,
+    /// Object patterns destructured from a value whose chain starts at an
+    /// identifier, waiting to learn whether that identifier is imported.
+    pending: Vec<PendingRuntimeBinding>,
+}
+
+struct PendingRuntimeBinding {
+    root: String,
+    names: Vec<String>,
+    lines: (u32, u32),
+    bytes: (u32, u32),
+}
+
+impl<'s> FileBindings<'s> {
+    /// Records what `node` binds, if anything. Called once for every node the
+    /// main pass visits.
+    fn visit(&mut self, node: &Node, source: &'s str) {
+        match node.kind() {
+            "variable_declarator" => {
+                let Some(pattern) = node.child_by_field_name("name") else {
+                    return;
+                };
+                pattern_names(pattern, source, &mut self.locals);
+                if pattern.kind() != "object_pattern" {
+                    return;
+                }
+                let Some(Chain {
+                    root: ChainRoot::Identifier(root),
+                    ..
+                }) = node
+                    .child_by_field_name("value")
+                    .and_then(|value| value_chain(&value, source))
+                else {
+                    return;
+                };
+                let names = destructured_names(&pattern, source, NameMode::RuntimeBinding);
+                if !names.is_empty() {
+                    self.pending.push(PendingRuntimeBinding {
+                        root,
+                        names,
+                        lines: (
+                            node.start_position().row as u32 + 1,
+                            node.end_position().row as u32 + 1,
+                        ),
+                        bytes: (node.start_byte() as u32, node.end_byte() as u32),
+                    });
+                }
+            }
+            "formal_parameters" => {
+                for i in 0..node.named_child_count() {
+                    if let Some(parameter) = node.named_child(i) {
+                        pattern_names(parameter, source, &mut self.locals);
+                    }
+                }
+            }
+            "arrow_function" | "catch_clause" => {
+                if let Some(parameter) = node.child_by_field_name("parameter") {
+                    pattern_names(parameter, source, &mut self.locals);
+                }
+            }
+            "for_in_statement" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    pattern_names(left, source, &mut self.locals);
+                }
+            }
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function"
+            | "function_expression"
+            | "class_declaration"
+            | "class" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    pattern_names(name, source, &mut self.locals);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The run-time binding nodes for pending destructurings whose root the
+    /// file binds from a project module, then the one node of local bindings.
+    fn into_nodes(self, nodes: &[CodeNode], root: &Node, file_path: &str) -> Vec<CodeNode> {
+        let mut modules: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for import in nodes.iter().filter(|n| n.kind == NodeKind::Import) {
+            for reference in &import.references {
+                let local = match (
+                    reference.strip_prefix("*as:"),
+                    import_alias(reference).or_else(|| runtime_binding(reference)),
+                ) {
+                    (Some(namespace), _) => namespace,
+                    (None, Some((local, _))) => local,
+                    (None, None) => reference.as_str(),
+                };
+                modules.insert(local, import.name.as_str());
+            }
+        }
+        let mut out = Vec::new();
+        for pending in self.pending {
+            let Some(&module) = modules
+                .get(pending.root.as_str())
+                .filter(|module| is_relative_module(module))
+            else {
+                continue;
+            };
+            out.push(
+                CodeNode::new(module, module, NodeKind::Import, file_path)
+                    .with_lines(pending.lines.0, pending.lines.1)
+                    .with_bytes(pending.bytes.0, pending.bytes.1)
+                    .with_references(pending.names),
+            );
+        }
+        if !self.locals.is_empty() {
+            let names = self
+                .locals
+                .iter()
+                .map(|name| local_binding_ref(name))
+                .collect();
+            out.push(import_node("", names, root, file_path));
+        }
+        out
+    }
+}
+
+/// Adds every name `pattern` binds: an identifier, or each name inside an
+/// object or array pattern, a default (`a = 1`), a `...rest` or a TypeScript
+/// parameter (`a: T`, `b?: T`). Property keys and types bind nothing. Walked
+/// with a stack, not recursion.
+fn pattern_names<'s>(
+    pattern: Node,
+    source: &'s str,
+    names: &mut std::collections::BTreeSet<&'s str>,
+) {
+    let mut stack = vec![pattern];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" | "type_identifier" => {
+                names.insert(&source[node.byte_range()]);
+            }
+            "pair_pattern" => stack.extend(node.child_by_field_name("value")),
+            "object_assignment_pattern" | "assignment_pattern" => {
+                stack.extend(node.child_by_field_name("left"));
+            }
+            "required_parameter" | "optional_parameter" => {
+                stack.extend(node.child_by_field_name("pattern"));
+            }
+            "object_pattern" | "array_pattern" | "rest_pattern" => {
+                stack.extend((0..node.named_child_count()).filter_map(|i| node.named_child(i)));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `./m`, `../m`: a module in this project, as opposed to a package.
+fn is_relative_module(module: &str) -> bool {
+    module.starts_with('.')
+}
+
+/// The pattern and value of a `variable_declarator`: `const <pattern> = <value>`.
+fn declarator_parts<'tree>(node: &Node<'tree>) -> Option<(Node<'tree>, Node<'tree>)> {
+    if node.kind() != "variable_declarator" {
+        return None;
+    }
+    Some((
+        node.child_by_field_name("name")?,
+        node.child_by_field_name("value")?,
+    ))
+}
+
+/// Where a value's chain of member accesses, calls, `await`s and parentheses
+/// starts, and how many steps it takes from there.
+struct Chain {
+    root: ChainRoot,
+    /// Member and call steps between the root and the value.
+    steps: usize,
+    /// `.B` when the value's outermost step is a property access.
+    outer_property: Option<String>,
+}
+
+enum ChainRoot {
+    /// `require('m')` or `import('m')` with a string-literal module.
+    Module { module: String, dynamic: bool },
+    /// A plain identifier: `useListFilters()`, `config.make()`, `api`.
+    Identifier(String),
+}
+
+/// Walks a declarator's value down its chain to the root, in a loop rather
+/// than recursion so a very long chain can't exhaust the stack. `None` for any
+/// other root (`this`, a literal, `require(name)`, ...).
+fn value_chain(value: &Node, source: &str) -> Option<Chain> {
+    let mut node = *value;
+    let mut steps = 0usize;
+    let mut outer_property = None;
+    loop {
+        match node.kind() {
+            "parenthesized_expression" | "await_expression" => node = node.named_child(0)?,
+            "member_expression" => {
+                if steps == 0 {
+                    outer_property = node
+                        .child_by_field_name("property")
+                        .filter(|property| property.kind() == "property_identifier")
+                        .map(|property| get_text(&property, source));
+                }
+                steps += 1;
+                node = node.child_by_field_name("object")?;
+            }
+            "call_expression" => {
+                let function = node.child_by_field_name("function")?;
+                let dynamic = match function.kind() {
+                    "import" => true,
+                    "identifier" if get_text(&function, source) == "require" => false,
+                    _ => {
+                        steps += 1;
+                        node = function;
+                        continue;
+                    }
+                };
+                let module = sole_string_argument(&node, source)?;
+                return Some(Chain {
+                    root: ChainRoot::Module { module, dynamic },
+                    steps,
+                    outer_property,
+                });
+            }
+            "identifier" => {
+                return Some(Chain {
+                    root: ChainRoot::Identifier(get_text(&node, source)),
+                    steps,
+                    outer_property,
+                });
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The module a `require` or `import()` call names: its one argument, when
+/// that is a string literal. Comments (webpack's magic comments) are not
+/// arguments.
+fn sole_string_argument(call: &Node, source: &str) -> Option<String> {
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut values = (0..arguments.named_child_count())
+        .filter_map(|i| arguments.named_child(i))
+        .filter(|argument| argument.kind() != "comment");
+    let module = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    string_literal(&module, source)
+}
+
+/// How [`destructured_names`] records each name.
+#[derive(Clone, Copy)]
+enum NameMode {
+    /// Destructuring a module itself (`require('m')`, `await import('m')`)
+    /// reads its exports, recorded as `import` statements record them.
+    Import,
+    /// Destructuring a value computed from a project module (a hook's or
+    /// factory's return value, a property of an export): `bound:A:A`. The
+    /// names need not be the module's top-level ones, so the graph builder
+    /// looks for each inside that module first, and otherwise treats it as a
+    /// local binding.
+    RuntimeBinding,
+}
+
+/// The names an object pattern binds: `{ A }`, `{ A = d }`, `{ B: C }`,
+/// `{ 'B': C }` and `{ B: C = d }`, recorded as `mode` says.
+fn destructured_names(pattern: &Node, source: &str, mode: NameMode) -> Vec<String> {
+    let binding = |local: &str, exported: &str| match mode {
+        NameMode::Import => import_binding(local, exported),
+        NameMode::RuntimeBinding => runtime_binding_ref(local, exported),
+    };
+    let mut names = Vec::new();
+    for i in 0..pattern.named_child_count() {
+        let Some(property) = pattern.named_child(i) else {
+            continue;
+        };
+        match property.kind() {
+            "shorthand_property_identifier_pattern" => {
+                let name = get_text(&property, source);
+                names.push(binding(&name, &name));
+            }
+            "object_assignment_pattern" => {
+                if let Some(left) = property
+                    .child_by_field_name("left")
+                    .filter(|left| left.kind() == "shorthand_property_identifier_pattern")
+                {
+                    let name = get_text(&left, source);
+                    names.push(binding(&name, &name));
+                }
+            }
+            "pair_pattern" => {
+                let local =
+                    property
+                        .child_by_field_name("value")
+                        .and_then(|value| match value.kind() {
+                            "identifier" => Some(value),
+                            "assignment_pattern" => value
+                                .child_by_field_name("left")
+                                .filter(|left| left.kind() == "identifier"),
+                            _ => None,
+                        });
+                let exported =
+                    property
+                        .child_by_field_name("key")
+                        .and_then(|key| match key.kind() {
+                            "property_identifier" => Some(get_text(&key, source)),
+                            "string" => string_literal(&key, source),
+                            _ => None,
+                        });
+                if let (Some(local), Some(exported)) = (local, exported) {
+                    names.push(binding(&get_text(&local, source), &exported));
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// The text of a `string` node without its quotes.
+fn string_literal(node: &Node, source: &str) -> Option<String> {
+    (node.kind() == "string").then(|| {
+        get_text(node, source)
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_string()
+    })
+}
+
+fn named_child_of_kind<'tree>(node: &Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    (0..node.named_child_count())
+        .filter_map(|i| node.named_child(i))
+        .find(|child| child.kind() == kind)
 }
 
 // ============================================================================
@@ -1031,11 +1492,245 @@ it('works', () => { again(); });
     fn ordinary_calls_with_callbacks_are_not_tests() {
         let source =
             "items.forEach((item) => { use(item); });\nsetTimeout(() => { tick(); }, 10);\n";
-        let nodes = parse(source, "src/a.ts");
+        let nodes: Vec<_> = parse(source, "src/a.ts")
+            .into_iter()
+            .filter(|n| n.kind != NodeKind::Import)
+            .collect();
         assert!(
             nodes.is_empty(),
             "{:?}",
             nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// #258: `{ formatName as fmt }` recorded only `fmt`.
+    #[test]
+    fn aliased_named_imports_keep_the_imported_name() {
+        let source = "\
+import { formatName as fmt, parse } from './format';
+import { a as a, default as Widget } from '../ui/widget';
+import Default, { b as c } from './lib';
+import * as types from '@babel/types';
+";
+        let imports: Vec<(String, Vec<String>)> = parse(source, "src/app.ts")
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Import && !n.name.is_empty())
+            .map(|n| (n.name, n.references))
+            .collect();
+        let owned = |refs: &[&str]| refs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            imports,
+            vec![
+                (
+                    "./format".to_string(),
+                    owned(&["alias:fmt:formatName", "parse"])
+                ),
+                // `a as a` binds the imported name; `default` names no export.
+                ("../ui/widget".to_string(), owned(&["a", "Widget"])),
+                ("./lib".to_string(), owned(&["Default", "alias:c:b"])),
+                ("@babel/types".to_string(), owned(&["*as:types"])),
+            ]
+        );
+    }
+
+    /// Names destructured from a value computed from a required project
+    /// module (a factory call, a property of an export) come from that module
+    /// too, but not necessarily from its top level, so each is a run-time
+    /// binding of the module. An identifier bound to such a value records
+    /// nothing here.
+    #[test]
+    fn names_destructured_from_a_required_module_value_are_recorded() {
+        let source = "\
+const { getOrderPage, getOrderDetail: detail } = require('./paged').createPagedReads(prisma);
+const { a } = require('./factory')(deps);
+const made = require('./factory')(deps);
+const { x } = require('./m').b;
+const deep = require('./m').a.b;
+export async function load() {
+  const c = (await import('./p')).q;
+  const { t } = await import('./p').then((m) => m.default);
+  return [c, t];
+}
+";
+        let imports: Vec<(String, Vec<String>)> = parse(source, "src/app.ts")
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Import && !n.name.is_empty())
+            .map(|n| (n.name, n.references))
+            .collect();
+        let owned = |refs: &[&str]| refs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            imports,
+            vec![
+                (
+                    "./paged".to_string(),
+                    owned(&[
+                        "bound:getOrderPage:getOrderPage",
+                        "bound:detail:getOrderDetail"
+                    ])
+                ),
+                ("./factory".to_string(), owned(&["bound:a:a"])),
+                ("./m".to_string(), owned(&["bound:x:x"])),
+                ("./p".to_string(), owned(&["alias:c:q"])),
+                ("./p".to_string(), owned(&["bound:t:t"])),
+            ]
+        );
+    }
+
+    /// Names destructured from a value computed from a binding of a project
+    /// module (a hook, a factory, an object) are run-time bindings of that
+    /// module. A package's value (`useForm()`) and an unimported root record
+    /// none: those names are only local bindings.
+    #[test]
+    fn names_destructured_from_a_project_binding_are_runtime_bindings() {
+        let source = "\
+import { useListFilters } from './hooks';
+import * as api from './api';
+import { useForm } from 'react-hook-form';
+const config = require('./config');
+const { setFilters, reset: clear } = useListFilters();
+const { load } = config.make();
+const { get } = api;
+const { handleSubmit } = useForm();
+const { other } = notImported();
+const value = useListFilters();
+";
+        let imports: Vec<(String, Vec<String>)> = parse(source, "src/app.ts")
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Import && !n.name.is_empty())
+            .map(|n| (n.name, n.references))
+            .collect();
+        let owned = |refs: &[&str]| refs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            imports,
+            vec![
+                ("./hooks".to_string(), owned(&["useListFilters"])),
+                ("./api".to_string(), owned(&["*as:api"])),
+                ("react-hook-form".to_string(), owned(&["useForm"])),
+                ("./config".to_string(), owned(&["config", "*as:config"])),
+                (
+                    "./hooks".to_string(),
+                    owned(&["bound:setFilters:setFilters", "bound:clear:reset"])
+                ),
+                ("./config".to_string(), owned(&["bound:load:load"])),
+                ("./api".to_string(), owned(&["bound:get:get"])),
+            ]
+        );
+    }
+
+    /// Every name the file binds itself is recorded once, sorted, on one
+    /// import node with an empty module. Property keys, types and the names a
+    /// file merely calls are not bindings.
+    #[test]
+    fn local_bindings_are_recorded_on_one_import_node() {
+        let source = "\
+import { imported } from './m';
+const plain = 1, { a, b: c, d = 2, ...rest } = make();
+let [first, , third = 3, ...others] = list;
+var later;
+function outer(param, { opt }: Options, [arr]: number[], deflt = 1, ...tail: string[]) {
+  const inner = (x) => x;
+  const single = y => y;
+  try { called(); } catch (err) { report(err); }
+  for (const item of items) {}
+  for (let key in object) {}
+  return function named() {};
+}
+class Shape {}
+";
+        let locals: Vec<String> = parse(source, "src/app.ts")
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Import && n.name.is_empty())
+            .flat_map(|n| n.references)
+            .collect();
+        let expected: Vec<String> = [
+            "Shape", "a", "arr", "c", "d", "deflt", "err", "first", "inner", "item", "key",
+            "later", "named", "opt", "others", "outer", "param", "plain", "rest", "single", "tail",
+            "third", "x", "y",
+        ]
+        .iter()
+        .map(|name| format!("local:{name}"))
+        .collect();
+        assert_eq!(locals, expected);
+    }
+
+    /// A comment beside the module, such as webpack's magic comments, is
+    /// not a second argument.
+    #[test]
+    fn a_comment_in_the_arguments_does_not_hide_the_module() {
+        let source = "\
+const b = require(/* webpackIgnore: true */ './b');
+export async function load() {
+  const { a } = await import(/* webpackChunkName: \"a\" */ './a');
+  return a;
+}
+const two = require('./c', './d');
+";
+        let imports: Vec<(String, Vec<String>)> = parse(source, "src/app.ts")
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Import && !n.name.is_empty())
+            .map(|n| (n.name, n.references))
+            .collect();
+        let owned = |refs: &[&str]| refs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            imports,
+            vec![
+                ("./b".to_string(), owned(&["b", "*as:b"])),
+                ("./a".to_string(), owned(&["a"])),
+            ]
+        );
+    }
+
+    /// The chain from a declarator's value down to `require` is walked in a
+    /// loop, so a very long member chain can't exhaust the stack.
+    #[test]
+    fn a_long_member_chain_is_not_a_require_binding() {
+        let source = format!("const x = a{};\n", ".b".repeat(20_000));
+        let imports = parse(&source, "src/long.ts")
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Import && !n.name.is_empty())
+            .count();
+        assert_eq!(imports, 0);
+    }
+
+    /// `require`, `import x = require()` and an awaited `import()` bind
+    /// names as `import` statements do, in the same format.
+    #[test]
+    fn require_bindings_are_recorded_as_imports() {
+        let source = "\
+const { a, b: c, d = 1, e: f = 2, 'g': h, default: dflt, i: { j }, ...rest } = require('./m');
+const whole = require(\"./whole\"), other = require('./other').helper;
+var same = require('./same').same;
+import helper = require('./helper');
+const notAModule = require(name);
+const called = require('./factory')('arg');
+const resolved = require.resolve('./path');
+export async function load() {
+  const { lazy, x: y } = await import('./lazy.js');
+  const ns = await import('./ns');
+  return [lazy, y, ns];
+}
+";
+        let imports: Vec<(String, Vec<String>)> = parse(source, "src/app.ts")
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Import && !n.name.is_empty())
+            .map(|n| (n.name, n.references))
+            .collect();
+        let owned = |refs: &[&str]| refs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            imports,
+            vec![
+                // Nested `{ j }` and `...rest` bind objects, not exports.
+                (
+                    "./m".to_string(),
+                    owned(&["a", "alias:c:b", "d", "alias:f:e", "alias:h:g", "dflt"])
+                ),
+                ("./whole".to_string(), owned(&["whole", "*as:whole"])),
+                ("./other".to_string(), owned(&["alias:other:helper"])),
+                ("./same".to_string(), owned(&["same"])),
+                ("./helper".to_string(), owned(&["helper", "*as:helper"])),
+                ("./lazy.js".to_string(), owned(&["lazy", "alias:y:x"])),
+                ("./ns".to_string(), owned(&["*as:ns"])),
+            ]
         );
     }
 }

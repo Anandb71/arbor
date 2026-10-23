@@ -112,6 +112,19 @@ Parsers record each call as a reference string. The builder resolves it to a def
 
 Only definitions in the caller's language family are candidates (TypeScript and JavaScript together; C and C++ together; Java, Kotlin and Scala together), so a TypeScript `enqueue()` never binds to a Rust `enqueue`.
 
+A bare `calls` edge to another file is dropped when the caller cannot see the name:
+
+- **Python:** the edge stays only when the calling file defines the name or imports it (`import`, `from m import`). After `from m import *` every bare call stays, at the lower confidence of an unimported name, since the star doesn't say which names it brought in.
+- **JavaScript and TypeScript:** a bare name resolves to something the file binds, or to a global.
+  - **Imports.** An `import`, a CommonJS `require` (`const { a, b: c } = require("./m")`, `const m = require("./m")`, `require("./m").b`), TypeScript's `import m = require("./m")` and an awaited `import()` are imports, and the edge gets an import's confidence. A renamed binding (`b as c`, `{ b: c }`) is an alias, so `c()` resolves to the module's `b`.
+  - **Run-time bindings.** Names destructured from a value a project module produced (a factory's or a React hook's return value: `const { a } = require("./m").make()`, `const { setFilters } = useListFilters()` after importing `useListFilters` from `./hooks`) are looked up in that module first. When the module defines the name, the call links there.
+  - **Local bindings.** Otherwise a name the file binds itself (a variable, a parameter, any destructured value, such as `const { login } = useContext(AuthContext)`) may hold any function, so the edge stays at the lower confidence of an unimported name (×0.6 in the same directory, ×0.3 elsewhere). If the file binds one name from two different modules in two functions, it is treated the same way.
+  - **Globals.** Any other name is a global. It reaches a function in a possible classic script (a file with no imports and no exports), at the lower confidence, or at full confidence when the caller is a possible script too. It never reaches a function in another module, so that edge is dropped: Jest's global `expect()` doesn't reach a script's own `expect` helper.
+- **Go:** the edge stays only when both files declare the same package clause and share a directory. The clause is the `Module` node the Go parser already emits.
+- **Other languages:** an unimported cross-file bare name still links, at lower confidence.
+
+Dotted (`obj.method()`) and path (`jobs::enqueue()`) calls are not part of this check, and a call through a module alias (`m.f()` after `import money as m`) is not resolved by it.
+
 Reference shapes:
 
 | Shape | Example | Resolves to |
