@@ -3300,6 +3300,72 @@ async function getOrderById(id) {
         );
     }
 
+    /// A React custom hook: the setter comes from the return value of a hook
+    /// the file imports, so it is the hook module's function, not the
+    /// exported function of the same name in another file.
+    #[test]
+    fn names_destructured_from_an_imported_hook_reach_the_hook_module() {
+        let graph = index(&[
+            (
+                "hooks/useListState.js",
+                "\
+export function useListFilters(defaults) {
+  function setFilters(patch) {
+    return { ...defaults, ...patch };
+  }
+  return { setFilters };
+}
+",
+            ),
+            (
+                "components/Search.jsx",
+                "export function setFilters(event) {\n  return event;\n}\n",
+            ),
+            (
+                "pages/Orders.jsx",
+                "\
+import { useListFilters } from \"../hooks/useListState\";
+
+export function Orders() {
+  const { setFilters } = useListFilters({});
+  return setFilters({ q: \"\" });
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "pages/Orders.jsx::Orders -> hooks/useListState.js::setFilters",
+                "pages/Orders.jsx::Orders -> hooks/useListState.js::useListFilters",
+            ])
+        );
+    }
+
+    /// A name from an external hook's return value is that package's, so it
+    /// never binds to a project function that shares it.
+    #[test]
+    fn names_destructured_from_an_external_hook_link_nothing() {
+        let graph = index(&[
+            (
+                "components/Other.jsx",
+                "export function handleSubmit(event) {\n  return event;\n}\n",
+            ),
+            (
+                "components/Form.jsx",
+                "\
+import { useForm } from \"react-hook-form\";
+
+export function Form({ save }) {
+  const { handleSubmit } = useForm();
+  return handleSubmit(save);
+}
+",
+            ),
+        ]);
+        assert_eq!(calls(&graph), edges(&[]));
+    }
+
     /// TypeScript's own CommonJS import form.
     #[test]
     fn a_typescript_import_require_keeps_the_call() {

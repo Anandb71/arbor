@@ -1307,8 +1307,9 @@ import * as types from '@babel/types';
     }
 
     /// Names destructured from a value computed from a required module (a
-    /// factory call, a property of an export) come from that module too. An
-    /// identifier bound to such a value is not one of the module's names.
+    /// factory call, a property of an export) come from that module too, but
+    /// not necessarily from its top level, so each is pinned to the module as
+    /// an alias. An identifier bound to such a value is not one of its names.
     #[test]
     fn names_destructured_from_a_required_module_value_are_recorded() {
         let source = "\
@@ -1334,12 +1335,51 @@ export async function load() {
             vec![
                 (
                     "./paged".to_string(),
-                    owned(&["getOrderPage", "alias:detail:getOrderDetail"])
+                    owned(&[
+                        "alias:getOrderPage:getOrderPage",
+                        "alias:detail:getOrderDetail"
+                    ])
                 ),
-                ("./factory".to_string(), owned(&["a"])),
-                ("./m".to_string(), owned(&["x"])),
+                ("./factory".to_string(), owned(&["alias:a:a"])),
+                ("./m".to_string(), owned(&["alias:x:x"])),
                 ("./p".to_string(), owned(&["alias:c:q"])),
-                ("./p".to_string(), owned(&["t"])),
+                ("./p".to_string(), owned(&["alias:t:t"])),
+            ]
+        );
+    }
+
+    /// Names destructured from a value computed from an imported binding (a
+    /// hook, a factory, an object) are pinned to that binding's module.
+    #[test]
+    fn names_destructured_from_an_imported_binding_are_pinned_to_its_module() {
+        let source = "\
+import { useListFilters } from './hooks';
+import * as api from './api';
+const config = require('./config');
+const { setFilters, reset: clear } = useListFilters();
+const { load } = config.make();
+const { get } = api;
+const { other } = notImported();
+const value = useListFilters();
+";
+        let imports: Vec<(String, Vec<String>)> = parse(source, "src/app.ts")
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Import)
+            .map(|n| (n.name, n.references))
+            .collect();
+        let owned = |refs: &[&str]| refs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            imports,
+            vec![
+                ("./hooks".to_string(), owned(&["useListFilters"])),
+                ("./api".to_string(), owned(&["*as:api"])),
+                ("./config".to_string(), owned(&["config", "*as:config"])),
+                (
+                    "./hooks".to_string(),
+                    owned(&["alias:setFilters:setFilters", "alias:clear:reset"])
+                ),
+                ("./config".to_string(), owned(&["alias:load:load"])),
+                ("./api".to_string(), owned(&["alias:get:get"])),
             ]
         );
     }
