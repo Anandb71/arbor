@@ -1477,6 +1477,33 @@ const value = useListFilters();
         );
     }
 
+    /// A comment beside the module, such as webpack's magic comments, is
+    /// not a second argument.
+    #[test]
+    fn a_comment_in_the_arguments_does_not_hide_the_module() {
+        let source = "\
+const b = require(/* webpackIgnore: true */ './b');
+export async function load() {
+  const { a } = await import(/* webpackChunkName: \"a\" */ './a');
+  return a;
+}
+const two = require('./c', './d');
+";
+        let imports: Vec<(String, Vec<String>)> = parse(source, "src/app.ts")
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Import)
+            .map(|n| (n.name, n.references))
+            .collect();
+        let owned = |refs: &[&str]| refs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            imports,
+            vec![
+                ("./b".to_string(), owned(&["b", "*as:b"])),
+                ("./a".to_string(), owned(&["a"])),
+            ]
+        );
+    }
+
     /// The chain from a declarator's value down to `require` is walked in a
     /// loop, so a very long member chain can't exhaust the stack.
     #[test]
