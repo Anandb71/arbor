@@ -7,7 +7,7 @@
 //! files anyway.
 
 use crate::languages::LanguageParser;
-use crate::node::{import_alias_ref, CodeNode, NodeKind, Visibility};
+use crate::node::{import_alias, import_alias_ref, CodeNode, NodeKind, Visibility};
 use tree_sitter::{Language, Node, Tree};
 
 pub struct TypeScriptParser;
@@ -26,6 +26,8 @@ impl LanguageParser for TypeScriptParser {
         let root = tree.root_node();
         extract_from_node(&root, source, file_path, &mut nodes, None);
         distinguish_repeated_tests(&mut nodes, file_path);
+        let pinned = extract_bindings_from_imported_values(&root, source, file_path, &nodes);
+        nodes.extend(pinned);
         nodes
     }
 }
@@ -552,88 +554,156 @@ fn import_binding(local: &str, exported: &str) -> String {
 ///   - `const M = require('m')`           → "M", "*as:M"
 ///   - `const { A } = await import('m')`  → "A"
 ///   - `const M = await import('m')`      → "*as:M"
-///   - `const { A } = require('m').make(deps)`, `require('m')(deps)` → "A"
+///   - `const { A } = require('m').make(deps)`, `require('m')(deps)` → "alias:A:A"
 ///
 /// A required module is `module.exports`, which may be the function itself,
 /// so `M()` is a call to it as with a default import. An ES module namespace
 /// is never callable, so a dynamic import binds only the namespace. Names
 /// destructured from a value computed from the module (a factory it exports,
-/// the module called) are the module's too, but an identifier bound to such
-/// a value is not one of its names. Only a string-literal module is read, and
-/// nested or `...rest` patterns bind objects rather than exports, so they
-/// record nothing.
+/// the module called, a property of an export) are pinned to the module, see
+/// [`destructured_names`]; an identifier bound to such a value is not one of
+/// its names. Only a string-literal module is read, and nested or `...rest`
+/// patterns bind objects rather than exports, so they record nothing.
 fn extract_require_bindings(node: &Node, source: &str, file_path: &str) -> Vec<CodeNode> {
     let mut imports = Vec::new();
     for i in 0..node.named_child_count() {
         let Some(declarator) = node.named_child(i) else {
             continue;
         };
-        if declarator.kind() != "variable_declarator" {
-            continue;
-        }
-        let (Some(pattern), Some(value)) = (
-            declarator.child_by_field_name("name"),
-            declarator.child_by_field_name("value"),
-        ) else {
+        let Some((pattern, value)) = declarator_parts(&declarator) else {
             continue;
         };
-        let Some(binding) = module_binding(&value, source) else {
+        let Some(chain) = value_chain(&value, source) else {
             continue;
         };
-        let names = match (pattern.kind(), binding.shape) {
-            ("identifier", BindingShape::Export(export)) => {
-                vec![import_binding(&get_text(&pattern, source), &export)]
-            }
-            ("identifier", BindingShape::Whole) => {
+        let ChainRoot::Module { module, dynamic } = chain.root else {
+            continue;
+        };
+        let names = match (pattern.kind(), chain.steps, chain.outer_property) {
+            ("identifier", 0, _) => {
                 let local = get_text(&pattern, source);
-                if binding.dynamic {
+                if dynamic {
                     vec![format!("*as:{local}")]
                 } else {
                     vec![local.clone(), format!("*as:{local}")]
                 }
             }
-            ("object_pattern", _) => destructured_names(&pattern, source),
+            ("identifier", 1, Some(export)) => {
+                vec![import_binding(&get_text(&pattern, source), &export)]
+            }
+            ("object_pattern", 0, _) => destructured_names(&pattern, source, false),
+            ("object_pattern", _, _) => destructured_names(&pattern, source, true),
             _ => continue,
         };
         if !names.is_empty() {
-            imports.push(import_node(&binding.module, names, &declarator, file_path));
+            imports.push(import_node(&module, names, &declarator, file_path));
         }
     }
     imports
 }
 
-/// What a declarator's value takes from another module.
-struct ModuleBinding {
-    module: String,
-    shape: BindingShape,
-    /// Loaded with `import()`: an ES module namespace, never callable.
-    dynamic: bool,
+/// Names destructured from a value computed from something the file already
+/// binds from another module: `const { setFilters } = useListFilters()` after
+/// `import { useListFilters } from './hooks'`, `const { load } = config.make()`
+/// after `const config = require('./config')`, `const { get } = api` after
+/// `import * as api from './api'`. One `Import` node per declarator, pinned to
+/// that module (see [`destructured_names`]).
+///
+/// It runs after the main pass, over the `Import` nodes that pass found, so a
+/// binding is recognised wherever the import sits in the file. The tree is
+/// walked with a cursor, not recursion.
+fn extract_bindings_from_imported_values(
+    root: &Node,
+    source: &str,
+    file_path: &str,
+    nodes: &[CodeNode],
+) -> Vec<CodeNode> {
+    let mut modules: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for import in nodes.iter().filter(|n| n.kind == NodeKind::Import) {
+        for reference in &import.references {
+            let local = match (reference.strip_prefix("*as:"), import_alias(reference)) {
+                (Some(namespace), _) => namespace,
+                (None, Some((local, _))) => local,
+                (None, None) => reference.as_str(),
+            };
+            modules.insert(local, import.name.as_str());
+        }
+    }
+    let mut imports = Vec::new();
+    if modules.is_empty() {
+        return imports;
+    }
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        if let Some((pattern, value)) = declarator_parts(&node) {
+            if pattern.kind() == "object_pattern" {
+                if let Some(Chain {
+                    root: ChainRoot::Identifier(binding),
+                    ..
+                }) = value_chain(&value, source)
+                {
+                    if let Some(module) = modules.get(binding.as_str()) {
+                        let names = destructured_names(&pattern, source, true);
+                        if !names.is_empty() {
+                            imports.push(import_node(module, names, &node, file_path));
+                        }
+                    }
+                }
+            }
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return imports;
+            }
+        }
+    }
 }
 
-enum BindingShape {
-    /// `require('m')` or `await import('m')`.
-    Whole,
-    /// `require('m').B`: one export.
-    Export(String),
-    /// Anything else computed from the module: `require('m').make(deps)`,
-    /// `require('m')(deps)`, `require('m').a.b`.
-    Derived,
+/// The pattern and value of a `variable_declarator`: `const <pattern> = <value>`.
+fn declarator_parts<'tree>(node: &Node<'tree>) -> Option<(Node<'tree>, Node<'tree>)> {
+    if node.kind() != "variable_declarator" {
+        return None;
+    }
+    Some((
+        node.child_by_field_name("name")?,
+        node.child_by_field_name("value")?,
+    ))
 }
 
-/// The module a declarator's value is computed from, and how. Walks the
-/// value's member, call, `await` and parenthesised chain down to a
-/// `require('m')` or `import('m')` call, in a loop rather than recursion so
-/// a very long chain can't exhaust the stack.
-fn module_binding(value: &Node, source: &str) -> Option<ModuleBinding> {
+/// Where a value's chain of member accesses, calls, `await`s and parentheses
+/// starts, and how many steps it takes from there.
+struct Chain {
+    root: ChainRoot,
+    /// Member and call steps between the root and the value.
+    steps: usize,
+    /// `.B` when the value's outermost step is a property access.
+    outer_property: Option<String>,
+}
+
+enum ChainRoot {
+    /// `require('m')` or `import('m')` with a string-literal module.
+    Module { module: String, dynamic: bool },
+    /// A plain identifier: `useListFilters()`, `config.make()`, `api`.
+    Identifier(String),
+}
+
+/// Walks a declarator's value down its chain to the root, in a loop rather
+/// than recursion so a very long chain can't exhaust the stack. `None` for any
+/// other root (`this`, a literal, `require(name)`, ...).
+fn value_chain(value: &Node, source: &str) -> Option<Chain> {
     let mut node = *value;
     let mut steps = 0usize;
-    let mut export = None;
+    let mut outer_property = None;
     loop {
         match node.kind() {
             "parenthesized_expression" | "await_expression" => node = node.named_child(0)?,
             "member_expression" => {
                 if steps == 0 {
-                    export = node
+                    outer_property = node
                         .child_by_field_name("property")
                         .filter(|property| property.kind() == "property_identifier")
                         .map(|property| get_text(&property, source));
@@ -652,15 +722,18 @@ fn module_binding(value: &Node, source: &str) -> Option<ModuleBinding> {
                         continue;
                     }
                 };
-                let shape = match (steps, export) {
-                    (0, _) => BindingShape::Whole,
-                    (1, Some(export)) => BindingShape::Export(export),
-                    _ => BindingShape::Derived,
-                };
-                return Some(ModuleBinding {
-                    module: sole_string_argument(&node, source)?,
-                    shape,
-                    dynamic,
+                let module = sole_string_argument(&node, source)?;
+                return Some(Chain {
+                    root: ChainRoot::Module { module, dynamic },
+                    steps,
+                    outer_property,
+                });
+            }
+            "identifier" => {
+                return Some(Chain {
+                    root: ChainRoot::Identifier(get_text(&node, source)),
+                    steps,
+                    outer_property,
                 });
             }
             _ => return None,
@@ -678,22 +751,42 @@ fn sole_string_argument(call: &Node, source: &str) -> Option<String> {
     string_literal(&arguments.named_child(0)?, source)
 }
 
-/// The names an object pattern binds from a module's exports: `{ A }`,
-/// `{ A = d }`, `{ B: C }`, `{ 'B': C }` and `{ B: C = d }`.
-fn destructured_names(pattern: &Node, source: &str) -> Vec<String> {
+/// The names an object pattern binds: `{ A }`, `{ A = d }`, `{ B: C }`,
+/// `{ 'B': C }` and `{ B: C = d }`.
+///
+/// Destructuring a module itself (`require('m')`, `await import('m')`) reads
+/// its exports, recorded as `import` statements record them. A `pinned`
+/// pattern destructures a value computed from the module instead (a hook's or
+/// factory's return value, a property of an export), whose names need not be
+/// the module's top-level ones. Each is recorded as an alias even when the
+/// local name matches (`alias:A:A`), so the graph builder links the call only
+/// to a definition of that name in that module, never to a same-named
+/// function elsewhere.
+fn destructured_names(pattern: &Node, source: &str, pinned: bool) -> Vec<String> {
+    let binding = |local: &str, exported: &str| {
+        if pinned {
+            import_alias_ref(local, exported)
+        } else {
+            import_binding(local, exported)
+        }
+    };
     let mut names = Vec::new();
     for i in 0..pattern.named_child_count() {
         let Some(property) = pattern.named_child(i) else {
             continue;
         };
         match property.kind() {
-            "shorthand_property_identifier_pattern" => names.push(get_text(&property, source)),
+            "shorthand_property_identifier_pattern" => {
+                let name = get_text(&property, source);
+                names.push(binding(&name, &name));
+            }
             "object_assignment_pattern" => {
                 if let Some(left) = property
                     .child_by_field_name("left")
                     .filter(|left| left.kind() == "shorthand_property_identifier_pattern")
                 {
-                    names.push(get_text(&left, source));
+                    let name = get_text(&left, source);
+                    names.push(binding(&name, &name));
                 }
             }
             "pair_pattern" => {
@@ -716,7 +809,7 @@ fn destructured_names(pattern: &Node, source: &str) -> Vec<String> {
                             _ => None,
                         });
                 if let (Some(local), Some(exported)) = (local, exported) {
-                    names.push(import_binding(&get_text(&local, source), &exported));
+                    names.push(binding(&get_text(&local, source), &exported));
                 }
             }
             _ => {}
