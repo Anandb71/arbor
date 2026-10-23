@@ -1286,6 +1286,56 @@ import * as types from '@babel/types';
         );
     }
 
+    /// Names destructured from a value computed from a required module (a
+    /// factory call, a property of an export) come from that module too. An
+    /// identifier bound to such a value is not one of the module's names.
+    #[test]
+    fn names_destructured_from_a_required_module_value_are_recorded() {
+        let source = "\
+const { getOrderPage, getOrderDetail: detail } = require('./paged').createPagedReads(prisma);
+const { a } = require('./factory')(deps);
+const made = require('./factory')(deps);
+const { x } = require('./m').b;
+const deep = require('./m').a.b;
+export async function load() {
+  const c = (await import('./p')).q;
+  const { t } = await import('./p').then((m) => m.default);
+  return [c, t];
+}
+";
+        let imports: Vec<(String, Vec<String>)> = parse(source, "src/app.ts")
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Import)
+            .map(|n| (n.name, n.references))
+            .collect();
+        let owned = |refs: &[&str]| refs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            imports,
+            vec![
+                (
+                    "./paged".to_string(),
+                    owned(&["getOrderPage", "alias:detail:getOrderDetail"])
+                ),
+                ("./factory".to_string(), owned(&["a"])),
+                ("./m".to_string(), owned(&["x"])),
+                ("./p".to_string(), owned(&["alias:c:q"])),
+                ("./p".to_string(), owned(&["t"])),
+            ]
+        );
+    }
+
+    /// The chain from a declarator's value down to `require` is walked in a
+    /// loop, so a very long member chain can't exhaust the stack.
+    #[test]
+    fn a_long_member_chain_is_not_a_require_binding() {
+        let source = format!("const x = a{};\n", ".b".repeat(20_000));
+        let imports = parse(&source, "src/long.ts")
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Import)
+            .count();
+        assert_eq!(imports, 0);
+    }
+
     /// `require`, `import x = require()` and an awaited `import()` bind
     /// names as `import` statements do, in the same format.
     #[test]

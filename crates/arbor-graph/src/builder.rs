@@ -3262,6 +3262,44 @@ function main() {
         );
     }
 
+    /// Dependency injection through a factory the module exports: the names
+    /// come from a call on the required module, so they are the module's.
+    #[test]
+    fn names_destructured_from_a_required_factory_keep_the_call() {
+        let graph = index(&[
+            (
+                "services/paged.js",
+                "\
+const db = require(\"./db\");
+
+function createPagedReads(prisma) {
+  async function getOrderDetail(id) {
+    return prisma.find(id);
+  }
+  return { getOrderDetail };
+}
+
+module.exports = { createPagedReads };
+",
+            ),
+            (
+                "services/orders.js",
+                "\
+const prisma = require(\"./prisma\");
+const { getOrderDetail } = require(\"./paged\").createPagedReads(prisma);
+
+async function getOrderById(id) {
+  return getOrderDetail(id);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["services/orders.js::getOrderById -> services/paged.js::getOrderDetail"])
+        );
+    }
+
     /// TypeScript's own CommonJS import form.
     #[test]
     fn a_typescript_import_require_keeps_the_call() {
