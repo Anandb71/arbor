@@ -552,12 +552,16 @@ fn import_binding(local: &str, exported: &str) -> String {
 ///   - `const M = require('m')`           → "M", "*as:M"
 ///   - `const { A } = await import('m')`  → "A"
 ///   - `const M = await import('m')`      → "*as:M"
+///   - `const { A } = require('m').make(deps)`, `require('m')(deps)` → "A"
 ///
 /// A required module is `module.exports`, which may be the function itself,
 /// so `M()` is a call to it as with a default import. An ES module namespace
-/// is never callable, so a dynamic import binds only the namespace. Only a
-/// string-literal module is read, and nested or `...rest` patterns bind
-/// objects rather than exports, so they record nothing.
+/// is never callable, so a dynamic import binds only the namespace. Names
+/// destructured from a value computed from the module (a factory it exports,
+/// the module called) are the module's too, but an identifier bound to such
+/// a value is not one of its names. Only a string-literal module is read, and
+/// nested or `...rest` patterns bind objects rather than exports, so they
+/// record nothing.
 fn extract_require_bindings(node: &Node, source: &str, file_path: &str) -> Vec<CodeNode> {
     let mut imports = Vec::new();
     for i in 0..node.named_child_count() {
@@ -576,11 +580,11 @@ fn extract_require_bindings(node: &Node, source: &str, file_path: &str) -> Vec<C
         let Some(binding) = module_binding(&value, source) else {
             continue;
         };
-        let names = match (pattern.kind(), binding.export) {
-            ("identifier", Some(export)) => {
+        let names = match (pattern.kind(), binding.shape) {
+            ("identifier", BindingShape::Export(export)) => {
                 vec![import_binding(&get_text(&pattern, source), &export)]
             }
-            ("identifier", None) => {
+            ("identifier", BindingShape::Whole) => {
                 let local = get_text(&pattern, source);
                 if binding.dynamic {
                     vec![format!("*as:{local}")]
@@ -588,7 +592,7 @@ fn extract_require_bindings(node: &Node, source: &str, file_path: &str) -> Vec<C
                     vec![local.clone(), format!("*as:{local}")]
                 }
             }
-            ("object_pattern", None) => destructured_names(&pattern, source),
+            ("object_pattern", _) => destructured_names(&pattern, source),
             _ => continue,
         };
         if !names.is_empty() {
@@ -601,50 +605,66 @@ fn extract_require_bindings(node: &Node, source: &str, file_path: &str) -> Vec<C
 /// What a declarator's value takes from another module.
 struct ModuleBinding {
     module: String,
-    /// `require('m').B`: one export rather than the whole module.
-    export: Option<String>,
-    /// `await import('m')`: an ES module namespace.
+    shape: BindingShape,
+    /// Loaded with `import()`: an ES module namespace, never callable.
     dynamic: bool,
 }
 
-/// `require('m')`, `require('m').B` or `await import('m')`.
+enum BindingShape {
+    /// `require('m')` or `await import('m')`.
+    Whole,
+    /// `require('m').B`: one export.
+    Export(String),
+    /// Anything else computed from the module: `require('m').make(deps)`,
+    /// `require('m')(deps)`, `require('m').a.b`.
+    Derived,
+}
+
+/// The module a declarator's value is computed from, and how. Walks the
+/// value's member, call, `await` and parenthesised chain down to a
+/// `require('m')` or `import('m')` call, in a loop rather than recursion so
+/// a very long chain can't exhaust the stack.
 fn module_binding(value: &Node, source: &str) -> Option<ModuleBinding> {
-    match value.kind() {
-        "call_expression" => {
-            let function = value.child_by_field_name("function")?;
-            if function.kind() != "identifier" || get_text(&function, source) != "require" {
-                return None;
+    let mut node = *value;
+    let mut steps = 0usize;
+    let mut export = None;
+    loop {
+        match node.kind() {
+            "parenthesized_expression" | "await_expression" => node = node.named_child(0)?,
+            "member_expression" => {
+                if steps == 0 {
+                    export = node
+                        .child_by_field_name("property")
+                        .filter(|property| property.kind() == "property_identifier")
+                        .map(|property| get_text(&property, source));
+                }
+                steps += 1;
+                node = node.child_by_field_name("object")?;
             }
-            Some(ModuleBinding {
-                module: sole_string_argument(value, source)?,
-                export: None,
-                dynamic: false,
-            })
-        }
-        "member_expression" => {
-            let object = value.child_by_field_name("object")?;
-            let property = value.child_by_field_name("property")?;
-            if object.kind() != "call_expression" || property.kind() != "property_identifier" {
-                return None;
+            "call_expression" => {
+                let function = node.child_by_field_name("function")?;
+                let dynamic = match function.kind() {
+                    "import" => true,
+                    "identifier" if get_text(&function, source) == "require" => false,
+                    _ => {
+                        steps += 1;
+                        node = function;
+                        continue;
+                    }
+                };
+                let shape = match (steps, export) {
+                    (0, _) => BindingShape::Whole,
+                    (1, Some(export)) => BindingShape::Export(export),
+                    _ => BindingShape::Derived,
+                };
+                return Some(ModuleBinding {
+                    module: sole_string_argument(&node, source)?,
+                    shape,
+                    dynamic,
+                });
             }
-            let mut binding = module_binding(&object, source)?;
-            binding.export = Some(get_text(&property, source));
-            Some(binding)
+            _ => return None,
         }
-        "await_expression" => {
-            let call = value.named_child(0)?;
-            if call.kind() != "call_expression"
-                || call.child_by_field_name("function")?.kind() != "import"
-            {
-                return None;
-            }
-            Some(ModuleBinding {
-                module: sole_string_argument(&call, source)?,
-                export: None,
-                dynamic: true,
-            })
-        }
-        _ => None,
     }
 }
 
