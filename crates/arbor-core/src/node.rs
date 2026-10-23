@@ -159,6 +159,49 @@ pub fn import_alias(reference: &str) -> Option<(&str, &str)> {
     (!local.is_empty() && !imported.is_empty()).then_some((local, imported))
 }
 
+/// Prefix for a name an import node records as bound at run time from a value
+/// its module produced: `bound:setFilters:setFilters` for
+/// `const { setFilters } = useListFilters()` after
+/// `import { useListFilters } from "./hooks"`.
+///
+/// The value is the module's, but not necessarily one of its top-level names,
+/// so the graph builder first looks for the name inside that module and, when
+/// the module doesn't define it, treats it as any other local binding.
+pub const RUNTIME_BINDING_REF_PREFIX: &str = "bound:";
+
+/// Encodes a name bound from a value its module produced.
+pub fn runtime_binding_ref(local: &str, name: &str) -> String {
+    format!("{RUNTIME_BINDING_REF_PREFIX}{local}:{name}")
+}
+
+/// Splits a `bound:local:name` reference into the local name and the name to
+/// look for in the module.
+pub fn runtime_binding(reference: &str) -> Option<(&str, &str)> {
+    let (local, name) = reference
+        .strip_prefix(RUNTIME_BINDING_REF_PREFIX)?
+        .split_once(':')?;
+    (!local.is_empty() && !name.is_empty()).then_some((local, name))
+}
+
+/// Prefix for a name the file binds itself (a variable, a parameter, a
+/// destructured value), recorded on an import node with an empty module.
+///
+/// A call to such a name may reach any function the value holds. A call to a
+/// name the file never binds can only reach a global.
+pub const LOCAL_BINDING_REF_PREFIX: &str = "local:";
+
+/// Encodes a name the file binds itself.
+pub fn local_binding_ref(name: &str) -> String {
+    format!("{LOCAL_BINDING_REF_PREFIX}{name}")
+}
+
+/// The name in a `local:name` reference.
+pub fn local_binding(reference: &str) -> Option<&str> {
+    reference
+        .strip_prefix(LOCAL_BINDING_REF_PREFIX)
+        .filter(|name| !name.is_empty())
+}
+
 /// A type relationship stored on a node until the graph builder resolves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeRelationKind {
@@ -639,6 +682,23 @@ mod tests {
         // Plain and namespace imports are not aliases.
         assert_eq!(import_alias("to_minor"), None);
         assert_eq!(import_alias("*as:types"), None);
+    }
+
+    #[test]
+    fn binding_refs_round_trip() {
+        assert_eq!(
+            runtime_binding(&runtime_binding_ref("set", "setFilters")),
+            Some(("set", "setFilters"))
+        );
+        assert_eq!(runtime_binding("bound:set"), None);
+        assert_eq!(runtime_binding("bound::setFilters"), None);
+        assert_eq!(runtime_binding("alias:set:setFilters"), None);
+        assert_eq!(local_binding(&local_binding_ref("onSave")), Some("onSave"));
+        assert_eq!(local_binding("local:"), None);
+        assert_eq!(local_binding("onSave"), None);
+        // The other import encodings are neither.
+        assert_eq!(import_alias("bound:set:setFilters"), None);
+        assert_eq!(import_alias("local:onSave"), None);
     }
 
     #[test]
