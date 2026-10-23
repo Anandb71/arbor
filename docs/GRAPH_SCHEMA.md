@@ -114,7 +114,11 @@ Only definitions in the caller's language family are candidates (TypeScript and 
 
 A bare `calls` edge to another file is dropped when the caller cannot see the name:
 
-- **Python, JavaScript and TypeScript:** the edge stays only when the calling file defines the name or binds it from another module. A binding is an `import` or `from m import`, a CommonJS `require` (`const { a, b: c } = require("./m")`, `const m = require("./m")`, `require("./m").b`), TypeScript's `import m = require("./m")`, or an awaited `import()`. A renamed binding (`b as c`, `{ b: c }`) is an alias, so `c()` resolves to the module's `b`. `from m import *` keeps every bare call. A JavaScript or TypeScript file that binds nothing from another module may be a classic script, whose functions are page globals, so its bare calls keep the confidence their resolution gives.
+- **Python, JavaScript and TypeScript:** the edge stays only when the calling file defines the name or binds it from another module. A binding is an `import` or `from m import`, a CommonJS `require` (`const { a, b: c } = require("./m")`, `const m = require("./m")`, `require("./m").b`), TypeScript's `import m = require("./m")`, or an awaited `import()`. A renamed binding (`b as c`, `{ b: c }`) is an alias, so `c()` resolves to the module's `b`. `from m import *` keeps every bare call. In JavaScript and TypeScript two more cases stay:
+  - a file that binds nothing from another module may be a classic script, whose functions are page globals, so its bare calls keep the confidence their resolution gives;
+  - a call to a function another module could reach without a recorded import, one that is exported (and may be bound at run time, as an `await import()` inside a helper or Next.js `dynamic()` does) or one in a possible classic script, keeps the lower confidence of an unimported name (×0.6 in the same directory, ×0.3 elsewhere).
+
+  A module's private function can't be called from another module by a bare name, so that call is dropped. `export { f }` and `export default f` written apart from the declaration, and CommonJS `module.exports`, don't mark `f` as exported.
 - **Go:** the edge stays only when both files declare the same package clause and share a directory. The clause is the `Module` node the Go parser already emits.
 - **Other languages:** an unimported cross-file bare name still links, at lower confidence.
 
