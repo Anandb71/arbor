@@ -26,11 +26,12 @@ impl LanguageParser for TypeScriptParser {
 
     fn extract_nodes(&self, tree: &Tree, source: &str, file_path: &str) -> Vec<CodeNode> {
         let mut nodes = Vec::new();
+        let mut bindings = FileBindings::default();
         let root = tree.root_node();
-        extract_from_node(&root, source, file_path, &mut nodes, None);
+        extract_from_node(&root, source, file_path, &mut nodes, &mut bindings, None);
         distinguish_repeated_tests(&mut nodes, file_path);
-        let bindings = extract_file_bindings(&root, source, file_path, &nodes);
-        nodes.extend(bindings);
+        let binding_nodes = bindings.into_nodes(&nodes, &root, file_path);
+        nodes.extend(binding_nodes);
         nodes
     }
 }
@@ -82,15 +83,17 @@ impl LanguageParser for TsxParser {
 /// Recursively extracts nodes from the AST.
 /// Uses stacker::maybe_grow to prevent stack overflow on deeply-nested files
 /// (e.g. TypeScript compiler's checker.ts which is 50k+ lines).
-fn extract_from_node(
+fn extract_from_node<'s>(
     node: &Node,
-    source: &str,
+    source: &'s str,
     file_path: &str,
     nodes: &mut Vec<CodeNode>,
+    bindings: &mut FileBindings<'s>,
     parent_name: Option<&str>,
 ) {
     stacker::maybe_grow(64 * 1024, 4 * 1024 * 1024, || {
         let kind = node.kind();
+        bindings.visit(node, source);
 
         match kind {
             "function_declaration" | "function" => {
@@ -118,6 +121,7 @@ fn extract_from_node(
                                     source,
                                     file_path,
                                     nodes,
+                                    bindings,
                                     Some(&class_name),
                                 );
                             }
@@ -177,7 +181,7 @@ fn extract_from_node(
 
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
-                extract_from_node(&child, source, file_path, nodes, parent_name);
+                extract_from_node(&child, source, file_path, nodes, bindings, parent_name);
             }
         }
     });
@@ -607,10 +611,9 @@ fn extract_require_bindings(node: &Node, source: &str, file_path: &str) -> Vec<C
     imports
 }
 
-/// The names a file binds itself, and the run-time bindings it takes from a
-/// project module's values. Runs after the main pass, over the `Import` nodes
-/// that pass found, so a binding is recognised wherever its import sits, and
-/// walks the tree with a cursor rather than recursion.
+/// What the main pass learns about the names a file binds, turned into
+/// `Import` nodes by [`FileBindings::into_nodes`] once the file's imports are
+/// all known (a binding may come before the import it depends on).
 ///
 /// - **Local bindings:** every name a variable declaration (any pattern), a
 ///   parameter, a `catch` or `for` binding, or a function or class
@@ -624,78 +627,71 @@ fn extract_require_bindings(node: &Node, source: &str, file_path: &str) -> Vec<C
 ///   `import { useListFilters } from './hooks'`, `const { load } =
 ///   config.make()` after `const config = require('./config')`. One `Import`
 ///   node per declarator, for that module (see [`NameMode::RuntimeBinding`]).
-fn extract_file_bindings(
-    root: &Node,
-    source: &str,
-    file_path: &str,
-    nodes: &[CodeNode],
-) -> Vec<CodeNode> {
-    let mut modules: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    for import in nodes.iter().filter(|n| n.kind == NodeKind::Import) {
-        for reference in &import.references {
-            let local = match (
-                reference.strip_prefix("*as:"),
-                import_alias(reference).or_else(|| runtime_binding(reference)),
-            ) {
-                (Some(namespace), _) => namespace,
-                (None, Some((local, _))) => local,
-                (None, None) => reference.as_str(),
-            };
-            modules.insert(local, import.name.as_str());
-        }
-    }
+#[derive(Default)]
+struct FileBindings<'s> {
+    locals: std::collections::BTreeSet<&'s str>,
+    /// Object patterns destructured from a value whose chain starts at an
+    /// identifier, waiting to learn whether that identifier is imported.
+    pending: Vec<PendingRuntimeBinding>,
+}
 
-    let mut imports = Vec::new();
-    let mut locals = std::collections::BTreeSet::new();
-    let mut cursor = root.walk();
-    loop {
-        let node = cursor.node();
+struct PendingRuntimeBinding {
+    root: String,
+    names: Vec<String>,
+    lines: (u32, u32),
+    bytes: (u32, u32),
+}
+
+impl<'s> FileBindings<'s> {
+    /// Records what `node` binds, if anything. Called once for every node the
+    /// main pass visits.
+    fn visit(&mut self, node: &Node, source: &'s str) {
         match node.kind() {
             "variable_declarator" => {
-                if let Some((pattern, value)) = declarator_parts(&node) {
-                    pattern_names(pattern, source, &mut locals);
-                    if pattern.kind() == "object_pattern" {
-                        if let Some(Chain {
-                            root: ChainRoot::Identifier(binding),
-                            ..
-                        }) = value_chain(&value, source)
-                        {
-                            if let Some(module) = modules
-                                .get(binding.as_str())
-                                .filter(|module| is_relative_module(module))
-                            {
-                                let names =
-                                    destructured_names(&pattern, source, NameMode::RuntimeBinding);
-                                if !names.is_empty() {
-                                    imports.push(import_node(module, names, &node, file_path));
-                                }
-                            }
-                        }
-                    }
-                } else if let Some(name) = node.child_by_field_name("name") {
-                    pattern_names(name, source, &mut locals);
+                let Some(pattern) = node.child_by_field_name("name") else {
+                    return;
+                };
+                pattern_names(pattern, source, &mut self.locals);
+                if pattern.kind() != "object_pattern" {
+                    return;
+                }
+                let Some(Chain {
+                    root: ChainRoot::Identifier(root),
+                    ..
+                }) = node
+                    .child_by_field_name("value")
+                    .and_then(|value| value_chain(&value, source))
+                else {
+                    return;
+                };
+                let names = destructured_names(&pattern, source, NameMode::RuntimeBinding);
+                if !names.is_empty() {
+                    self.pending.push(PendingRuntimeBinding {
+                        root,
+                        names,
+                        lines: (
+                            node.start_position().row as u32 + 1,
+                            node.end_position().row as u32 + 1,
+                        ),
+                        bytes: (node.start_byte() as u32, node.end_byte() as u32),
+                    });
                 }
             }
             "formal_parameters" => {
                 for i in 0..node.named_child_count() {
                     if let Some(parameter) = node.named_child(i) {
-                        pattern_names(parameter, source, &mut locals);
+                        pattern_names(parameter, source, &mut self.locals);
                     }
                 }
             }
-            "arrow_function" => {
+            "arrow_function" | "catch_clause" => {
                 if let Some(parameter) = node.child_by_field_name("parameter") {
-                    pattern_names(parameter, source, &mut locals);
-                }
-            }
-            "catch_clause" => {
-                if let Some(parameter) = node.child_by_field_name("parameter") {
-                    pattern_names(parameter, source, &mut locals);
+                    pattern_names(parameter, source, &mut self.locals);
                 }
             }
             "for_in_statement" => {
                 if let Some(left) = node.child_by_field_name("left") {
-                    pattern_names(left, source, &mut locals);
+                    pattern_names(left, source, &mut self.locals);
                 }
             }
             "function_declaration"
@@ -705,23 +701,54 @@ fn extract_file_bindings(
             | "class_declaration"
             | "class" => {
                 if let Some(name) = node.child_by_field_name("name") {
-                    pattern_names(name, source, &mut locals);
+                    pattern_names(name, source, &mut self.locals);
                 }
             }
             _ => {}
         }
-        if cursor.goto_first_child() {
-            continue;
-        }
-        while !cursor.goto_next_sibling() {
-            if !cursor.goto_parent() {
-                if !locals.is_empty() {
-                    let names = locals.iter().map(|name| local_binding_ref(name)).collect();
-                    imports.push(import_node("", names, root, file_path));
-                }
-                return imports;
+    }
+
+    /// The run-time binding nodes for pending destructurings whose root the
+    /// file binds from a project module, then the one node of local bindings.
+    fn into_nodes(self, nodes: &[CodeNode], root: &Node, file_path: &str) -> Vec<CodeNode> {
+        let mut modules: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for import in nodes.iter().filter(|n| n.kind == NodeKind::Import) {
+            for reference in &import.references {
+                let local = match (
+                    reference.strip_prefix("*as:"),
+                    import_alias(reference).or_else(|| runtime_binding(reference)),
+                ) {
+                    (Some(namespace), _) => namespace,
+                    (None, Some((local, _))) => local,
+                    (None, None) => reference.as_str(),
+                };
+                modules.insert(local, import.name.as_str());
             }
         }
+        let mut out = Vec::new();
+        for pending in self.pending {
+            let Some(&module) = modules
+                .get(pending.root.as_str())
+                .filter(|module| is_relative_module(module))
+            else {
+                continue;
+            };
+            out.push(
+                CodeNode::new(module, module, NodeKind::Import, file_path)
+                    .with_lines(pending.lines.0, pending.lines.1)
+                    .with_bytes(pending.bytes.0, pending.bytes.1)
+                    .with_references(pending.names),
+            );
+        }
+        if !self.locals.is_empty() {
+            let names = self
+                .locals
+                .iter()
+                .map(|name| local_binding_ref(name))
+                .collect();
+            out.push(import_node("", names, root, file_path));
+        }
+        out
     }
 }
 
@@ -729,12 +756,16 @@ fn extract_file_bindings(
 /// object or array pattern, a default (`a = 1`), a `...rest` or a TypeScript
 /// parameter (`a: T`, `b?: T`). Property keys and types bind nothing. Walked
 /// with a stack, not recursion.
-fn pattern_names(pattern: Node, source: &str, names: &mut std::collections::BTreeSet<String>) {
+fn pattern_names<'s>(
+    pattern: Node,
+    source: &'s str,
+    names: &mut std::collections::BTreeSet<&'s str>,
+) {
     let mut stack = vec![pattern];
     while let Some(node) = stack.pop() {
         match node.kind() {
             "identifier" | "shorthand_property_identifier_pattern" | "type_identifier" => {
-                names.insert(get_text(&node, source));
+                names.insert(&source[node.byte_range()]);
             }
             "pair_pattern" => stack.extend(node.child_by_field_name("value")),
             "object_assignment_pattern" | "assignment_pattern" => {
