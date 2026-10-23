@@ -3305,6 +3305,173 @@ function main() {
         );
     }
 
+    /// The confidence of the call edge `from -> to`, written as in [`calls`].
+    fn confidence(graph: &super::ArborGraph, from: &str, to: &str) -> Option<f32> {
+        use petgraph::visit::{EdgeRef, IntoEdgeReferences};
+        graph
+            .graph
+            .edge_references()
+            .filter(|e| e.weight().kind == super::EdgeKind::Calls)
+            .find(|e| {
+                let source = &graph.graph[e.source()];
+                let target = &graph.graph[e.target()];
+                format!("{}::{}", source.file, source.name) == from
+                    && format!("{}::{}", target.file, target.name) == to
+            })
+            .map(|e| e.weight().confidence)
+    }
+
+    /// Jest's `jest.resetModules()` pattern: the test binds the export from
+    /// an `await import()` inside a helper, which no import records. The
+    /// function is exported, so another module can reach it this way; the
+    /// call keeps a weak edge, as on main.
+    #[test]
+    fn an_exported_function_bound_through_a_helper_keeps_a_weak_edge() {
+        let graph = index(&[
+            (
+                "lib/razorpay.ts",
+                "export function verifyPaymentSignature(sig: string): boolean {\n  return sig.length > 0;\n}\n",
+            ),
+            (
+                "lib/__tests__/razorpay.test.ts",
+                "\
+import crypto from \"crypto\";
+
+async function loadModule() {
+  return await import(\"../razorpay\");
+}
+
+export async function acceptsAValidSignature() {
+  const { verifyPaymentSignature } = await loadModule();
+  return verifyPaymentSignature(crypto.randomUUID());
+}
+",
+            ),
+        ]);
+        let test = "lib/__tests__/razorpay.test.ts::acceptsAValidSignature";
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "lib/__tests__/razorpay.test.ts::acceptsAValidSignature -> lib/__tests__/razorpay.test.ts::loadModule",
+                "lib/__tests__/razorpay.test.ts::acceptsAValidSignature -> lib/razorpay.ts::verifyPaymentSignature",
+            ])
+        );
+        let weak = confidence(&graph, test, "lib/razorpay.ts::verifyPaymentSignature").unwrap();
+        assert!(
+            weak > 0.0 && weak < super::Edge::CONFIDENT_THRESHOLD,
+            "unproven, so weak: {weak}"
+        );
+    }
+
+    /// Next.js `dynamic()` loads a component without a static import.
+    #[test]
+    fn an_exported_component_loaded_with_next_dynamic_keeps_a_weak_edge() {
+        let graph = index(&[
+            (
+                "components/TrendsChart.tsx",
+                "export function TrendsChart({ points }: { points: number[] }) {\n  return <svg>{points.length}</svg>;\n}\n",
+            ),
+            (
+                "app/trends/page.tsx",
+                "\
+import dynamic from \"next/dynamic\";
+
+const TrendsChart = dynamic(() =>
+  import(\"../../components/TrendsChart\").then((m) => ({ default: m.TrendsChart })),
+);
+
+export function TrendsPage() {
+  return <TrendsChart points={[]} />;
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["app/trends/page.tsx::TrendsPage -> components/TrendsChart.tsx::TrendsChart"])
+        );
+    }
+
+    /// A function a module doesn't export can't be called from another
+    /// module by a bare name: a Jest test's global `expect` is not a script's
+    /// private `expect` helper.
+    #[test]
+    fn a_module_private_function_is_not_reached_from_another_module() {
+        let graph = index(&[
+            (
+                "scripts/verify-site.mjs",
+                "\
+import { strict as assert } from \"node:assert\";
+
+async function expect(path, status) {
+  assert.ok(path, status);
+}
+",
+            ),
+            (
+                "src/add.ts",
+                "export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+            ),
+            (
+                "src/__tests__/add.test.ts",
+                "\
+import { add } from \"../add\";
+
+export function addsTwoNumbers() {
+  return expect(add(1, 2)).toBe(3);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["src/__tests__/add.test.ts::addsTwoNumbers -> src/add.ts::add"])
+        );
+    }
+
+    /// A classic script's top-level functions are page globals, so a module
+    /// can call one by a bare name. Unproven, so the edge is weak.
+    #[test]
+    fn a_classic_script_function_keeps_a_weak_edge_from_a_module() {
+        let graph = index(&[
+            (
+                "legacy/format.js",
+                "function formatPrice(x) {\n  return \"$\" + x;\n}\n",
+            ),
+            (
+                "src/cart.ts",
+                "\
+import { total } from \"./total\";
+
+export function render(): string {
+  return formatPrice(total());
+}
+",
+            ),
+            (
+                "src/total.ts",
+                "export function total(): number {\n  return 1;\n}\n",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "src/cart.ts::render -> legacy/format.js::formatPrice",
+                "src/cart.ts::render -> src/total.ts::total",
+            ])
+        );
+        let weak = confidence(
+            &graph,
+            "src/cart.ts::render",
+            "legacy/format.js::formatPrice",
+        )
+        .unwrap();
+        assert!(
+            weak > 0.0 && weak < super::Edge::CONFIDENT_THRESHOLD,
+            "{weak}"
+        );
+    }
+
     /// A namespace import binds a name too, so the file is a module and an
     /// unimported bare name stays dropped.
     #[test]
