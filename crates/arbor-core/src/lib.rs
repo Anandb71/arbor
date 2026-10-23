@@ -28,10 +28,10 @@ pub mod usages;
 pub use error::{ParseError, Result};
 pub use languages::LanguageParser;
 pub use node::{
-    clean_type_name, field_ref, field_type_ref, import_alias, import_alias_ref, local_binding,
-    local_binding_ref, return_type_ref, returns_ref, runtime_binding, runtime_binding_ref,
-    type_relation_ref, typed_receiver, typed_receiver_ref, CodeNode, NodeKind, TypeRelationKind,
-    Visibility,
+    clean_type_name, field_ref, field_type_ref, import_alias, import_alias_ref,
+    import_qualified_name, local_binding, local_binding_ref, return_type_ref, returns_ref,
+    runtime_binding, runtime_binding_ref, type_relation_ref, typed_receiver, typed_receiver_ref,
+    CodeNode, NodeKind, TypeRelationKind, Visibility,
 };
 pub use parser::{
     detect_language, parse_file, parse_file_usages, parse_source, parse_source_usages,

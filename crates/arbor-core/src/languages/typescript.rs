@@ -8,8 +8,8 @@
 
 use crate::languages::LanguageParser;
 use crate::node::{
-    import_alias, import_alias_ref, local_binding_ref, runtime_binding, runtime_binding_ref,
-    CodeNode, NodeKind, Visibility,
+    import_alias, import_alias_ref, import_qualified_name, local_binding_ref, runtime_binding,
+    runtime_binding_ref, CodeNode, NodeKind, Visibility,
 };
 use tree_sitter::{Language, Node, Tree};
 
@@ -518,13 +518,18 @@ fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode
 
 /// An `Import` node for `module`, spanning `node`, with the names it binds.
 fn import_node(module: &str, names: Vec<String>, node: &Node, file_path: &str) -> CodeNode {
-    CodeNode::new(module, module, NodeKind::Import, file_path)
-        .with_lines(
-            node.start_position().row as u32 + 1,
-            node.end_position().row as u32 + 1,
-        )
-        .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
-        .with_references(names)
+    CodeNode::new(
+        module,
+        import_qualified_name(module, node.start_byte()),
+        NodeKind::Import,
+        file_path,
+    )
+    .with_lines(
+        node.start_position().row as u32 + 1,
+        node.end_position().row as u32 + 1,
+    )
+    .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
+    .with_references(names)
 }
 
 /// `A as B` in `import { A as B }`: calls use `B`, and the module exports
@@ -734,10 +739,15 @@ impl<'s> FileBindings<'s> {
                 continue;
             };
             out.push(
-                CodeNode::new(module, module, NodeKind::Import, file_path)
-                    .with_lines(pending.lines.0, pending.lines.1)
-                    .with_bytes(pending.bytes.0, pending.bytes.1)
-                    .with_references(pending.names),
+                CodeNode::new(
+                    module,
+                    import_qualified_name(module, pending.bytes.0 as usize),
+                    NodeKind::Import,
+                    file_path,
+                )
+                .with_lines(pending.lines.0, pending.lines.1)
+                .with_bytes(pending.bytes.0, pending.bytes.1)
+                .with_references(pending.names),
             );
         }
         if !self.locals.is_empty() {

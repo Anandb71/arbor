@@ -159,6 +159,19 @@ pub fn import_alias(reference: &str) -> Option<(&str, &str)> {
     (!local.is_empty() && !imported.is_empty()).then_some((local, imported))
 }
 
+/// The qualified name of an import node: its module, then the byte where the
+/// statement starts (`./hooks@120`). The node's `name` stays the module.
+///
+/// The index cache stores nodes by id, and an id hashes the qualified name.
+/// A file can import one module more than once (`import { a } from './m'`
+/// and `import type { T } from './m'`, two `from m import ...` lines, a
+/// function-scoped `require('./m')`), and with the module alone as the
+/// qualified name those nodes would share an id and the cache would keep
+/// only the last.
+pub fn import_qualified_name(module: &str, start_byte: usize) -> String {
+    format!("{module}@{start_byte}")
+}
+
 /// Prefix for a name an import node records as bound at run time from a value
 /// its module produced: `bound:setFilters:setFilters` for
 /// `const { setFilters } = useListFilters()` after
