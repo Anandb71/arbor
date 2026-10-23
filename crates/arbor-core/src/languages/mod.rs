@@ -18,6 +18,7 @@ mod typescript;
 
 use crate::fallback_parser::is_fallback_supported_extension;
 use crate::node::CodeNode;
+use crate::usages::FileUsages;
 
 /// Trait for language-specific parsing logic.
 ///
@@ -41,6 +42,32 @@ pub trait LanguageParser: Send + Sync {
         source: &str,
         file_path: &str,
     ) -> Vec<CodeNode>;
+
+    /// Extracts tracked SDK usages (see [`crate::usages`]) from the same tree.
+    ///
+    /// `None` means this language has no usage extractor yet, which is
+    /// different from a file with no usages (an empty [`FileUsages`]).
+    fn extract_usages(
+        &self,
+        _tree: &tree_sitter::Tree,
+        _source: &str,
+        _file_path: &str,
+    ) -> Option<FileUsages> {
+        None
+    }
+
+    /// The language name usage records carry, for a language that
+    /// implements [`Self::extract_usages`].
+    fn usages_language(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Whether `source` can contain usages at all. A `false` answer lets
+    /// [`crate::parse_source_usages`] skip the parse: most files of a large
+    /// tree never mention an SDK.
+    fn may_have_usages(&self, _source: &str) -> bool {
+        true
+    }
 }
 
 /// Gets a parser for the given file extension.

@@ -5,6 +5,7 @@
 
 use crate::languages::LanguageParser;
 use crate::node::{import_alias_ref, CodeNode, NodeKind, Visibility};
+use crate::usages::FileUsages;
 use tree_sitter::{Language, Node, Tree};
 
 pub struct PythonParser;
@@ -23,6 +24,18 @@ impl LanguageParser for PythonParser {
         let root = tree.root_node();
         extract_from_node(&root, source, file_path, &mut nodes, None);
         nodes
+    }
+
+    fn extract_usages(&self, tree: &Tree, source: &str, file_path: &str) -> Option<FileUsages> {
+        Some(crate::usages::python::extract(tree, source, file_path))
+    }
+
+    fn usages_language(&self) -> Option<&'static str> {
+        Some("python")
+    }
+
+    fn may_have_usages(&self, source: &str) -> bool {
+        crate::usages::python::may_use_sdk(source)
     }
 }
 

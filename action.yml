@@ -29,10 +29,45 @@ inputs:
     description: "The GITHUB_TOKEN secret, needed to post PR comments."
     required: false
     default: "${{ github.token }}"
+  mode:
+    description: "'command' (default) runs the command input. Any other value fails the step before anything is installed. 'retirements' finds direct SDK calls to AI models their provider has retired or is retiring, writes a job summary and annotates the affected lines (up to GitHub's 10 warnings per step; the summary lists every call). It runs on the runner; no code is sent anywhere."
+    required: false
+    default: command
+  retirements-path:
+    description: "Retirements mode: the directory or file to check, relative to working-directory."
+    required: false
+    default: .
+  retirements-fail-on:
+    description: "Retirements mode: 'never' (default; warnings only), 'retired' (fail when a confirmed call uses a model that is already retired), or a number of days (also fail when a model retires within that many days). A check that cannot run (exit 2) fails the step whatever this says."
+    required: false
+    default: never
+  retirements-include-routed:
+    description: "Retirements mode: also list calls through Azure, another host in base_url or another cloud, where the provider's dates may not apply, and let them fail the check."
+    required: false
+    default: "false"
+  retirements-count-unconfirmed:
+    description: "Retirements mode: also let unconfirmed calls fail the check (environment or config fallbacks, parameter defaults, possible values, unresolved clients, unknown routing). They are always listed."
+    required: false
+    default: "false"
 
 runs:
   using: composite
   steps:
+    # Before anything is installed: a typo such as `mode: retirement` would
+    # otherwise run command mode (and its PR comment) without a word.
+    - name: Check the mode input
+      shell: bash
+      env:
+        ARBOR_MODE: ${{ inputs.mode }}
+      run: |
+        case "$ARBOR_MODE" in
+          command|retirements) ;;
+          *)
+            echo "::error title=Arbor::mode must be 'command' or 'retirements', not '${ARBOR_MODE//[$'\r\n%']/}'"
+            exit 2
+            ;;
+        esac
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
@@ -130,7 +165,67 @@ runs:
           fi
         fi
 
+    - name: Check model retirements
+      if: inputs.mode == 'retirements'
+      shell: bash
+      env:
+        RET_WORKDIR: ${{ inputs.working-directory }}
+        RET_PATH: ${{ inputs.retirements-path }}
+        RET_FAIL_ON: ${{ inputs.retirements-fail-on }}
+        RET_ROUTED: ${{ inputs.retirements-include-routed }}
+        RET_UNCONFIRMED: ${{ inputs.retirements-count-unconfirmed }}
+      run: |
+        set -uo pipefail
+        # Run from the repository root so annotation paths match the repository.
+        TARGET="$RET_PATH"
+        if [[ -n "$RET_WORKDIR" && "$RET_WORKDIR" != "." ]]; then
+          if [[ "$RET_PATH" == "." ]]; then TARGET="$RET_WORKDIR"; else TARGET="${RET_WORKDIR%/}/$RET_PATH"; fi
+        fi
+
+        ARGS=()
+        if [[ "$RET_ROUTED" == "true" ]]; then ARGS+=(--include-routed); fi
+        if [[ "$RET_UNCONFIRMED" == "true" ]]; then ARGS+=(--count-unconfirmed); fi
+        case "$RET_FAIL_ON" in
+          never|retired) ;;
+          ''|*[!0-9]*)
+            echo "::error title=Arbor retirements::retirements-fail-on must be 'never', 'retired' or a number of days, not '$RET_FAIL_ON'"
+            exit 2
+            ;;
+          *) ARGS+=(--fail-within "$RET_FAIL_ON") ;;
+        esac
+
+        # One scan for both outputs: warning annotations on stdout (GitHub
+        # shows at most 10 per step, so Arbor prints 10 and one notice for
+        # the rest) and the Markdown report, which lists every call, for the
+        # job summary. The exit code says whether anything is failing:
+        # 0 nothing, 1 retired (or retiring within the window), 2 error.
+        # (`shell: bash` runs with -e, so the exit code is caught, not fatal.)
+        REPORT="$(mktemp)"
+        CODE=0
+        arbor retirements "$TARGET" --annotations --markdown-out "$REPORT" ${ARGS[@]+"${ARGS[@]}"} || CODE=$?
+        if [[ -s "$REPORT" ]]; then
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+          else
+            cat "$REPORT"
+          fi
+        fi
+        rm -f "$REPORT"
+
+        # A check that could not run fails the step even with
+        # retirements-fail-on: never: a missing report must not pass quietly.
+        if [[ $CODE -ge 2 ]]; then
+          echo "::error title=Arbor retirements::the check could not run (exit $CODE); this fails the step whatever retirements-fail-on says"
+          exit 2
+        fi
+        if [[ $CODE -eq 1 && "$RET_FAIL_ON" != "never" ]]; then
+          echo "::error title=Arbor retirements::calls use models that are retired or retire within the configured window; see the job summary"
+          exit 1
+        fi
+        exit 0
+
     - name: Run Arbor and Comment on PR
+      if: inputs.mode != 'retirements'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
