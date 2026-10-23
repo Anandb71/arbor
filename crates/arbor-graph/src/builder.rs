@@ -2430,6 +2430,27 @@ def total_cents(amount):
         );
     }
 
+    /// `pkg/__init__.py` is the module `pkg` itself, so it is the target and a
+    /// submodule that defines the same name is not.
+    #[test]
+    fn an_alias_from_a_package_reaches_its_init_not_a_submodule() {
+        let graph = index(&[
+            ("pkg/__init__.py", "def f(x):\n    return x\n"),
+            ("pkg/sub.py", "def f(x):\n    return -x\n"),
+            (
+                "app.py",
+                "\
+from pkg import f as g
+
+
+def run(x):
+    return g(x)
+",
+            ),
+        ]);
+        assert_eq!(calls(&graph), edges(&["app.py::run -> pkg/__init__.py::f"]));
+    }
+
     /// `subscribe/route.ts` only re-exports `POST` from another file, so the
     /// name is not defined where the import points. Nothing else named `POST`
     /// is the target.

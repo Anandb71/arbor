@@ -1073,6 +1073,49 @@ mod import_resolution_tests {
         );
     }
 
+    /// `pkg/__init__.py` is `pkg` itself, so it outranks a submodule's
+    /// definition of the same name. `arbor index` stores absolute paths, so
+    /// both path shapes are checked, and a package whose name only ends like
+    /// the module's (`mypkg`) is not `pkg`.
+    #[test]
+    fn an_aliased_import_from_a_package_prefers_its_init() {
+        for root in ["", "/repo/"] {
+            let mut table = SymbolTable::default();
+            for (i, file) in ["pkg/__init__.py", "pkg/sub.py", "mypkg/__init__.py"]
+                .iter()
+                .enumerate()
+            {
+                table.insert(
+                    "f".to_string(),
+                    nid(i),
+                    PathBuf::from(format!("{root}{file}")),
+                );
+            }
+            let caller = PathBuf::from(format!("{root}app.py"));
+            assert_eq!(
+                table.resolve_imported("f", "pkg", &caller),
+                Resolution::ViaImport(nid(0)),
+                "root {root:?}"
+            );
+
+            table.insert(
+                "f".to_string(),
+                nid(3),
+                PathBuf::from(format!("{root}shop/cart/__init__.py")),
+            );
+            table.insert(
+                "f".to_string(),
+                nid(4),
+                PathBuf::from(format!("{root}shop/cart/items.py")),
+            );
+            assert_eq!(
+                table.resolve_imported("f", "shop.cart", &caller),
+                Resolution::ViaImport(nid(3)),
+                "root {root:?}: a dotted package's own __init__"
+            );
+        }
+    }
+
     #[test]
     fn an_aliased_import_from_an_external_module_is_unresolved() {
         let table = money_table();
