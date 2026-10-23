@@ -404,13 +404,34 @@ impl GraphBuilder {
         )
     }
 
+    /// Is this a JavaScript or TypeScript file that binds no name from another
+    /// module: no `import`, `require` or `import()` binding at all?
+    ///
+    /// Such a file may be a classic script, whose top-level functions are
+    /// globals shared with every other script on the page, so a bare call to
+    /// another file's function can be real. Python has no globals shared
+    /// across modules, so a Python file never qualifies.
+    fn is_import_free_script(&self, from_file: &Path, from_file_str: &str) -> bool {
+        is_js_family_file(from_file)
+            && self
+                .import_map
+                .get(from_file_str)
+                .is_none_or(HashMap::is_empty)
+            && self
+                .namespace_imports
+                .get(from_file_str)
+                .is_none_or(HashMap::is_empty)
+    }
+
     /// Decides whether a resolved reference may become an edge.
     ///
     /// Python and JavaScript/TypeScript bare names are file-scoped: a cross-file
     /// call is kept only when this file defines the name or its import map
-    /// contains that local name (or `*`). A Go bare name is kept across files
-    /// only inside the caller's package (same directory and the same package
-    /// clause). Other languages keep the confidence downgrade.
+    /// contains that local name (or `*`). A JavaScript or TypeScript file that
+    /// binds no name from another module may be a classic script, so it keeps
+    /// the downgrade ([`Self::is_import_free_script`]). A Go bare name is kept
+    /// across files only inside the caller's package (same directory and the
+    /// same package clause). Other languages keep the confidence downgrade.
     ///
     /// Dotted references are not bare-name visibility. Returns `0.0` to drop.
     fn apply_import_validation(
@@ -435,7 +456,9 @@ impl GraphBuilder {
             );
         }
 
-        if bare_name_requires_import(from_file) {
+        if bare_name_requires_import(from_file)
+            && !self.is_import_free_script(from_file, from_file_str)
+        {
             return self.validate_bare_import_visibility(
                 reference,
                 from_file,
@@ -894,6 +917,16 @@ fn bare_name_requires_import(file: &Path) -> bool {
     matches!(
         ext.to_ascii_lowercase().as_str(),
         "py" | "pyi" | "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs"
+    )
+}
+
+fn is_js_family_file(file: &Path) -> bool {
+    let Some(ext) = file.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs"
     )
 }
 
@@ -3257,5 +3290,32 @@ function main() {
             calls(&graph),
             edges(&["legacy/cart.js::render -> legacy/format.js::formatPrice"])
         );
+    }
+
+    /// A namespace import binds a name too, so the file is a module and an
+    /// unimported bare name stays dropped.
+    #[test]
+    fn a_namespace_import_makes_the_file_a_module() {
+        let graph = index(&[
+            (
+                "format.ts",
+                "export function pad(x: string): string {\n  return x;\n}\n",
+            ),
+            (
+                "other.ts",
+                "export function other(x: string): string {\n  return x;\n}\n",
+            ),
+            (
+                "app.ts",
+                "\
+import * as fmt from \"./format\";
+
+export function show(x: string): string {
+  return other(x);
+}
+",
+            ),
+        ]);
+        assert_eq!(calls(&graph), edges(&[]));
     }
 }
