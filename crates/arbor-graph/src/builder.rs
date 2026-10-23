@@ -83,6 +83,10 @@ pub struct GraphBuilder {
     /// Go package clause per file. The parser stores `package name` as a
     /// `Module` node, and a bare call is visible only inside that package.
     go_packages: HashMap<String, String>,
+
+    /// Files with at least one exported definition. A JavaScript or
+    /// TypeScript file with none, and no imports, may be a classic script.
+    exporting_files: HashSet<String>,
 }
 
 impl Default for GraphBuilder {
@@ -101,6 +105,7 @@ impl GraphBuilder {
             namespace_imports: HashMap::new(),
             import_aliases: HashMap::new(),
             go_packages: HashMap::new(),
+            exporting_files: HashSet::new(),
         }
     }
 
@@ -167,6 +172,9 @@ impl GraphBuilder {
             let name = node.name.clone();
             let qualified = node.qualified_name.clone();
             let file = PathBuf::from(&node.file);
+            if node.is_exported {
+                self.exporting_files.insert(node.file.clone());
+            }
 
             let node_idx = self.graph.add_node(node);
 
@@ -424,13 +432,32 @@ impl GraphBuilder {
                 .is_none_or(HashMap::is_empty)
     }
 
+    /// Can another JavaScript or TypeScript module reach this definition by a
+    /// bare name that no recorded import binds?
+    ///
+    /// An exported function can be bound at run time in ways the parser does
+    /// not record: `const { f } = await loadModule()` around an `import()`,
+    /// Next.js `dynamic(() => import("./f"))`, `jest.requireActual("./f")`.
+    /// A classic script's top-level functions are globals. A module-private
+    /// function can't be called from another module by a bare name at all.
+    fn reachable_without_import(&self, to_node: &CodeNode) -> bool {
+        let to_file = Path::new(&to_node.file);
+        is_js_family_file(to_file)
+            && (to_node.is_exported
+                || (self.is_import_free_script(to_file, &to_node.file)
+                    && !self.exporting_files.contains(&to_node.file)))
+    }
+
     /// Decides whether a resolved reference may become an edge.
     ///
     /// Python and JavaScript/TypeScript bare names are file-scoped: a cross-file
     /// call is kept only when this file defines the name or its import map
-    /// contains that local name (or `*`). A JavaScript or TypeScript file that
-    /// binds no name from another module may be a classic script, so it keeps
-    /// the downgrade ([`Self::is_import_free_script`]). A Go bare name is kept
+    /// contains that local name (or `*`). In JavaScript and TypeScript, a call
+    /// to a function another module could reach without a recorded import (an
+    /// exported one, or a classic script's) keeps the downgrade
+    /// ([`Self::reachable_without_import`]), and a file that binds no name from
+    /// another module may itself be a classic script, so it keeps the downgrade
+    /// too ([`Self::is_import_free_script`]). A Go bare name is kept
     /// across files only inside the caller's package (same directory and the
     /// same package clause). Other languages keep the confidence downgrade.
     ///
@@ -490,20 +517,13 @@ impl GraphBuilder {
             return base_confidence;
         }
 
-        if to_file.parent() == from_file.parent() {
-            // Same directory but never imported. Plausible in languages with
-            // implicit module scope, suspicious everywhere else.
-            return base_confidence * 0.6;
-        }
-
-        // Different module and not imported: almost certainly a name collision.
         debug!(
             "Downgrading unimported cross-module reference '{}' in {} → {}",
             reference,
             from_file.display(),
             to_file.display()
         );
-        base_confidence * 0.3
+        unimported_confidence(from_file, &to_file, base_confidence)
     }
 
     /// Drops a bare cross-file name the caller cannot see.
@@ -511,7 +531,9 @@ impl GraphBuilder {
     /// Same-file definitions stay. An import-map entry for the local name stays,
     /// boosted the same way an explicit import always was. `*` (`from m import *`)
     /// stays at the resolution's own confidence, because the map does not say
-    /// which names the star brought in.
+    /// which names the star brought in. A JavaScript or TypeScript definition
+    /// another module could reach without a recorded import keeps the
+    /// downgrade every unimported name used to get.
     fn validate_bare_import_visibility(
         &self,
         reference: &str,
@@ -535,6 +557,16 @@ impl GraphBuilder {
             if file_imports.contains_key("*") {
                 return base_confidence;
             }
+        }
+
+        if is_js_family_file(from_file) && self.reachable_without_import(to_node) {
+            debug!(
+                "Downgrading unimported reference '{}' in {} → {}, reachable without an import",
+                reference,
+                from_file.display(),
+                to_file.display()
+            );
+            return unimported_confidence(from_file, &to_file, base_confidence);
         }
 
         debug!(
@@ -898,6 +930,17 @@ impl GraphBuilder {
     /// Builds without resolving edges (for incremental updates).
     pub fn build_without_resolve(self) -> ArborGraph {
         self.graph
+    }
+}
+
+/// The confidence of a bare cross-file call the caller never imported, where
+/// the call is kept: plausible in the same directory (languages with
+/// implicit module scope), most likely a name collision anywhere else.
+fn unimported_confidence(from_file: &Path, to_file: &Path, base_confidence: f32) -> f32 {
+    if to_file.parent() == from_file.parent() {
+        base_confidence * 0.6
+    } else {
+        base_confidence * 0.3
     }
 }
 
@@ -1759,15 +1802,19 @@ mod tests {
         );
     }
 
+    /// `far.ts` imports something, so it is a module, and its unexported
+    /// `validate` can't be called from another file by a bare name.
     #[test]
-    fn unimported_ts_cross_file_bare_call_is_dropped() {
+    fn unimported_ts_cross_file_call_to_a_private_function_is_dropped() {
         let mut b = GraphBuilder::new();
         let import = CodeNode::new("./other", "./other", NodeKind::Import, "src/a/main.ts")
             .with_references(vec!["somethingElse".to_string()]);
         let caller = CodeNode::new("main", "main", NodeKind::Function, "src/a/main.ts")
             .with_references(vec!["validate".to_string()]);
+        let callee_import = CodeNode::new("./util", "./util", NodeKind::Import, "src/z/far.ts")
+            .with_references(vec!["util".to_string()]);
         let callee = CodeNode::new("validate", "validate", NodeKind::Function, "src/z/far.ts");
-        b.add_nodes(vec![import, caller, callee]);
+        b.add_nodes(vec![import, caller, callee_import, callee]);
         let graph = b.build();
 
         assert_eq!(graph.edge_count(), 0);
@@ -1791,14 +1838,16 @@ mod tests {
     }
 
     #[test]
-    fn unimported_ts_same_dir_bare_call_is_dropped() {
+    fn unimported_ts_same_dir_call_to_a_private_function_is_dropped() {
         let mut b = GraphBuilder::new();
         let import = CodeNode::new("./x", "./x", NodeKind::Import, "src/main.ts")
             .with_references(vec!["other".to_string()]);
         let caller = CodeNode::new("main", "main", NodeKind::Function, "src/main.ts")
             .with_references(vec!["validate".to_string()]);
+        let callee_import = CodeNode::new("./util", "./util", NodeKind::Import, "src/sibling.ts")
+            .with_references(vec!["util".to_string()]);
         let callee = CodeNode::new("validate", "validate", NodeKind::Function, "src/sibling.ts");
-        b.add_nodes(vec![import, caller, callee]);
+        b.add_nodes(vec![import, caller, callee_import, callee]);
         let graph = b.build();
 
         assert_eq!(graph.edge_count(), 0);
@@ -3267,7 +3316,10 @@ export async function main() {
     fn a_name_the_file_does_not_require_is_still_dropped() {
         let graph = index(&[
             ("utils.js", UTILS),
-            ("other.js", "function other(x) {\n  return x;\n}\n"),
+            (
+                "other.js",
+                "const path = require(\"path\");\n\nfunction other(x) {\n  return path.basename(x);\n}\n\nmodule.exports = { other };\n",
+            ),
             (
                 "index.js",
                 "\
@@ -3483,7 +3535,7 @@ export function render(): string {
             ),
             (
                 "other.ts",
-                "export function other(x: string): string {\n  return x;\n}\n",
+                "export function shown(x: string): string {\n  return other(x);\n}\n\nfunction other(x: string): string {\n  return x;\n}\n",
             ),
             (
                 "app.ts",
@@ -3496,6 +3548,9 @@ export function show(x: string): string {
 ",
             ),
         ]);
-        assert_eq!(calls(&graph), edges(&[]));
+        assert_eq!(
+            calls(&graph),
+            edges(&["other.ts::shown -> other.ts::other"])
+        );
     }
 }
