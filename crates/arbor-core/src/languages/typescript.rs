@@ -98,6 +98,7 @@ fn extract_from_node(
                 if let Some(code_node) = extract_arrow_function(node, source, file_path) {
                     nodes.push(code_node);
                 }
+                nodes.extend(extract_require_bindings(node, source, file_path));
             }
 
             "class_declaration" | "class" => {
@@ -436,7 +437,22 @@ fn extract_type_alias(node: &Node, source: &str, file_path: &str) -> Option<Code
 ///   - Aliased       `{ X as Y }`  → "alias:Y:X"
 ///   - Default import `import X`   → "X"
 ///   - Namespace     `* as X`      → "*as:X"  (graph builder resolves X.method() calls)
+///   - TypeScript    `import X = require('m')` → "X", "*as:X" (see [`extract_require_bindings`])
 fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
+    // TypeScript's CommonJS form keeps its module on the clause, not on the
+    // statement.
+    if let Some(clause) = named_child_of_kind(node, "import_require_clause") {
+        let local = named_child_of_kind(&clause, "identifier")?;
+        let module = string_literal(&clause.child_by_field_name("source")?, source)?;
+        let local = get_text(&local, source);
+        return Some(import_node(
+            &module,
+            vec![local.clone(), format!("*as:{local}")],
+            node,
+            file_path,
+        ));
+    }
+
     let source_node = node.child_by_field_name("source")?;
     let raw = get_text(&source_node, source);
     let module_path = raw.trim_matches(|c| c == '"' || c == '\'');
@@ -488,15 +504,18 @@ fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode
         }
     }
 
-    Some(
-        CodeNode::new(module_path, module_path, NodeKind::Import, file_path)
-            .with_lines(
-                node.start_position().row as u32 + 1,
-                node.end_position().row as u32 + 1,
-            )
-            .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
-            .with_references(imported_names),
-    )
+    Some(import_node(module_path, imported_names, node, file_path))
+}
+
+/// An `Import` node for `module`, spanning `node`, with the names it binds.
+fn import_node(module: &str, names: Vec<String>, node: &Node, file_path: &str) -> CodeNode {
+    CodeNode::new(module, module, NodeKind::Import, file_path)
+        .with_lines(
+            node.start_position().row as u32 + 1,
+            node.end_position().row as u32 + 1,
+        )
+        .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
+        .with_references(names)
 }
 
 /// `A as B` in `import { A as B }`: calls use `B`, and the module exports
@@ -510,11 +529,195 @@ fn import_specifier(spec: &Node, source: &str) -> Option<String> {
         .child_by_field_name("alias")
         .map(|n| get_text(&n, source));
     match (local, imported) {
-        (Some(local), Some(imported)) if local != imported && imported != "default" => {
-            Some(import_alias_ref(&local, &imported))
-        }
+        (Some(local), Some(imported)) => Some(import_binding(&local, &imported)),
         (local, imported) => local.or(imported),
     }
+}
+
+/// `local` bound to the module's export `exported`: `alias:local:exported`,
+/// or the local name alone when the two match or the export is `default`.
+fn import_binding(local: &str, exported: &str) -> String {
+    if local != exported && exported != "default" {
+        import_alias_ref(local, exported)
+    } else {
+        local.to_string()
+    }
+}
+
+/// CommonJS `require` and awaited `import()` bindings, recorded in the same
+/// format as `import` statements so the graph builder sees every name a file
+/// takes from another module. One `Import` node per declarator:
+///   - `const { A, B: C } = require('m')` → "A", "alias:C:B"
+///   - `const C = require('m').B`         → "alias:C:B"
+///   - `const M = require('m')`           → "M", "*as:M"
+///   - `const { A } = await import('m')`  → "A"
+///   - `const M = await import('m')`      → "*as:M"
+///
+/// A required module is `module.exports`, which may be the function itself,
+/// so `M()` is a call to it as with a default import. An ES module namespace
+/// is never callable, so a dynamic import binds only the namespace. Only a
+/// string-literal module is read, and nested or `...rest` patterns bind
+/// objects rather than exports, so they record nothing.
+fn extract_require_bindings(node: &Node, source: &str, file_path: &str) -> Vec<CodeNode> {
+    let mut imports = Vec::new();
+    for i in 0..node.named_child_count() {
+        let Some(declarator) = node.named_child(i) else {
+            continue;
+        };
+        if declarator.kind() != "variable_declarator" {
+            continue;
+        }
+        let (Some(pattern), Some(value)) = (
+            declarator.child_by_field_name("name"),
+            declarator.child_by_field_name("value"),
+        ) else {
+            continue;
+        };
+        let Some(binding) = module_binding(&value, source) else {
+            continue;
+        };
+        let names = match (pattern.kind(), binding.export) {
+            ("identifier", Some(export)) => {
+                vec![import_binding(&get_text(&pattern, source), &export)]
+            }
+            ("identifier", None) => {
+                let local = get_text(&pattern, source);
+                if binding.dynamic {
+                    vec![format!("*as:{local}")]
+                } else {
+                    vec![local.clone(), format!("*as:{local}")]
+                }
+            }
+            ("object_pattern", None) => destructured_names(&pattern, source),
+            _ => continue,
+        };
+        if !names.is_empty() {
+            imports.push(import_node(&binding.module, names, &declarator, file_path));
+        }
+    }
+    imports
+}
+
+/// What a declarator's value takes from another module.
+struct ModuleBinding {
+    module: String,
+    /// `require('m').B`: one export rather than the whole module.
+    export: Option<String>,
+    /// `await import('m')`: an ES module namespace.
+    dynamic: bool,
+}
+
+/// `require('m')`, `require('m').B` or `await import('m')`.
+fn module_binding(value: &Node, source: &str) -> Option<ModuleBinding> {
+    match value.kind() {
+        "call_expression" => {
+            let function = value.child_by_field_name("function")?;
+            if function.kind() != "identifier" || get_text(&function, source) != "require" {
+                return None;
+            }
+            Some(ModuleBinding {
+                module: sole_string_argument(value, source)?,
+                export: None,
+                dynamic: false,
+            })
+        }
+        "member_expression" => {
+            let object = value.child_by_field_name("object")?;
+            let property = value.child_by_field_name("property")?;
+            if object.kind() != "call_expression" || property.kind() != "property_identifier" {
+                return None;
+            }
+            let mut binding = module_binding(&object, source)?;
+            binding.export = Some(get_text(&property, source));
+            Some(binding)
+        }
+        "await_expression" => {
+            let call = value.named_child(0)?;
+            if call.kind() != "call_expression"
+                || call.child_by_field_name("function")?.kind() != "import"
+            {
+                return None;
+            }
+            Some(ModuleBinding {
+                module: sole_string_argument(&call, source)?,
+                export: None,
+                dynamic: true,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The module a `require` or `import()` call names: its one argument, when
+/// that is a string literal.
+fn sole_string_argument(call: &Node, source: &str) -> Option<String> {
+    let arguments = call.child_by_field_name("arguments")?;
+    if arguments.named_child_count() != 1 {
+        return None;
+    }
+    string_literal(&arguments.named_child(0)?, source)
+}
+
+/// The names an object pattern binds from a module's exports: `{ A }`,
+/// `{ A = d }`, `{ B: C }`, `{ 'B': C }` and `{ B: C = d }`.
+fn destructured_names(pattern: &Node, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for i in 0..pattern.named_child_count() {
+        let Some(property) = pattern.named_child(i) else {
+            continue;
+        };
+        match property.kind() {
+            "shorthand_property_identifier_pattern" => names.push(get_text(&property, source)),
+            "object_assignment_pattern" => {
+                if let Some(left) = property
+                    .child_by_field_name("left")
+                    .filter(|left| left.kind() == "shorthand_property_identifier_pattern")
+                {
+                    names.push(get_text(&left, source));
+                }
+            }
+            "pair_pattern" => {
+                let local =
+                    property
+                        .child_by_field_name("value")
+                        .and_then(|value| match value.kind() {
+                            "identifier" => Some(value),
+                            "assignment_pattern" => value
+                                .child_by_field_name("left")
+                                .filter(|left| left.kind() == "identifier"),
+                            _ => None,
+                        });
+                let exported =
+                    property
+                        .child_by_field_name("key")
+                        .and_then(|key| match key.kind() {
+                            "property_identifier" => Some(get_text(&key, source)),
+                            "string" => string_literal(&key, source),
+                            _ => None,
+                        });
+                if let (Some(local), Some(exported)) = (local, exported) {
+                    names.push(import_binding(&get_text(&local, source), &exported));
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// The text of a `string` node without its quotes.
+fn string_literal(node: &Node, source: &str) -> Option<String> {
+    (node.kind() == "string").then(|| {
+        get_text(node, source)
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_string()
+    })
+}
+
+fn named_child_of_kind<'tree>(node: &Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    (0..node.named_child_count())
+        .filter_map(|i| node.named_child(i))
+        .find(|child| child.kind() == kind)
 }
 
 // ============================================================================
@@ -1079,6 +1282,48 @@ import * as types from '@babel/types';
                 ("../ui/widget".to_string(), owned(&["a", "Widget"])),
                 ("./lib".to_string(), owned(&["Default", "alias:c:b"])),
                 ("@babel/types".to_string(), owned(&["*as:types"])),
+            ]
+        );
+    }
+
+    /// `require`, `import x = require()` and an awaited `import()` bind
+    /// names as `import` statements do, in the same format.
+    #[test]
+    fn require_bindings_are_recorded_as_imports() {
+        let source = "\
+const { a, b: c, d = 1, e: f = 2, 'g': h, default: dflt, i: { j }, ...rest } = require('./m');
+const whole = require(\"./whole\"), other = require('./other').helper;
+var same = require('./same').same;
+import helper = require('./helper');
+const notAModule = require(name);
+const called = require('./factory')('arg');
+const resolved = require.resolve('./path');
+export async function load() {
+  const { lazy, x: y } = await import('./lazy.js');
+  const ns = await import('./ns');
+  return [lazy, y, ns];
+}
+";
+        let imports: Vec<(String, Vec<String>)> = parse(source, "src/app.ts")
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Import)
+            .map(|n| (n.name, n.references))
+            .collect();
+        let owned = |refs: &[&str]| refs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            imports,
+            vec![
+                // Nested `{ j }` and `...rest` bind objects, not exports.
+                (
+                    "./m".to_string(),
+                    owned(&["a", "alias:c:b", "d", "alias:f:e", "alias:h:g", "dflt"])
+                ),
+                ("./whole".to_string(), owned(&["whole", "*as:whole"])),
+                ("./other".to_string(), owned(&["alias:other:helper"])),
+                ("./same".to_string(), owned(&["same"])),
+                ("./helper".to_string(), owned(&["helper", "*as:helper"])),
+                ("./lazy.js".to_string(), owned(&["lazy", "alias:y:x"])),
+                ("./ns".to_string(), owned(&["*as:ns"])),
             ]
         );
     }
