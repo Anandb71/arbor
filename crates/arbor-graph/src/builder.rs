@@ -2614,7 +2614,7 @@ mod import_alias_tests {
 
     /// Parses each `(path, source)` with its real language parser and builds
     /// the graph, as `arbor index` does.
-    fn index(files: &[(&str, &str)]) -> ArborGraph {
+    pub(super) fn index(files: &[(&str, &str)]) -> ArborGraph {
         let mut builder = GraphBuilder::new();
         for (path, source) in files {
             let ext = Path::new(path)
@@ -2629,7 +2629,7 @@ mod import_alias_tests {
     }
 
     /// Every call edge, as `file::name -> file::name`.
-    fn calls(graph: &ArborGraph) -> BTreeSet<String> {
+    pub(super) fn calls(graph: &ArborGraph) -> BTreeSet<String> {
         graph
             .graph
             .edge_references()
@@ -2642,7 +2642,7 @@ mod import_alias_tests {
             .collect()
     }
 
-    fn edges(expected: &[&str]) -> BTreeSet<String> {
+    pub(super) fn edges(expected: &[&str]) -> BTreeSet<String> {
         expected.iter().map(|e| e.to_string()).collect()
     }
 
@@ -3047,5 +3047,215 @@ export async function postsTheForm(req: Request) {
             ),
         ]);
         assert_eq!(calls(&graph), edges(&[]));
+    }
+}
+
+/// The bare-name visibility rule keeps a JavaScript or TypeScript call to
+/// another file only when the caller imports the name. CommonJS `require`,
+/// TypeScript's `import x = require()` and an awaited `import()` bind names
+/// too, so they have to reach the import map like an ES `import` does.
+#[cfg(test)]
+mod commonjs_visibility_tests {
+    use super::import_alias_tests::{calls, edges, index};
+
+    const UTILS: &str = "\
+function helper(x) {
+  return x * 2;
+}
+
+module.exports = { helper };
+";
+
+    /// The repro from review: one caller on main, none with the rule alone.
+    #[test]
+    fn a_destructured_require_keeps_the_call() {
+        let graph = index(&[
+            ("utils.js", UTILS),
+            (
+                "index.js",
+                "\
+const { helper } = require(\"./utils\");
+
+function main() {
+  return helper(21);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["index.js::main -> utils.js::helper"])
+        );
+    }
+
+    /// `{ helper: twice }` is `import { helper as twice }`: the call reaches
+    /// `helper`, not a function that happens to be named `twice`.
+    #[test]
+    fn a_renamed_destructured_require_reaches_the_exported_name() {
+        let graph = index(&[
+            ("utils.js", UTILS),
+            (
+                "legacy/twice.js",
+                "function twice(x) {\n  return x + x;\n}\n",
+            ),
+            (
+                "index.js",
+                "\
+const { helper: twice } = require(\"./utils\");
+
+function main() {
+  return twice(21);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["index.js::main -> utils.js::helper"])
+        );
+    }
+
+    /// `const twice = require("./utils").helper` names one export too.
+    #[test]
+    fn a_property_of_a_required_module_reaches_that_export() {
+        let graph = index(&[
+            ("utils.js", UTILS),
+            (
+                "legacy/twice.js",
+                "function twice(x) {\n  return x + x;\n}\n",
+            ),
+            (
+                "index.js",
+                "\
+const twice = require(\"./utils\").helper;
+
+function main() {
+  return twice(21);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["index.js::main -> utils.js::helper"])
+        );
+    }
+
+    /// `module.exports = helper`: the required value is the function itself,
+    /// as with a default import.
+    #[test]
+    fn a_required_module_called_directly_keeps_the_call() {
+        let graph = index(&[
+            (
+                "helper.js",
+                "function helper(x) {\n  return x * 2;\n}\n\nmodule.exports = helper;\n",
+            ),
+            (
+                "index.js",
+                "\
+const helper = require(\"./helper\");
+
+function main() {
+  return helper(21);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["index.js::main -> helper.js::helper"])
+        );
+    }
+
+    /// TypeScript's own CommonJS import form.
+    #[test]
+    fn a_typescript_import_require_keeps_the_call() {
+        let graph = index(&[
+            (
+                "helper.ts",
+                "function helper(x: number): number {\n  return x * 2;\n}\n\nexport = helper;\n",
+            ),
+            (
+                "index.ts",
+                "\
+import helper = require(\"./helper\");
+
+export function main(): number {
+  return helper(21);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["index.ts::main -> helper.ts::helper"])
+        );
+    }
+
+    /// An awaited `import()` destructures named exports like `require` does.
+    #[test]
+    fn a_destructured_dynamic_import_keeps_the_call() {
+        let graph = index(&[
+            (
+                "utils.mjs",
+                "export function helper(x) {\n  return x * 2;\n}\n",
+            ),
+            (
+                "index.mjs",
+                "\
+export async function main() {
+  const { helper } = await import(\"./utils.mjs\");
+  return helper(21);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["index.mjs::main -> utils.mjs::helper"])
+        );
+    }
+
+    /// Requiring some names does not make every other name visible.
+    #[test]
+    fn a_name_the_file_does_not_require_is_still_dropped() {
+        let graph = index(&[
+            ("utils.js", UTILS),
+            ("other.js", "function other(x) {\n  return x;\n}\n"),
+            (
+                "index.js",
+                "\
+const { helper } = require(\"./utils\");
+
+function main() {
+  return other(helper(21));
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["index.js::main -> utils.js::helper"])
+        );
+    }
+
+    /// A file with no import or `require` may be a classic script, whose
+    /// top-level functions are globals shared with the page's other scripts.
+    #[test]
+    fn a_script_with_no_imports_keeps_its_bare_calls() {
+        let graph = index(&[
+            (
+                "legacy/format.js",
+                "function formatPrice(x) {\n  return \"$\" + x;\n}\n",
+            ),
+            (
+                "legacy/cart.js",
+                "function render(total) {\n  return formatPrice(total);\n}\n",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["legacy/cart.js::render -> legacy/format.js::formatPrice"])
+        );
     }
 }
