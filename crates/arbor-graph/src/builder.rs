@@ -2349,6 +2349,46 @@ def build(values):
         assert_eq!(calls(&graph), edges(&[]));
     }
 
+    /// Known limit: a module is matched by name, so an external module (Node's
+    /// `http`) that shares its name with a project file binds to that file.
+    /// The alias binds exactly as the unaliased import does, no further.
+    #[test]
+    fn an_external_module_named_like_a_project_file_binds_like_a_plain_import() {
+        let graph = index(&[
+            (
+                "src/lib/http.ts",
+                "export function request(url: string): string {\n  return url;\n}\n",
+            ),
+            (
+                "src/aliased.ts",
+                "\
+import { request as httpRequest } from \"http\";
+
+export function go(url: string): string {
+  return httpRequest(url);
+}
+",
+            ),
+            (
+                "src/plain.ts",
+                "\
+import { request } from \"http\";
+
+export function go(url: string): string {
+  return request(url);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "src/aliased.ts::go -> src/lib/http.ts::request",
+                "src/plain.ts::go -> src/lib/http.ts::request",
+            ])
+        );
+    }
+
     /// `import { formatName as fmt } from "./format"` has the same gap: the
     /// import recorded only `fmt`.
     #[test]

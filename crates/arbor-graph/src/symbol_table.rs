@@ -333,8 +333,10 @@ impl SymbolTable {
     /// `name` in that module are candidates: the module's own file first
     /// (`money.py`, or a package's `__init__.py` or `index.ts`), then anything
     /// inside a package of that name. A same-named function elsewhere is not
-    /// the target, and a module this project doesn't define (`numpy`) leaves
-    /// the call unresolved.
+    /// the target. A module this project doesn't define (`numpy`) leaves the
+    /// call unresolved, unless a project file or directory, or a directory
+    /// above the project, has the module's name: modules are matched by name,
+    /// so it then binds there, as an unaliased import of the name does.
     ///
     /// A relative module (`./format`, `../route`, `.money`, `..core.money`)
     /// names one place, read from the importing file's directory, so a
@@ -1129,6 +1131,27 @@ mod import_resolution_tests {
                 "root {root:?}: a dotted package's own __init__"
             );
         }
+    }
+
+    /// Known limit: `flask` is not part of this project, but a checkout under
+    /// `/home/u/flask/` has a directory named `flask`, so the module matches
+    /// it, as it does for an unaliased import.
+    #[test]
+    fn an_external_module_named_like_a_directory_above_the_project_matches_it() {
+        let mut table = SymbolTable::default();
+        table.insert(
+            "render_template".to_string(),
+            nid(0),
+            PathBuf::from("/home/u/flask/app/views.py"),
+        );
+        assert_eq!(
+            table.resolve_imported(
+                "render_template",
+                "flask",
+                Path::new("/home/u/flask/app/main.py")
+            ),
+            Resolution::ViaImport(nid(0))
+        );
     }
 
     #[test]
