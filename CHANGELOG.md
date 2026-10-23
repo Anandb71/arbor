@@ -5,7 +5,110 @@ All notable changes to Arbor will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2.5.0
+## [Unreleased]
+
+### Fixed
+- **Calls through aliased imports (#258):** after `from money import money_to_minor_units as to_minor`, a call to `to_minor()` recorded no edge, because the import kept only the local name. When another file defined a function named like the alias, the call was bound to that function at full confidence instead. Python's `from X import Y as Z` and TypeScript and JavaScript's `import { Y as Z }` now record the imported name, so the call reaches `Y` in the module the import names. Dotted modules (`pkg.mod`) are supported, a package's own `__init__.py` comes before its submodules, and relative modules (`.mod`, `../route`) are read from the importing file's directory, so a same-named module elsewhere is never the target. An alias imported from a module the project doesn't define (`numpy`) links nothing, unless a project file or directory, or a directory above the project, has the module's name (Node's `http` and a `src/lib/http.ts`): then the alias binds there, as the unaliased import already does. A function the caller's own file defines under the alias name still wins. Indexes rebuild once (`extract-5`).
+- **`arbor refactor` exited 0 for a missing symbol (#195):** it now exits 1 and prints `error: Symbol '<name>' not found` to stderr after the "Did you mean" suggestions, matching `inspect` and `callers`.
+
+## [3.1.0] - 2026-10-20
+
+A feature release: two commands for Python code that calls AI model APIs. See [docs/RELEASE_NOTES_v3.1.0.md](docs/RELEASE_NOTES_v3.1.0.md).
+
+### Added
+- **`arbor retirements` (#277):** lists the direct `openai`, `anthropic` and Google SDK calls in a Python project that use a model its provider has retired or is retiring, with the date and days left, the replacement the provider lists (followed through a chain to the first model that still works), the arguments that have to change with it, the per-repo choices it needs and what needs a manual check. The data is bundled at build time from the providers' deprecation pages (283 entries, 276 model IDs; OpenAI read on 18 October 2026, Anthropic and Google on 16 October 2026): OpenAI shuts down `gpt-4`, `gpt-4-turbo`, `gpt-3.5-turbo`, `o1`, `o3-mini`, `o4-mini` and others on 23 October 2026, and `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` on 14 January 2027. A finding is confirmed only for a literal or same-file constant at a call where `arbor usages` left no gap; environment fallbacks, parameter defaults, possible values, overridable class attributes and unresolved clients are listed as *confirm first* or counted under "Not checked". Calls through Azure, another `base_url` host, Bedrock or Vertex for Claude are listed apart (`--include-routed`). Changes whose effect differs by design (the reasoning effort on gpt-6-luna and GPT-5.6, thinking on claude-sonnet-5-5) are shown as decisions with both options, never made for you. Exit 0 nothing failing, 1 a confirmed direct call uses a retired model (or one retiring within `--fail-within <days>`; the shutdown day counts as retired, UTC), 2 the check could not run. `--count-unconfirmed`, `--json`, `--markdown`, `--markdown-out <file>`, `--annotations` and `--quiet`. Runs locally with no network requests or telemetry. Data is regenerated from the retirement recipes at release by `scripts/retirements/generate_model_retirements.py`, and a test fails on any hand edit ([docs/RETIREMENTS.md](docs/RETIREMENTS.md)).
+- **GitHub Action `mode: retirements` (#277):** runs `arbor retirements` once, writes the Markdown report to the job summary and annotates up to 10 affected lines (GitHub's limit per step) with a notice for the rest. It warns by default; `retirements-fail-on: retired` or a number of days fails the build. A check that cannot run fails the step whatever that input says, and an unknown `mode` fails before anything is installed. `retirements-path`, `retirements-include-routed` and `retirements-count-unconfirmed` map to the CLI.
+- **`arbor usages` and the MCP tool `find_api_usages` (#276):** where a Python project calls the OpenAI, Anthropic and Gemini SDKs (`google.genai` and the legacy `google.generativeai`). Each call has its file, line and column, enclosing function, keyword-argument names and the client's routing: `openai_direct`, `azure_openai`, `custom_base_url` (a `base_url`/`api_base` whose host is not the provider's own; `api.openai.com` and `api.anthropic.com` stay direct), `anthropic_direct`, `anthropic_bedrock`, `anthropic_vertex`, `google_genai`, `google_generativeai_legacy` or `unknown`. Values are captured only for `model`, `engine`, `deployment_id` and `model_name`, from string literals, same-file constants, same-file dict literals (`**PARAMS`, `MODELS["fast"]`) and parameter defaults. A value or route with no gap is confirmed only inside a small supported grammar ([docs/SDK_USAGES.md](docs/SDK_USAGES.md)); everything else keeps a gap, including anything a dynamic feature of the file may change (`exec`, `eval`, `globals()`, `sys.modules`, `__dict__`, `setattr`/`delattr` with a run-time name, attribute hooks, a class decorator or metaclass, multiple or deep inheritance, a class used as a value, environment writes with a run-time name, `builtins` or `sys` under another name, a frame's `f_globals`, scopes nested more than 64 deep, an SDK member replaced in the file), which is a `dynamic_feature` gap naming the feature and its line; the literal fallback of an environment or config lookup (`os.getenv("MODEL", "gpt-4o")`, `config(..., default=...)`) is captured with origin `env_default` and keeps its gap. No credential value is ever captured: a value is refused when any name it flows through looks like a secret or the value itself is credential-shaped (`sk-`, `AIza`, `ghp_`, `xox...`, long random tokens), and that refusal is an `unresolved_model` gap with reason `credential`. Each call site sees the assignment that reaches it (including `nonlocal`, `match` captures, `except ... as`, `globals()["NAME"]` and a wildcard import from another module, which may rebind any name before it), `self.x` also sees up to 16 direct same-file subclasses (a model value read through `self` or `cls` in a class other modules may subclass keeps a `subclass_override` gap), every binding of a name in a class body (`def`, `class`, an import, a loop target...) counts as an assignment of that attribute in the class, its base and its subclasses, a method that rebinds its `self` or `cls` reads nothing through it, a dict entry that a later `**` expansion or computed key may replace is a `splat` gap, and a client passed to a helper resolves when every in-file caller passes the same one (a public function keeps an `ambiguous_client` gap, `in_file_callers`, since other modules may pass another; a public function's client or model default keeps `parameter_default`). Constructor calls count as calls of `__init__`. A parameter default that an in-file caller overrides keeps a `parameter_overridden` gap, and one of a function whose callers cannot all be seen (decorated, passed to an executor, `functools.partial`, `map`, a task queue) keeps `unseen_callers`; a client constructor chosen at run time against anything else builds an ambiguous client; a client set up outside its constructor (`client.base_url = ...`, `setattr(client, "base_url", ...)`, `OPENAI_BASE_URL`/`ANTHROPIC_BASE_URL` set in the file, through `os.environ` or `os.environb`) routes as `unknown` with a gap, and so does a `base_url` read from the environment with no fallback (`base_url_env`) or not resolved (`base_url_unresolved`), while one read from the environment with a fallback keeps the fallback's routing with a `base_url_env` gap; a Gemini client given `vertexai=True`, an endpoint in `http_options` or a `**` expansion routes `unknown` with an `endpoint_option` gap; the module-level OpenAI API's configuration counts only as plain assignments in the top-of-file setup block, before the first `def`, `class`, decorator, bare expression or compound statement, each setting once and through a name only imports bind (anything else gives every module-level call a `module_config` gap), and a module-level call passing `engine` or `deployment_id` in a file that configures nothing is `unknown` with a `module_config` gap; a request that passes no model is a `missing_model` gap; and a gap for a run-time dict key, a branch-assigned name, a loop over a literal list or a conditional lists the values it may take, with `values_complete: true` only when that list comes from literals in one scope (or from every call of a private function) with no alias, mutation or dynamic feature. What cannot be resolved is a typed gap (`unresolved_model`, `unknown_client_factory`, `ambiguous_client`, `dynamic_dispatch`, `vendored_path`); `venv`, `site-packages`, `node_modules` and other vendored directories are excluded and counted, and so are hidden directories such as `.github/`. Extensionless scripts with a Python shebang are scanned, and files with syntax errors are listed. `--sdk` filters by provider (`gemini` is an alias for `google`) and `--json` is always valid JSON, argument errors included. Each lookup reads a bounded number of definitions (64), candidate values (64), subclasses (16) and callers (256), scopes nested more than 64 deep are not analyzed (a `truncated` gap), and lists, loops and class lookups are read once, so time and memory grow linearly with the file (in release builds, the review stress files up to 2.6 MB take at most 3.2 s and 580 MB; 4 MiB files about 5 s and 1 GB, bound by the parse; larger files are skipped). The report is bounded too: nested values (32 per call, 4,096 per file), listed candidate values (32 per gap, 4,096 per file), names and import paths (200 bytes), records including imports (20,000 per file, then a `truncated` gap) and imported names (20,000 per file, past which the file's calls are not analyzed) are bounded. Graph extraction is unchanged; as after every upgrade, a saved graph is rebuilt once on first use.
+
+## [3.0.5] - 2026-10-09
+
+A fix release. See [docs/RELEASE_NOTES_v3.0.5.md](docs/RELEASE_NOTES_v3.0.5.md).
+
+### Fixed
+- **MCP tool output leaked local paths (#261):** every serialized node `file` is now relative to the project root, and `initialize` reads the namespaced `io.modelcontextprotocol/protocolVersion` key before the flat ones.
+- **Tests in TypeScript and JavaScript were invisible (#235):** calls inside `describe`/`it`/`test` callbacks belonged to no symbol, so `arbor callers` missed every Jest, Vitest and Mocha test and `diff`/`check` reported changes as having no tests exercising them. Each `it`, `test`, `specify` and `bench` call, and each `beforeEach`/`afterEach`/`beforeAll`/`afterAll`/`before`/`after` hook, is now a function named after the test, such as `it: accepts two`, that owns the calls in its callback. `.only`, `.skip` and `test.each(rows)(...)` are included; `describe` blocks are containers and get no node of their own. A title repeated in one file gets its line, such as `it: works (line 8)`. Indexes rebuild once (`extract-4`).
+
+## [3.0.4] - 2026-10-03
+
+A fix release. See [docs/RELEASE_NOTES_v3.0.4.md](docs/RELEASE_NOTES_v3.0.4.md).
+
+### Fixed
+- **First run without git or a repository:** `arbor diff`, `check`, `summary`, `agent review` and `agent guard` now say whether git is missing from PATH, the folder is outside a repository, or git refused the repository (quoting git, which names the fix, such as `safe.directory`). They check this before the index, so the reason is the real one and a failed run no longer creates `.arbor/`. The `.git` folder and bare repositories are no longer mistaken for work trees.
+- **Receipts that could not record:** `arbor hook claude` warns at install time when receipts cannot work there, and `receipt begin` writes the reason to stderr instead of returning silently.
+- **Read-only projects:** failing to create `.arbor/`, `CLAUDE.md` or `.claude/settings.json` names the path and what to do, instead of a bare "Access is denied".
+- **`arbor hook claude` overwriting files:** an existing `CLAUDE.md` or `.claude/settings.json` that could not be read (for example, saved as UTF-16) was treated as empty and replaced. It is now left untouched and the install stops with an explanation.
+- **Linux binaries on older distributions (#242):** v3.0.3's Linux binaries needed glibc 2.39 and would not start on Ubuntu 22.04, Debian 12 or RHEL 9. They are now built in manylinux_2_28 and need glibc 2.28, and the build fails if that floor rises.
+- **Missed Rust callers on method receivers:** `draft.run_started()` was resolved by method name alone and dropped once more than two types defined `run_started`, so `arbor callers` reported none. The receiver's type is now read from the code: typed parameters (through `&`, `Box`, `Arc`, `Mutex`, guards, `Option`, `Result`, collections, channels and Tauri's `State`), `let` annotations, constructors, struct literals, `if let` / `let … else` / `match` arms, closures, `self.field`, and the return types of the functions and methods that produced the value, followed across files. A type the project doesn't define links nothing, so `client.get()` no longer binds to a project `get`. Indexes rebuild once (`extract-3`).
+- **`arbor diff` counting containers and comments:** a module, class, trait, struct or enum no longer counts as modified when every changed line inside it belongs to one of its members, and a hunk that only adds comments, blank lines or an item's doc comment no longer implicates anything; an attribute or decorator counts as a change to its item. On a real three-file PR the report went from 6 modified symbols (four of them `mod` blocks) to the 2 functions it edited.
+- **`arbor diff` impact counting callees:** impact, files likely to need updates and entrypoints now come from callers only. Editing a function can't break what it calls; counting those made 8 edited startup symbols report 944 impacted nodes instead of 3.
+- **Noisy output:** one-shot commands log warnings only (servers keep their lifecycle lines, `-v` shows more, `RUST_LOG` overrides). Logs always go to stderr.
+- **Receipts missing an edit on Linux (#246):** seeding the receipt snapshot from a copy of git's index lost git's racy-clean check on Linux, where the copy gets a new timestamp, so an edit made right after the snapshot could be missed. The snapshot now keeps that check.
+- **First run after an upgrade (#251):** clearing an outdated graph cache re-opened the store right after dropping its handle, and sled could still hold the directory lock ("could not acquire lock … WouldBlock"). The cache is now checked, cleared and re-stamped through one handle.
+- **MCP protocol (#254, #256):** `initialize` rejects a malformed `protocolVersion` with `-32602` naming the supported versions, and maps any dated version from 2026 on to the current protocol. On HTTP, one connection's negotiation no longer changes what another sees. Over stdio a malformed line gets a `-32700` response instead of leaving the client waiting. Declared extensions are intersected with the implemented ones.
+- **`.arbor/` showing up in git (#233):** Arbor now writes `.arbor/.gitignore` whenever it creates or initialises the folder, including when a receipt creates it, so `git add -A` no longer picks up the graph or saved prompts. An existing `.arbor/.gitignore` is left alone. Files from `.arbor/` that you already committed stay tracked; remove them with `git rm -r --cached .arbor`.
+
+### Added
+- **Named symbols in `arbor diff` and `check`:** each modified symbol is listed with its file, line and direct caller count, most-called first (top 12 in the text report, a table in `--markdown`, all in `--json` as `modified`).
+- **Shadowed installs:** `arbor doctor` fails when an older `arbor` earlier on PATH runs instead of a newer install, and says how to remove it. The npm postinstall, `install.sh` and `install.ps1` warn about the same thing after installing. A leftover `cargo install` of 1.9.0 had kept answering after npm installed 3.0.3, giving its file-level diff (377 symbols for a 3-file change) and 100,000 warning lines.
+- **Release checks:** every binary runs a first-use smoke test on its own platform before anything is published, including Intel macOS, Linux arm64, AlmaLinux 8, Ubuntu 22.04 and Debian 12. Pull requests that change the release build or `Cargo.lock` run the same build and smoke test without publishing.
+- **Provenance for npm and GHCR (#247):** the npm package is published with provenance and the container image carries a signed SLSA attestation.
+- **Installer and accuracy checks in CI (#255, #257):** `install.sh` and `install.ps1` install a locally served release on Linux, macOS and Windows runners on every pull request, and a versioned evaluation corpus checks the graph's recall and precision against hand-derived truth.
+- **Verifiable downloads:** releases publish `SHA256SUMS` and a signed build provenance attestation for each archive (`gh attestation verify <archive> --repo Anandb71/arbor`).
+
+### Security
+- **WebSocket servers refuse foreign origins:** the RPC and sync WebSocket servers, which `arbor bridge` always starts and `arbor serve` runs, accepted a handshake from any web page, because browsers apply no CORS to WebSockets. A page open while they ran could read the code graph. They now apply the MCP HTTP transport's policy: a present `Origin` must be loopback, and on a loopback-bound server `Host` must be too (403 otherwise). Desktop clients send no `Origin` and are unaffected; `--headless` still accepts remote hosts but checks `Origin`.
+
+## [3.0.3] - 2026-09-29
+
+A fix release. See [docs/RELEASE_NOTES_v3.0.3.md](docs/RELEASE_NOTES_v3.0.3.md).
+
+### Fixed
+- **Rust call edges (#226):** calls through paths (`crate::jobs::enqueue()`, `jobs::enqueue()`), associated functions (`Type::new()`), `self.method()` and calls inside macro arguments (`assert!`, `format!`) now resolve. Paths resolve through the module tree via the new `SymbolTable::resolve_path`; paths into external crates stay unresolved instead of binding to a same-named local function.
+- **Per-symbol `arbor diff` (#226):** only modified symbols carry a blast radius; new symbols are listed separately. Tests that call the change are counted as `tests_exercising`, not as impact or entry points.
+- **Change scopes (#226):** `arbor diff`, `check` and `summary` take `--base <ref>` (committed and uncommitted changes since the merge base, as a pull request shows them) and `--staged`. Whitespace-only edits and generated files are ignored.
+- **Cross-language callers (#226):** resolution only considers definitions in the caller's language family. `arbor callers`/`callees` list each same-named definition separately, accept `module::name` and `file:name`, and say what an empty answer cannot see.
+- **Stale graphs (#226, this release):** the saved graph records the commit and the extractor that built it. A `HEAD` move (checkout, commit, rebase) or an upgrade refreshes it instead of answering from the old graph. A leftover index cache no longer disables the staleness check.
+- **Inheritance (#191):** classes emit `extends`/`implements` edges to their bases, and inherited methods stay reachable.
+- **Call cycles (#190):** PageRank runs on the condensation of the call graph, so a closed ring no longer fills the top of the ranking. `CentralityScores::get` is still the percentile rank.
+- **Vendor assets (#189):** `vendor/` and minified files are not indexed, `arbor agent onboard` computes centrality before ranking hotspots, and Android activities and Hilt annotations are entry points.
+- **HTTP bridge (#222):** `arbor bridge --http` rejects non-loopback `Origin` and `Host` headers (cross-origin and DNS-rebinding requests), requires `application/json`, sends no CORS headers, and bounds request size, time and connections.
+- **Bridge busy loop (#174):** the bridge's watcher skips ignored build and dependency directories, and graph patches run off the async runtime.
+- **GitHub Action:** the prebuilt-binary download named assets that don't exist, so every run compiled from crates.io instead. It now downloads the release asset, and a pinned version builds that tag when no asset fits.
+- **Packaging (#186):** v3.0.0 Homebrew and Scoop checksums corrected.
+
+### Added
+- **`arbor receipt` (#223, #224):** a plain-English receipt after each coding-agent turn: what changed, what was touched outside the request, and `arbor receipt undo` to put a turn back. `arbor hook claude` wires it into Claude Code; reading receipts needs no prompt, undo asks first.
+- **cargo-deny in CI (#220):** licences, duplicate dependencies and advisories are checked on every pull request.
+
+### Changed
+- **Release workflow:** a crates.io or manifest-PR failure is reported on its job without failing the run, so GHCR, npm and the VS Code extension still publish (v3.0.0's expired crates.io token skipped all three). The Homebrew formula and Scoop manifest are written by the workflow after the build instead of being bumped by hand before the tag.
+- **Docs (#219 and this release):** new brand mark; install instructions list only channels that work; MCP tool tables list all sixteen tools; `docs/GRAPH_SCHEMA.md` documents call resolution.
+- Cached graphs and per-file caches from 3.0.0 are rebuilt on first use.
+
+## [3.0.0] - 2026-08-10 "The Right Node"
+
+### Fixed
+- **Symbol resolution consults the importing file.** When a bare name matched several modules, resolution fell through to the same-directory rule and attached the edge to whichever definition sat beside the caller. The file's own imports are now checked first (`Resolution::ViaImport`, confidence 0.93).
+
+### Breaking
+- `Resolution` gains a `ViaImport` variant; an exhaustive match will not compile.
+- Edges land on different nodes, so cached graphs, stored node ids and centrality baselines from 2.6.0 differ.
+
+## [2.6.0] - 2026-08-03 "Ground Truth"
+
+### Fixed
+- Colliding symbols are kept instead of the second definition replacing the first.
+- Resolution is deterministic across processes.
+- Edges carry a confidence in `[0, 1]` from how they resolved.
+- Exported TypeScript symbols are indexed once, not twice.
+- Method calls on untyped receivers resolve.
+- Markdown headings and shell comments are no longer indexed as code.
+- Centrality is a percentile rank rather than a fraction of the maximum.
+
+### Added
+- Concept search on the library (`ArborGraph::search_ranked`).
+
+## [2.5.0] - 2026-07-15
 
 ### Added
 - **Parallel indexing:** `index_directory` fans the cache-check/parse phase out across all cores with rayon; results assemble in walk order so graph construction stays deterministic. Measured (median of 3, warm FS cache): Arbor itself 253ms → 95ms (2.7x, 123 files); tokio 2.7s → 1.6s (1.7x, 815 files / 178k LOC — serial graph assembly caps the gain, see `docs/BENCHMARKS.md`). Thread count is tunable via `RAYON_NUM_THREADS`.
@@ -108,16 +211,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Stable for v2.0 Release
 - `v2.0.0` tagged and `v2.0` PR branch prepared; release workflows (release, GHCR, Marketplace, MCP notes) are aligned and stable.
 
-## [Unreleased]
-
-### Added
-
-- None yet.
-
-### Changed
-
-- None yet.
-
 ## [1.7.0] - 2026-03-25 "Distribution & Reach"
 
 > **Feature release focused on making Arbor available everywhere — every package manager, every editor, every CI pipeline.**
@@ -214,7 +307,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.6.0] - 2026-03-16
 
-> See [Release Notes](docs/RELEASE_NOTES_v1.6.0.md) for full details.
+> See [Release Notes](https://github.com/Anandb71/arbor/blob/v1.6.0/docs/RELEASE_NOTES_v1.6.0.md) for full details.
 
 ## [1.5.0] - 2026-02-xx
 
@@ -222,7 +315,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.4.0] - 2026-02-xx "The Trust Update"
 
-> See [Release Notes](docs/RELEASE_NOTES_v1.4.0.md) for full details.
+> See [Release Notes](https://github.com/Anandb71/arbor/blob/v1.4.0/docs/RELEASE_NOTES_v1.4.0.md) for full details.
 
 ## [1.3.0] - 2026-01-xx
 

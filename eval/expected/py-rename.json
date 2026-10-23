@@ -1,0 +1,15 @@
+{
+  "states": {
+    "before": {
+      "symbols": ["main.py::checkout_total", "money.py::money_to_minor_units"],
+      "edges_expected": [["main.py::checkout_total", "money.py::money_to_minor_units"]],
+      "edges_forbidden": [["main.py::checkout_total", "currency.py::money_to_minor_units"]]
+    },
+    "after": {
+      "symbols": ["currency.py::money_to_minor_units", "main.py::checkout_total"],
+      "symbols_forbidden": ["money.py::money_to_minor_units"],
+      "edges_expected": [["main.py::checkout_total", "currency.py::money_to_minor_units"]],
+      "edges_forbidden": [["main.py::checkout_total", "money.py::money_to_minor_units"]]
+    }
+  }
+}

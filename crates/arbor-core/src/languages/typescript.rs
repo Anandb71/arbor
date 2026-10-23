@@ -1,10 +1,13 @@
 //! TypeScript/JavaScript parser implementation.
 //!
-//! This handles TS, TSX, JS, and JSX files. Tree-sitter's TypeScript
-//! grammar is comprehensive enough to handle most JS patterns too.
+//! `.ts` files use the TypeScript grammar. `.tsx`, `.jsx` and JavaScript use
+//! the TSX grammar: the plain TypeScript grammar cannot parse JSX, so every
+//! component body in a React file used to come back as error nodes. The only
+//! construct TSX rejects, `<T>value` type assertions, is not valid in those
+//! files anyway.
 
 use crate::languages::LanguageParser;
-use crate::node::{CodeNode, NodeKind, Visibility};
+use crate::node::{import_alias_ref, CodeNode, NodeKind, Visibility};
 use tree_sitter::{Language, Node, Tree};
 
 pub struct TypeScriptParser;
@@ -15,14 +18,59 @@ impl LanguageParser for TypeScriptParser {
     }
 
     fn extensions(&self) -> &[&str] {
-        &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"]
+        &["ts", "mts", "cts"]
     }
 
     fn extract_nodes(&self, tree: &Tree, source: &str, file_path: &str) -> Vec<CodeNode> {
         let mut nodes = Vec::new();
         let root = tree.root_node();
         extract_from_node(&root, source, file_path, &mut nodes, None);
+        distinguish_repeated_tests(&mut nodes, file_path);
         nodes
+    }
+}
+
+/// Two tests in one file may share a title. Give each repeat its line, so
+/// ids stay distinct while a unique title keeps its plain name.
+fn distinguish_repeated_tests(nodes: &mut [CodeNode], file_path: &str) {
+    let mut seen = std::collections::HashMap::<String, usize>::new();
+    for node in nodes.iter() {
+        if is_test_block_name(&node.name) {
+            *seen.entry(node.qualified_name.clone()).or_default() += 1;
+        }
+    }
+    for node in nodes.iter_mut() {
+        if is_test_block_name(&node.name)
+            && seen
+                .get(&node.qualified_name)
+                .is_some_and(|count| *count > 1)
+        {
+            node.qualified_name = format!("{} (line {})", node.qualified_name, node.line_start);
+            node.id = CodeNode::compute_id(file_path, &node.qualified_name, node.kind);
+        }
+    }
+}
+
+fn is_test_block_name(name: &str) -> bool {
+    TEST_BLOCKS
+        .iter()
+        .any(|block| name == *block || name.starts_with(&format!("{block}: ")))
+}
+
+/// TSX, JSX and JavaScript: the same extraction on the grammar that parses JSX.
+pub struct TsxParser;
+
+impl LanguageParser for TsxParser {
+    fn language(&self) -> Language {
+        tree_sitter_typescript::language_tsx()
+    }
+
+    fn extensions(&self) -> &[&str] {
+        &["tsx", "jsx", "js", "mjs", "cjs"]
+    }
+
+    fn extract_nodes(&self, tree: &Tree, source: &str, file_path: &str) -> Vec<CodeNode> {
+        TypeScriptParser.extract_nodes(tree, source, file_path)
     }
 }
 
@@ -93,6 +141,15 @@ fn extract_from_node(
 
             "import_statement" => {
                 if let Some(code_node) = extract_import(node, source, file_path) {
+                    nodes.push(code_node);
+                }
+            }
+
+            // A test or hook body is an anonymous callback, so without a node
+            // of its own its calls belonged to nothing and every Jest, Vitest
+            // and Mocha test was invisible to `callers` (#235).
+            "call_expression" => {
+                if let Some(code_node) = extract_test_block(node, source, file_path) {
                     nodes.push(code_node);
                 }
             }
@@ -197,6 +254,78 @@ fn extract_arrow_function(node: &Node, source: &str, file_path: &str) -> Option<
         }
     }
     None
+}
+
+/// Test and hook calls whose callback runs as a test. Containers such as
+/// `describe` are left out: their bodies hold the tests, which get nodes of
+/// their own, and counting both would report each test twice.
+const TEST_BLOCKS: &[&str] = &[
+    "it",
+    "test",
+    "specify",
+    "bench",
+    "beforeEach",
+    "afterEach",
+    "beforeAll",
+    "afterAll",
+    "before",
+    "after",
+];
+
+/// The test-runner function a call goes through: `it`, `it.only`,
+/// `test.skip`, or `test.each(rows)` all name a test block.
+fn test_callee(callee: &Node, source: &str) -> Option<&'static str> {
+    let mut current = *callee;
+    loop {
+        match current.kind() {
+            "identifier" => {
+                let name = get_text(&current, source);
+                return TEST_BLOCKS.iter().find(|block| **block == name).copied();
+            }
+            "member_expression" => current = current.child_by_field_name("object")?,
+            "call_expression" => current = current.child_by_field_name("function")?,
+            _ => return None,
+        }
+    }
+}
+
+/// `it("accepts two", () => { ... })` becomes a function named
+/// `it: accepts two` that owns the calls in its callback.
+fn extract_test_block(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
+    let callee = node.child_by_field_name("function")?;
+    let block = test_callee(&callee, source)?;
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut title = None;
+    let mut callback = None;
+    for i in 0..arguments.named_child_count() {
+        let argument = arguments.named_child(i)?;
+        match argument.kind() {
+            "string" | "template_string" if title.is_none() => {
+                let text = get_text(&argument, source);
+                let trimmed = text.trim_matches(|c| matches!(c, '"' | '\'' | '`'));
+                title = Some(trimmed.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+            "arrow_function" | "function" | "function_expression" => callback = Some(argument),
+            _ => {}
+        }
+    }
+    let callback = callback?;
+    let label = match title.filter(|title| !title.is_empty()) {
+        Some(title) => {
+            let title: String = title.chars().take(80).collect();
+            format!("{block}: {title}")
+        }
+        None => block.to_string(),
+    };
+    let line = node.start_position().row as u32 + 1;
+    Some(
+        CodeNode::new(&label, &label, NodeKind::Function, file_path)
+            .with_lines(line, node.end_position().row as u32 + 1)
+            .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
+            .with_column(callee.start_position().column as u32)
+            .with_visibility(Visibility::Private)
+            .with_references(extract_call_references(&callback, source)),
+    )
 }
 
 fn extract_class(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
@@ -304,6 +433,7 @@ fn extract_type_alias(node: &Node, source: &str, file_path: &str) -> Option<Code
 /// The imported names are stored in `references` so the graph builder can build an
 /// import map for import-aware edge resolution. Format:
 ///   - Named import  `{ X }`       → "X"
+///   - Aliased       `{ X as Y }`  → "alias:Y:X"
 ///   - Default import `import X`   → "X"
 ///   - Namespace     `* as X`      → "*as:X"  (graph builder resolves X.method() calls)
 fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode> {
@@ -331,12 +461,7 @@ fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode
                             for k in 0..child.child_count() {
                                 if let Some(spec) = child.child(k) {
                                     if spec.kind() == "import_specifier" {
-                                        // Use the local alias if present, otherwise the original name
-                                        let local = spec
-                                            .child_by_field_name("alias")
-                                            .or_else(|| spec.child_by_field_name("name"))
-                                            .map(|n| get_text(&n, source));
-                                        if let Some(n) = local {
+                                        if let Some(n) = import_specifier(&spec, source) {
                                             imported_names.push(n);
                                         }
                                     }
@@ -372,6 +497,24 @@ fn extract_import(node: &Node, source: &str, file_path: &str) -> Option<CodeNode
             .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
             .with_references(imported_names),
     )
+}
+
+/// `A as B` in `import { A as B }`: calls use `B`, and the module exports
+/// `A`, so both are recorded (`alias:B:A`). `{ A }`, `{ A as A }` and
+/// `{ default as B }` record the local name, as a default import does.
+fn import_specifier(spec: &Node, source: &str) -> Option<String> {
+    let imported = spec
+        .child_by_field_name("name")
+        .map(|n| get_text(&n, source));
+    let local = spec
+        .child_by_field_name("alias")
+        .map(|n| get_text(&n, source));
+    match (local, imported) {
+        (Some(local), Some(imported)) if local != imported && imported != "default" => {
+            Some(import_alias_ref(&local, &imported))
+        }
+        (local, imported) => local.or(imported),
+    }
 }
 
 // ============================================================================
@@ -487,6 +630,22 @@ fn extract_call_references(root: &Node, source: &str) -> Vec<String> {
             }
         }
 
+        // Rendering `<PricingButton />` uses that component the way a call
+        // does. In React code this is most of the dependency graph.
+        if matches!(
+            node.kind(),
+            "jsx_opening_element" | "jsx_self_closing_element"
+        ) {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let range = name_node.byte_range();
+                if range.end <= source.len() {
+                    if let Some(reference) = component_reference(&source[range]) {
+                        refs.push(reference);
+                    }
+                }
+            }
+        }
+
         // Iterative depth-first traversal — no recursion, no stack overflow
         if cursor.goto_first_child() {
             continue;
@@ -511,6 +670,16 @@ fn extract_call_references(root: &Node, source: &str) -> Vec<String> {
     refs.sort();
     refs.dedup();
     refs
+}
+
+/// A JSX tag that names a component. `<div>` and `<motion.div>` are host
+/// elements; a component starts with a capital letter.
+fn component_reference(tag: &str) -> Option<String> {
+    let last = tag.rsplit('.').next()?;
+    if !last.chars().next()?.is_ascii_uppercase() {
+        return None;
+    }
+    classify_callee(tag)
 }
 
 /// Turns the callee text of a call expression into a resolvable reference.
@@ -605,6 +774,81 @@ impl CodeNodeExt for CodeNode {
 }
 
 #[cfg(test)]
+mod jsx_tests {
+    use super::{component_reference, TsxParser, TypeScriptParser};
+    use crate::languages::LanguageParser;
+
+    fn parse(parser: &dyn LanguageParser, source: &str, file: &str) -> Vec<crate::node::CodeNode> {
+        let mut ts = tree_sitter::Parser::new();
+        ts.set_language(&parser.language()).unwrap();
+        let tree = ts.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{file} did not parse cleanly"
+        );
+        parser.extract_nodes(&tree, source, file)
+    }
+
+    #[test]
+    fn rendering_a_component_references_it() {
+        let source = r#"
+import { PricingButton } from "./PricingButton";
+import * as Tabs from "./tabs";
+
+export default function PricingPage({ plans }: { plans: string[] }) {
+  return (
+    <main className="p-4">
+      <PricingButton plan={plans[0]} />
+      <Tabs.Panel>{plans.map(p => <span key={p}>{p}</span>)}</Tabs.Panel>
+    </main>
+  );
+}
+"#;
+        let nodes = parse(&TsxParser, source, "app/pricing/page.tsx");
+        let page = nodes
+            .iter()
+            .find(|n| n.name == "PricingPage")
+            .expect("page component");
+        assert!(
+            page.references.contains(&"PricingButton".to_string()),
+            "{:?}",
+            page.references
+        );
+        assert!(
+            page.references.contains(&"Tabs.Panel".to_string()),
+            "{:?}",
+            page.references
+        );
+        assert!(
+            !page
+                .references
+                .iter()
+                .any(|r| r == "main" || r == "span" || r == "div"),
+            "{:?}",
+            page.references
+        );
+    }
+
+    #[test]
+    fn plain_typescript_keeps_angle_bracket_assertions() {
+        let source = "export function toCount(value: unknown) { return <number>value; }\n";
+        let nodes = parse(&TypeScriptParser, source, "lib/count.ts");
+        assert!(nodes.iter().any(|n| n.name == "toCount"));
+    }
+
+    #[test]
+    fn host_elements_are_not_components() {
+        assert_eq!(component_reference("div"), None);
+        assert_eq!(component_reference("motion.div"), None);
+        assert_eq!(
+            component_reference("PricingButton"),
+            Some("PricingButton".into())
+        );
+        assert_eq!(component_reference("ui.Button"), Some(".Button".into()));
+    }
+}
+
+#[cfg(test)]
 mod callee_tests {
     use super::classify_callee;
 
@@ -681,5 +925,161 @@ mod callee_tests {
     #[test]
     fn trailing_dot_is_not_a_method() {
         assert_eq!(classify_callee("obj."), None);
+    }
+}
+
+#[cfg(test)]
+mod test_block_tests {
+    use super::TypeScriptParser;
+    use crate::languages::LanguageParser;
+    use crate::node::{CodeNode, NodeKind};
+
+    fn parse(source: &str, file: &str) -> Vec<CodeNode> {
+        let parser = TypeScriptParser;
+        let mut ts = tree_sitter::Parser::new();
+        ts.set_language(&parser.language()).unwrap();
+        let tree = ts.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{file} did not parse cleanly"
+        );
+        parser.extract_nodes(&tree, source, file)
+    }
+
+    fn block<'a>(nodes: &'a [CodeNode], name: &str) -> &'a CodeNode {
+        nodes
+            .iter()
+            .find(|node| node.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name} missing: {:?}",
+                    nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+                )
+            })
+    }
+
+    /// The repro from #235: calls inside `it` and `test` callbacks belong to the test.
+    #[test]
+    fn calls_inside_test_callbacks_belong_to_the_test() {
+        let source = r#"
+import { decide } from './policy';
+
+describe('decide', () => {
+  it('accepts two', () => {
+    expect(decide(2)).toBe(true);
+  });
+});
+
+test('rejects zero', function () {
+  expect(decide(0)).toBe(false);
+});
+
+function namedHelper() {
+  return decide(5);
+}
+"#;
+        let nodes = parse(source, "src/policy.test.ts");
+        let accepts = block(&nodes, "it: accepts two");
+        assert_eq!(accepts.kind, NodeKind::Function);
+        assert!(
+            accepts.references.contains(&"decide".to_string()),
+            "{:?}",
+            accepts.references
+        );
+        assert_eq!(accepts.line_start, 5);
+        let rejects = block(&nodes, "test: rejects zero");
+        assert!(rejects.references.contains(&"decide".to_string()));
+        assert!(block(&nodes, "namedHelper")
+            .references
+            .contains(&"decide".to_string()));
+        // `describe` holds tests; it is not a test itself.
+        assert!(nodes.iter().all(|node| !node.name.starts_with("describe")));
+    }
+
+    #[test]
+    fn runner_variants_hooks_and_repeated_titles_are_distinct_tests() {
+        let source = r#"
+beforeEach(() => { resetDatabase(); });
+it.only('works', async () => { await load(); });
+test.skip('works', () => { load(); });
+test.each([[1], [2]])('handles %i', (n) => { handle(n); });
+it(`template ${name}`, () => { render(); });
+it('has no callback');
+it('works', () => { again(); });
+"#;
+        let nodes = parse(source, "src/a.test.ts");
+        assert!(block(&nodes, "beforeEach")
+            .references
+            .contains(&"resetDatabase".to_string()));
+        // `it.only('works')` and `it('works')` share a name; `test.skip('works')` doesn't.
+        let works: Vec<_> = nodes
+            .iter()
+            .filter(|node| node.name == "it: works")
+            .collect();
+        assert_eq!(works.len(), 2);
+        assert_ne!(
+            works[0].id, works[1].id,
+            "same title on different lines keeps distinct ids"
+        );
+        assert_eq!(works[0].qualified_name, "it: works (line 3)");
+        assert_eq!(works[1].qualified_name, "it: works (line 8)");
+        assert_eq!(block(&nodes, "test: works").qualified_name, "test: works");
+        assert_eq!(
+            block(&nodes, "beforeEach").qualified_name,
+            "beforeEach",
+            "a unique test keeps its plain name"
+        );
+        assert!(block(&nodes, "test: handles %i")
+            .references
+            .contains(&"handle".to_string()));
+        assert!(block(&nodes, "it: template ${name}")
+            .references
+            .contains(&"render".to_string()));
+        assert!(
+            nodes.iter().all(|node| node.name != "it: has no callback"),
+            "a call without a callback runs nothing"
+        );
+    }
+
+    #[test]
+    fn ordinary_calls_with_callbacks_are_not_tests() {
+        let source =
+            "items.forEach((item) => { use(item); });\nsetTimeout(() => { tick(); }, 10);\n";
+        let nodes = parse(source, "src/a.ts");
+        assert!(
+            nodes.is_empty(),
+            "{:?}",
+            nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// #258: `{ formatName as fmt }` recorded only `fmt`.
+    #[test]
+    fn aliased_named_imports_keep_the_imported_name() {
+        let source = "\
+import { formatName as fmt, parse } from './format';
+import { a as a, default as Widget } from '../ui/widget';
+import Default, { b as c } from './lib';
+import * as types from '@babel/types';
+";
+        let imports: Vec<(String, Vec<String>)> = parse(source, "src/app.ts")
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Import)
+            .map(|n| (n.name, n.references))
+            .collect();
+        let owned = |refs: &[&str]| refs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            imports,
+            vec![
+                (
+                    "./format".to_string(),
+                    owned(&["alias:fmt:formatName", "parse"])
+                ),
+                // `a as a` binds the imported name; `default` names no export.
+                ("../ui/widget".to_string(), owned(&["a", "Widget"])),
+                ("./lib".to_string(), owned(&["Default", "alias:c:b"])),
+                ("@babel/types".to_string(), owned(&["*as:types"])),
+            ]
+        );
     }
 }

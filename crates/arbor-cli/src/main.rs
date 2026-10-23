@@ -9,8 +9,14 @@ use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod audit;
+mod changes;
 mod commands;
 mod hook;
+mod hunk_lines;
+mod install_check;
+mod receipt;
+mod retirements;
+mod usages;
 
 #[derive(Parser)]
 #[command(name = "arbor")]
@@ -108,6 +114,15 @@ enum Commands {
         /// Output as Markdown (for PR comments)
         #[arg(long)]
         markdown: bool,
+
+        /// Compare against where this branch left REF (e.g. origin/main):
+        /// committed and uncommitted changes since the merge base, as a PR shows them
+        #[arg(long, value_name = "REF", conflicts_with = "staged")]
+        base: Option<String>,
+
+        /// Only staged changes, against HEAD
+        #[arg(long)]
+        staged: bool,
     },
 
     /// CI safety mode for changed code paths
@@ -135,6 +150,15 @@ enum Commands {
         /// Output as Markdown (for PR comments)
         #[arg(long)]
         markdown: bool,
+
+        /// Compare against where this branch left REF (e.g. origin/main):
+        /// committed and uncommitted changes since the merge base, as a PR shows them
+        #[arg(long, value_name = "REF", conflicts_with = "staged")]
+        base: Option<String>,
+
+        /// Only staged changes, against HEAD
+        #[arg(long)]
+        staged: bool,
     },
 
     /// Start the Arbor server
@@ -296,6 +320,15 @@ enum Commands {
         /// Path to analyze (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Compare against where this branch left REF (e.g. origin/main):
+        /// committed and uncommitted changes since the merge base, as a PR shows them
+        #[arg(long, value_name = "REF", conflicts_with = "staged")]
+        base: Option<String>,
+
+        /// Only staged changes, against HEAD
+        #[arg(long)]
+        staged: bool,
     },
 
     /// Watch for file changes and re-index automatically
@@ -321,6 +354,68 @@ enum Commands {
         /// Path to analyze (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+    },
+
+    /// Find OpenAI, Anthropic and Gemini SDK calls (Python today): routing, model IDs and gaps. Never prints credential values
+    Usages {
+        /// Directory or file to scan (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: String,
+
+        /// Only this provider's SDK: openai, anthropic or google (alias: gemini)
+        #[arg(long)]
+        sdk: Option<String>,
+
+        /// Output as JSON; errors are printed as {"version", "error"} on stdout
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Find direct SDK calls to AI models their provider has retired or is retiring, with the replacement, the argument changes and the choices it needs (Python today). Runs locally. Exit 0: nothing failing, 1: a confirmed call uses a retired model (or one retiring within --fail-within days), 2: error
+    Retirements {
+        /// Directory or file to scan (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: String,
+
+        /// Output as JSON; errors are printed as {"version", "error"} on stdout
+        #[arg(long, conflicts_with_all = ["markdown", "annotations"])]
+        json: bool,
+
+        /// Output a Markdown report (for a GitHub job summary)
+        #[arg(long, conflicts_with = "annotations")]
+        markdown: bool,
+
+        /// Output GitHub Actions annotations: one warning per affected call, up to --max-annotations, then one notice for the rest
+        #[arg(long)]
+        annotations: bool,
+
+        /// With --annotations: the most warnings to print (GitHub shows 10 per step)
+        #[arg(long, value_name = "N", requires = "annotations")]
+        max_annotations: Option<usize>,
+
+        /// Also write the Markdown report to this file, from the same scan
+        #[arg(long, value_name = "FILE")]
+        markdown_out: Option<String>,
+
+        /// Also fail (exit 1) when a model retires within this many days; by default only already-retired models fail
+        #[arg(long, value_name = "DAYS", value_parser = clap::value_parser!(i64).range(0..=36500))]
+        fail_within: Option<i64>,
+
+        /// List calls that go through Azure, another host in base_url or another cloud (the provider's dates may not apply) and let them fail the check
+        #[arg(long)]
+        include_routed: bool,
+
+        /// Also let unconfirmed calls fail the check: environment or config fallbacks, parameter defaults, possible values, unresolved clients and unknown routing
+        #[arg(long)]
+        count_unconfirmed: bool,
+
+        /// Print only the calls and the summary
+        #[arg(short, long)]
+        quiet: bool,
+
+        /// Count days from this date (YYYY-MM-DD) instead of today
+        #[arg(long, hide = true)]
+        today: Option<String>,
     },
 
     /// Show direct callers of a symbol (who calls this?)
@@ -454,6 +549,12 @@ enum Commands {
         focus: Option<String>,
     },
 
+    /// Plain-English receipts of what each agent turn changed
+    Receipt {
+        #[command(subcommand)]
+        action: ReceiptAction,
+    },
+
     /// Built-in agent workflows for autonomous code analysis
     Agent {
         #[command(subcommand)]
@@ -470,6 +571,70 @@ enum Commands {
         /// Maximum number of ranked symbols to print
         #[arg(long, default_value = "25000")]
         top: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReceiptAction {
+    /// Record the start of an agent turn (run by the agent's prompt hook)
+    Begin {
+        /// Project path (defaults to the hook's working directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Which agent is making the change
+        #[arg(long, default_value = "claude-code")]
+        agent: String,
+    },
+    /// Explain what changed since the turn began (run by the agent's stop hook)
+    End {
+        /// Project path (defaults to the hook's working directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Print the receipt as a hook `systemMessage` and never fail the agent
+        #[arg(long)]
+        hook: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List recent receipts, newest first
+    List {
+        /// Project path (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// How many to show
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one receipt in full (the latest by default)
+    Show {
+        /// Receipt id or a prefix of it
+        id: Option<String>,
+        /// Project path (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Put back what a turn changed, as it was before the turn
+    Undo {
+        /// Receipt id or a prefix of it
+        id: String,
+        /// Only these files (default: every file the turn changed)
+        files: Vec<String>,
+        /// Only the files outside your request
+        #[arg(long, conflicts_with = "files")]
+        unasked: bool,
+        /// Undo even files that changed again after the turn
+        #[arg(long)]
+        force: bool,
+        /// Project path (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
     },
 }
 
@@ -509,12 +674,78 @@ enum AgentAction {
     },
 }
 
-#[tokio::main]
-async fn main() {
-    let cli = Cli::parse();
+/// The command tree and its async dispatch are large in debug builds, and
+/// Windows gives the main thread only 1 MB of stack. Running the CLI on a
+/// thread with room keeps every command (and every future one) clear of it.
+const CLI_STACK_BYTES: usize = 16 * 1024 * 1024;
 
-    // Set up logging
-    let filter = if cli.verbose { "debug" } else { "info" };
+fn main() {
+    let cli = std::thread::Builder::new()
+        .name("arbor".into())
+        .stack_size(CLI_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to start the async runtime")
+                .block_on(run())
+        })
+        .expect("failed to start the arbor thread");
+    if cli.join().is_err() {
+        std::process::exit(101);
+    }
+}
+
+/// The log filter for this run: `RUST_LOG` if set, else `debug` with `-v`,
+/// `info` for a server and `warn` for everything else.
+fn log_filter(verbose: bool, long_running: bool, env: Option<String>) -> String {
+    match env.filter(|value| !value.trim().is_empty()) {
+        Some(value) => value,
+        None if verbose => "debug".to_string(),
+        None if long_running => "info".to_string(),
+        None => "warn".to_string(),
+    }
+}
+
+async fn run() {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            use clap::error::ErrorKind;
+            let informational = matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            );
+            // `arbor usages --json` promises JSON on stdout, argument
+            // errors included.
+            if !informational && usages::wants_json(std::env::args_os().skip(1)) {
+                let _ = error.print();
+                usages::print_json_error(&error.render().to_string());
+                std::process::exit(error.exit_code());
+            }
+            if !informational && retirements::wants_json(std::env::args_os().skip(1)) {
+                let _ = error.print();
+                retirements::print_json_error(&error.render().to_string());
+                std::process::exit(2);
+            }
+            error.exit()
+        }
+    };
+
+    // Logs go to stderr and never mix with a report on stdout. A one-shot
+    // command already says what it did on stdout, so by default it logs only
+    // warnings; servers keep their lifecycle lines. `-v` shows everything and
+    // `RUST_LOG` overrides both.
+    let long_running = matches!(
+        cli.command,
+        Commands::Serve { .. }
+            | Commands::Viz { .. }
+            | Commands::Bridge { .. }
+            | Commands::Gui { .. }
+    );
+    let filter = log_filter(cli.verbose, long_running, std::env::var("RUST_LOG").ok());
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -556,7 +787,15 @@ async fn main() {
             depth,
             json,
             markdown,
-        } => commands::diff(&path, depth, json, markdown),
+            base,
+            staged,
+        } => commands::diff(
+            &path,
+            depth,
+            json,
+            markdown,
+            &changes::Scope::from_flags(base, staged),
+        ),
         Commands::Check {
             path,
             depth,
@@ -564,7 +803,17 @@ async fn main() {
             no_fail,
             json,
             markdown,
-        } => commands::check(&path, depth, max_blast_radius, no_fail, json, markdown),
+            base,
+            staged,
+        } => commands::check(
+            &path,
+            depth,
+            max_blast_radius,
+            no_fail,
+            json,
+            markdown,
+            &changes::Scope::from_flags(base, staged),
+        ),
         Commands::Serve {
             port,
             headless,
@@ -602,7 +851,9 @@ async fn main() {
         Commands::Open { symbol, path } => commands::open(&symbol, &path),
         Commands::Gui { path } => commands::gui(&path),
         Commands::PrSummary { symbols, path } => commands::pr_summary(&symbols, &path),
-        Commands::Summary { path } => commands::summary(&path),
+        Commands::Summary { path, base, staged } => {
+            commands::summary(&path, &changes::Scope::from_flags(base, staged))
+        }
         Commands::Watch { path } => commands::watch(&path).await,
         Commands::Audit {
             sink,
@@ -610,6 +861,32 @@ async fn main() {
             format,
             path,
         } => commands::audit(&sink, depth, &format, &path),
+        Commands::Usages { path, sdk, json } => usages::run(&path, sdk.as_deref(), json),
+        Commands::Retirements {
+            path,
+            json,
+            markdown,
+            annotations,
+            max_annotations,
+            markdown_out,
+            fail_within,
+            include_routed,
+            count_unconfirmed,
+            quiet,
+            today,
+        } => std::process::exit(retirements::run(&retirements::Args {
+            path,
+            json,
+            markdown,
+            annotations,
+            markdown_out,
+            max_annotations,
+            fail_within,
+            include_routed,
+            count_unconfirmed,
+            quiet,
+            today,
+        })),
         Commands::Callers { symbol, path, json } => commands::callers(&symbol, &path, json),
         Commands::Callees { symbol, path, json } => commands::callees(&symbol, &path, json),
         Commands::EntryPoints { path, json } => commands::entry_points(&path, json),
@@ -652,10 +929,47 @@ async fn main() {
             } => commands::agent_guard(&path, max_blast_radius),
         },
         Commands::AnalyzeLocal { path, top } => commands::analyze_local(&path, top),
+        Commands::Receipt { action } => match action {
+            ReceiptAction::Begin { path, agent } => {
+                // A hook must never block the agent. Failures go to stderr,
+                // which Claude Code keeps in its debug log.
+                if let Err(error) = receipt::begin(&path, &agent) {
+                    eprintln!("arbor receipt begin: {error}");
+                }
+                Ok(())
+            }
+            ReceiptAction::End { path, hook, json } => receipt::end(&path, hook, json),
+            ReceiptAction::List { path, limit, json } => receipt::list(&path, limit, json),
+            ReceiptAction::Show { id, path, json } => receipt::show(id.as_deref(), &path, json),
+            ReceiptAction::Undo {
+                id,
+                files,
+                unasked,
+                force,
+                path,
+            } => receipt::undo(&id, &files, unasked, force, &path),
+        },
     };
 
     if let Err(e) = result {
         eprintln!("{} {}", "error:".red().bold(), e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::log_filter;
+
+    #[test]
+    fn one_shot_commands_log_only_warnings() {
+        assert_eq!(log_filter(false, false, None), "warn");
+        assert_eq!(log_filter(false, true, None), "info");
+        assert_eq!(log_filter(true, false, None), "debug");
+        assert_eq!(
+            log_filter(false, false, Some("arbor=trace".into())),
+            "arbor=trace"
+        );
+        assert_eq!(log_filter(true, false, Some("  ".into())), "debug");
     }
 }

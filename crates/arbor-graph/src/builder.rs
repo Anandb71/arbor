@@ -6,8 +6,11 @@
 
 use crate::edge::{Edge, EdgeKind};
 use crate::graph::{ArborGraph, NodeId};
-use crate::symbol_table::SymbolTable;
-use arbor_core::{clean_type_name, type_relation_ref, CodeNode, NodeKind, TypeRelationKind};
+use crate::symbol_table::{Resolution, SymbolTable};
+use arbor_core::{
+    clean_type_name, field_type_ref, import_alias, return_type_ref, type_relation_ref,
+    typed_receiver, CodeNode, NodeKind, TypeRelationKind,
+};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use tracing::debug;
@@ -23,6 +26,22 @@ const MAX_UNKNOWN_RECEIVER_FANOUT: usize = 2;
 /// (`userService.findOne()`). The method name is real evidence, but which
 /// `findOne` it reaches is a guess.
 const UNKNOWN_RECEIVER_PENALTY: f32 = 0.55;
+
+/// Confidence for a call whose receiver's type was read from the code
+/// (`draft: &mut Draft`). Inferred, so a little below a written path.
+const TYPED_RECEIVER_CONFIDENCE: f32 = 0.9;
+
+/// How a call on a typed receiver (`.run_started@AppState.draft`) resolved.
+enum TypedReceiver {
+    /// The method on the receiver's type, or on each implementor of a trait.
+    Found(Vec<NodeId>),
+    /// The type isn't defined in this project (`reqwest::Client`): the
+    /// method is external too, and must not bind to a same-named project one.
+    External,
+    /// The type is known but its method isn't (a trait default elsewhere, a
+    /// `Deref` target, a struct from a macro). Fall back to the method name.
+    Unknown,
+}
 
 /// Builds an ArborGraph from parsed code nodes.
 pub struct GraphBuilder {
@@ -52,6 +71,15 @@ pub struct GraphBuilder {
     /// a richer call-site representation.
     namespace_imports: HashMap<String, HashMap<String, String>>,
 
+    /// Aliased imports: file → local name → the name the module defines.
+    ///
+    /// Example:
+    ///   `from money import money_to_minor_units as to_minor`
+    ///   → import_aliases["orders.py"]["to_minor"] = "money_to_minor_units"
+    ///
+    /// The module is in `import_map` under the same local name.
+    import_aliases: HashMap<String, HashMap<String, String>>,
+
     /// Go package clause per file. The parser stores `package name` as a
     /// `Module` node, and a bare call is visible only inside that package.
     go_packages: HashMap<String, String>,
@@ -71,6 +99,7 @@ impl GraphBuilder {
             name_to_id: HashMap::new(),
             import_map: HashMap::new(),
             namespace_imports: HashMap::new(),
+            import_aliases: HashMap::new(),
             go_packages: HashMap::new(),
         }
     }
@@ -103,12 +132,27 @@ impl GraphBuilder {
                             .entry(file.clone())
                             .or_default()
                             .insert(alias.to_string(), module.clone());
+                    } else if let Some((local, imported)) = import_alias(imported_name) {
+                        // `from money import money_to_minor_units as to_minor`:
+                        // calls use `to_minor`, the module defines the other.
+                        self.import_map
+                            .entry(file.clone())
+                            .or_default()
+                            .insert(local.to_string(), module.clone());
+                        self.import_aliases
+                            .entry(file.clone())
+                            .or_default()
+                            .insert(local.to_string(), imported.to_string());
                     } else {
                         // `import { name } from 'module'` or `import DefaultName from 'module'`
                         self.import_map
                             .entry(file.clone())
                             .or_default()
                             .insert(imported_name.clone(), module.clone());
+                        // A later plain import of the same name rebinds it.
+                        if let Some(aliases) = self.import_aliases.get_mut(&file) {
+                            aliases.remove(imported_name);
+                        }
                     }
                 }
                 // Import nodes are intentionally NOT added to the graph.
@@ -169,17 +213,44 @@ impl GraphBuilder {
                 // [`resolve_inheritance`](Self::resolve_inheritance), where an
                 // override can hide a base method. Falling through to a bare
                 // name here would attach the edge to the wrong definition.
-                if type_relation_ref(&reference).is_some() || receiver_method(&reference).is_some()
+                if type_relation_ref(&reference).is_some()
+                    || receiver_method(&reference).is_some()
+                    || field_type_ref(&reference).is_some()
+                    || return_type_ref(&reference).is_some()
                 {
                     continue;
+                }
+
+                // `.run_started@AppState.draft`: the receiver's type is known,
+                // so the call reaches that type's method and nothing else.
+                if let Some((method, receiver)) = typed_receiver(&reference) {
+                    match self.resolve_typed_receiver(method, receiver, &from_file) {
+                        TypedReceiver::Found(targets) => {
+                            for to_idx in targets {
+                                if to_idx != from_idx {
+                                    edges_to_add.push((
+                                        from_idx,
+                                        to_idx,
+                                        TYPED_RECEIVER_CONFIDENCE,
+                                    ));
+                                }
+                            }
+                            continue;
+                        }
+                        TypedReceiver::External => continue,
+                        TypedReceiver::Unknown => {}
+                    }
                 }
 
                 // A leading `.` marks a call on a receiver whose type we could
                 // not determine (`userService.findOne()`). Resolve it by method
                 // name, but never let it claim the confidence of a real match.
-                let (lookup, receiver_unknown) = match reference.strip_prefix('.') {
-                    Some(method) => (method, true),
-                    None => (reference.as_str(), false),
+                let (lookup, receiver_unknown) = match typed_receiver(&reference) {
+                    Some((method, _)) => (method, true),
+                    None => match reference.strip_prefix('.') {
+                        Some(method) => (method, true),
+                        None => (reference.as_str(), false),
+                    },
                 };
 
                 if lookup.is_empty() {
@@ -192,9 +263,28 @@ impl GraphBuilder {
                 // falls through to SameDir and attaches the edge to whichever
                 // definition happens to sit in the caller's own directory.
                 let file_imports = self.import_map.get(&from_file_str);
-                let resolution =
-                    self.symbol_table
-                        .resolve_ref_with_imports(lookup, &from_file, file_imports);
+                // `to_minor()` after `from money import money_to_minor_units
+                // as to_minor` calls money's function. Nothing is named
+                // `to_minor`, so looking it up finds nothing, or a same-named
+                // function in another module.
+                let alias = if receiver_unknown {
+                    None
+                } else {
+                    self.resolve_alias(lookup, &from_file, &from_file_str)
+                };
+                // `jobs::enqueue` / `Provider::new` name where the definition
+                // lives; matching only the last segment would drop the call or
+                // bind it to a same-named function in the wrong module.
+                let resolution = match alias {
+                    Some(resolution) => resolution,
+                    None if !receiver_unknown && lookup.contains("::") => {
+                        self.symbol_table.resolve_path(lookup, &from_file)
+                    }
+                    None => {
+                        self.symbol_table
+                            .resolve_ref_with_imports(lookup, &from_file, file_imports)
+                    }
+                };
 
                 if !resolution.is_resolved() {
                     // The overwhelming majority of references are stdlib or
@@ -212,7 +302,20 @@ impl GraphBuilder {
                 if receiver_unknown {
                     base_confidence *= UNKNOWN_RECEIVER_PENALTY;
                 }
-                let candidates = resolution.candidates();
+                let mut candidates = resolution.candidates();
+                // In Rust `x.f()` is always a method call (modules use `::`),
+                // so it can't reach a free function that shares the name:
+                // sqlx's `.bind(...)` is not a test helper called `bind`.
+                if receiver_unknown && from_file_str.ends_with(".rs") {
+                    candidates.retain(|id| {
+                        self.graph
+                            .get(*id)
+                            .is_some_and(|n| n.kind == NodeKind::Method)
+                    });
+                    if candidates.is_empty() {
+                        continue;
+                    }
+                }
 
                 // A receiver-unknown call to a name shared by many symbols
                 // (`get`, `run`, `execute`) is pure noise; hold it to a tighter
@@ -276,6 +379,31 @@ impl GraphBuilder {
         }
     }
 
+    /// Resolves `reference` through the caller file's aliased import of it.
+    ///
+    /// `None` when the name is not an alias there, or when the caller's own
+    /// file defines it: a local definition shadows an import, aliased or not.
+    fn resolve_alias(
+        &self,
+        reference: &str,
+        from_file: &Path,
+        from_file_str: &str,
+    ) -> Option<Resolution> {
+        let imported = self.import_aliases.get(from_file_str)?.get(reference)?;
+        let module = self.import_map.get(from_file_str)?.get(reference)?;
+        let defined_here = self
+            .symbol_table
+            .get_file_exports(&from_file.to_path_buf())
+            .is_some_and(|fqns| fqns.iter().any(|fqn| fqn == reference));
+        if defined_here {
+            return None;
+        }
+        Some(
+            self.symbol_table
+                .resolve_imported(imported, module, from_file),
+        )
+    }
+
     /// Decides whether a resolved reference may become an edge.
     ///
     /// Python and JavaScript/TypeScript bare names are file-scoped: a cross-file
@@ -293,7 +421,7 @@ impl GraphBuilder {
         to_idx: NodeId,
         base_confidence: f32,
     ) -> f32 {
-        if reference.contains('.') {
+        if reference.contains('.') || reference.contains("::") {
             return base_confidence;
         }
 
@@ -511,6 +639,185 @@ impl GraphBuilder {
         }
     }
 
+    /// Resolves a method call whose receiver type path the extractor read from
+    /// the code: `Draft`, `AppState.draft` for a field of an `AppState`, or
+    /// `prepare()` / `mac::Draft::capture().inner()` for what calls return.
+    fn resolve_typed_receiver(&self, method: &str, receiver: &str, file: &Path) -> TypedReceiver {
+        let mut segments = receiver.split('.');
+        let Some(base) = segments.next() else {
+            return TypedReceiver::Unknown;
+        };
+        let mut current = match base.strip_suffix("()") {
+            Some(callee) => match self.returned_type(self.callable(callee, file)) {
+                Ok(id) => id,
+                Err(outcome) => return outcome,
+            },
+            None => match self.type_named(base, file) {
+                Ok(id) => id,
+                Err(outcome) => return outcome,
+            },
+        };
+        for segment in segments {
+            let Some(node) = self.graph.get(current) else {
+                return TypedReceiver::Unknown;
+            };
+            let owner_file = PathBuf::from(&node.file);
+            if let Some(called) = segment.strip_suffix("()") {
+                // `draft.inner().run()`: whatever `Draft::inner` returns.
+                let path = format!("{}::{called}", node.name);
+                current = match self.returned_type(self.callable(&path, &owner_file)) {
+                    Ok(id) => id,
+                    Err(outcome) => return outcome,
+                };
+                continue;
+            }
+            let field_type = node
+                .references
+                .iter()
+                .filter_map(|reference| field_type_ref(reference))
+                .find(|(name, _)| *name == segment)
+                .map(|(_, type_name)| type_name.to_string());
+            let Some(field_type) = field_type else {
+                return TypedReceiver::Unknown;
+            };
+            current = match self.type_named(&field_type, &owner_file) {
+                Ok(id) => id,
+                Err(outcome) => return outcome,
+            };
+        }
+
+        let Some(owner) = self.graph.get(current) else {
+            return TypedReceiver::Unknown;
+        };
+        let owner_file = PathBuf::from(&owner.file);
+        let mut owners = vec![owner.name.clone()];
+        if owner.kind == NodeKind::Interface {
+            // `obs: &mut dyn RunObserver`: any implementor's method may run.
+            owners.extend(self.implementors(&owner.name, &owner_file));
+        } else {
+            // A method from a trait the type implements (a default body).
+            owners.extend(
+                owner.references.iter().filter_map(|reference| {
+                    match type_relation_ref(reference) {
+                        Some((TypeRelationKind::Implements, name)) => Some(name.to_string()),
+                        _ => None,
+                    }
+                }),
+            );
+        }
+        let mut targets = Vec::new();
+        for owner_name in owners {
+            let resolution = self
+                .symbol_table
+                .resolve_path(&format!("{owner_name}::{method}"), &owner_file);
+            for id in resolution.candidates() {
+                let is_method = self
+                    .graph
+                    .get(id)
+                    .is_some_and(|n| matches!(n.kind, NodeKind::Method | NodeKind::Function));
+                if is_method && !targets.contains(&id) {
+                    targets.push(id);
+                }
+            }
+        }
+        if targets.is_empty() || targets.len() > MAX_AMBIGUOUS_FANOUT {
+            TypedReceiver::Unknown
+        } else {
+            TypedReceiver::Found(targets)
+        }
+    }
+
+    /// One type node for `name`, or why there isn't one.
+    fn type_named(&self, name: &str, file: &Path) -> Result<NodeId, TypedReceiver> {
+        match self.resolve_type_name(name, file) {
+            Some(id) => Ok(id),
+            None if self.defines_type(name, file) => Err(TypedReceiver::Unknown),
+            None => Err(TypedReceiver::External),
+        }
+    }
+
+    /// The functions or methods a call path names: `prepare`, `drafts::load`,
+    /// `Draft::capture`.
+    fn callable(&self, path: &str, file: &Path) -> Vec<NodeId> {
+        let resolution = if path.contains("::") {
+            self.symbol_table.resolve_path(path, file)
+        } else {
+            let imports = self.import_map.get(&file.to_string_lossy().to_string());
+            self.symbol_table
+                .resolve_ref_with_imports(path, file, imports)
+        };
+        resolution
+            .candidates()
+            .into_iter()
+            .filter(|id| {
+                self.graph
+                    .get(*id)
+                    .is_some_and(|n| matches!(n.kind, NodeKind::Function | NodeKind::Method))
+            })
+            .collect()
+    }
+
+    /// The type node the given functions return, when they agree on one.
+    fn returned_type(&self, functions: Vec<NodeId>) -> Result<NodeId, TypedReceiver> {
+        let mut returned: Option<(String, PathBuf)> = None;
+        for id in functions {
+            let Some(function) = self.graph.get(id) else {
+                continue;
+            };
+            let Some(type_name) = function.references.iter().find_map(|r| return_type_ref(r))
+            else {
+                // Unit, a primitive, a tuple or an unbounded generic.
+                return Err(TypedReceiver::Unknown);
+            };
+            match &returned {
+                Some((seen, _)) if seen != type_name => return Err(TypedReceiver::Unknown),
+                Some(_) => {}
+                None => returned = Some((type_name.to_string(), PathBuf::from(&function.file))),
+            }
+        }
+        // No project function by that name: an external call, whose result
+        // may still be a project type (`serde_json::from_str::<Draft>`).
+        let Some((type_name, file)) = returned else {
+            return Err(TypedReceiver::Unknown);
+        };
+        self.type_named(&type_name, &file)
+    }
+
+    /// Whether any type in the file's language is called `name`, even if the
+    /// name is too ambiguous to pick one.
+    fn defines_type(&self, name: &str, file: &Path) -> bool {
+        self.symbol_table
+            .resolve_ref_with_imports(name, file, None)
+            .candidates()
+            .into_iter()
+            .any(|id| {
+                self.graph
+                    .get(id)
+                    .is_some_and(|node| is_inheritable_type(node.kind) && node.name == name)
+            })
+    }
+
+    /// Names of the types in `file`'s language that implement trait `name`.
+    fn implementors(&self, name: &str, file: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        for idx in self.graph.node_indexes() {
+            let Some(node) = self.graph.get(idx) else {
+                continue;
+            };
+            let implements = node.references.iter().any(|reference| {
+                matches!(type_relation_ref(reference),
+                    Some((TypeRelationKind::Implements, target)) if target == name)
+            });
+            if implements
+                && crate::symbol_table::same_language(file, Path::new(&node.file))
+                && !found.contains(&node.name)
+            {
+                found.push(node.name.clone());
+            }
+        }
+        found
+    }
+
     /// Resolves a base or interface name to one type node.
     ///
     /// A path like `pkg.Base` is tried whole, then as its last segment, so a
@@ -644,8 +951,15 @@ fn index_methods(
     HashMap<NodeId, NodeId>,
 ) {
     let mut types_by_file: HashMap<&str, Vec<&InheritedType>> = HashMap::new();
+    let mut rust_types_by_name: HashMap<&str, Vec<&InheritedType>> = HashMap::new();
     for ty in types {
         types_by_file.entry(ty.file.as_str()).or_default().push(ty);
+        if ty.file.ends_with(".rs") {
+            rust_types_by_name
+                .entry(ty.clean_name.as_str())
+                .or_default()
+                .push(ty);
+        }
     }
 
     let mut methods_of: HashMap<NodeId, BTreeMap<String, NodeId>> = HashMap::new();
@@ -664,21 +978,49 @@ fn index_methods(
         if parent.is_empty() || method_name.is_empty() {
             continue;
         }
-        let Some(file_types) = types_by_file.get(node.file.as_str()) else {
-            continue;
-        };
+        let file_types = types_by_file
+            .get(node.file.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let owners: Vec<NodeId> = file_types
             .iter()
             .filter(|ty| ty.clean_name == parent || ty.clean_qualified == parent)
             .map(|ty| ty.id)
             .collect();
-        let Some(owner) = unique_owner(&owners, |id| {
+        let owner = unique_owner(&owners, |id| {
             file_types
                 .iter()
                 .find(|ty| ty.id == id)
                 .map(|ty| ty.qualified_len)
                 .unwrap_or(0)
-        }) else {
+        })
+        .or_else(|| {
+            // A Rust `impl Provider` block may sit in any file of the crate,
+            // far from `struct Provider`. Without this its methods have no
+            // owner, and every `self.method()` call inside them is lost.
+            // Look where Rust puts it: the impl file's own module directory
+            // first, then its parents. Tests often declare their own mock
+            // `struct Provider`, so a repo-wide unique name is too strict.
+            if !node.file.ends_with(".rs") || !owners.is_empty() {
+                return None;
+            }
+            let candidates = rust_types_by_name.get(parent.as_str())?;
+            let mut dir = Path::new(&node.file).parent();
+            while let Some(current) = dir {
+                let here: Vec<NodeId> = candidates
+                    .iter()
+                    .filter(|ty| Path::new(&ty.file).parent() == Some(current))
+                    .map(|ty| ty.id)
+                    .collect();
+                match here.as_slice() {
+                    [] => dir = current.parent(),
+                    [only] => return Some(*only),
+                    _ => return None,
+                }
+            }
+            None
+        });
+        let Some(owner) = owner else {
             continue;
         };
         methods_of
@@ -1046,6 +1388,74 @@ mod tests {
     }
 
     #[test]
+    fn test_alias_import_map() {
+        let mut builder = GraphBuilder::new();
+        let import_node = CodeNode::new("money", "money", NodeKind::Import, "orders.py")
+            .with_references(vec!["alias:to_minor:money_to_minor_units".to_string()]);
+        builder.add_nodes(vec![import_node]);
+        assert_eq!(
+            builder
+                .import_map
+                .get("orders.py")
+                .and_then(|m| m.get("to_minor")),
+            Some(&"money".to_string())
+        );
+        assert_eq!(
+            builder
+                .import_aliases
+                .get("orders.py")
+                .and_then(|m| m.get("to_minor")),
+            Some(&"money_to_minor_units".to_string())
+        );
+    }
+
+    #[test]
+    fn aliased_call_reaches_the_imported_name_with_import_confidence() {
+        let mut builder = GraphBuilder::new();
+        let import = CodeNode::new("money", "money", NodeKind::Import, "orders.py")
+            .with_references(vec!["alias:to_minor:money_to_minor_units".to_string()]);
+        let caller = CodeNode::new(
+            "total_cents",
+            "total_cents",
+            NodeKind::Function,
+            "orders.py",
+        )
+        .with_references(vec!["to_minor".to_string()]);
+        let callee = CodeNode::new(
+            "money_to_minor_units",
+            "money_to_minor_units",
+            NodeKind::Function,
+            "money.py",
+        );
+        builder.add_nodes(vec![import, caller, callee]);
+        let graph = builder.build();
+        assert!(
+            only_edge_confidence(&graph) >= 0.95,
+            "an aliased import is as strong as an unaliased one"
+        );
+    }
+
+    /// `from a import x as y` then `from b import y`: the last binding wins.
+    #[test]
+    fn a_plain_import_rebinds_an_earlier_alias() {
+        let mut builder = GraphBuilder::new();
+        let aliased = CodeNode::new("a", "a", NodeKind::Import, "main.py")
+            .with_references(vec!["alias:y:x".to_string()]);
+        let plain = CodeNode::new("b", "b", NodeKind::Import, "main.py")
+            .with_references(vec!["y".to_string()]);
+        let caller = CodeNode::new("run", "run", NodeKind::Function, "main.py")
+            .with_references(vec!["y".to_string()]);
+        let x = CodeNode::new("x", "x", NodeKind::Function, "a.py");
+        let y = CodeNode::new("y", "y", NodeKind::Function, "b.py");
+        builder.add_nodes(vec![aliased, plain, caller, x, y]);
+        let graph = builder.build();
+        let edges = graph.export_edges();
+        assert_eq!(edges.len(), 1, "{edges:?}");
+        let target = graph.get_index(&edges[0].target).expect("target");
+        assert_eq!(graph.get(target).unwrap().file, "b.py");
+    }
+
+    #[test]
     fn test_build_empty_graph() {
         let builder = GraphBuilder::new();
         let graph = builder.build();
@@ -1092,6 +1502,171 @@ mod tests {
         assert!(
             confidence > 0.0 && confidence < Edge::CONFIDENT_THRESHOLD,
             "edge should exist but not be treated as proven, got {confidence}"
+        );
+    }
+
+    /// `run_started` on three types, plus a trait two of them implement.
+    fn receiver_fixture(caller_refs: &[&str]) -> ArborGraph {
+        let mut b = GraphBuilder::new();
+        let mut nodes = vec![
+            CodeNode::new("on_key", "on_key", NodeKind::Function, "src/lib.rs")
+                .with_references(caller_refs.iter().map(|r| r.to_string()).collect()),
+            CodeNode::new("AppState", "AppState", NodeKind::Struct, "src/state.rs")
+                .with_references(vec![arbor_core::field_ref("draft", "Draft")]),
+            CodeNode::new("Draft", "Draft", NodeKind::Struct, "src/draft.rs"),
+            CodeNode::new(
+                "Telemetry",
+                "Telemetry",
+                NodeKind::Struct,
+                "src/telemetry.rs",
+            ),
+            CodeNode::new("Logger", "Logger", NodeKind::Struct, "src/observer.rs"),
+            CodeNode::new(
+                "RunObserver",
+                "RunObserver",
+                NodeKind::Interface,
+                "src/observer.rs",
+            ),
+        ];
+        nodes[4].add_type_relation(TypeRelationKind::Implements, "RunObserver");
+        nodes[3].add_type_relation(TypeRelationKind::Implements, "RunObserver");
+        for (owner, file) in [
+            ("Draft", "src/draft.rs"),
+            ("Telemetry", "src/telemetry.rs"),
+            ("Logger", "src/observer.rs"),
+        ] {
+            nodes.push(CodeNode::new(
+                "run_started",
+                format!("{owner}.run_started"),
+                NodeKind::Method,
+                file,
+            ));
+        }
+        b.add_nodes(nodes);
+        b.build()
+    }
+
+    fn callees(graph: &ArborGraph) -> Vec<String> {
+        use petgraph::visit::EdgeRef;
+        let mut names: Vec<String> = graph
+            .graph
+            .edge_references()
+            .filter(|edge| edge.weight().kind == EdgeKind::Calls)
+            .filter_map(|edge| graph.get(edge.target()).map(|n| n.qualified_name.clone()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn typed_receiver_reaches_only_its_own_type() {
+        // Name-based resolution sees three `run_started` and links none.
+        assert!(callees(&receiver_fixture(&[".run_started"])).is_empty());
+        let graph = receiver_fixture(&[".run_started@Draft"]);
+        assert_eq!(callees(&graph), ["Draft.run_started"]);
+        let call = graph
+            .graph
+            .edge_weights()
+            .find(|edge| edge.kind == EdgeKind::Calls)
+            .expect("the call edge");
+        assert!((call.confidence - TYPED_RECEIVER_CONFIDENCE).abs() < 1e-6);
+    }
+
+    #[test]
+    fn typed_receiver_follows_fields_into_other_files() {
+        let graph = receiver_fixture(&[".run_started@AppState.draft"]);
+        assert_eq!(callees(&graph), ["Draft.run_started"]);
+    }
+
+    #[test]
+    fn trait_typed_receiver_reaches_each_implementor() {
+        let graph = receiver_fixture(&[".run_started@RunObserver"]);
+        assert_eq!(
+            callees(&graph),
+            ["Logger.run_started", "Telemetry.run_started"]
+        );
+    }
+
+    #[test]
+    fn external_receiver_never_binds_to_a_project_method() {
+        // `client.run_started()` on `reqwest::Client` is not Draft's method.
+        assert!(callees(&receiver_fixture(&[".run_started@Client"])).is_empty());
+    }
+
+    #[test]
+    fn project_type_without_the_method_falls_back_to_the_name() {
+        // A field this struct doesn't declare: the type is no longer known,
+        // so the call is resolved by name (here: too ambiguous to link).
+        assert!(callees(&receiver_fixture(&[".run_started@AppState.missing"])).is_empty());
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            CodeNode::new("on_key", "on_key", NodeKind::Function, "src/lib.rs")
+                .with_references(vec![".flush@Draft".to_string()]),
+            CodeNode::new("Draft", "Draft", NodeKind::Struct, "src/draft.rs"),
+            CodeNode::new("flush", "Buffer.flush", NodeKind::Method, "src/buffer.rs"),
+        ]);
+        let graph = b.build();
+        // Draft has no `flush` (a Deref target might): a weak name-based edge.
+        assert_eq!(callees(&graph), ["Buffer.flush"]);
+        assert!(only_edge_confidence(&graph) < TYPED_RECEIVER_CONFIDENCE);
+    }
+
+    #[test]
+    fn typed_receiver_follows_return_types() {
+        let mut b = GraphBuilder::new();
+        let mut prepare = CodeNode::new("prepare", "prepare", NodeKind::Function, "src/lib.rs")
+            .with_references(vec![arbor_core::returns_ref("Prepared")]);
+        prepare.line_end = 0;
+        b.add_nodes(vec![
+            CodeNode::new("on_key", "on_key", NodeKind::Function, "src/lib.rs").with_references(
+                vec![
+                    ".run_started@prepare()".to_string(),
+                    ".flush@mac::Prepared::capture().buffer()".to_string(),
+                ],
+            ),
+            prepare,
+            CodeNode::new("Prepared", "Prepared", NodeKind::Struct, "src/mac.rs"),
+            CodeNode::new("Buffer", "Buffer", NodeKind::Struct, "src/buffer.rs"),
+            CodeNode::new(
+                "capture",
+                "Prepared.capture",
+                NodeKind::Method,
+                "src/mac.rs",
+            )
+            .with_references(vec![arbor_core::returns_ref("Prepared")]),
+            CodeNode::new("buffer", "Prepared.buffer", NodeKind::Method, "src/mac.rs")
+                .with_references(vec![arbor_core::returns_ref("Buffer")]),
+            CodeNode::new(
+                "run_started",
+                "Prepared.run_started",
+                NodeKind::Method,
+                "src/mac.rs",
+            ),
+            CodeNode::new(
+                "run_started",
+                "Other.run_started",
+                NodeKind::Method,
+                "src/other.rs",
+            ),
+            CodeNode::new(
+                "run_started",
+                "Third.run_started",
+                NodeKind::Method,
+                "src/third.rs",
+            ),
+            CodeNode::new("flush", "Buffer.flush", NodeKind::Method, "src/buffer.rs"),
+            CodeNode::new("flush", "Pipe.flush", NodeKind::Method, "src/pipe.rs"),
+            CodeNode::new("flush", "Sink.flush", NodeKind::Method, "src/sink.rs"),
+        ]);
+        let graph = b.build();
+        assert_eq!(callees(&graph), ["Buffer.flush", "Prepared.run_started"]);
+    }
+
+    #[test]
+    fn field_types_are_not_calls() {
+        assert!(
+            callees(&receiver_fixture(&[])).is_empty(),
+            "a field: reference is not a call"
         );
     }
 
@@ -1853,5 +2428,624 @@ mod tests {
         assert!(!bare_name_requires_import(Path::new("lib/main.dart")));
         assert!(!bare_name_requires_import(Path::new("src/main.c")));
         assert!(!bare_name_requires_import(Path::new("Makefile")));
+    }
+}
+
+#[cfg(test)]
+mod rust_path_tests {
+    use super::*;
+    use arbor_core::NodeKind;
+
+    fn function(name: &str, file: &str, calls: &[&str]) -> CodeNode {
+        CodeNode::new(name, name, NodeKind::Function, file)
+            .with_references(calls.iter().map(|c| c.to_string()).collect())
+    }
+
+    fn method(owner: &str, name: &str, file: &str, calls: &[&str]) -> CodeNode {
+        CodeNode::new(name, format!("{owner}.{name}"), NodeKind::Method, file)
+            .with_references(calls.iter().map(|c| c.to_string()).collect())
+    }
+
+    fn callers_of(graph: &ArborGraph, name: &str, file: &str) -> Vec<String> {
+        let id = graph
+            .node_indexes()
+            .find(|id| {
+                graph
+                    .get(*id)
+                    .is_some_and(|n| n.name == name && n.file == file)
+            })
+            .unwrap_or_else(|| panic!("no {name} in {file}"));
+        let mut names: Vec<String> = graph
+            .get_callers(id)
+            .into_iter()
+            .map(|n| n.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn module_paths_resolve_to_the_named_module_and_never_across_languages() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            function("enqueue", "src/app/jobs.rs", &[]),
+            function("enqueue", "src/billing/jobs_old.rs", &[]),
+            function("enqueue", "web/src/components/Toast.tsx", &[]),
+            function("dispatch", "src/app/dispatch.rs", &["jobs::enqueue"]),
+            function("start", "web/src/lib/bridge.ts", &["enqueue"]),
+        ]);
+        let graph = b.build();
+        assert_eq!(
+            callers_of(&graph, "enqueue", "src/app/jobs.rs"),
+            vec!["dispatch"]
+        );
+        assert!(callers_of(&graph, "enqueue", "src/billing/jobs_old.rs").is_empty());
+        // The TypeScript call binds to the TypeScript definition only.
+        assert_eq!(
+            callers_of(&graph, "enqueue", "web/src/components/Toast.tsx"),
+            vec!["start"]
+        );
+    }
+
+    #[test]
+    fn mod_rs_crate_prefixes_and_re_exports_resolve() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            function("create_project", "src/app/mod.rs", &[]),
+            function("record", "src/app/audit/writer.rs", &[]),
+            function(
+                "handler",
+                "src/routes/mod.rs",
+                &["app::create_project", "app::audit::record"],
+            ),
+            function(
+                "persistence_test",
+                "tests/integration.rs",
+                &["my_app::app::create_project", "app::record"],
+            ),
+        ]);
+        let graph = b.build();
+        assert_eq!(
+            callers_of(&graph, "create_project", "src/app/mod.rs"),
+            vec!["handler", "persistence_test"]
+        );
+        // `app::record` is a `pub use audit::writer::record` re-export.
+        assert_eq!(
+            callers_of(&graph, "record", "src/app/audit/writer.rs"),
+            vec!["handler", "persistence_test"]
+        );
+    }
+
+    #[test]
+    fn external_crate_paths_do_not_bind_to_local_names() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            function("query", "src/db/queries.rs", &[]),
+            function("load", "src/routes/mod.rs", &["sqlx::query"]),
+        ]);
+        let graph = b.build();
+        assert!(callers_of(&graph, "query", "src/db/queries.rs").is_empty());
+    }
+
+    #[test]
+    fn type_paths_resolve_to_the_types_method() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            CodeNode::new(
+                "Provider",
+                "Provider",
+                NodeKind::Struct,
+                "src/billing/mod.rs",
+            ),
+            method("Provider", "new", "src/billing/mod.rs", &[]),
+            method("Fixture", "new", "tests/fixture.rs", &[]),
+            function("boot", "src/main.rs", &["Provider::new"]),
+        ]);
+        let graph = b.build();
+        assert_eq!(
+            callers_of(&graph, "new", "src/billing/mod.rs"),
+            vec!["boot"]
+        );
+        assert!(callers_of(&graph, "new", "tests/fixture.rs").is_empty());
+    }
+
+    #[test]
+    fn a_mock_struct_with_the_same_name_does_not_hide_the_real_owner() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            CodeNode::new(
+                "Provider",
+                "Provider",
+                NodeKind::Struct,
+                "src/payments/mod.rs",
+            ),
+            CodeNode::new("Provider", "Provider", NodeKind::Struct, "tests/mocks.rs"),
+            method("Provider", "owner_of", "src/payments/checkout.rs", &[]),
+            method(
+                "Provider",
+                "order_history",
+                "src/payments/cancellation.rs",
+                &["self.owner_of", ".bind"],
+            ),
+            function("bind", "src/payments/tests.rs", &[]),
+        ]);
+        let graph = b.build();
+        assert_eq!(
+            callers_of(&graph, "owner_of", "src/payments/checkout.rs"),
+            vec!["order_history"]
+        );
+        // `.bind(...)` is a method call; it can't reach a free function.
+        assert!(callers_of(&graph, "bind", "src/payments/tests.rs").is_empty());
+    }
+
+    #[test]
+    fn self_calls_reach_methods_whose_impl_is_in_another_file() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            CodeNode::new(
+                "Provider",
+                "Provider",
+                NodeKind::Struct,
+                "src/payments/mod.rs",
+            ),
+            method("Provider", "owner_of", "src/payments/checkout.rs", &[]),
+            method(
+                "Provider",
+                "order_history",
+                "src/payments/cancellation.rs",
+                &["self.owner_of"],
+            ),
+        ]);
+        let graph = b.build();
+        assert_eq!(
+            callers_of(&graph, "owner_of", "src/payments/checkout.rs"),
+            vec!["order_history"]
+        );
+    }
+}
+
+/// `from money import money_to_minor_units as to_minor` makes `to_minor()` a
+/// call to `money.money_to_minor_units` (#258).
+#[cfg(test)]
+mod import_alias_tests {
+    use super::*;
+    use petgraph::visit::{EdgeRef, IntoEdgeReferences};
+    use std::collections::BTreeSet;
+
+    /// Parses each `(path, source)` with its real language parser and builds
+    /// the graph, as `arbor index` does.
+    fn index(files: &[(&str, &str)]) -> ArborGraph {
+        let mut builder = GraphBuilder::new();
+        for (path, source) in files {
+            let ext = Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .expect("extension");
+            let parser = arbor_core::languages::get_parser(ext).expect("parser");
+            builder
+                .add_nodes(arbor_core::parse_source(source, path, parser.as_ref()).expect("parse"));
+        }
+        builder.build()
+    }
+
+    /// Every call edge, as `file::name -> file::name`.
+    fn calls(graph: &ArborGraph) -> BTreeSet<String> {
+        graph
+            .graph
+            .edge_references()
+            .filter(|e| e.weight().kind == EdgeKind::Calls)
+            .map(|e| {
+                let from = &graph.graph[e.source()];
+                let to = &graph.graph[e.target()];
+                format!("{}::{} -> {}::{}", from.file, from.name, to.file, to.name)
+            })
+            .collect()
+    }
+
+    fn edges(expected: &[&str]) -> BTreeSet<String> {
+        expected.iter().map(|e| e.to_string()).collect()
+    }
+
+    const MONEY: &str = "\
+def money_to_minor_units(amount, currency):
+    return int(round(amount * 100))
+
+
+def minor_unit_scale(currency):
+    return 2
+";
+
+    /// The eval corpus repro (`eval/corpus/py-alias`).
+    #[test]
+    fn aliased_import_call_reaches_the_imported_function() {
+        let graph = index(&[
+            ("money.py", MONEY),
+            (
+                "orders.py",
+                "\
+from money import money_to_minor_units as to_minor
+
+
+def total_cents(items):
+    return sum(to_minor(item[\"price\"], \"USD\") for item in items)
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["orders.py::total_cents -> money.py::money_to_minor_units"])
+        );
+    }
+
+    #[test]
+    fn alias_from_a_dotted_module_reaches_that_module_only() {
+        let graph = index(&[
+            ("billing/money.py", MONEY),
+            ("legacy/money.py", MONEY),
+            (
+                "app/orders.py",
+                "\
+from billing.money import money_to_minor_units as to_minor
+
+
+def total_cents(items):
+    return sum(to_minor(item, \"USD\") for item in items)
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["app/orders.py::total_cents -> billing/money.py::money_to_minor_units"])
+        );
+    }
+
+    #[test]
+    fn alias_from_a_relative_module_reaches_the_sibling_module() {
+        let graph = index(&[
+            ("shop/money.py", MONEY),
+            ("other/money.py", MONEY),
+            (
+                "shop/orders.py",
+                "\
+from .money import money_to_minor_units as to_minor
+
+
+def total_cents(items):
+    return sum(to_minor(item, \"USD\") for item in items)
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["shop/orders.py::total_cents -> shop/money.py::money_to_minor_units"])
+        );
+    }
+
+    #[test]
+    fn several_aliases_in_one_import_each_reach_their_own_target() {
+        let graph = index(&[
+            ("money.py", MONEY),
+            (
+                "orders.py",
+                "\
+from money import money_to_minor_units as to_minor, minor_unit_scale as scale
+
+
+def total_cents(amount):
+    return to_minor(amount, \"USD\") * scale(\"USD\")
+",
+            ),
+            (
+                "invoices.py",
+                "\
+from money import (
+    money_to_minor_units as cents,
+    minor_unit_scale as digits,
+)
+
+
+def invoice_total(amount):
+    return cents(amount, \"EUR\") + digits(\"EUR\")
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "invoices.py::invoice_total -> money.py::minor_unit_scale",
+                "invoices.py::invoice_total -> money.py::money_to_minor_units",
+                "orders.py::total_cents -> money.py::minor_unit_scale",
+                "orders.py::total_cents -> money.py::money_to_minor_units",
+            ])
+        );
+    }
+
+    /// `fmt_b.fmt` shares the alias's name. Resolving the local name instead
+    /// of the imported one binds the call to it.
+    #[test]
+    fn alias_reaches_its_target_not_a_function_named_like_the_alias() {
+        let graph = index(&[
+            ("fmt_a.py", "def render(value):\n    return f\"A{value}\"\n"),
+            ("fmt_b.py", "def fmt(value):\n    return f\"B{value}\"\n"),
+            (
+                "app.py",
+                "\
+from fmt_a import render as fmt
+
+
+def show(value):
+    return fmt(value)
+",
+            ),
+        ]);
+        assert_eq!(calls(&graph), edges(&["app.py::show -> fmt_a.py::render"]));
+    }
+
+    /// Only a call creates an edge: `scale` is imported and never called, and
+    /// `describe` calls neither alias.
+    #[test]
+    fn an_alias_that_is_never_called_adds_no_edge() {
+        let graph = index(&[
+            ("money.py", MONEY),
+            (
+                "orders.py",
+                "\
+from money import money_to_minor_units as to_minor, minor_unit_scale as scale
+
+
+def total_cents(amount):
+    return to_minor(amount, \"USD\")
+
+
+def describe(order):
+    return str(order)
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["orders.py::total_cents -> money.py::money_to_minor_units"])
+        );
+    }
+
+    /// A compatibility wrapper that keeps the imported function's name. The
+    /// import names another module, so the call is not a call to itself.
+    #[test]
+    fn a_wrapper_named_like_the_imported_function_reaches_the_import() {
+        let graph = index(&[
+            ("money.py", MONEY),
+            (
+                "compat.py",
+                "\
+from money import money_to_minor_units as _impl
+
+
+def money_to_minor_units(amount):
+    return _impl(amount, \"USD\")
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["compat.py::money_to_minor_units -> money.py::money_to_minor_units"])
+        );
+    }
+
+    /// As with an unaliased import, a definition in the caller's own file
+    /// outranks the import.
+    #[test]
+    fn a_local_definition_of_the_alias_name_still_shadows_the_import() {
+        let graph = index(&[
+            ("money.py", MONEY),
+            (
+                "orders.py",
+                "\
+from money import money_to_minor_units as to_minor
+
+
+def to_minor(amount, currency):
+    return amount
+
+
+def total_cents(amount):
+    return to_minor(amount, \"USD\")
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["orders.py::total_cents -> orders.py::to_minor"])
+        );
+    }
+
+    /// `numpy` is not in the project, so its `array` is not the project's.
+    #[test]
+    fn an_alias_of_an_external_name_links_nothing() {
+        let graph = index(&[
+            (
+                "helpers.py",
+                "def array(values):\n    return list(values)\n",
+            ),
+            (
+                "calc.py",
+                "\
+from numpy import array as arr
+
+
+def build(values):
+    return arr(values)
+",
+            ),
+        ]);
+        assert_eq!(calls(&graph), edges(&[]));
+    }
+
+    /// Known limit: a module is matched by name, so an external module (Node's
+    /// `http`) that shares its name with a project file binds to that file.
+    /// The alias binds exactly as the unaliased import does, no further.
+    #[test]
+    fn an_external_module_named_like_a_project_file_binds_like_a_plain_import() {
+        let graph = index(&[
+            (
+                "src/lib/http.ts",
+                "export function request(url: string): string {\n  return url;\n}\n",
+            ),
+            (
+                "src/aliased.ts",
+                "\
+import { request as httpRequest } from \"http\";
+
+export function go(url: string): string {
+  return httpRequest(url);
+}
+",
+            ),
+            (
+                "src/plain.ts",
+                "\
+import { request } from \"http\";
+
+export function go(url: string): string {
+  return request(url);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "src/aliased.ts::go -> src/lib/http.ts::request",
+                "src/plain.ts::go -> src/lib/http.ts::request",
+            ])
+        );
+    }
+
+    /// `import { formatName as fmt } from "./format"` has the same gap: the
+    /// import recorded only `fmt`.
+    #[test]
+    fn typescript_named_import_alias_reaches_the_imported_function() {
+        let graph = index(&[
+            (
+                "format.ts",
+                "export function formatName(first: string, last: string): string {\n  return `${last}, ${first}`;\n}\n",
+            ),
+            (
+                "legacy/fmt.ts",
+                "export function fmt(value: string): string {\n  return value;\n}\n",
+            ),
+            (
+                "app.ts",
+                "\
+import { formatName as fmt } from \"./format\";
+
+export function label(first: string, last: string): string {
+  return fmt(first, last);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["app.ts::label -> format.ts::formatName"])
+        );
+    }
+
+    /// `../route` is one file, read from the importing file's directory. A
+    /// Next.js app has a `route.ts` per endpoint, each exporting `POST`.
+    #[test]
+    fn a_relative_typescript_alias_reaches_only_the_file_it_names() {
+        let post = "export async function POST(req: Request) {\n  return req;\n}\n";
+        let graph = index(&[
+            ("app/api/subscribe/route.ts", post),
+            ("app/api/waitlist/route.ts", post),
+            ("app/api/admin/route.ts", post),
+            (
+                "app/api/subscribe/__tests__/route.test.ts",
+                "\
+import { POST as subscribe } from \"../route\";
+
+export async function postsTheForm(req: Request) {
+  return subscribe(req);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "app/api/subscribe/__tests__/route.test.ts::postsTheForm -> app/api/subscribe/route.ts::POST"
+            ])
+        );
+    }
+
+    /// `..money` is the parent package's `money`, not any `money.py`.
+    #[test]
+    fn a_relative_python_alias_reaches_only_the_module_it_names() {
+        let graph = index(&[
+            ("shop/money.py", MONEY),
+            ("other/money.py", MONEY),
+            (
+                "shop/checkout/orders.py",
+                "\
+from ..money import money_to_minor_units as to_minor
+
+
+def total_cents(amount):
+    return to_minor(amount, \"USD\")
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["shop/checkout/orders.py::total_cents -> shop/money.py::money_to_minor_units"])
+        );
+    }
+
+    /// `pkg/__init__.py` is the module `pkg` itself, so it is the target and a
+    /// submodule that defines the same name is not.
+    #[test]
+    fn an_alias_from_a_package_reaches_its_init_not_a_submodule() {
+        let graph = index(&[
+            ("pkg/__init__.py", "def f(x):\n    return x\n"),
+            ("pkg/sub.py", "def f(x):\n    return -x\n"),
+            (
+                "app.py",
+                "\
+from pkg import f as g
+
+
+def run(x):
+    return g(x)
+",
+            ),
+        ]);
+        assert_eq!(calls(&graph), edges(&["app.py::run -> pkg/__init__.py::f"]));
+    }
+
+    /// `subscribe/route.ts` only re-exports `POST` from another file, so the
+    /// name is not defined where the import points. Nothing else named `POST`
+    /// is the target.
+    #[test]
+    fn a_relative_alias_to_a_re_export_links_nothing_else() {
+        let post = "export async function POST(req: Request) {\n  return req;\n}\n";
+        let graph = index(&[
+            (
+                "app/api/subscribe/route.ts",
+                "export { POST } from \"../waitlist/route\";\n",
+            ),
+            ("app/api/admin/route.ts", post),
+            ("app/api/reports/route.ts", post),
+            (
+                "app/api/subscribe/__tests__/route.test.ts",
+                "\
+import { POST as subscribe } from \"../route\";
+
+export async function postsTheForm(req: Request) {
+  return subscribe(req);
+}
+",
+            ),
+        ]);
+        assert_eq!(calls(&graph), edges(&[]));
     }
 }

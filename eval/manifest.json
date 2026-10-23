@@ -1,0 +1,107 @@
+{
+  "version": 2,
+  "description": "Versioned evaluation corpus. expected/<name>.json is hand-audited truth for the fixture in corpus/<name>; known_missing/known_extra record the engine's current deltas so regressions fail and fixes must retire entries. Fixtures with before/ and after/ subdirectories are controlled changes \u2014 each state is indexed and compared independently (renames, deletions, removed exports, base-only code). Fixtures with \"suite\": \"usages\" are SDK-usage fixtures: `arbor usages . --json` is run on them and compared against expected/<name>.json (usages, clients, captured values, typed gaps, skipped vendored files, and strings that must never be output).",
+  "fixtures": [
+    {
+      "name": "py-crossfile",
+      "language": "python",
+      "covers": "cross-file calls, callers, genexpr attribution"
+    },
+    {
+      "name": "py-alias",
+      "language": "python",
+      "covers": "import-alias resolution (from X import Y as Z)"
+    },
+    {
+      "name": "py-alias-shadow",
+      "language": "python",
+      "covers": "alias named like another project function; same imported name in two modules"
+    },
+    {
+      "name": "py-alias-dotted",
+      "language": "python",
+      "covers": "aliases from a dotted module (pkg.mod) and a relative module (.mod)"
+    },
+    {
+      "name": "py-same-name",
+      "language": "python",
+      "covers": "same-name disambiguation via import filtering"
+    },
+    {
+      "name": "py-cycle",
+      "language": "python",
+      "covers": "cross-file cyclic calls"
+    },
+    {
+      "name": "mono-mixed",
+      "language": "python",
+      "covers": "monorepo layout, vendored dir, generated file"
+    },
+    {
+      "name": "py-rename",
+      "language": "python",
+      "states": [
+        "before",
+        "after"
+      ],
+      "covers": "file rename keeping symbol and re-attaching the cross-file edge"
+    },
+    {
+      "name": "py-delete",
+      "language": "python",
+      "states": [
+        "before",
+        "after"
+      ],
+      "covers": "function deleted from a surviving file; stale edge and symbol must vanish"
+    },
+    {
+      "name": "py-export-removed",
+      "language": "python",
+      "states": [
+        "before",
+        "after"
+      ],
+      "covers": "package re-export removed; stale edge is a recorded precision miss"
+    },
+    {
+      "name": "ts-crossfile",
+      "language": "typescript",
+      "covers": "named ES import and cross-file call resolution"
+    },
+    {
+      "name": "ts-alias",
+      "language": "typescript",
+      "covers": "aliased named import (import { X as Y }) named like another project function"
+    },
+    {
+      "name": "py-real-slice",
+      "language": "python",
+      "covers": "real repository code (pallets/itsdangerous exc+encoding+signer, BSD-3-Clause) with real cross-file calls"
+    },
+    {
+      "name": "py-sdk-usages",
+      "language": "python",
+      "suite": "usages",
+      "covers": "OpenAI/Anthropic/Gemini SDK usage extraction: aliasing, routing, self.client, constants, v0 API, gaps, vendored dirs, secrets"
+    },
+    {
+      "name": "py-sdk-real-slice",
+      "language": "python",
+      "suite": "usages",
+      "covers": "real SDK example code from openai-python (Apache-2.0), anthropic-sdk-python (MIT) and deprecated-generative-ai-python (Apache-2.0)"
+    },
+    {
+      "name": "py-sdk-rereview",
+      "language": "python",
+      "suite": "usages",
+      "covers": "the second review of #276 and the Track C re-measurement: bounded **DICT expansion, wider credential refusal, dict mutations, endpoints set after construction or in the environment, parameter defaults against their callers, run-time lookups, missing models, per-use scoping and the h042 loop"
+    },
+    {
+      "name": "py-sdk-rereview3",
+      "language": "python",
+      "suite": "usages",
+      "covers": "the third review of #276: nonlocal, match, except and wildcard-import bindings, globals() writes, constructor calls against __init__ defaults, subclasses and outside writes against self attributes, functions used as values, constructors chosen at run time, dict aliases through chains and attributes, candidate values with no credential, a clipped import path"
+    }
+  ]
+}

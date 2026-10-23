@@ -2,7 +2,17 @@
 
 Install Arbor without building from source.
 
-> Updated for March 2026 standards (reproducibility + safer install flows).
+## Supported Platforms
+
+| Platform | Release archive |
+|---|---|
+| Linux x86_64 | `arbor-linux-x86_64.tar.gz` |
+| Linux aarch64 | `arbor-linux-aarch64.tar.gz` |
+| macOS Intel | `arbor-macos-x86_64.tar.gz` |
+| macOS Apple Silicon | `arbor-macos-aarch64.tar.gz` |
+| Windows x86_64 | `arbor-windows-x86_64.zip` |
+
+The Linux binaries need glibc 2.28 or later: Ubuntu 20.04+, Debian 10+, RHEL, Rocky and AlmaLinux 8+, Amazon Linux 2023. Each release runs every binary on its own platform before publishing, and the Linux ones also on AlmaLinux 8, Ubuntu 22.04 and Debian 12. v3.0.3 is the exception: its Linux binaries need glibc 2.39 ([#242](https://github.com/Anandb71/arbor/issues/242)). On an older system, install that version with `cargo install` or use the Docker image. musl-based distributions such as Alpine need `cargo install` or Docker.
 
 ## Fastest Install (Recommended)
 
@@ -60,6 +70,13 @@ arbor --version
 arbor doctor
 ```
 
+Releases after v3.0.3 publish `SHA256SUMS` and a signed build provenance attestation for each archive. To check a download by hand:
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify arbor-linux-x86_64.tar.gz --repo Anandb71/arbor
+```
+
 ## Cargo Install (Alternative)
 
 If you already use Rust tooling:
@@ -68,9 +85,37 @@ If you already use Rust tooling:
 cargo install arbor-graph-cli
 ```
 
+crates.io can lag the GitHub releases. Check with `cargo search arbor-graph-cli`; if it is behind the [latest release](https://github.com/Anandb71/arbor/releases/latest), build the release tag from source instead:
+
+```bash
+cargo install --git https://github.com/Anandb71/arbor --tag v3.1.0 arbor-graph-cli
+```
+
+Run `arbor --version` afterwards. An older `arbor` earlier on your `PATH` (for example in `~/.cargo/bin`) wins over a newer one elsewhere. The crates.io crate named plain `arbor` is an unrelated project.
+
+## Scoop (Windows)
+
+The manifest lives in this repository rather than in a bucket, so install it by URL:
+
+```powershell
+scoop install https://raw.githubusercontent.com/Anandb71/arbor/main/packaging/scoop/arbor.json
+```
+
+## npm wrapper
+
+Downloads the matching release binary on install:
+
+```bash
+npx @anandb71/arbor-cli
+```
+
+## Homebrew
+
+A formula is kept at [`packaging/homebrew/arbor.rb`](../packaging/homebrew/arbor.rb), but no tap is published yet, so `brew install` cannot find it. On macOS and Linux use the install script above.
+
 ## GitHub Packages (GHCR Container)
 
-Arbor container images are published to GitHub Container Registry (GHCR) when a release is published.
+Arbor container images are published to GitHub Container Registry (GHCR) after the release workflow finishes.
 
 Pull image:
 
@@ -106,6 +151,6 @@ Release page:
 
 ---
 
-For maintainers shipping new versions across registries (GitHub Releases, crates.io, GHCR, VS Code Marketplace, Open VSX), follow:
+For maintainers shipping new versions across registries (GitHub Releases, crates.io, GHCR, npm, VS Code Marketplace, Open VSX, Scoop), follow:
 
 - [Release Runbook](./RELEASING.md)

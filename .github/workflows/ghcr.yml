@@ -15,6 +15,9 @@ permissions:
   actions: read
   contents: read
   packages: write
+  # Signing and storing the image's build provenance attestation.
+  id-token: write
+  attestations: write
 
 concurrency:
   group: ghcr-${{ github.event.workflow_run.head_branch || github.event.inputs.tag || github.ref }}
@@ -94,6 +97,7 @@ jobs:
             type=raw,value=latest
 
       - name: Build and push image
+        id: push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -103,3 +107,20 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Image references must be lowercase; github.repository is Anandb71/arbor.
+      - name: Resolve image name
+        id: image
+        run: echo "name=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      # A signed SLSA provenance statement for the pushed digest, stored next
+      # to the image. Check with
+      # `gh attestation verify oci://ghcr.io/anandb71/arbor:<tag> --repo Anandb71/arbor`.
+      # Storage records only exist for organization-owned repositories.
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false

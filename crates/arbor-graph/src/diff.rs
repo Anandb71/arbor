@@ -1,8 +1,9 @@
 //! Git-diff blast radius computation shared by CLI and MCP.
 
 use crate::{ArborGraph, NodeId};
+use arbor_core::NodeKind;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Summary of blast radius for changed files (matches CLI `arbor diff` output).
@@ -111,6 +112,12 @@ pub struct ChangedSymbols {
 /// parsers produce) cannot be positioned, so they are included whenever their
 /// file is touched. That is the conservative choice — better a slightly wide
 /// radius than a silently missing symbol.
+///
+/// A container (a module, class, trait, struct or enum) counts only when a
+/// changed line inside it falls outside all of its members: editing a method
+/// changes the method, not `mod mac` or `class Session` around it. A field, a
+/// `use` or the header itself still counts. Functions are not containers here:
+/// changing a closure inside one changes what the function does.
 pub fn changed_node_ids_for_ranges(
     graph: &ArborGraph,
     ranges: &[ChangedRange],
@@ -139,6 +146,8 @@ pub fn changed_node_ids_for_ranges(
         }
     }
 
+    let node_ids = drop_explained_containers(graph, node_ids, ranges, project_root);
+
     let mut files_without_symbol_hits: Vec<String> = ranges
         .iter()
         .map(|r| r.file.clone())
@@ -151,6 +160,110 @@ pub fn changed_node_ids_for_ranges(
         node_ids,
         files_without_symbol_hits,
     }
+}
+
+fn is_container(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Module
+            | NodeKind::Class
+            | NodeKind::Interface
+            | NodeKind::Struct
+            | NodeKind::Enum
+    )
+}
+
+/// Removes containers whose changed lines all fall inside their members.
+fn drop_explained_containers(
+    graph: &ArborGraph,
+    node_ids: Vec<NodeId>,
+    ranges: &[ChangedRange],
+    project_root: &Path,
+) -> Vec<NodeId> {
+    let containers: Vec<NodeId> = node_ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            graph
+                .get(*id)
+                .is_some_and(|node| is_container(node.kind) && node.line_end > 0)
+        })
+        .collect();
+    if containers.is_empty() {
+        return node_ids;
+    }
+
+    // Positioned spans of every symbol in the files that hold a container.
+    let files: HashSet<&str> = containers
+        .iter()
+        .filter_map(|id| graph.get(*id).map(|node| node.file.as_str()))
+        .collect();
+    let mut spans: HashMap<&str, Vec<(u32, u32)>> = HashMap::new();
+    for idx in graph.node_indexes() {
+        if let Some(node) = graph.get(idx) {
+            if node.line_end > 0 && files.contains(node.file.as_str()) {
+                spans
+                    .entry(node.file.as_str())
+                    .or_default()
+                    .push((node.line_start, node.line_end));
+            }
+        }
+    }
+
+    let explained: HashSet<NodeId> = containers
+        .into_iter()
+        .filter(|id| {
+            let Some(container) = graph.get(*id) else {
+                return false;
+            };
+            let (start, end) = (container.line_start, container.line_end);
+            let mut members: Vec<(u32, u32)> = spans
+                .get(container.file.as_str())
+                .map(|all| {
+                    all.iter()
+                        .copied()
+                        .filter(|&(s, e)| s >= start && e <= end && (s, e) != (start, end))
+                        .collect()
+                })
+                .unwrap_or_default();
+            members.sort_unstable();
+            ranges
+                .iter()
+                .filter(|range| {
+                    node_matches_changed_file(&container.file, &range.file, project_root)
+                })
+                .filter(|range| range.overlaps(start, end))
+                .all(|range| {
+                    covered(
+                        range.start_line.max(start),
+                        range.end_line.min(end),
+                        &members,
+                    )
+                })
+        })
+        .collect();
+
+    node_ids
+        .into_iter()
+        .filter(|id| !explained.contains(id))
+        .collect()
+}
+
+/// Whether every line in `[start, end]` lies inside one of the sorted `spans`.
+fn covered(start: u32, end: u32, spans: &[(u32, u32)]) -> bool {
+    let mut next = start;
+    for &(s, e) in spans {
+        if s > next {
+            break;
+        }
+        if e >= next {
+            next = e.saturating_add(1);
+            if next > end {
+                return true;
+            }
+        }
+    }
+    next > end
 }
 
 /// Extract changed line ranges from a unified diff patch for one file.
@@ -381,6 +494,82 @@ mod tests {
         let c = graph
             .add_node(CodeNode::new("c", "c", NodeKind::Function, "src/lib.rs").with_lines(40, 50));
         (graph, a, b, c)
+    }
+
+    /// `mod mac` (1-40) holding `capture` (5-15) and `finish` (20-30), plus a
+    /// struct (45-50) with no member nodes, and a function with a nested
+    /// closure node.
+    fn container_file() -> (ArborGraph, NodeId, NodeId, NodeId, NodeId, NodeId) {
+        let mut graph = ArborGraph::new();
+        let file = "src/lib.rs";
+        let module =
+            graph.add_node(CodeNode::new("mac", "mac", NodeKind::Module, file).with_lines(1, 40));
+        let capture = graph.add_node(
+            CodeNode::new("capture", "mac.capture", NodeKind::Function, file).with_lines(5, 15),
+        );
+        let finish = graph.add_node(
+            CodeNode::new("finish", "mac.finish", NodeKind::Function, file).with_lines(20, 30),
+        );
+        let config = graph
+            .add_node(CodeNode::new("Config", "Config", NodeKind::Struct, file).with_lines(45, 50));
+        let outer = graph
+            .add_node(CodeNode::new("outer", "outer", NodeKind::Function, file).with_lines(60, 80));
+        graph.add_node(
+            CodeNode::new("handler", "outer.handler", NodeKind::Function, file).with_lines(65, 70),
+        );
+        (graph, module, capture, finish, config, outer)
+    }
+
+    fn changed(graph: &ArborGraph, ranges: &[(u32, u32)]) -> Vec<NodeId> {
+        let ranges: Vec<ChangedRange> = ranges
+            .iter()
+            .map(|&(s, e)| ChangedRange::new("src/lib.rs", s, e))
+            .collect();
+        let mut ids = changed_node_ids_for_ranges(graph, &ranges, Path::new(".")).node_ids;
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn an_edit_inside_a_member_does_not_change_its_container() {
+        let (graph, _module, capture, finish, _, _) = container_file();
+        assert_eq!(changed(&graph, &[(8, 9)]), vec![capture]);
+        let mut both = vec![capture, finish];
+        both.sort();
+        assert_eq!(changed(&graph, &[(8, 9), (25, 25)]), both);
+    }
+
+    #[test]
+    fn an_edit_outside_every_member_changes_the_container() {
+        let (graph, module, capture, _, config, _) = container_file();
+        // The module header, or a line between members.
+        assert_eq!(changed(&graph, &[(1, 1)]), vec![module]);
+        assert_eq!(changed(&graph, &[(17, 17)]), vec![module]);
+        // One range across a member and the module's own lines: both.
+        let mut both = vec![module, capture];
+        both.sort();
+        assert_eq!(changed(&graph, &[(14, 17)]), both);
+        // A struct field: no member nodes, so the struct itself changed.
+        assert_eq!(changed(&graph, &[(47, 47)]), vec![config]);
+    }
+
+    #[test]
+    fn a_function_still_changes_when_its_closure_does() {
+        let (graph, _, _, _, _, outer) = container_file();
+        let ids = changed(&graph, &[(66, 66)]);
+        assert!(
+            ids.contains(&outer),
+            "functions are not containers: {ids:?}"
+        );
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn coverage_merges_adjacent_and_overlapping_spans() {
+        assert!(covered(5, 15, &[(5, 10), (11, 15)]));
+        assert!(covered(5, 15, &[(1, 12), (8, 20)]));
+        assert!(!covered(5, 15, &[(5, 10), (12, 15)]));
+        assert!(!covered(5, 15, &[]));
     }
 
     #[test]

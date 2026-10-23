@@ -8,12 +8,17 @@ on:
         required: false
         default: status .
         type: string
+  pull_request:
+    paths:
+      - action.yml
+      - .github/workflows/arbor-action-smoke.yml
 
 permissions:
   contents: read
 
 jobs:
   smoke:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -31,3 +36,102 @@ jobs:
         with:
           install-from-source: "true"
           command: ${{ github.event.inputs.command || matrix.command }}
+
+  # The in-repo workflows install from source, so nothing exercised the
+  # prebuilt download that users of `uses: Anandb71/arbor@vX` get, and it
+  # matched no release asset for as long as it existed.
+  prebuilt:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Arbor action with a released binary
+        uses: ./
+        with:
+          arbor-version: "3.0.0"
+          command: --version
+          comment-on-pr: "false"
+
+      - name: Binary came from the release, not a source build
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls "$HOME/.arbor-bin"
+          test -f "$HOME/.arbor-bin/arbor" || test -f "$HOME/.arbor-bin/arbor.exe"
+          arbor --version | grep -F "3.0.0"
+
+  # Retirements mode builds Arbor from this checkout (no release has the
+  # command yet), warns by default, and fails only when asked to.
+  retirements:
+    runs-on: ubuntu-latest
+    env:
+      # Both action runs below install from source; share one build.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: An unknown mode fails before anything is installed
+        id: typo
+        continue-on-error: true
+        uses: ./
+        with:
+          mode: retirement
+
+      - name: The unknown mode failed
+        shell: bash
+        run: test "${{ steps.typo.outcome }}" = "failure"
+
+      - name: Write a project that calls a retired model
+        shell: bash
+        run: |
+          mkdir -p smoke-retirements
+          cat > smoke-retirements/app.py <<'PY'
+          from anthropic import Anthropic
+          from openai import OpenAI
+
+          claude = Anthropic()
+          client = OpenAI()
+
+
+          def legacy():
+              return claude.messages.create(model="claude-3-5-sonnet-20241022", max_tokens=64, messages=[])
+
+
+          def current():
+              return client.chat.completions.create(model="gpt-4o", messages=[], max_tokens=64)
+          PY
+
+      - name: Retirements mode warns by default
+        uses: ./
+        with:
+          install-from-source: "true"
+          mode: retirements
+          retirements-path: smoke-retirements
+
+      - name: Retirements mode fails when asked to
+        id: strict
+        continue-on-error: true
+        uses: ./
+        with:
+          install-from-source: "true"
+          mode: retirements
+          retirements-path: smoke-retirements
+          retirements-fail-on: retired
+
+      - name: The strict run failed on the retired call
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ steps.strict.outcome }}" = "failure"
+          CODE=0
+          arbor retirements smoke-retirements --json > report.json || CODE=$?
+          test "$CODE" -eq 1
+          grep -F '"model": "claude-3-5-sonnet-20241022"' report.json
+          grep -F '"status": "retired"' report.json

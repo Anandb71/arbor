@@ -1,0 +1,26 @@
+{
+  "corpus_version": 1,
+  "language": "python",
+  "covers": ["cross-file calls", "callers", "generator-expression call attribution"],
+  "symbols": [
+    "orders.py::total_cents",
+    "orders.py::checkout_total",
+    "orders.py::apply_discount",
+    "money.py::money_to_minor_units",
+    "money.py::minor_unit_scale",
+    "main.py::run_checkout"
+  ],
+  "edges_expected": [
+    ["orders.py::checkout_total", "orders.py::total_cents"],
+    ["orders.py::checkout_total", "orders.py::apply_discount"],
+    ["orders.py::total_cents", "money.py::money_to_minor_units"],
+    ["main.py::run_checkout", "orders.py::checkout_total"]
+  ],
+  "edges_forbidden": [
+    ["main.py::run_checkout", "money.py::money_to_minor_units"],
+    ["orders.py::total_cents", "money.py::minor_unit_scale"]
+  ],
+  "known_missing": [],
+  "known_extra": [],
+  "notes": "total_cents calls money_to_minor_units inside a genexpr; correct attribution to total_cents, not the module."
+}

@@ -99,6 +99,33 @@ A class records each base at parse time, and the builder emits `extends` (or `im
 
 A bare `calls` edge is also dropped when the caller cannot see the name. In Python and JavaScript/TypeScript, a cross-file bare call stays only when that file defines the name or its import map contains the local name or `*`. In Go, a cross-file bare call stays only when both files declare the same package clause and share a directory; the clause is the `Module` node the Go parser already emits. Dotted calls are not part of this check. Other languages still keep an unimported cross-file bare name and lower its confidence. `from m import *`, a CommonJS `require`, and a qualified `module.name()` call are not resolved by this rule.
 
+### Call Resolution
+
+Parsers record each call as a reference string. The builder resolves it to a definition and stamps the edge with how it resolved (`Resolution::confidence`):
+
+| Resolution | Confidence | Meaning |
+|------------|-----------:|---------|
+| `Exact` | 1.00 | One definition with that fully qualified name |
+| `SameFile` | 0.95 | Defined in the calling file |
+| `ViaImport` | 0.93 | The calling file imports the module that defines it, or a Rust path names that module |
+| `UniqueSuffix` | 0.80 | The only definition with that name suffix in the repository |
+| `SameDir` | 0.55 | Several candidates; one sits in the caller's directory |
+| `Ambiguous` | 0.25 | Several equally plausible candidates |
+
+Only definitions in the caller's language family are candidates (TypeScript and JavaScript together; C and C++ together; Java, Kotlin and Scala together), so a TypeScript `enqueue()` never binds to a Rust `enqueue`.
+
+Reference shapes:
+
+| Shape | Example | Resolves to |
+|-------|---------|-------------|
+| `name` | `helper()` | The ranking above |
+| `module::name` | `crate::jobs::enqueue()`, `jobs::enqueue()` | A function whose file is that module (`jobs.rs`, `jobs/mod.rs`); a re-export from a submodule at lower confidence. `crate`, `self` and `super` segments and a leading crate name are skipped. A path into an external crate stays unresolved |
+| `Type::name` | `Wrapper::new()` | The method on that type, stored as `Wrapper.new`. An enum variant or external type stays unresolved |
+| `self.name` | `self.save()`, `this.save()` | The enclosing type's method, then its bases |
+| `.name` | `order.total()` | A method of that name when the receiver's type is unknown; common standard-library methods (`clone`, `unwrap`, `iter`, ...) are not recorded for Rust |
+
+Rust calls inside macro arguments (`assert!(verify())`, `format!("{}", name())`) are recorded like any other call. Generic arguments and turbofish (`parse::<u8>()`) are dropped; qualified-self paths (`<T as Trait>::f`) are not recorded.
+
 ## Graph Structure
 
 The graph is stored using an adjacency list representation:

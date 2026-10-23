@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arbor_graph::{
@@ -17,9 +17,9 @@ mod tasks;
 
 pub use http::run_http_server;
 use protocol::{
-    discover_response, legacy_capabilities, parse_request_meta, resolve_protocol_version,
-    server_capabilities, with_cache_meta, DEFAULT_TTL_MS, PROTOCOL_VERSION_LATEST,
-    PROTOCOL_VERSION_LEGACY,
+    classify_protocol_version, client_declared_extensions, discover_response, legacy_capabilities,
+    parse_request_meta, resolve_protocol_version, server_capabilities_for, with_cache_meta,
+    DEFAULT_TTL_MS, PROTOCOL_VERSION_LATEST, PROTOCOL_VERSION_LEGACY,
 };
 use tasks::TaskManager;
 
@@ -46,6 +46,62 @@ struct JsonRpcError {
     code: i32,
     message: String,
     data: Option<Value>,
+}
+
+/// How the HTTP transport answers one POSTed message.
+pub(crate) enum HttpReply {
+    /// A JSON-RPC response body with the HTTP status its outcome maps to.
+    Json(u16, String),
+    /// An accepted notification: `202 Accepted` with no body.
+    Accepted,
+}
+
+/// Caps on client-supplied sizes so one request cannot inflate a response
+/// unboundedly.
+const MAX_LIST_LIMIT: usize = 500;
+
+/// Entries of each `skipped` list (`too_large`, `unreadable`,
+/// `syntax_errors`, vendored and hidden roots) `find_api_usages` returns.
+const MAX_SKIPPED_LISTED: usize = 20;
+
+/// `find_api_usages`'s `skipped` for one page: every count, a `*_total` for
+/// each list, and the first [`MAX_SKIPPED_LISTED`] entries of each list on
+/// the first page only, so a large project's lists neither grow the
+/// response without bound nor repeat on every page.
+fn skipped_summary(skipped: &arbor_watcher::usages::Skipped, first_page: bool) -> Value {
+    fn head<T: serde::Serialize>(items: &[T], listed: usize) -> Value {
+        json!(items.iter().take(listed).collect::<Vec<_>>())
+    }
+    let listed = if first_page { MAX_SKIPPED_LISTED } else { 0 };
+    json!({
+        "vendored_files": skipped.vendored_files,
+        "vendored_files_with_usages": skipped.vendored_files_with_usages,
+        "vendored_calls": skipped.vendored_calls,
+        "vendored_roots": head(&skipped.vendored_roots, listed),
+        "vendored_roots_total": skipped.vendored_roots.len(),
+        "hidden_files": skipped.hidden_files,
+        "hidden_files_with_usages": skipped.hidden_files_with_usages,
+        "hidden_calls": skipped.hidden_calls,
+        "hidden_roots": head(&skipped.hidden_roots, listed),
+        "hidden_roots_total": skipped.hidden_roots.len(),
+        "too_large": head(&skipped.too_large, listed),
+        "too_large_total": skipped.too_large.len(),
+        "unreadable": head(&skipped.unreadable, listed),
+        "unreadable_total": skipped.unreadable.len(),
+        "syntax_errors": head(&skipped.syntax_errors, listed),
+        "syntax_errors_total": skipped.syntax_errors.len(),
+    })
+}
+const MAX_DEPTH: usize = 32;
+const MAX_TOKEN_BUDGET: usize = 64_000;
+
+/// Read a numeric argument with a default and a hard ceiling.
+fn bounded_usize(args: &Value, key: &str, default: usize, max: usize) -> usize {
+    args.get(key)
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(default)
+        .min(max)
 }
 
 pub struct McpServer {
@@ -140,12 +196,36 @@ impl McpServer {
         }
     }
 
+    /// Paths that leave the server in tool responses are project-relative —
+    /// absolute local paths are internal detail, not part of the contract.
+    fn rel_path(&self, file: &str) -> String {
+        Path::new(file)
+            .strip_prefix(&self.project_root)
+            .unwrap_or_else(|_| Path::new(file))
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
     pub async fn run_stdio(&self) -> Result<()> {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::io::BufReader;
 
         let stdin = tokio::io::stdin();
-        let mut stdout = tokio::io::stdout();
-        let mut reader = BufReader::new(stdin);
+        let stdout = tokio::io::stdout();
+        self.serve_lines(BufReader::new(stdin), stdout).await
+    }
+
+    /// The stdio protocol loop over any reader/writer pair: newline-delimited
+    /// JSON-RPC, one response per request, nothing else on the writer. Tests
+    /// drive the real transport through a duplex channel.
+    pub async fn serve_lines<R, W>(&self, reader: R, writer: W) -> Result<()>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let mut stdout = writer;
+        let mut reader = reader;
         let mut line = String::new();
 
         loop {
@@ -162,6 +242,22 @@ impl McpServer {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("Failed to parse input: {}", e);
+                    // The client still needs the JSON-RPC parse error —
+                    // swallowing it would leave a pending request unanswered.
+                    let resp = JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32700,
+                            message: format!("Parse error: {}", e),
+                            data: None,
+                        }),
+                        id: None,
+                    };
+                    let json = serde_json::to_string(&resp)?;
+                    stdout.write_all(json.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
                     continue;
                 }
             };
@@ -195,9 +291,50 @@ impl McpServer {
             }
         };
 
-        match self.handle_request(req).await {
+        match self.handle_request_inner(req, false).await {
             Some(resp) => serde_json::to_string(&resp).unwrap_or_default(),
             None => "{}".to_string(),
+        }
+    }
+
+    /// Handle one POSTed Streamable HTTP message and say how the transport
+    /// should answer. The body must be a single JSON-RPC request or
+    /// notification; arrays, responses and other shapes are invalid.
+    pub(crate) async fn handle_http_message(&self, body: &str) -> HttpReply {
+        let invalid = |code: i32, message: String| {
+            HttpReply::Json(
+                400,
+                serde_json::to_string(&JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code,
+                        message,
+                        data: None,
+                    }),
+                    id: None,
+                })
+                .unwrap_or_default(),
+            )
+        };
+        let value: Value = match serde_json::from_str(body) {
+            Ok(value) => value,
+            Err(e) => return invalid(-32700, format!("Parse error: {}", e)),
+        };
+        if !value.is_object() {
+            return invalid(
+                -32600,
+                "Invalid Request: the body must be a single JSON-RPC request or notification"
+                    .to_string(),
+            );
+        }
+        let req: JsonRpcRequest = match serde_json::from_value(value) {
+            Ok(req) => req,
+            Err(e) => return invalid(-32600, format!("Invalid Request: {}", e)),
+        };
+        match self.handle_request_inner(req, false).await {
+            Some(resp) => HttpReply::Json(200, serde_json::to_string(&resp).unwrap_or_default()),
+            None => HttpReply::Accepted,
         }
     }
 
@@ -240,10 +377,26 @@ impl McpServer {
     }
 
     async fn handle_request(&self, req: JsonRpcRequest) -> Option<JsonRpcResponse> {
+        self.handle_request_inner(req, true).await
+    }
+
+    /// `persistent` distinguishes stdio (one client owns the process, so
+    /// initialize negotiation is shared state) from HTTP (each connection
+    /// carries a single request, so negotiation must live in the request's
+    /// `_meta` and never on the shared server).
+    async fn handle_request_inner(
+        &self,
+        req: JsonRpcRequest,
+        persistent: bool,
+    ) -> Option<JsonRpcResponse> {
         let id = req.id.clone();
         let params = req.params.clone().unwrap_or(Value::Null);
         let meta = parse_request_meta(&params);
-        let negotiated = self.negotiated_protocol.read().await.clone();
+        let negotiated = if persistent {
+            self.negotiated_protocol.read().await.clone()
+        } else {
+            None
+        };
         let protocol = resolve_protocol_version(&meta, negotiated.as_deref());
 
         let result = match req.method.as_str() {
@@ -252,22 +405,37 @@ impl McpServer {
                     .get("protocolVersion")
                     .and_then(|v| v.as_str())
                     .unwrap_or(PROTOCOL_VERSION_LEGACY);
-                *self.negotiated_protocol.write().await = Some(client_version.to_string());
 
-                let caps = if client_version == PROTOCOL_VERSION_LATEST
-                    || client_version.starts_with("2026-")
-                {
-                    server_capabilities()
+                let Some(classified) = classify_protocol_version(client_version) else {
+                    return Some(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32602,
+                            message: format!(
+                                "Unsupported protocolVersion {:?}; supported: {} or {} (any later dated version negotiates the latest)",
+                                client_version, PROTOCOL_VERSION_LEGACY, PROTOCOL_VERSION_LATEST
+                            ),
+                            data: None,
+                        }),
+                        id,
+                    });
+                };
+                if persistent {
+                    *self.negotiated_protocol.write().await = Some(client_version.to_string());
+                }
+
+                let caps = if classified == PROTOCOL_VERSION_LATEST {
+                    // Extensions are opt-in features: when the client declares
+                    // `capabilities.extensions`, advertise only the ones it
+                    // understands. Clients that omit the field get the full set.
+                    server_capabilities_for(client_declared_extensions(&params).as_deref())
                 } else {
                     legacy_capabilities()
                 };
 
                 Ok(json!({
-                    "protocolVersion": if client_version.starts_with("2026-") {
-                        PROTOCOL_VERSION_LATEST
-                    } else {
-                        PROTOCOL_VERSION_LEGACY
-                    },
+                    "protocolVersion": classified,
                     "capabilities": caps,
                     "serverInfo": {
                         "name": "arbor-mcp",
@@ -424,6 +592,132 @@ impl McpServer {
                 })).unwrap_or_default()
             }]
         })
+    }
+
+    /// `find_api_usages`: the `arbor usages` scan, paginated, with every path
+    /// relative to the project root.
+    async fn find_api_usages(&self, args: &Value) -> Value {
+        const TOOL: &str = "find_api_usages";
+        let sdk = match args.get("sdk").and_then(|v| v.as_str()) {
+            None => None,
+            Some(name) => match arbor_core::usages::Sdk::parse(name) {
+                Some(sdk) => Some(sdk),
+                None => {
+                    return Self::err_envelope(
+                        TOOL,
+                        &format!("unknown sdk '{name}': use openai, anthropic or google"),
+                    )
+                }
+            },
+        };
+        let relative = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let relative_path = Path::new(relative);
+        let escapes = relative_path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        });
+        if escapes {
+            return Self::err_envelope(
+                TOOL,
+                "path must be relative to the project root and stay inside it",
+            );
+        }
+        let offset = bounded_usize(args, "offset", 0, usize::MAX);
+        let limit = bounded_usize(args, "limit", 100, MAX_LIST_LIMIT).max(1);
+        let clients_offset = bounded_usize(args, "clients_offset", 0, usize::MAX);
+        let gaps_offset = bounded_usize(args, "gaps_offset", 0, usize::MAX);
+
+        let target = self.project_root.join(relative_path);
+        let options = arbor_watcher::UsageScanOptions {
+            sdk,
+            display_root: Some(relative.to_string()),
+            ..arbor_watcher::UsageScanOptions::default()
+        };
+        let scanned =
+            tokio::task::spawn_blocking(move || arbor_watcher::scan_usages(&target, &options))
+                .await;
+        let mut report = match scanned {
+            Ok(Ok(report)) => report,
+            Ok(Err(error)) => {
+                let shown = if relative.is_empty() { "." } else { relative };
+                return Self::err_envelope(TOOL, &format!("cannot scan '{shown}': {error}"));
+            }
+            Err(error) => return Self::err_envelope(TOOL, &format!("scan failed: {error}")),
+        };
+        if relative.is_empty() {
+            report.root = ".".to_string();
+        }
+
+        let total = report.usages.len();
+        let page: Vec<_> = report
+            .usages
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect();
+        let has_more = offset.saturating_add(page.len()) < total;
+        // Clients and gaps page separately, at most MAX_LIST_LIMIT at a time.
+        let clients_total = report.clients.len();
+        let gaps_total = report.gaps.len();
+        let clients: Vec<_> = report
+            .clients
+            .drain(..)
+            .skip(clients_offset)
+            .take(MAX_LIST_LIMIT)
+            .collect();
+        let gaps: Vec<_> = report
+            .gaps
+            .drain(..)
+            .skip(gaps_offset)
+            .take(MAX_LIST_LIMIT)
+            .collect();
+        let clients_has_more = clients_offset.saturating_add(clients.len()) < clients_total;
+        let gaps_has_more = gaps_offset.saturating_add(gaps.len()) < gaps_total;
+
+        let next_symbol = page.iter().find_map(|call| call.symbol.clone());
+        let data = json!({
+            "root": report.root,
+            "sdk": report.sdk,
+            "summary": report.summary,
+            "usages": page,
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+            "hasMore": has_more,
+            "clients": clients,
+            "clients_offset": clients_offset,
+            "clients_total": clients_total,
+            "clients_hasMore": clients_has_more,
+            "gaps": gaps,
+            "gaps_offset": gaps_offset,
+            "gaps_total": gaps_total,
+            "gaps_hasMore": gaps_has_more,
+            "skipped": skipped_summary(
+                &report.skipped,
+                offset == 0 && clients_offset == 0 && gaps_offset == 0,
+            ),
+        });
+        let node_count = self.graph.read().await.node_count();
+        match next_symbol {
+            // Who reaches this SDK call? The graph answers from here.
+            Some(symbol) => Self::ok_envelope(
+                TOOL,
+                data,
+                node_count,
+                "get_callers",
+                json!({ "symbol": symbol }),
+            ),
+            None => Self::ok_envelope(TOOL, data, node_count, "get_map", json!({})),
+        }
     }
 
     fn list_tools(&self) -> Result<Value, JsonRpcError> {
@@ -615,6 +909,22 @@ impl McpServer {
                     "_meta": apps::ui_meta(apps::UI_ARCHITECTURE_MAP)
                 },
                 {
+                    "name": "find_api_usages",
+                    "description": "Finds calls to the OpenAI, Anthropic and Gemini SDKs (Python files and Python shebang scripts today): each call with file, line, enclosing symbol, client routing (openai_direct, azure_openai, custom_base_url, anthropic_bedrock, anthropic_vertex, google_genai...) and the model IDs passed as string literals, same-file constants, dict literals or parameter defaults. A literal fallback of an env/config lookup is returned with origin env_default and the call keeps a gap: confirm it before acting. Also returns client constructions, typed gaps for what could not be resolved (models from env/config, unknown client factories, getattr) and what was skipped: counts on every page, and the first 20 vendored and hidden directories, oversized, unreadable and syntax-error files on the first page. Use INSTEAD of grep to find where a deprecated model or SDK is used. Reads files directly; does not need the graph. Never returns credential values: a value is refused when any name it flows through looks like a secret (key, token, secret, password, pwd, auth, credential, private) or the value itself is credential-shaped (sk-, AIza, ghp_, xox..., URLs with a user or password, long random tokens).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "sdk": { "type": "string", "enum": ["openai", "anthropic", "google"], "description": "Only this provider's SDK" },
+                            "path": { "type": "string", "description": "Project-relative directory or file to scan (default: the whole project)" },
+                            "offset": { "type": "integer", "description": "Pagination offset for usages (default: 0)", "default": 0 },
+                            "limit": { "type": "integer", "description": "Max usages per page (default: 100)", "default": 100 },
+                            "clients_offset": { "type": "integer", "description": "Pagination offset for clients, 500 per page (default: 0)", "default": 0 },
+                            "gaps_offset": { "type": "integer", "description": "Pagination offset for gaps, 500 per page (default: 0)", "default": 0 }
+                        }
+                    },
+                    "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+                },
+                {
                     "name": "batch_query",
                     "description": "Query multiple symbols in a single call. Returns node details for all matched symbols, reducing round-trips. Optionally includes callers/callees for each.",
                     "inputSchema": {
@@ -643,6 +953,11 @@ impl McpServer {
             })?;
 
         let arguments = params.get("arguments").unwrap_or(&Value::Null);
+
+        // Reads source files directly, so it answers before indexing finishes.
+        if name == "find_api_usages" {
+            return Ok(self.find_api_usages(arguments).await);
+        }
 
         // If the graph is empty, return a task handle instead of erroring (Tasks extension)
         if self.graph.read().await.node_count() == 0 {
@@ -677,10 +992,7 @@ impl McpServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
-                let max_depth = arguments
-                    .get("max_depth")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(5) as usize;
+                let max_depth = bounded_usize(arguments, "max_depth", 5, MAX_DEPTH);
 
                 // Trigger Spotlight
                 self.trigger_spotlight(node_id).await;
@@ -710,7 +1022,7 @@ impl McpServer {
                                     "id": n.node_info.id,
                                     "name": n.node_info.name,
                                     "kind": n.node_info.kind,
-                                    "file": n.node_info.file,
+                                    "file": self.rel_path(&n.node_info.file),
                                     "severity": n.severity.as_str(),
                                     "hop_distance": n.hop_distance,
                                     "entry_edge": n.entry_edge.to_string()
@@ -726,7 +1038,7 @@ impl McpServer {
                                     "id": n.node_info.id,
                                     "name": n.node_info.name,
                                     "kind": n.node_info.kind,
-                                    "file": n.node_info.file,
+                                    "file": self.rel_path(&n.node_info.file),
                                     "severity": n.severity.as_str(),
                                     "hop_distance": n.hop_distance,
                                     "entry_edge": n.entry_edge.to_string()
@@ -742,7 +1054,7 @@ impl McpServer {
                                         "id": analysis.target.id,
                                         "name": analysis.target.name,
                                         "kind": analysis.target.kind,
-                                        "file": analysis.target.file
+                                        "file": self.rel_path(&analysis.target.file)
                                     },
                                     "confidence": {
                                         "level": confidence.level.to_string(),
@@ -845,7 +1157,7 @@ impl McpServer {
                             "id": n.id,
                             "name": n.name,
                             "kind": n.kind.to_string(),
-                            "file": n.file,
+                            "file": self.rel_path(&n.file),
                             "line": n.line_start
                         })
                     })
@@ -897,7 +1209,7 @@ impl McpServer {
                                     "id": n.id,
                                     "name": n.name,
                                     "kind": n.kind.to_string(),
-                                    "file": n.file,
+                                    "file": self.rel_path(&n.file),
                                     "line": n.line_start
                                 })
                             })
@@ -949,7 +1261,7 @@ impl McpServer {
                                     "id": n.id,
                                     "name": n.name,
                                     "kind": n.kind.to_string(),
-                                    "file": n.file,
+                                    "file": self.rel_path(&n.file),
                                     "line": n.line_start
                                 })
                             })
@@ -983,10 +1295,7 @@ impl McpServer {
                     .get("query")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let limit = arguments
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(20) as usize;
+                let limit = bounded_usize(arguments, "limit", 20, MAX_LIST_LIMIT);
                 let offset = arguments
                     .get("offset")
                     .and_then(|v| v.as_u64())
@@ -1002,7 +1311,7 @@ impl McpServer {
                             "id": n.id,
                             "name": n.name,
                             "kind": n.kind.to_string(),
-                            "file": n.file,
+                            "file": self.rel_path(&n.file),
                             "line": n.line_start
                         })
                     })
@@ -1122,7 +1431,7 @@ impl McpServer {
                                 "id": node.id,
                                 "name": node.name,
                                 "kind": node.kind.to_string(),
-                                "file": node.file,
+                                "file": self.rel_path(&node.file),
                                 "line_start": node.line_start,
                                 "line_end": node.line_end,
                                 "signature": node.signature,
@@ -1140,10 +1449,7 @@ impl McpServer {
                 }
             }
             "get_map" => {
-                let token_budget = arguments
-                    .get("tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1024) as usize;
+                let token_budget = bounded_usize(arguments, "tokens", 1024, MAX_TOKEN_BUDGET);
                 let exclude_test = arguments
                     .get("exclude_test")
                     .and_then(|v| v.as_bool())
@@ -1156,10 +1462,7 @@ impl McpServer {
                     .get("offset")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
-                let limit = arguments
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(50) as usize;
+                let limit = bounded_usize(arguments, "limit", 50, MAX_LIST_LIMIT);
 
                 self.ensure_graph_centrality().await;
                 let graph = self.graph.read().await;
@@ -1194,10 +1497,7 @@ impl McpServer {
                 ))
             }
             "get_blast_radius" => {
-                let depth = arguments
-                    .get("max_depth")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(5) as usize;
+                let depth = bounded_usize(arguments, "max_depth", 5, MAX_DEPTH);
                 let format = arguments
                     .get("format")
                     .and_then(|v| v.as_str())
@@ -1381,10 +1681,7 @@ impl McpServer {
                         message: "Missing 'source' parameter".to_string(),
                         data: None,
                     })?;
-                let max_depth = arguments
-                    .get("max_depth")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(8) as usize;
+                let max_depth = bounded_usize(arguments, "max_depth", 8, MAX_DEPTH);
 
                 self.trigger_spotlight(source).await;
                 let graph = self.graph.read().await;
@@ -1433,7 +1730,7 @@ impl McpServer {
                                 flagged_paths.push(json!({
                                     "symbol": dep_node.name,
                                     "kind": dep_node.kind.to_string(),
-                                    "file": dep_node.file,
+                                    "file": self.rel_path(&dep_node.file),
                                     "line": dep_node.line_start,
                                     "hop_distance": hop_distance
                                 }));
@@ -1459,10 +1756,7 @@ impl McpServer {
                 }
             }
             "get_architecture_overview" => {
-                let top_n = arguments
-                    .get("top_n")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(20) as usize;
+                let top_n = bounded_usize(arguments, "top_n", 20, MAX_LIST_LIMIT);
 
                 self.ensure_graph_centrality().await;
                 let graph = self.graph.read().await;
@@ -1477,7 +1771,7 @@ impl McpServer {
                                 "id": node.id,
                                 "name": node.name,
                                 "kind": node.kind.to_string(),
-                                "file": node.file,
+                                "file": self.rel_path(&node.file),
                                 "centrality": centrality
                             })
                         })
@@ -1492,7 +1786,7 @@ impl McpServer {
                         json!({
                             "name": n.name,
                             "kind": n.kind.to_string(),
-                            "file": n.file
+                            "file": self.rel_path(&n.file)
                         })
                     })
                     .collect();
@@ -1565,7 +1859,7 @@ impl McpServer {
                                     "id": node.id,
                                     "name": node.name,
                                     "kind": node.kind.to_string(),
-                                    "file": node.file,
+                                    "file": self.rel_path(&node.file),
                                     "line_start": node.line_start,
                                     "line_end": node.line_end,
                                     "centrality": graph.centrality(idx)
@@ -1574,14 +1868,14 @@ impl McpServer {
                                 if include_callers {
                                     let callers = graph.get_callers(idx);
                                     detail["callers"] = json!(callers.iter().map(|n| {
-                                        json!({ "id": n.id, "name": n.name, "kind": n.kind.to_string(), "file": n.file })
+                                        json!({ "id": n.id, "name": n.name, "kind": n.kind.to_string(), "file": self.rel_path(&n.file) })
                                     }).collect::<Vec<_>>());
                                 }
 
                                 if include_callees {
                                     let callees = graph.get_callees(idx);
                                     detail["callees"] = json!(callees.iter().map(|n| {
-                                        json!({ "id": n.id, "name": n.name, "kind": n.kind.to_string(), "file": n.file })
+                                        json!({ "id": n.id, "name": n.name, "kind": n.kind.to_string(), "file": self.rel_path(&n.file) })
                                     }).collect::<Vec<_>>());
                                 }
 
@@ -2018,7 +2312,7 @@ impl McpServer {
                             "id": n.id,
                             "name": n.name,
                             "kind": n.kind.to_string(),
-                            "file": n.file
+                            "file": self.rel_path(&n.file)
                         })
                     })
                     .collect();
@@ -2033,7 +2327,7 @@ impl McpServer {
                                 "id": node.id,
                                 "name": node.name,
                                 "kind": node.kind.to_string(),
-                                "file": node.file,
+                                "file": self.rel_path(&node.file),
                                 "centrality": centrality
                             })
                         })
@@ -2105,6 +2399,196 @@ mod tool_tests {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
         McpServer::with_project(shared, project_root)
+    }
+
+    fn tool_envelope(result: Value) -> Value {
+        let text = result["content"][0]["text"].as_str().unwrap().to_string();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn find_api_usages_scans_files_without_waiting_for_the_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("svc")).unwrap();
+        std::fs::write(
+            dir.path().join("svc/llm.py"),
+            "from openai import OpenAI\nclient = OpenAI(api_key=\"sk-test-NOT-A-REAL-KEY\")\n\ndef ask():\n    return client.chat.completions.create(model=\"gpt-3.5-turbo\", messages=[])\n",
+        )
+        .unwrap();
+        // An empty graph: other tools would return a task handle.
+        let shared: SharedGraph = Arc::new(RwLock::new(ArborGraph::new()));
+        let server = McpServer::with_project(shared, dir.path().to_path_buf());
+
+        let result = server
+            .call_tool(json!({ "name": "find_api_usages", "arguments": {} }))
+            .await
+            .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("sk-test-NOT-A-REAL-KEY"));
+        assert!(!text.contains(&dir.path().display().to_string()));
+        let envelope = tool_envelope(result);
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["tool"], "find_api_usages");
+        let data = &envelope["data"];
+        assert_eq!(data["root"], ".");
+        assert_eq!(data["total"], 1);
+        assert_eq!(data["hasMore"], false);
+        let usage = &data["usages"][0];
+        assert_eq!(usage["file"], "svc/llm.py");
+        assert_eq!(usage["routing"], "openai_direct");
+        assert_eq!(usage["values"][0]["value"], "gpt-3.5-turbo");
+        assert_eq!(envelope["meta"]["suggested_next_tool"], "get_callers");
+        assert_eq!(envelope["meta"]["suggested_next_args"]["symbol"], "ask");
+
+        let scoped = tool_envelope(
+            server
+                .call_tool(json!({
+                    "name": "find_api_usages",
+                    "arguments": { "path": "svc", "sdk": "anthropic" }
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(scoped["data"]["root"], "svc");
+        assert_eq!(scoped["data"]["total"], 0);
+        assert_eq!(scoped["data"]["clients_hasMore"], false);
+        assert_eq!(scoped["data"]["gaps_hasMore"], false);
+
+        for (args, error) in [
+            (json!({ "path": "../elsewhere" }), "stay inside"),
+            (json!({ "sdk": "cohere" }), "unknown sdk"),
+            (json!({ "path": "missing" }), "cannot scan"),
+        ] {
+            let failed = tool_envelope(
+                server
+                    .call_tool(json!({ "name": "find_api_usages", "arguments": args }))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(failed["ok"], false);
+            assert!(
+                failed["error"].as_str().unwrap().contains(error),
+                "{failed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn find_api_usages_never_returns_credentials_and_pages_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        // The five leaks from the review of #276.
+        let mut source = String::from(
+            r#"import os
+from openai import OpenAI
+
+client = OpenAI()
+OPENAI_API_KEY = "sk-proj-LEAKONE0000000000000000"
+client.chat.completions.create(model=OPENAI_API_KEY, messages=[])
+client.chat.completions.create(model="sk-ant-api03-LEAKTWO00000000000", messages=[])
+
+def f(token="sk-LEAKTHREE000000000000000"):
+    return client.chat.completions.create(model=token, messages=[])
+
+class Bot:
+    def __init__(self):
+        self.secret = "sk-LEAKFOUR0000000000000000"
+
+    def go(self):
+        return client.chat.completions.create(model=self.secret, messages=[])
+
+client.chat.completions.create(model="gpt-4", messages=[], extra_body={"sk-proj-LEAKFIVE000000000": {"model": "gpt-4"}})
+"#,
+        );
+        // Enough unresolved models to need a second page of gaps.
+        for _ in 0..501 {
+            source
+                .push_str("client.chat.completions.create(model=os.getenv(\"M\"), messages=[])\n");
+        }
+        std::fs::write(dir.path().join("leaks.py"), source).unwrap();
+        let shared: SharedGraph = Arc::new(RwLock::new(ArborGraph::new()));
+        let server = McpServer::with_project(shared, dir.path().to_path_buf());
+
+        let result = server
+            .call_tool(json!({ "name": "find_api_usages", "arguments": {} }))
+            .await
+            .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("LEAK"), "a secret was returned");
+        assert!(!text.contains("sk-"), "a key prefix was returned");
+        let data = &tool_envelope(result)["data"];
+        assert_eq!(data["gaps_total"], 505);
+        assert_eq!(data["gaps"].as_array().unwrap().len(), 500);
+        assert_eq!(data["gaps_hasMore"], true);
+        let credential = data["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|g| g["reason"] == "credential")
+            .count();
+        assert_eq!(credential, 4);
+
+        let next = tool_envelope(
+            server
+                .call_tool(json!({
+                    "name": "find_api_usages",
+                    "arguments": { "gaps_offset": 500 }
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(next["data"]["gaps"].as_array().unwrap().len(), 5);
+        assert_eq!(next["data"]["gaps_offset"], 500);
+        assert_eq!(next["data"]["gaps_hasMore"], false);
+    }
+
+    #[tokio::test]
+    async fn find_api_usages_caps_skipped_lists_and_sends_them_once() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..30 {
+            std::fs::write(
+                dir.path().join(format!("broken_{i}.py")),
+                "from openai import OpenAI
+def broken(:
+    pass
+",
+            )
+            .unwrap();
+        }
+        let shared: SharedGraph = Arc::new(RwLock::new(ArborGraph::new()));
+        let server = McpServer::with_project(shared, dir.path().to_path_buf());
+        let first = tool_envelope(
+            server
+                .call_tool(json!({ "name": "find_api_usages", "arguments": {} }))
+                .await
+                .unwrap(),
+        );
+        let skipped = &first["data"]["skipped"];
+        assert_eq!(skipped["syntax_errors"].as_array().unwrap().len(), 20);
+        assert_eq!(skipped["syntax_errors_total"], 30);
+        let later = tool_envelope(
+            server
+                .call_tool(json!({ "name": "find_api_usages", "arguments": { "gaps_offset": 1 } }))
+                .await
+                .unwrap(),
+        );
+        let skipped = &later["data"]["skipped"];
+        assert!(skipped["syntax_errors"].as_array().unwrap().is_empty());
+        assert_eq!(skipped["syntax_errors_total"], 30);
+        assert_eq!(skipped["vendored_files"], 0);
+    }
+
+    #[tokio::test]
+    async fn tools_list_has_seventeen_tools_including_find_api_usages() {
+        let server = empty_server();
+        let tools = server.list_tools().unwrap();
+        let names: Vec<&str> = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 17);
+        assert!(names.contains(&"find_api_usages"));
     }
 
     #[tokio::test]
@@ -2355,6 +2839,99 @@ mod tool_tests {
             .await
             .unwrap();
         assert_eq!(resp.result.unwrap()["protocolVersion"], "2026-07-28");
+    }
+
+    #[tokio::test]
+    async fn test_initialize_rejects_malformed_protocol_version() {
+        let server = empty_server();
+        let resp = server
+            .handle_request(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "initialize".to_string(),
+                params: Some(json!({ "protocolVersion": "banana" })),
+                id: Some(json!(1)),
+            })
+            .await
+            .unwrap();
+        let error = resp.error.unwrap();
+        assert_eq!(error.code, -32602);
+        assert!(error.message.contains(PROTOCOL_VERSION_LATEST));
+    }
+
+    #[tokio::test]
+    async fn test_initialize_future_version_negotiates_latest() {
+        let server = empty_server();
+        let resp = server
+            .handle_request(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "initialize".to_string(),
+                params: Some(json!({ "protocolVersion": "2030-01-15" })),
+                id: Some(json!(1)),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.result.unwrap()["protocolVersion"],
+            PROTOCOL_VERSION_LATEST
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initialize_legacy_version_gets_legacy_caps() {
+        let server = empty_server();
+        let resp = server
+            .handle_request(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: "initialize".to_string(),
+                params: Some(json!({ "protocolVersion": "2025-03-26" })),
+                id: Some(json!(1)),
+            })
+            .await
+            .unwrap();
+        let result = resp.result.unwrap();
+        assert_eq!(result["protocolVersion"], PROTOCOL_VERSION_LEGACY);
+        assert!(result["capabilities"]["extensions"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_http_initialize_does_not_mutate_shared_negotiation() {
+        let server = empty_server();
+        // An HTTP-mode initialize must not write the shared negotiation state —
+        // a different connection's request would otherwise observe it.
+        let resp = server
+            .handle_request_inner(
+                JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    method: "initialize".to_string(),
+                    params: Some(json!({ "protocolVersion": PROTOCOL_VERSION_LATEST })),
+                    id: Some(json!(1)),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.result.unwrap()["protocolVersion"],
+            PROTOCOL_VERSION_LATEST
+        );
+        assert!(server.negotiated_protocol.read().await.is_none());
+    }
+
+    #[test]
+    fn bounded_numeric_arguments_clamp_to_caps() {
+        let args =
+            serde_json::json!({ "limit": 10_000_000, "max_depth": 10_000, "tokens": u64::MAX });
+        assert_eq!(
+            bounded_usize(&args, "limit", 20, MAX_LIST_LIMIT),
+            MAX_LIST_LIMIT
+        );
+        assert_eq!(bounded_usize(&args, "max_depth", 5, MAX_DEPTH), MAX_DEPTH);
+        assert_eq!(
+            bounded_usize(&args, "tokens", 1024, MAX_TOKEN_BUDGET),
+            MAX_TOKEN_BUDGET
+        );
+        let empty = serde_json::json!({});
+        assert_eq!(bounded_usize(&empty, "limit", 20, MAX_LIST_LIMIT), 20);
     }
 
     #[tokio::test]

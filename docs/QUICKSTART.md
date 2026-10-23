@@ -79,6 +79,9 @@ arbor explain validate_input
 # Preview impact for current git diff
 arbor diff
 
+# Preview a whole branch the way its pull request will show it
+arbor diff --base origin/main
+
 # CI safety gate (fails on risky blast radius)
 arbor check --max-blast-radius 30
 
@@ -181,6 +184,6 @@ If `arbor check` fails, run focused tests before merge and include blast-radius 
 - [Supported Languages](./ADDING_LANGUAGES.md)
 - [MCP Protocol](./PROTOCOL.md)
 - [MCP Integration](./MCP_INTEGRATION.md)
-- [Release Notes (v1.6)](./RELEASE_NOTES_v1.6.0.md)
-- [Release Notes (v1.6.2)](./RELEASE_NOTES_v1.6.2.md)
+- [Release Notes (v3.1.0)](./RELEASE_NOTES_v3.1.0.md)
+- [Changelog](../CHANGELOG.md)
 - [Glama MCP Directory Listing](https://glama.ai/mcp/servers/@Anandb71/arbor)

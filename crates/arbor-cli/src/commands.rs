@@ -17,12 +17,55 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 struct DiffSummary {
     changed_files: Vec<String>,
     changed_symbols: usize,
+    /// Symbols that existed before the change and were edited. Blast radius
+    /// is measured from these alone.
+    modified_symbols: usize,
+    /// Symbols the change introduces. Nothing existing calls them yet.
+    added_symbols: usize,
+    added_names: Vec<String>,
+    /// Each modified symbol with where it is and how many non-test callers
+    /// it has, busiest first: where a reviewer should look.
+    modified: Vec<ModifiedSymbol>,
+    /// `(path, "Added" | "Modified" | "Renamed")` for each changed file.
+    file_status: Vec<(String, &'static str)>,
+    deleted_files: Vec<String>,
+    /// What was compared, e.g. "uncommitted changes against HEAD".
+    compared: String,
+    /// Tests that call the modified code. They are worth running, but they are
+    /// not impact: counting them as callers or as API entrypoints made any
+    /// well-tested function look critical.
+    tests_exercising: usize,
     direct_callers: usize,
     indirect_callers: usize,
     entrypoints_affected: usize,
     files_likely_updates: usize,
     blast_radius_nodes: usize,
     mermaid_diagram: Option<String>,
+}
+
+/// A symbol the change edited, for the report.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ModifiedSymbol {
+    name: String,
+    file: String,
+    line: u32,
+    direct_callers: usize,
+}
+
+/// `file` relative to `root`, with forward slashes, for display.
+fn display_path(file: &str, root: &Path) -> String {
+    // Windows' extended-length prefix (`\\?\C:\...`) never reaches a reader.
+    let file = normalize_slashes(file)
+        .trim_start_matches("//?/")
+        .to_string();
+    let root = normalize_slashes(&root.to_string_lossy());
+    let root = root.trim_start_matches("//?/").trim_end_matches('/');
+    let relative = if file.len() > root.len() && file[..root.len()].eq_ignore_ascii_case(root) {
+        file[root.len()..].trim_start_matches('/')
+    } else {
+        file.as_str()
+    };
+    relative.to_string()
 }
 
 const ROOT_MARKERS: &[&str] = &[
@@ -100,7 +143,7 @@ pub(crate) fn resolve_project_path(path: &Path) -> Result<PathBuf> {
 /// different repo) don't silently create a `.arbor/` and write a cache into it.
 /// Resolution order: `ARBOR_AUTO_INDEX` env var, then `auto_index` in the
 /// global config (`~/.arbor/config.json`), then `false`.
-fn auto_index_enabled() -> bool {
+pub(crate) fn auto_index_enabled() -> bool {
     if let Ok(val) = std::env::var("ARBOR_AUTO_INDEX") {
         return matches!(
             val.trim().to_lowercase().as_str(),
@@ -119,7 +162,7 @@ fn global_config_auto_index() -> Option<bool> {
 }
 
 /// Returns true if `path` has already been indexed (has a `.arbor/` directory).
-fn project_is_indexed(path: &Path) -> bool {
+pub(crate) fn project_is_indexed(path: &Path) -> bool {
     path.join(".arbor").exists()
 }
 
@@ -136,6 +179,21 @@ fn not_indexed_error(path: &Path) -> Box<dyn std::error::Error> {
     .into()
 }
 
+/// Name the path Arbor failed to write, and the fix when access was refused.
+/// A bare "Access is denied. (os error 5)" says neither.
+pub(crate) fn write_error(path: &Path, error: std::io::Error) -> Box<dyn std::error::Error> {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => format!(
+            "Arbor could not write {}: {error}.\n  \
+             Check that your user can write there, or run Arbor on a copy of the project you own.",
+            path.display()
+        )
+        .into(),
+        _ => format!("Arbor could not write {}: {error}", path.display()).into(),
+    }
+}
+
 /// Ensures `.arbor/` exists for an *implicit* (non-`index`/`init`) command.
 ///
 /// If the project is already indexed, this is a no-op create. If it is NOT
@@ -148,6 +206,23 @@ fn ensure_arbor_initialized(path: &Path) -> Result<bool> {
     init_arbor_dir(path)
 }
 
+/// What `.arbor/.gitignore` holds: everything in the folder is local state.
+const ARBOR_GITIGNORE: &str = concat!(
+    "# Arbor's local graph and receipts. Receipts include the text of your prompts.\n",
+    "# Keep them out of git. To share config.json, add a line: !config.json\n",
+    "*\n",
+);
+
+/// Keeps `.arbor/` out of git by giving it its own `.gitignore`, so one
+/// `git add -A` can't commit the graph or saved prompts. An existing file is
+/// left alone, and a failure to write it doesn't fail the command.
+pub(crate) fn ignore_arbor_dir(project: &Path) {
+    let gitignore = project.join(".arbor").join(".gitignore");
+    if !gitignore.exists() {
+        let _ = fs::write(gitignore, ARBOR_GITIGNORE);
+    }
+}
+
 /// Creates and populates `.arbor/` unconditionally. Used by the explicit
 /// `init`/`index`/`setup` commands, which always opt the user into indexing.
 fn init_arbor_dir(path: &Path) -> Result<bool> {
@@ -155,8 +230,10 @@ fn init_arbor_dir(path: &Path) -> Result<bool> {
     let config_path = arbor_dir.join("config.json");
 
     if !arbor_dir.exists() {
-        fs::create_dir_all(&arbor_dir)?;
+        fs::create_dir_all(&arbor_dir).map_err(|e| write_error(&arbor_dir, e))?;
     }
+    // Also on an existing folder, so projects indexed by an older Arbor get it.
+    ignore_arbor_dir(path);
 
     if !config_path.exists() {
         let default_config = serde_json::json!({
@@ -175,7 +252,8 @@ fn init_arbor_dir(path: &Path) -> Result<bool> {
             ],
             "ignore": ["node_modules", "target", "dist", "__pycache__", ".venv", "build", "out", "vendor", "*.min.js", "*.min.css"]
         });
-        fs::write(&config_path, serde_json::to_string_pretty(&default_config)?)?;
+        fs::write(&config_path, serde_json::to_string_pretty(&default_config)?)
+            .map_err(|e| write_error(&config_path, e))?;
         return Ok(true);
     }
 
@@ -226,7 +304,81 @@ fn save_graph_binary(path: &Path, graph: &arbor_graph::ArborGraph) -> Result<()>
     let bytes = bincode::serialize(graph)?;
     fs::write(&tmp_path, bytes)?;
     fs::rename(&tmp_path, &graph_path)?;
+    record_indexed_head(path);
+    let _ = fs::write(graph_builder_path(path), arbor_graph::store::CACHE_VERSION);
     Ok(())
+}
+
+fn indexed_head_path(path: &Path) -> PathBuf {
+    path.join(".arbor").join("graph.head")
+}
+
+fn graph_builder_path(path: &Path) -> PathBuf {
+    path.join(".arbor").join("graph.builder")
+}
+
+/// Whether the saved graph came from a different extractor: another Arbor
+/// version, or one from before graphs were stamped. Its edges were resolved
+/// by other rules, and without this check an upgrade kept answering with
+/// them until some source file happened to change.
+fn built_by_another_extractor(path: &Path) -> bool {
+    let has_graph = graph_binary_path(path).exists() || graph_snapshot_path(path).exists();
+    has_graph
+        && fs::read_to_string(graph_builder_path(path))
+            .map(|stamp| stamp.trim() != arbor_graph::store::CACHE_VERSION)
+            .unwrap_or(true)
+}
+
+fn current_head(path: &Path) -> Option<String> {
+    run_git(path, &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .ok()
+        .filter(|sha| !sha.is_empty())
+}
+
+/// Remembers which commit the saved graph was built from, so a later read can
+/// tell that a checkout or a new commit moved HEAD out from under it.
+fn record_indexed_head(path: &Path) {
+    match current_head(path) {
+        Some(sha) => {
+            let _ = fs::write(indexed_head_path(path), sha);
+        }
+        None => {
+            let _ = fs::remove_file(indexed_head_path(path));
+        }
+    }
+}
+
+/// `(indexed, current)` when HEAD moved since the graph was saved. A graph
+/// saved before this was recorded compares as unmoved; the source-mtime
+/// check still applies to it.
+fn head_moved(path: &Path) -> Option<(String, String)> {
+    let indexed = fs::read_to_string(indexed_head_path(path)).ok()?;
+    let indexed = indexed.trim().to_string();
+    let current = current_head(path)?;
+    (!indexed.is_empty() && indexed != current).then_some((indexed, current))
+}
+
+/// Whether another process (a running `arbor bridge` or `watch`) holds the
+/// index cache. The sled database that `.arbor/cache` holds keeps an
+/// exclusive lock on its `db` file only while it is open, so probe that lock.
+/// The file merely existing proves nothing: every `arbor index` leaves one,
+/// and treating that as a live bridge switched staleness checks off for good.
+fn index_cache_in_use(path: &Path) -> bool {
+    use fs2::FileExt;
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(graph_store_path(path).join("db"))
+    else {
+        return false;
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            false
+        }
+        Err(_) => true,
+    }
 }
 
 fn load_graph_snapshot(path: &Path) -> Result<arbor_graph::ArborGraph> {
@@ -281,13 +433,8 @@ fn load_graph_from_store(path: &Path) -> Result<arbor_graph::ArborGraph> {
 }
 
 /// Returns the modified time of a cache file in seconds since the UNIX epoch.
-fn cache_mtime_secs(cache_path: &Path) -> Option<u64> {
-    fs::metadata(cache_path)
-        .and_then(|m| m.modified())
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs())
+fn cache_mtime(cache_path: &Path) -> Option<u64> {
+    arbor_watcher::mtime_nanos(cache_path)
 }
 
 /// Returns true if a source file is newer than the freshest cache file,
@@ -297,7 +444,7 @@ fn cache_is_stale(path: &Path) -> bool {
     // periodic writer keeps graph.bin current, so prefer whichever is newer.
     let newest = [graph_binary_path(path), graph_snapshot_path(path)]
         .iter()
-        .filter_map(|p| cache_mtime_secs(p))
+        .filter_map(|p| cache_mtime(p))
         .max();
     match newest {
         Some(cache_mtime) => arbor_watcher::sources_newer_than(path, cache_mtime, false),
@@ -305,7 +452,23 @@ fn cache_is_stale(path: &Path) -> bool {
     }
 }
 
-fn load_or_index_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
+/// Re-index now, reusing the per-file cache so only changed files are parsed.
+/// For callers that must see edits made moments ago (agent turn receipts),
+/// where a staleness check is one more thing that can be fooled.
+pub(crate) fn refresh_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
+    let result = index_directory(
+        path,
+        IndexOptions {
+            cache_path: Some(path.join(".arbor").join("cache")),
+            ..IndexOptions::default()
+        },
+    )?;
+    save_graph_snapshot(path, &result.graph)?;
+    save_graph_binary(path, &result.graph)?;
+    Ok(result.graph)
+}
+
+pub(crate) fn load_or_index_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
     // Refuse to index an un-indexed project unless auto-indexing is enabled —
     // this is the choke point for read commands that don't call
     // ensure_arbor_initialized first, and prevents writing a cache into a
@@ -314,21 +477,44 @@ fn load_or_index_graph(path: &Path) -> Result<arbor_graph::ArborGraph> {
         return Err(not_indexed_error(path));
     }
 
-    // When a bridge is running it keeps graph.bin fresh via its own persister —
-    // skip the staleness check to avoid a redundant re-index that races with
-    // the bridge's writes.
-    let store_path = graph_store_path(path);
-    let bridge_may_be_running = store_path.join("db").exists();
-
-    let stale = !bridge_may_be_running && cache_is_stale(path);
-    if !stale {
-        if let Ok(graph) = load_graph_binary(path) {
-            return Ok(graph);
+    // A running bridge keeps graph.bin fresh through its own persister and
+    // holds the cache lock, so don't race it with a re-index. Otherwise a
+    // source newer than the graph, or a HEAD that moved (checkout, commit,
+    // rebase), means the graph is stale: refresh it through the per-file
+    // cache, which re-parses only what changed.
+    let bridge_may_be_running = index_cache_in_use(path);
+    let moved = head_moved(path);
+    if bridge_may_be_running {
+        if let Some((indexed, current)) = &moved {
+            eprintln!(
+                "note: the graph was built at {} but HEAD is now {}. A running `arbor bridge` holds the index and will catch up; stop it and run `arbor index` to refresh now.",
+                &indexed[..indexed.len().min(7)],
+                &current[..current.len().min(7)]
+            );
         }
-
-        if let Ok(graph) = load_graph_snapshot(path) {
-            return Ok(graph);
+    } else {
+        let other_extractor = built_by_another_extractor(path);
+        if moved.is_some() || other_extractor || cache_is_stale(path) {
+            if let Some((indexed, current)) = &moved {
+                eprintln!(
+                    "note: HEAD moved from {} to {} since the last index; refreshing the graph.",
+                    &indexed[..indexed.len().min(7)],
+                    &current[..current.len().min(7)]
+                );
+            } else if other_extractor {
+                eprintln!(
+                    "note: the saved graph was built by a different Arbor version; rebuilding it."
+                );
+            }
+            return refresh_graph(path);
         }
+    }
+
+    if let Ok(graph) = load_graph_binary(path) {
+        return Ok(graph);
+    }
+    if let Ok(graph) = load_graph_snapshot(path) {
+        return Ok(graph);
     }
 
     // Only try sled store if no snapshot files exist AND no bridge/server
@@ -358,13 +544,235 @@ fn run_git(path: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn is_git_repo(path: &Path) -> bool {
-    Command::new("git")
+/// What git can tell us about a project directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GitAvailability {
+    /// No `git` executable could be started.
+    Missing,
+    /// Git runs, but the directory is not inside a work tree (or does not exist).
+    NotARepository,
+    /// Git found a repository but would not use it, for example because of
+    /// "dubious ownership". Holds git's own explanation, which says how to fix it.
+    Refused(String),
+    /// The directory is inside a git work tree.
+    Repository,
+}
+
+pub(crate) fn git_availability(path: &Path) -> GitAvailability {
+    git_availability_with("git", path)
+}
+
+fn git_availability_with(program: &str, path: &Path) -> GitAvailability {
+    // Spawning with a missing working directory also reports NotFound, which
+    // would be misread as "git is not installed".
+    if !path.is_dir() {
+        return GitAvailability::NotARepository;
+    }
+    match Command::new(program)
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(path)
+        // Untranslated, so "not a git repository" can be recognised below.
+        .env("LC_ALL", "C")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => GitAvailability::Missing,
+        Err(error) => GitAvailability::Refused(format!("git could not be started: {error}")),
+        // Inside .git or a bare repository git succeeds but prints "false".
+        Ok(output) if output.status.success() && output.stdout.trim_ascii() == b"true" => {
+            GitAvailability::Repository
+        }
+        Ok(output) if output.status.success() => GitAvailability::NotARepository,
+        Ok(output) => classify_git_failure(&String::from_utf8_lossy(&output.stderr)),
+    }
+}
+
+/// Tell "no repository here" apart from git refusing the one it found.
+fn classify_git_failure(stderr: &str) -> GitAvailability {
+    let reason = stderr.trim();
+    if reason.is_empty() || reason.contains("not a git repository") {
+        GitAvailability::NotARepository
+    } else {
+        GitAvailability::Refused(reason.to_string())
+    }
+}
+
+pub(crate) fn is_git_repo(path: &Path) -> bool {
+    git_availability(path) == GitAvailability::Repository
+}
+
+/// The actionable reason `command` cannot run in `path`, or `None` when git is
+/// installed and `path` is inside a repository.
+pub(crate) fn git_prerequisite_error(path: &Path, command: &str) -> Option<String> {
+    git_prerequisite_message(git_availability(path), path, command)
+}
+
+fn git_prerequisite_message(
+    availability: GitAvailability,
+    path: &Path,
+    command: &str,
+) -> Option<String> {
+    match availability {
+        GitAvailability::Repository => None,
+        GitAvailability::Missing => Some(format!(
+            "{command} needs git, but no `git` executable was found on PATH.\n  \
+             Install Git (https://git-scm.com/downloads) or add it to PATH, then run it again."
+        )),
+        GitAvailability::NotARepository => Some(format!(
+            "{command} needs a git repository, and {} is not inside one.\n  \
+             Run it from your project's repository, or run `git init` there first.",
+            path.display()
+        )),
+        GitAvailability::Refused(reason) => Some(format!(
+            "{command} could not use the git repository at {}. Git said:\n{}",
+            path.display(),
+            indent(&reason)
+        )),
+    }
+}
+
+fn indent(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Fail with an actionable message unless git is installed and `path` is a repository.
+///
+/// Call it before `ensure_arbor_initialized`: outside a repository git is the
+/// real blocker, and auto-index would otherwise create `.arbor/` there first.
+pub(crate) fn require_git_repo(path: &Path, command: &str) -> Result<()> {
+    match git_prerequisite_error(path, command) {
+        Some(message) => Err(message.into()),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod git_prerequisite_tests {
+    use super::{
+        classify_git_failure, git_availability_with, git_prerequisite_message, GitAvailability,
+    };
+    use std::path::Path;
+
+    const DUBIOUS: &str = "fatal: detected dubious ownership in repository at '/work/app'\n\
+        '/work/app' is owned by:\n\t1000\nbut the current user is:\n\t0\n\
+        To add an exception for this directory, call:\n\n\
+        \tgit config --global --add safe.directory /work/app\n";
+
+    #[test]
+    fn git_refusing_a_repository_is_not_reported_as_no_repository() {
+        assert_eq!(
+            classify_git_failure(
+                "fatal: not a git repository (or any of the parent directories): .git\n"
+            ),
+            GitAvailability::NotARepository
+        );
+        assert_eq!(classify_git_failure(""), GitAvailability::NotARepository);
+        assert_eq!(
+            classify_git_failure(DUBIOUS),
+            GitAvailability::Refused(DUBIOUS.trim().to_string())
+        );
+    }
+
+    #[test]
+    fn a_refusal_passes_on_git_s_own_fix() {
+        let message = git_prerequisite_message(
+            classify_git_failure(DUBIOUS),
+            Path::new("app"),
+            "arbor diff",
+        )
+        .unwrap();
+        assert!(
+            message.starts_with("arbor diff could not use the git repository at app. Git said:\n"),
+            "{message}"
+        );
+        assert!(
+            message.contains("\n  \tgit config --global --add safe.directory /work/app"),
+            "{message}"
+        );
+    }
+
+    const NO_SUCH_GIT: &str = "arbor-test-no-such-git-executable";
+
+    #[test]
+    fn a_missing_git_executable_is_reported_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            git_availability_with(NO_SUCH_GIT, dir.path()),
+            GitAvailability::Missing
+        );
+    }
+
+    #[test]
+    fn a_missing_directory_is_not_mistaken_for_a_missing_git() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            git_availability_with(NO_SUCH_GIT, &dir.path().join("gone")),
+            GitAvailability::NotARepository
+        );
+    }
+
+    #[test]
+    fn a_plain_directory_is_not_a_repository_until_git_init() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            git_availability_with("git", dir.path()),
+            GitAvailability::NotARepository
+        );
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            git_availability_with("git", dir.path()),
+            GitAvailability::Repository
+        );
+    }
+
+    #[test]
+    fn the_git_directory_itself_is_not_a_work_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            git_availability_with("git", &dir.path().join(".git")),
+            GitAvailability::NotARepository
+        );
+    }
+
+    #[test]
+    fn messages_name_the_command_the_problem_and_the_fix() {
+        let path = Path::new("work").join("app");
+        assert!(
+            git_prerequisite_message(GitAvailability::Repository, &path, "arbor diff").is_none()
+        );
+
+        let missing =
+            git_prerequisite_message(GitAvailability::Missing, &path, "arbor diff").unwrap();
+        assert!(missing.starts_with("arbor diff needs git,"), "{missing}");
+        assert!(missing.contains("PATH"), "{missing}");
+        assert!(
+            missing.contains("https://git-scm.com/downloads"),
+            "{missing}"
+        );
+
+        let outside =
+            git_prerequisite_message(GitAvailability::NotARepository, &path, "arbor diff").unwrap();
+        assert!(
+            outside.starts_with("arbor diff needs a git repository,"),
+            "{outside}"
+        );
+        assert!(outside.contains(&path.display().to_string()), "{outside}");
+        assert!(outside.contains("git init"), "{outside}");
+    }
 }
 
 fn parse_git_name_status_output(output: &str) -> Vec<String> {
@@ -400,7 +808,7 @@ fn parse_git_name_status_output(output: &str) -> Vec<String> {
         .collect()
 }
 
-fn is_generated_or_internal_path(path: &str) -> bool {
+pub(crate) fn is_generated_or_internal_path(path: &str) -> bool {
     let normalized = normalize_slashes(path).to_lowercase();
     let with_boundary = format!("/{normalized}/");
 
@@ -546,23 +954,6 @@ fn node_matches_changed_file(node_file: &str, changed_file: &str, project_root: 
     node_norm == abs_norm
 }
 
-fn changed_node_ids(
-    graph: &arbor_graph::ArborGraph,
-    changed_files: &[String],
-    project_root: &Path,
-) -> Vec<arbor_graph::NodeId> {
-    graph
-        .node_indexes()
-        .filter(|idx| {
-            graph.get(*idx).is_some_and(|node| {
-                changed_files
-                    .iter()
-                    .any(|f| node_matches_changed_file(&node.file, f, project_root))
-            })
-        })
-        .collect()
-}
-
 fn compute_diff_summary(
     graph: &arbor_graph::ArborGraph,
     changed_files: Vec<String>,
@@ -574,25 +965,47 @@ fn compute_diff_summary(
     let mut indirect_callers = std::collections::HashSet::new();
     let mut affected_nodes = std::collections::HashSet::new();
     let mut affected_files = std::collections::HashSet::new();
+    let mut tests_exercising = std::collections::HashSet::new();
+    let mut modified = Vec::new();
 
+    // Impact is what may break: the callers of the edited code, directly or
+    // through other callers. What the edited code itself calls is unchanged
+    // by the edit, so it is not counted.
     for node_id in changed_node_ids.iter().copied() {
         let analysis = graph.analyze_impact(node_id, max_depth);
+        let mut own_direct = 0;
 
         for up in &analysis.upstream {
+            if is_test_file(&up.node_info.file) {
+                tests_exercising.insert(up.node_info.id.clone());
+                continue;
+            }
             affected_nodes.insert(up.node_info.id.clone());
             affected_files.insert(up.node_info.file.clone());
             if up.hop_distance <= 1 {
+                own_direct += 1;
                 direct_callers.insert(up.node_info.id.clone());
             } else {
                 indirect_callers.insert(up.node_info.id.clone());
             }
         }
 
-        for down in &analysis.downstream {
-            affected_nodes.insert(down.node_info.id.clone());
-            affected_files.insert(down.node_info.file.clone());
+        if let Some(node) = graph.get(node_id) {
+            modified.push(ModifiedSymbol {
+                name: node.qualified_name.clone(),
+                file: display_path(&node.file, project_root),
+                line: node.line_start,
+                direct_callers: own_direct,
+            });
         }
     }
+    // Busiest first, then by place, so the order is stable.
+    modified.sort_by(|a, b| {
+        b.direct_callers
+            .cmp(&a.direct_callers)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+    });
 
     let entrypoints_affected = affected_nodes
         .iter()
@@ -674,8 +1087,19 @@ fn compute_diff_summary(
     };
 
     DiffSummary {
+        file_status: changed_files
+            .iter()
+            .map(|f| (f.clone(), "Modified"))
+            .collect(),
         changed_files,
         changed_symbols: changed_node_ids.len(),
+        modified_symbols: changed_node_ids.len(),
+        added_symbols: 0,
+        added_names: Vec::new(),
+        modified,
+        deleted_files: Vec::new(),
+        compared: String::new(),
+        tests_exercising: tests_exercising.len(),
         direct_callers: direct_callers.len(),
         indirect_callers: indirect_callers.len(),
         entrypoints_affected,
@@ -685,15 +1109,86 @@ fn compute_diff_summary(
     }
 }
 
+/// Graph, changed symbols and impact for a change set. Blast radius comes
+/// from modified symbols only: a new symbol has no existing callers.
+fn change_impact(
+    root: &Path,
+    set: &crate::changes::ChangeSet,
+    depth: usize,
+) -> Result<(
+    arbor_graph::ArborGraph,
+    crate::changes::Symbols,
+    DiffSummary,
+)> {
+    let graph = load_or_index_graph(root)?;
+    let symbols = set.symbols(&graph, root);
+    let mut summary =
+        compute_diff_summary(&graph, set.paths(), symbols.modified.clone(), depth, root);
+    summary.modified_symbols = symbols.modified.len();
+    summary.added_symbols = symbols.added.len();
+    summary.changed_symbols = symbols.modified.len() + symbols.added.len();
+    summary.added_names = symbols
+        .added
+        .iter()
+        .filter_map(|id| graph.get(*id).map(|n| n.qualified_name.clone()))
+        .collect();
+    summary.file_status = set
+        .files
+        .iter()
+        .map(|f| (f.path.clone(), f.status.label()))
+        .collect();
+    summary.deleted_files = set.deleted.clone();
+    summary.compared = set.description.clone();
+    Ok((graph, symbols, summary))
+}
+
+fn no_changes_message(scope: &crate::changes::Scope) -> &'static str {
+    match scope {
+        crate::changes::Scope::WorkingTree => "No modified files detected against HEAD.",
+        crate::changes::Scope::Staged => "No staged changes.",
+        crate::changes::Scope::Base(_) => "No changes since this branch left its base.",
+    }
+}
+
 fn print_diff_summary(summary: &DiffSummary) {
     println!("{}", "Change Impact Preview".cyan().bold());
-    println!();
-    println!("Modified files:");
-    for f in &summary.changed_files {
-        println!("  • {}", f);
+    if !summary.compared.is_empty() {
+        println!("{}", format!("Compared: {}", summary.compared).dimmed());
     }
     println!();
-    println!("Impact:");
+    println!("Changed files:");
+    for (f, status) in &summary.file_status {
+        println!("  • {} ({})", f, status.to_lowercase());
+    }
+    for f in &summary.deleted_files {
+        println!("  • {} (deleted)", f);
+    }
+    println!();
+    println!(
+        "Symbols: {} modified · {} new",
+        summary.modified_symbols, summary.added_symbols
+    );
+    if !summary.added_names.is_empty() {
+        let shown: Vec<&str> = summary
+            .added_names
+            .iter()
+            .take(8)
+            .map(String::as_str)
+            .collect();
+        let more = summary.added_names.len().saturating_sub(shown.len());
+        println!(
+            "  new: {}{}",
+            shown.join(", "),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        );
+    }
+    print_modified_symbols(&summary.modified);
+    println!();
+    println!("Impact of the modified symbols (new code has no existing callers):");
     println!("  • {} direct callers", summary.direct_callers);
     println!("  • {} indirect callers", summary.indirect_callers);
     println!(
@@ -705,7 +1200,41 @@ fn print_diff_summary(summary: &DiffSummary) {
         summary.files_likely_updates
     );
     println!("  • {} impacted nodes total", summary.blast_radius_nodes);
-    println!("  • {} changed symbols resolved", summary.changed_symbols);
+    if summary.tests_exercising > 0 {
+        println!(
+            "  • {} tests exercise the modified code (worth running; not counted as impact)",
+            summary.tests_exercising
+        );
+    }
+}
+
+/// How many modified symbols the text report names before summarizing.
+const MODIFIED_SHOWN: usize = 12;
+
+fn print_modified_symbols(modified: &[ModifiedSymbol]) {
+    if modified.is_empty() {
+        return;
+    }
+    println!("  modified, most-called first:");
+    for symbol in modified.iter().take(MODIFIED_SHOWN) {
+        let callers = match symbol.direct_callers {
+            0 => "no callers".to_string(),
+            1 => "1 caller".to_string(),
+            n => format!("{n} callers"),
+        };
+        println!(
+            "    • {}  {}  {}",
+            symbol.name.cyan(),
+            format!("{}:{}", symbol.file, symbol.line).dimmed(),
+            callers
+        );
+    }
+    if modified.len() > MODIFIED_SHOWN {
+        println!(
+            "    and {} more (--json lists all)",
+            modified.len() - MODIFIED_SHOWN
+        );
+    }
 }
 
 fn print_diff_markdown(summary: &DiffSummary) {
@@ -721,16 +1250,30 @@ fn print_diff_markdown(summary: &DiffSummary) {
 
     println!("## 🌳 Arbor Impact Report\n");
     println!(
-        "**Risk Level:** {} {} | **Blast Radius:** {} nodes | **Changed Symbols:** {}\n",
-        risk.0, risk.1, summary.blast_radius_nodes, summary.changed_symbols
+        "**Risk Level:** {} {} | **Blast Radius:** {} nodes | **Changed Symbols:** {} modified, {} new\n",
+        risk.0, risk.1, summary.blast_radius_nodes, summary.modified_symbols, summary.added_symbols
     );
+    if !summary.compared.is_empty() {
+        println!("_Compared: {}_\n", summary.compared);
+    }
 
     // Changed files table
     println!("### Changed Files\n");
-    println!("| File | Status |");
-    println!("|------|--------|");
-    for f in &summary.changed_files {
-        println!("| `{}` | Modified |", f);
+    print_file_table(summary);
+
+    if !summary.modified.is_empty() {
+        println!("\n### Modified Symbols\n");
+        println!("| Symbol | Location | Direct callers |");
+        println!("|--------|----------|----------------|");
+        for symbol in summary.modified.iter().take(25) {
+            println!(
+                "| `{}` | `{}:{}` | {} |",
+                symbol.name, symbol.file, symbol.line, symbol.direct_callers
+            );
+        }
+        if summary.modified.len() > 25 {
+            println!("\n_and {} more_", summary.modified.len() - 25);
+        }
     }
 
     if let Some(ref diagram) = summary.mermaid_diagram {
@@ -758,6 +1301,10 @@ fn print_diff_markdown(summary: &DiffSummary) {
         summary.files_likely_updates
     );
     println!("| Total blast radius | {} |", summary.blast_radius_nodes);
+    println!(
+        "| Tests exercising the change (not counted as impact) | {} |",
+        summary.tests_exercising
+    );
 
     // Recommendations
     if summary.entrypoints_affected > 0 {
@@ -772,6 +1319,31 @@ fn print_diff_markdown(summary: &DiffSummary) {
 
     println!("\n---");
     println!("*Powered by [Arbor](https://github.com/Anandb71/arbor) v{} — graph-native code intelligence*", env!("CARGO_PKG_VERSION"));
+}
+
+fn print_file_table(summary: &DiffSummary) {
+    println!("| File | Status |");
+    println!("|------|--------|");
+    for (f, status) in &summary.file_status {
+        println!("| `{}` | {} |", f, status);
+    }
+    for f in &summary.deleted_files {
+        println!("| `{}` | Deleted |", f);
+    }
+    if summary.added_symbols > 0 {
+        println!(
+            "\n{} new symbol{} (no existing callers, so no blast radius): {}",
+            summary.added_symbols,
+            if summary.added_symbols == 1 { "" } else { "s" },
+            summary
+                .added_names
+                .iter()
+                .take(10)
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 }
 
 fn print_check_markdown(summary: &DiffSummary, risky: bool, max_blast_radius: usize) {
@@ -790,11 +1362,7 @@ fn print_check_markdown(summary: &DiffSummary, risky: bool, max_blast_radius: us
 
     // Changed files
     println!("### Changed Files\n");
-    println!("| File | Status |");
-    println!("|------|--------|");
-    for f in &summary.changed_files {
-        println!("| `{}` | Modified |", f);
-    }
+    print_file_table(summary);
 
     if let Some(ref diagram) = summary.mermaid_diagram {
         println!("\n### 📊 Visual Impact Graph\n");
@@ -1145,10 +1713,15 @@ fn export_graph(graph: &arbor_graph::ArborGraph, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn is_test_file(file_path: &str) -> bool {
+pub(crate) fn is_test_file(file_path: &str) -> bool {
     let lower = file_path.to_lowercase().replace('\\', "/");
     let segments: Vec<&str> = lower.split('/').collect();
     let filename = segments.last().copied().unwrap_or("");
+    // Rust keeps tests in `tests.rs` or `foo_tests.rs` next to the code.
+    let stem = filename.split('.').next().unwrap_or("");
+    if matches!(stem, "test" | "tests") || stem.ends_with("_tests") || stem.ends_with("_test") {
+        return true;
+    }
 
     segments.iter().any(|s| {
         *s == "test"
@@ -1238,23 +1811,24 @@ pub fn query(query: &str, limit: usize, path: &Path, exclude_test: bool) -> Resu
     Ok(())
 }
 
-pub fn diff(path: &Path, depth: usize, json_output: bool, markdown: bool) -> Result<()> {
+pub fn diff(
+    path: &Path,
+    depth: usize,
+    json_output: bool,
+    markdown: bool,
+    scope: &crate::changes::Scope,
+) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
+    require_git_repo(&resolved_path, "arbor diff")?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
 
-    if !is_git_repo(&resolved_path) {
-        return Err("arbor diff requires a git repository".into());
-    }
-
-    let changed_files = git_changed_files(&resolved_path)?;
-    if changed_files.is_empty() {
-        println!("{} No modified files detected against HEAD.", "✓".green());
+    let set = crate::changes::ChangeSet::collect(&resolved_path, scope)?;
+    if set.is_empty() {
+        println!("{} {}", "✓".green(), no_changes_message(scope));
         return Ok(());
     }
 
-    let graph = load_or_index_graph(&resolved_path)?;
-    let changed_nodes = changed_node_ids(&graph, &changed_files, &resolved_path);
-    let summary = compute_diff_summary(&graph, changed_files, changed_nodes, depth, &resolved_path);
+    let (_graph, _symbols, summary) = change_impact(&resolved_path, &set, depth)?;
 
     if markdown {
         print_diff_markdown(&summary);
@@ -1263,14 +1837,21 @@ pub fn diff(path: &Path, depth: usize, json_output: bool, markdown: bool) -> Res
 
     if json_output {
         let output = serde_json::json!({
+            "compared": summary.compared,
             "changed_files": summary.changed_files,
+            "deleted_files": summary.deleted_files,
             "changed_symbols": summary.changed_symbols,
+            "modified_symbols": summary.modified_symbols,
+            "added_symbols": summary.added_symbols,
+            "new_symbols": summary.added_names,
+            "modified": summary.modified,
             "impact": {
                 "direct_callers": summary.direct_callers,
                 "indirect_callers": summary.indirect_callers,
                 "api_entrypoints_affected": summary.entrypoints_affected,
                 "files_likely_require_updates": summary.files_likely_updates,
-                "blast_radius_nodes": summary.blast_radius_nodes
+                "blast_radius_nodes": summary.blast_radius_nodes,
+                "tests_exercising": summary.tests_exercising
             }
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -1288,18 +1869,14 @@ pub fn check(
     no_fail: bool,
     json_output: bool,
     markdown: bool,
+    scope: &crate::changes::Scope,
 ) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
+    require_git_repo(&resolved_path, "arbor check")?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
 
-    if !is_git_repo(&resolved_path) {
-        return Err("arbor check requires a git repository".into());
-    }
-
-    let changed_files = git_changed_files(&resolved_path)?;
-    let graph = load_or_index_graph(&resolved_path)?;
-    let changed_nodes = changed_node_ids(&graph, &changed_files, &resolved_path);
-    let summary = compute_diff_summary(&graph, changed_files, changed_nodes, depth, &resolved_path);
+    let set = crate::changes::ChangeSet::collect(&resolved_path, scope)?;
+    let (_graph, _symbols, summary) = change_impact(&resolved_path, &set, depth)?;
 
     let risky = summary.blast_radius_nodes > max_blast_radius
         || summary.entrypoints_affected > 0
@@ -1320,8 +1897,14 @@ pub fn check(
                 "max_blast_radius": max_blast_radius
             },
             "summary": {
+                "compared": summary.compared,
                 "changed_files": summary.changed_files,
+                "deleted_files": summary.deleted_files,
                 "changed_symbols": summary.changed_symbols,
+                "modified_symbols": summary.modified_symbols,
+                "added_symbols": summary.added_symbols,
+                "new_symbols": summary.added_names,
+                "modified": summary.modified,
                 "direct_callers": summary.direct_callers,
                 "indirect_callers": summary.indirect_callers,
                 "api_entrypoints_affected": summary.entrypoints_affected,
@@ -1875,6 +2458,32 @@ pub async fn check_health(path: Option<&Path>) -> Result<()> {
         env!("CARGO_PKG_VERSION")
     );
 
+    // An older `arbor` earlier on PATH runs instead of a newer install.
+    let installs = crate::install_check::installs_on_path();
+    if let Some(newer) = crate::install_check::shadowed_newer(&installs) {
+        all_ok = false;
+        let first = &installs[0];
+        println!(
+            "{} `arbor` runs {} {}, which hides {} {} later on PATH",
+            "✗".red(),
+            first.path.display(),
+            crate::install_check::format_version(first.version),
+            newer.path.display(),
+            crate::install_check::format_version(newer.version),
+        );
+        println!(
+            "  Remove the older one ({}) or move its directory after the newer one on PATH.",
+            crate::install_check::removal_hint(&first.path)
+        );
+    } else if installs.len() > 1 {
+        println!(
+            "{} {} `arbor` executables on PATH; the first, {}, is the newest",
+            "•".blue(),
+            installs.len(),
+            installs[0].path.display()
+        );
+    }
+
     // 0. Check git repo
     if is_git_repo(&workspace_root) {
         println!("{} Git repository detected", "✓".green());
@@ -2026,16 +2635,13 @@ pub fn refactor(
             if !json_output {
                 report_symbol_ambiguity(&graph, target, idx, &others);
             }
-            Some(idx)
+            idx
         }
-        Err(_) => None,
-    };
-
-    let node_idx = match node_idx {
-        Some(idx) => idx,
-        None => {
-            // Smart fallback: suggest similar symbols
-            return suggest_similar_symbols(&graph, target);
+        Err(e) => {
+            if !json_output {
+                let _ = suggest_similar_symbols(&graph, target);
+            }
+            return Err(e);
         }
     };
 
@@ -2690,32 +3296,21 @@ pub fn pr_summary(symbols: &str, path: &Path) -> Result<()> {
 }
 
 /// Generate an auto-description for a PR based on graph changes.
-pub fn summary(path: &Path) -> Result<()> {
+pub fn summary(path: &Path, scope: &crate::changes::Scope) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
+    require_git_repo(&resolved_path, "arbor summary")?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
 
-    if !is_git_repo(&resolved_path) {
-        return Err("arbor summary requires a git repository".into());
-    }
-
-    let changed_files = git_changed_files(&resolved_path)?;
-    if changed_files.is_empty() {
+    let set = crate::changes::ChangeSet::collect(&resolved_path, scope)?;
+    if set.is_empty() {
         println!("## 🌳 Arbor PR Summary\n");
-        println!("No changes detected in git. Working tree is clean.");
+        println!("No changes detected in git ({}).", set.description);
         return Ok(());
     }
-
-    let graph = load_or_index_graph(&resolved_path)?;
-    let changed_nodes = changed_node_ids(&graph, &changed_files, &resolved_path);
+    let changed_files = set.paths();
 
     // Reuse our depth=5 summary computation
-    let summary = compute_diff_summary(
-        &graph,
-        changed_files.clone(),
-        changed_nodes,
-        5,
-        &resolved_path,
-    );
+    let (_graph, _symbols, summary) = change_impact(&resolved_path, &set, 5)?;
 
     // Classify changes
     let mut code_changes = 0;
@@ -2788,7 +3383,11 @@ pub fn summary(path: &Path) -> Result<()> {
     }
 
     println!("### ⚡ Impact & Blast Radius");
-    println!("Our graph analysis resolved **{}** specific symbol changes with the following downstream impact:", summary.changed_symbols);
+    println!("_Compared: {}_\n", summary.compared);
+    println!(
+        "Our graph analysis found **{}** modified and **{}** new symbols. Only the modified ones can affect existing code:",
+        summary.modified_symbols, summary.added_symbols
+    );
     println!(
         "- **Direct Callers Affected:** {} callers will need direct integration review.",
         summary.direct_callers
@@ -2801,6 +3400,10 @@ pub fn summary(path: &Path) -> Result<()> {
     println!(
         "- **Total Blast Radius:** {} nodes total in the impact graph.",
         summary.blast_radius_nodes
+    );
+    println!(
+        "- **Tests Exercising the Change:** {} (worth running; not counted as impact).",
+        summary.tests_exercising
     );
     println!();
 
@@ -3004,6 +3607,25 @@ mod tests {
         {
             ("flutter", "linux")
         }
+    }
+
+    #[test]
+    fn write_errors_name_the_path_and_the_fix_for_refused_access() {
+        use std::io::{Error, ErrorKind};
+        let dir = std::path::Path::new("app").join(".arbor");
+
+        let refused = super::write_error(&dir, Error::from(ErrorKind::PermissionDenied));
+        let refused = refused.to_string();
+        assert!(refused.starts_with("Arbor could not write "), "{refused}");
+        assert!(refused.contains(&dir.display().to_string()), "{refused}");
+        assert_eq!(
+            refused.lines().nth(1),
+            Some("  Check that your user can write there, or run Arbor on a copy of the project you own.")
+        );
+
+        let full = super::write_error(&dir, Error::from(ErrorKind::StorageFull)).to_string();
+        assert!(full.contains(&dir.display().to_string()), "{full}");
+        assert_eq!(full.lines().count(), 1, "{full}");
     }
 
     #[test]
@@ -3343,96 +3965,249 @@ fn report_symbol_ambiguity(
 }
 
 pub fn callers(symbol: &str, path: &Path, json_output: bool) -> Result<()> {
-    let resolved_path = resolve_project_path(path)?;
-    let graph = load_or_index_graph(&resolved_path)?;
-
-    let (idx, ambiguous_with) = resolve_symbol_ranked(&graph, symbol)?;
-    if !json_output {
-        report_symbol_ambiguity(&graph, symbol, idx, &ambiguous_with);
-    }
-    let callers = graph.get_callers(idx);
-
-    if json_output {
-        let items: Vec<serde_json::Value> = callers
-            .iter()
-            .map(|n| {
-                serde_json::json!({
-                    "id": n.id,
-                    "name": n.name,
-                    "kind": n.kind.to_string(),
-                    "file": n.file,
-                    "line": n.line_start
-                })
-            })
-            .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "symbol": symbol,
-                "callers": items
-            }))?
-        );
-    } else if callers.is_empty() {
-        println!("No callers found for '{}'", symbol);
-    } else {
-        println!("Callers of '{}' ({}):\n", symbol, callers.len());
-        for n in &callers {
-            println!(
-                "  {} {} {}",
-                n.kind.to_string().yellow(),
-                n.qualified_name.cyan(),
-                format!("({}:{})", n.file, n.line_start).dimmed()
-            );
-        }
-    }
-
-    Ok(())
+    relations(symbol, path, json_output, Direction::Callers)
 }
 
 pub fn callees(symbol: &str, path: &Path, json_output: bool) -> Result<()> {
+    relations(symbol, path, json_output, Direction::Callees)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Callers,
+    Callees,
+}
+
+/// Definitions shown side by side when a name matches several.
+const MAX_DEFINITIONS_SHOWN: usize = 6;
+
+/// Printed when nothing is found, because an empty list looks like proof.
+const EMPTY_RESULT_NOTE: &str = "Not proof that nothing does: calls through trait objects, \
+function pointers, callbacks, reflection or generated code aren't followed. Confirm with a \
+text search before treating this symbol as unused or changing its signature.";
+
+fn language_of(file: &str) -> &'static str {
+    let ext = Path::new(file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "rs" => "Rust",
+        "ts" | "tsx" | "mts" | "cts" => "TypeScript",
+        "js" | "jsx" | "mjs" | "cjs" => "JavaScript",
+        "py" | "pyi" => "Python",
+        "go" => "Go",
+        "java" => "Java",
+        "kt" | "kts" => "Kotlin",
+        "c" | "h" => "C",
+        "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => "C++",
+        "cs" => "C#",
+        "rb" => "Ruby",
+        "php" => "PHP",
+        "swift" => "Swift",
+        "dart" => "Dart",
+        _ => "code",
+    }
+}
+
+/// Is `node` what `scope` names: `Type` in `Type::method`, or a module path
+/// in `jobs::enqueue` / `crate::app::create` (the file `jobs.rs`,
+/// `jobs/mod.rs`, or a file inside that module)?
+fn defined_in(node: &arbor_core::CodeNode, scope: &str) -> bool {
+    let segments: Vec<&str> = scope
+        .split("::")
+        .filter(|s| !s.is_empty() && !matches!(*s, "crate" | "self" | "super"))
+        .collect();
+    let Some(owner) = segments.last() else {
+        return false;
+    };
+    if node.qualified_name == format!("{owner}.{}", node.name) {
+        return true;
+    }
+    let file = node.file.replace('\\', "/");
+    let without_ext = file.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(&file);
+    let module = without_ext
+        .strip_suffix("/mod")
+        .unwrap_or(without_ext)
+        .to_string();
+    let parts: Vec<&str> = module.split('/').collect();
+    // Longest suffix first, so a crate-name prefix (`my_app::jobs`) still matches.
+    (0..segments.len()).any(|start| {
+        let wanted = &segments[start..];
+        parts.windows(wanted.len()).any(|window| window == wanted)
+    })
+}
+
+/// Definitions matching `symbol`, most connected first. Besides a name or a
+/// qualified `Type.method`, accepts a module path (`jobs::enqueue`) and a
+/// file (`src/jobs.rs:enqueue`) to pick one of several same-named symbols.
+fn matching_definitions(
+    graph: &arbor_graph::ArborGraph,
+    symbol: &str,
+) -> Result<Vec<arbor_graph::NodeId>> {
+    let narrowed = |name: &str, keep: &dyn Fn(&arbor_core::CodeNode) -> bool| {
+        graph
+            .resolve_symbol_ranked(name)
+            .into_iter()
+            .filter(|id| graph.get(*id).is_some_and(keep))
+            .collect::<Vec<_>>()
+    };
+    if let Some((scope, name)) = symbol.rsplit_once("::") {
+        if !scope.is_empty() && !name.is_empty() {
+            let found = narrowed(name, &|n| defined_in(n, scope));
+            if !found.is_empty() {
+                return Ok(found);
+            }
+        }
+    }
+    if let Some((file, name)) = symbol.rsplit_once(':') {
+        let looks_like_file = file.contains('/') || file.contains('\\') || file.contains('.');
+        if looks_like_file && !file.ends_with(':') && !name.is_empty() {
+            let wanted = file.replace('\\', "/");
+            let found = narrowed(name, &|n| n.file.replace('\\', "/").ends_with(&wanted));
+            if !found.is_empty() {
+                return Ok(found);
+            }
+        }
+    }
+    let ranked = graph.resolve_symbol_ranked(symbol);
+    if ranked.is_empty() {
+        return Err(format!("Symbol '{}' not found", symbol).into());
+    }
+    Ok(ranked)
+}
+
+fn relations(symbol: &str, path: &Path, json_output: bool, direction: Direction) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
     let graph = load_or_index_graph(&resolved_path)?;
-
-    let (idx, ambiguous_with) = resolve_symbol_ranked(&graph, symbol)?;
-    if !json_output {
-        report_symbol_ambiguity(&graph, symbol, idx, &ambiguous_with);
-    }
-    let callees = graph.get_callees(idx);
+    let definitions = matching_definitions(&graph, symbol)?;
+    let groups: Vec<(arbor_graph::NodeId, Vec<&arbor_core::CodeNode>)> = definitions
+        .iter()
+        .take(MAX_DEFINITIONS_SHOWN)
+        .map(|&id| {
+            let related = match direction {
+                Direction::Callers => graph.get_callers(id),
+                Direction::Callees => graph.get_callees(id),
+            };
+            (id, related)
+        })
+        .collect();
+    let (key, title) = match direction {
+        Direction::Callers => ("callers", "Callers"),
+        Direction::Callees => ("callees", "Callees"),
+    };
+    let describe = |id: arbor_graph::NodeId| {
+        graph.get(id).map(|d| {
+            format!(
+                "{} {} {} ({}:{})",
+                language_of(&d.file),
+                d.kind,
+                d.qualified_name,
+                d.file,
+                d.line_start
+            )
+        })
+    };
 
     if json_output {
-        let items: Vec<serde_json::Value> = callees
-            .iter()
-            .map(|n| {
-                serde_json::json!({
-                    "id": n.id,
-                    "name": n.name,
-                    "kind": n.kind.to_string(),
-                    "file": n.file,
-                    "line": n.line_start
-                })
+        let item = |n: &&arbor_core::CodeNode| {
+            serde_json::json!({
+                "id": n.id,
+                "name": n.name,
+                "kind": n.kind.to_string(),
+                "file": n.file,
+                "line": n.line_start
             })
-            .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "symbol": symbol,
-                "callees": items
-            }))?
-        );
-    } else if callees.is_empty() {
-        println!("No callees found for '{}'", symbol);
-    } else {
-        println!("Callees of '{}' ({}):\n", symbol, callees.len());
-        for n in &callees {
+        };
+        let mut output = serde_json::json!({
+            "symbol": symbol,
+            key: groups[0].1.iter().map(item).collect::<Vec<_>>(),
+        });
+        if groups.len() > 1 {
+            // One entry per same-named definition, so a TypeScript `enqueue`
+            // is never read as a caller of the Rust one.
+            output["matches"] = groups
+                .iter()
+                .filter_map(|(id, related)| {
+                    let d = graph.get(*id)?;
+                    Some(serde_json::json!({
+                        "definition": {
+                            "id": d.id,
+                            "name": d.name,
+                            "qualified_name": d.qualified_name,
+                            "kind": d.kind.to_string(),
+                            "language": language_of(&d.file),
+                            "file": d.file,
+                            "line": d.line_start
+                        },
+                        key: related.iter().map(item).collect::<Vec<_>>(),
+                    }))
+                })
+                .collect();
+        }
+        if groups[0].1.is_empty() {
+            output["note"] = serde_json::json!(EMPTY_RESULT_NOTE);
+        }
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    let print_list = |related: &[&arbor_core::CodeNode], indent: &str| {
+        for n in related {
             println!(
-                "  {} {} {}",
+                "{indent}{} {} {}",
                 n.kind.to_string().yellow(),
                 n.qualified_name.cyan(),
                 format!("({}:{})", n.file, n.line_start).dimmed()
             );
         }
+    };
+
+    if let [(id, related)] = groups.as_slice() {
+        if related.is_empty() {
+            println!(
+                "No {} found for '{}' — {}",
+                key,
+                symbol,
+                describe(*id).unwrap_or_default()
+            );
+            println!("{}", EMPTY_RESULT_NOTE.dimmed());
+        } else {
+            println!("{} of '{}' ({}):\n", title, symbol, related.len());
+            print_list(related, "  ");
+        }
+        return Ok(());
     }
 
+    // Several definitions share the name. Never merge their results.
+    println!(
+        "'{}' matches {} definitions. {} of each:\n",
+        symbol,
+        definitions.len(),
+        title
+    );
+    for (id, related) in &groups {
+        println!(
+            "{} — {} {}",
+            describe(*id).unwrap_or_default().bold(),
+            related.len(),
+            key
+        );
+        print_list(related, "    ");
+        println!();
+    }
+    if definitions.len() > groups.len() {
+        println!(
+            "… and {} more definitions",
+            definitions.len() - groups.len()
+        );
+    }
+    println!(
+        "{}",
+        "Pick one with a module path (jobs::enqueue), a type (Type.method) or a file (src/jobs.rs:enqueue)."
+            .dimmed()
+    );
     Ok(())
 }
 
@@ -4132,14 +4907,12 @@ pub fn analyze_local(path: &Path, top: usize) -> Result<()> {
 
 pub fn agent_review(path: &Path, json: bool) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
+    require_git_repo(&resolved_path, "arbor agent review")?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
 
-    if !is_git_repo(&resolved_path) {
-        return Err("arbor agent review requires a git repository".into());
-    }
-
-    let changed_files = git_changed_files(&resolved_path)?;
-    if changed_files.is_empty() {
+    let set =
+        crate::changes::ChangeSet::collect(&resolved_path, &crate::changes::Scope::WorkingTree)?;
+    if set.is_empty() {
         if json {
             println!("{{}}");
         } else {
@@ -4147,16 +4920,9 @@ pub fn agent_review(path: &Path, json: bool) -> Result<()> {
         }
         return Ok(());
     }
-
-    let graph = load_or_index_graph(&resolved_path)?;
-    let changed_nodes = changed_node_ids(&graph, &changed_files, &resolved_path);
-    let summary = compute_diff_summary(
-        &graph,
-        changed_files.clone(),
-        changed_nodes.clone(),
-        5,
-        &resolved_path,
-    );
+    let (graph, symbols, summary) = change_impact(&resolved_path, &set, 5)?;
+    // New symbols have no existing callers to put at risk.
+    let changed_nodes = symbols.modified;
 
     let mut high_risk_changes = Vec::new();
     let mut recommendations = Vec::new();
@@ -4494,30 +5260,20 @@ pub fn agent_onboard(path: &Path, json: bool) -> Result<()> {
 
 pub fn agent_guard(path: &Path, max_blast_radius: usize) -> Result<()> {
     let resolved_path = resolve_project_path(path)?;
+    require_git_repo(&resolved_path, "arbor agent guard")?;
     let _ = ensure_arbor_initialized(&resolved_path)?;
 
-    if !is_git_repo(&resolved_path) {
-        return Err("arbor agent guard requires a git repository".into());
-    }
-
-    let changed_files = git_changed_files(&resolved_path)?;
-    if changed_files.is_empty() {
+    let set =
+        crate::changes::ChangeSet::collect(&resolved_path, &crate::changes::Scope::WorkingTree)?;
+    if set.is_empty() {
         println!(
             "{} No changes detected. Architecture guard PASS.",
             "✓".green()
         );
         return Ok(());
     }
-
-    let graph = load_or_index_graph(&resolved_path)?;
-    let changed_nodes = changed_node_ids(&graph, &changed_files, &resolved_path);
-    let summary = compute_diff_summary(
-        &graph,
-        changed_files.clone(),
-        changed_nodes.clone(),
-        5,
-        &resolved_path,
-    );
+    let (graph, symbols, summary) = change_impact(&resolved_path, &set, 5)?;
+    let changed_nodes = symbols.modified;
 
     let mut failed = false;
     let mut checks = Vec::new();
@@ -4590,4 +5346,108 @@ pub fn agent_guard(path: &Path, max_blast_radius: usize) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod gitignore_tests {
+    use super::{ignore_arbor_dir, init_arbor_dir};
+
+    #[test]
+    fn creating_the_arbor_folder_ignores_everything_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        init_arbor_dir(dir.path()).unwrap();
+        let ignore = std::fs::read_to_string(dir.path().join(".arbor/.gitignore")).unwrap();
+        assert!(
+            ignore.lines().any(|line| line == "*"),
+            "expected a catch-all pattern, got: {ignore:?}"
+        );
+    }
+
+    #[test]
+    fn a_folder_made_by_an_older_arbor_gets_the_ignore_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let arbor = dir.path().join(".arbor");
+        std::fs::create_dir_all(&arbor).unwrap();
+        std::fs::write(arbor.join("config.json"), "{}").unwrap();
+        init_arbor_dir(dir.path()).unwrap();
+        assert!(arbor.join(".gitignore").exists());
+    }
+
+    #[test]
+    fn an_existing_ignore_file_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let arbor = dir.path().join(".arbor");
+        std::fs::create_dir_all(&arbor).unwrap();
+        let own = "*\n!config.json\n";
+        std::fs::write(arbor.join(".gitignore"), own).unwrap();
+        ignore_arbor_dir(dir.path());
+        assert_eq!(
+            std::fs::read_to_string(arbor.join(".gitignore")).unwrap(),
+            own
+        );
+    }
+
+    #[test]
+    fn nothing_is_written_when_the_folder_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        ignore_arbor_dir(dir.path());
+        assert!(!dir.path().join(".arbor").exists());
+    }
+}
+
+#[cfg(test)]
+mod staleness_tests {
+    use super::{built_by_another_extractor, index_cache_in_use};
+
+    #[test]
+    fn a_graph_from_another_extractor_is_not_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let arbor = dir.path().join(".arbor");
+        std::fs::create_dir_all(&arbor).unwrap();
+        assert!(
+            !built_by_another_extractor(dir.path()),
+            "no graph yet: nothing to rebuild"
+        );
+
+        std::fs::write(arbor.join("graph.bin"), b"").unwrap();
+        assert!(
+            built_by_another_extractor(dir.path()),
+            "a graph saved before stamping existed"
+        );
+
+        std::fs::write(arbor.join("graph.builder"), "arbor-3.0.0").unwrap();
+        assert!(built_by_another_extractor(dir.path()), "an older release");
+
+        std::fs::write(
+            arbor.join("graph.builder"),
+            arbor_graph::store::CACHE_VERSION,
+        )
+        .unwrap();
+        assert!(!built_by_another_extractor(dir.path()));
+    }
+
+    #[test]
+    fn only_an_open_index_cache_counts_as_a_running_bridge() {
+        let open = tempfile::tempdir().unwrap();
+        let _store =
+            arbor_graph::GraphStore::open_or_reset(open.path().join(".arbor").join("cache"))
+                .unwrap();
+        assert!(
+            index_cache_in_use(open.path()),
+            "an open store holds the lock"
+        );
+
+        // What every indexed project has once the indexing process exits: the
+        // `db` file, with no lock on it. It must not switch staleness off.
+        // (Dropping a store in-process is no substitute: sled's flusher thread
+        // can keep the file locked for a moment on Linux.)
+        let left = tempfile::tempdir().unwrap();
+        let cache = left.path().join(".arbor").join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("db"), b"").unwrap();
+        assert!(!index_cache_in_use(left.path()));
+
+        // No cache at all.
+        assert!(!index_cache_in_use(&left.path().join("elsewhere")));
+    }
 }

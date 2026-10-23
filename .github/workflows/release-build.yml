@@ -1,0 +1,125 @@
+name: Release build
+
+# The release binaries, built once per target. Called by release.yml so the
+# same matrix can later be reused without publishing anything.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Linux binaries link against the glibc they are built on, and the loader
+  # refuses one that needs a newer glibc than the machine has. Building on
+  # ubuntu-latest made v3.0.3 need glibc 2.39, so it would not start on
+  # Ubuntu 22.04, Debian 12 or RHEL 9. manylinux_2_28 (AlmaLinux 8,
+  # glibc 2.28) on a runner of the same architecture gives binaries that run
+  # on any distribution with glibc 2.28 or later, with no cross toolchain.
+  build-linux:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    container: quay.io/pypa/${{ matrix.image }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            image: manylinux_2_28_x86_64
+            artifact: arbor-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            image: manylinux_2_28_aarch64
+            artifact: arbor-linux-aarch64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} -p arbor-graph-cli
+
+      - name: Check the glibc floor
+        run: bash scripts/ci/check-glibc-floor.sh "target/${{ matrix.target }}/release/arbor" 2.28
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/arbor" "dist/arbor"
+          chmod +x dist/arbor
+          tar -C dist -czf "${{ matrix.artifact }}.tar.gz" arbor
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: arbor-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: arbor-macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: arbor-windows-x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} -p arbor-graph-cli
+
+      - name: Package artifact (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/arbor" "dist/arbor"
+          chmod +x dist/arbor
+          tar -C dist -czf "${{ matrix.artifact }}.tar.gz" arbor
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/arbor.exe" "dist/arbor.exe"
+          Compress-Archive -Path "dist/arbor.exe" -DestinationPath "${{ matrix.artifact }}.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.zip
+          if-no-files-found: error

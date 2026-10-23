@@ -14,6 +14,8 @@ on:
 permissions:
   actions: read
   contents: read
+  # npm provenance: the OIDC token that links the package to this run.
+  id-token: write
 
 concurrency:
   group: npm-publish-${{ github.event.workflow_run.head_branch || github.event.inputs.tag || github.ref }}
@@ -107,4 +109,7 @@ jobs:
             exit 0
           fi
 
-          npm publish --access public
+          # --provenance publishes a signed statement of the repository,
+          # commit and workflow that built this version; npmjs.com shows it,
+          # and `npm audit signatures` checks it.
+          npm publish --access public --provenance

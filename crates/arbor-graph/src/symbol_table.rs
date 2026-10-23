@@ -221,8 +221,18 @@ impl SymbolTable {
         context_file: &Path,
         imports: Option<&HashMap<String, String>>,
     ) -> Resolution {
-        let exact = self.by_fqn.get(name);
-        if let Some(entries) = exact {
+        // A call never crosses languages: a Rust `enqueue` isn't called by a
+        // TypeScript `enqueue(...)`. Definitions in another language are not
+        // candidates at all, so they can neither win nor make a match ambiguous.
+        let family = language_family(context_file);
+        let visible = |e: &SymbolEntry| same_family(family, &e.file);
+
+        let exact: Option<Vec<&SymbolEntry>> = self
+            .by_fqn
+            .get(name)
+            .map(|entries| entries.iter().filter(|e| visible(e)).collect::<Vec<_>>())
+            .filter(|entries| !entries.is_empty());
+        if let Some(entries) = &exact {
             if entries.len() == 1 {
                 return Resolution::Exact(entries[0].id);
             }
@@ -249,7 +259,7 @@ impl SymbolTable {
             for fqn in fqns {
                 if let Some(entries) = self.by_fqn.get(fqn) {
                     for e in entries {
-                        if !seen.contains(&e.id) {
+                        if visible(e) && !seen.contains(&e.id) {
                             seen.push(e.id);
                             candidates.push(e);
                         }
@@ -316,6 +326,171 @@ impl SymbolTable {
         Resolution::Ambiguous(candidates.into_iter().map(|e| e.id).collect())
     }
 
+    /// Resolves `name` imported from `module` under another name
+    /// (`from money import money_to_minor_units as to_minor`).
+    ///
+    /// The import says where the definition lives, so only definitions of
+    /// `name` in that module are candidates: the module's own file first
+    /// (`money.py`, or a package's `__init__.py` or `index.ts`), then anything
+    /// inside a package of that name. A same-named function elsewhere is not
+    /// the target. A module this project doesn't define (`numpy`) leaves the
+    /// call unresolved, unless a project file or directory, or a directory
+    /// above the project, has the module's name: modules are matched by name,
+    /// so it then binds there, as an unaliased import of the name does.
+    ///
+    /// A relative module (`./format`, `../route`, `.money`, `..core.money`)
+    /// names one place, read from the importing file's directory, so a
+    /// same-named file elsewhere (every `route.ts` in a Next.js app) is never a
+    /// candidate.
+    ///
+    /// An import binds a module-level name, so `name` is matched exactly and a
+    /// method (`Class.name`) is never a candidate. Neither is the importing
+    /// file: in a wrapper that keeps the imported function's name
+    /// (`from money import f as _f` then `def f(): _f()`), `_f` is money's.
+    pub fn resolve_imported(&self, name: &str, module: &str, context_file: &Path) -> Resolution {
+        let family = language_family(context_file);
+        let defined: Vec<&SymbolEntry> = self
+            .by_fqn
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|e| same_family(family, &e.file) && e.file != context_file)
+            .collect();
+
+        if module.starts_with('.') {
+            let Some(target) = relative_module_path(module, context_file) else {
+                return Resolution::Unresolved;
+            };
+            let in_module: Vec<&SymbolEntry> = defined
+                .iter()
+                .copied()
+                .filter(|e| is_module_file(&e.file, &target))
+                .collect();
+            if !in_module.is_empty() {
+                return pick(in_module, context_file, Resolution::ViaImport);
+            }
+            if target.as_os_str().is_empty() {
+                return Resolution::Unresolved;
+            }
+            let in_package: Vec<&SymbolEntry> = defined
+                .into_iter()
+                .filter(|e| e.file.starts_with(&target))
+                .collect();
+            return pick(in_package, context_file, Resolution::ViaImport);
+        }
+
+        let wanted = normalize_module_path(module);
+        if wanted.is_empty() {
+            return Resolution::Unresolved;
+        }
+        let in_module: Vec<&SymbolEntry> = defined
+            .iter()
+            .copied()
+            .filter(|e| module_is(e, &wanted) || package_init_is(e, &wanted))
+            .collect();
+        if !in_module.is_empty() {
+            return pick(in_module, context_file, Resolution::ViaImport);
+        }
+        let in_package: Vec<&SymbolEntry> = defined
+            .into_iter()
+            .filter(|e| entry_belongs_to_module(e, &wanted))
+            .collect();
+        pick(in_package, context_file, Resolution::ViaImport)
+    }
+
+    /// Resolves a `::` path reference: `jobs::enqueue`, `Provider::new`,
+    /// `crate::db::queries::get_user`, `my_app::app::create`.
+    ///
+    /// The path says where the definition lives, so it is matched on that
+    /// rather than on the bare name:
+    ///
+    /// - a path some parser recorded verbatim (C++ `ns::fn`) matches directly;
+    /// - a capitalised owner is a type, and `Type::new` is stored as `Type.new`;
+    /// - anything else is a module, matched against the definition's file
+    ///   (`jobs.rs`, `app/mod.rs`). Leading segments are dropped until one
+    ///   matches, so a crate-name prefix (`my_app::app::…`) works,
+    ///   and a definition re-exported from a submodule is found at lower
+    ///   confidence.
+    ///
+    /// A path into an external crate (`sqlx::query`, `std::fs::read`) matches
+    /// nothing here and stays unresolved, instead of binding to an unrelated
+    /// local function that shares the last name.
+    pub fn resolve_path(&self, path: &str, context_file: &Path) -> Resolution {
+        let family = language_family(context_file);
+        let visible = |e: &&SymbolEntry| same_family(family, &e.file);
+
+        let verbatim = self.entries_with_suffix(path, &visible);
+        if !verbatim.is_empty() {
+            return pick(verbatim, context_file, Resolution::Exact);
+        }
+
+        let segments: Vec<&str> = path
+            .split("::")
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !matches!(*s, "crate" | "self" | "super"))
+            .collect();
+        let Some((name, qualifiers)) = segments.split_last() else {
+            return Resolution::Unresolved;
+        };
+        let Some(owner) = qualifiers.last() else {
+            return self.resolve_ref(name, context_file);
+        };
+
+        if owner.starts_with(|c: char| c.is_uppercase()) {
+            let mut entries = self.entries_with_suffix(&format!("{owner}.{name}"), &visible);
+            entries.extend(self.entries_with_suffix(&format!("{owner}::{name}"), &visible));
+            // Nothing: an enum variant (`Error::NotFound(e)`) or an external type.
+            return pick(entries, context_file, Resolution::Exact);
+        }
+
+        // Free functions are stored under their bare name.
+        let named: Vec<&SymbolEntry> = self
+            .by_fqn
+            .get(*name)
+            .into_iter()
+            .flatten()
+            .filter(|e| visible(e))
+            .collect();
+        for start in 0..qualifiers.len() {
+            let wanted = normalize_module_path(&qualifiers[start..].join("."));
+            if wanted.is_empty() {
+                continue;
+            }
+            let in_module: Vec<&SymbolEntry> = named
+                .iter()
+                .copied()
+                .filter(|e| module_is(e, &wanted))
+                .collect();
+            if !in_module.is_empty() {
+                return pick(in_module, context_file, Resolution::ViaImport);
+            }
+            let re_exported: Vec<&SymbolEntry> = named
+                .iter()
+                .copied()
+                .filter(|e| entry_belongs_to_module(e, &wanted))
+                .collect();
+            if !re_exported.is_empty() {
+                return pick(re_exported, context_file, Resolution::UniqueSuffix);
+            }
+        }
+        Resolution::Unresolved
+    }
+
+    /// Entries whose FQN is `fqn` or ends with it on a segment boundary.
+    fn entries_with_suffix(
+        &self,
+        fqn: &str,
+        visible: &dyn Fn(&&SymbolEntry) -> bool,
+    ) -> Vec<&SymbolEntry> {
+        let mut fqns: Vec<&String> = self.by_suffix.get(fqn).into_iter().flatten().collect();
+        fqns.sort();
+        fqns.into_iter()
+            .filter_map(|f| self.by_fqn.get(f))
+            .flatten()
+            .filter(|e| visible(e))
+            .collect()
+    }
+
     /// Back-compatible wrapper returning only a confidently-resolved node.
     pub fn resolve_with_context(&self, name: &str, context_file: &Path) -> Option<NodeId> {
         self.resolve_ref(name, context_file).node()
@@ -357,6 +532,144 @@ fn normalize_module_path(raw: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// The path, without extension, that a relative import names, read from the
+/// importing file's directory: `./format` and `../route` in TypeScript and
+/// JavaScript, `.money` and `..core.money` in Python (one dot is the
+/// importing file's package, each further dot its parent). `None` when the
+/// import climbs out of the tree.
+fn relative_module_path(module: &str, context_file: &Path) -> Option<PathBuf> {
+    let mut path = context_file.parent()?.to_path_buf();
+    if module.contains('/') {
+        for segment in module.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    if !path.pop() {
+                        return None;
+                    }
+                }
+                name => path.push(name),
+            }
+        }
+        // `./format.js` names `format.ts` under TypeScript's ESM resolution.
+        if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts")
+        ) {
+            path.set_extension("");
+        }
+        return Some(path);
+    }
+
+    let rest = module.strip_prefix('.')?;
+    let name = rest.trim_start_matches('.');
+    for _ in 0..rest.len() - name.len() {
+        if !path.pop() {
+            return None;
+        }
+    }
+    for segment in name.split('.').filter(|s| !s.is_empty()) {
+        path.push(segment);
+    }
+    Some(path)
+}
+
+/// Is `file` the module at `target`: `target.ts` / `target.py`, or the
+/// package's own `index` / `__init__` file?
+fn is_module_file(file: &Path, target: &Path) -> bool {
+    file.with_extension("").as_path() == target
+        || (file.parent() == Some(target)
+            && matches!(
+                file.file_stem().and_then(|s| s.to_str()),
+                Some("index" | "__init__")
+            ))
+}
+
+/// Picks among entries that all match the reference equally well: one is
+/// `unique`, otherwise the referencing file, then its directory, break ties.
+fn pick(
+    mut entries: Vec<&SymbolEntry>,
+    context_file: &Path,
+    unique: fn(NodeId) -> Resolution,
+) -> Resolution {
+    sort_entries(&mut entries);
+    entries.dedup_by_key(|e| e.id);
+    match entries.as_slice() {
+        [] => Resolution::Unresolved,
+        [only] => unique(only.id),
+        _ => {
+            let same_file: Vec<&&SymbolEntry> =
+                entries.iter().filter(|e| e.file == context_file).collect();
+            if same_file.len() == 1 {
+                return Resolution::SameFile(same_file[0].id);
+            }
+            let dir = context_file.parent();
+            let same_dir: Vec<&&SymbolEntry> =
+                entries.iter().filter(|e| e.file.parent() == dir).collect();
+            if same_dir.len() == 1 {
+                return Resolution::SameDir(same_dir[0].id);
+            }
+            Resolution::Ambiguous(entries.into_iter().map(|e| e.id).collect())
+        }
+    }
+}
+
+/// Is this symbol defined in exactly `module` (`jobs.rs`, `jobs/mod.rs`)?
+fn module_is(entry: &SymbolEntry, module: &str) -> bool {
+    let file_norm = normalize_module_path(&entry.file.to_string_lossy());
+    file_norm == module || file_norm.ends_with(&format!(".{module}"))
+}
+
+/// Is this symbol defined in the package `module`'s own `__init__.py`?
+///
+/// `module_is` already matches `pkg/index.ts` and `pkg/mod.rs`, because
+/// `normalize_module_path` drops `index` and `mod`, but `pkg/__init__.py`
+/// normalizes to `pkg.__init__`. The package directory is compared the way
+/// `module_is` compares a file.
+fn package_init_is(entry: &SymbolEntry, module: &str) -> bool {
+    entry.file.file_stem().and_then(|s| s.to_str()) == Some("__init__")
+        && entry.file.parent().is_some_and(|dir| {
+            let dir_norm = normalize_module_path(&dir.to_string_lossy());
+            dir_norm == module || dir_norm.ends_with(&format!(".{module}"))
+        })
+}
+
+/// Source languages that can call each other directly. Calls are never
+/// resolved across families; a name shared by a Rust and a TypeScript
+/// definition is two symbols, not one.
+fn language_family(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "rs" => "rust",
+        "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" | "vue" | "svelte" => "js",
+        "py" | "pyi" => "python",
+        "go" => "go",
+        "java" | "kt" | "kts" | "scala" => "jvm",
+        "c" | "h" | "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" | "m" | "mm" => "c",
+        "cs" => "csharp",
+        "rb" => "ruby",
+        "php" | "phtml" => "php",
+        "swift" => "swift",
+        "dart" => "dart",
+        "sh" | "bash" | "zsh" => "shell",
+        _ => return None,
+    })
+}
+
+/// Unknown extensions on either side don't filter anything out.
+/// Whether two files are in the same language family (an unknown extension
+/// matches anything).
+pub(crate) fn same_language(a: &Path, b: &Path) -> bool {
+    same_family(language_family(a), b)
+}
+
+fn same_family(family: Option<&'static str>, file: &Path) -> bool {
+    match (family, language_family(file)) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
 }
 
 /// Did this symbol come from `module`?
@@ -725,5 +1038,212 @@ mod import_resolution_tests {
         assert!(segment_aligned_contains("x.deep.l0.m14", "deep.l0.m14"));
         assert!(!segment_aligned_contains("x.deep.l0.m140", "deep.l0.m14"));
         assert!(!segment_aligned_contains("x.deep.l0.m1", "deep.l0.m14"));
+    }
+
+    fn money_table() -> SymbolTable {
+        let mut table = SymbolTable::default();
+        table.insert(
+            "convert".to_string(),
+            nid(0),
+            PathBuf::from("billing/money.py"),
+        );
+        table.insert(
+            "convert".to_string(),
+            nid(1),
+            PathBuf::from("legacy/money.py"),
+        );
+        table.insert(
+            "convert".to_string(),
+            nid(2),
+            PathBuf::from("payments/rates/convert_impl.py"),
+        );
+        table.insert(
+            "Ledger.convert".to_string(),
+            nid(3),
+            PathBuf::from("ledger.py"),
+        );
+        table
+    }
+
+    #[test]
+    fn an_aliased_import_resolves_in_the_named_module_only() {
+        let table = money_table();
+        let caller = Path::new("app/orders.py");
+        assert_eq!(
+            table.resolve_imported("convert", "billing.money", caller),
+            Resolution::ViaImport(nid(0))
+        );
+        assert_eq!(
+            table.resolve_imported("convert", "legacy.money", caller),
+            Resolution::ViaImport(nid(1))
+        );
+    }
+
+    /// `from payments import convert as c`, where `payments/__init__.py`
+    /// re-exports it from a submodule.
+    #[test]
+    fn an_aliased_import_from_a_package_reaches_its_submodule() {
+        let table = money_table();
+        assert_eq!(
+            table.resolve_imported("convert", "payments", Path::new("app/orders.py")),
+            Resolution::ViaImport(nid(2))
+        );
+    }
+
+    /// `pkg/__init__.py` is `pkg` itself, so it outranks a submodule's
+    /// definition of the same name. `arbor index` stores absolute paths, so
+    /// both path shapes are checked, and a package whose name only ends like
+    /// the module's (`mypkg`) is not `pkg`.
+    #[test]
+    fn an_aliased_import_from_a_package_prefers_its_init() {
+        for root in ["", "/repo/"] {
+            let mut table = SymbolTable::default();
+            for (i, file) in ["pkg/__init__.py", "pkg/sub.py", "mypkg/__init__.py"]
+                .iter()
+                .enumerate()
+            {
+                table.insert(
+                    "f".to_string(),
+                    nid(i),
+                    PathBuf::from(format!("{root}{file}")),
+                );
+            }
+            let caller = PathBuf::from(format!("{root}app.py"));
+            assert_eq!(
+                table.resolve_imported("f", "pkg", &caller),
+                Resolution::ViaImport(nid(0)),
+                "root {root:?}"
+            );
+
+            table.insert(
+                "f".to_string(),
+                nid(3),
+                PathBuf::from(format!("{root}shop/cart/__init__.py")),
+            );
+            table.insert(
+                "f".to_string(),
+                nid(4),
+                PathBuf::from(format!("{root}shop/cart/items.py")),
+            );
+            assert_eq!(
+                table.resolve_imported("f", "shop.cart", &caller),
+                Resolution::ViaImport(nid(3)),
+                "root {root:?}: a dotted package's own __init__"
+            );
+        }
+    }
+
+    /// Known limit: `flask` is not part of this project, but a checkout under
+    /// `/home/u/flask/` has a directory named `flask`, so the module matches
+    /// it, as it does for an unaliased import.
+    #[test]
+    fn an_external_module_named_like_a_directory_above_the_project_matches_it() {
+        let mut table = SymbolTable::default();
+        table.insert(
+            "render_template".to_string(),
+            nid(0),
+            PathBuf::from("/home/u/flask/app/views.py"),
+        );
+        assert_eq!(
+            table.resolve_imported(
+                "render_template",
+                "flask",
+                Path::new("/home/u/flask/app/main.py")
+            ),
+            Resolution::ViaImport(nid(0))
+        );
+    }
+
+    #[test]
+    fn an_aliased_import_from_an_external_module_is_unresolved() {
+        let table = money_table();
+        assert_eq!(
+            table.resolve_imported("convert", "numpy", Path::new("app/orders.py")),
+            Resolution::Unresolved
+        );
+    }
+
+    /// Relative Python modules are read from the importing file's package.
+    /// The importing file itself is never the import.
+    #[test]
+    fn a_relative_python_alias_is_read_from_the_importing_package() {
+        let table = money_table();
+        assert_eq!(
+            table.resolve_imported("convert", ".", Path::new("legacy/orders.py")),
+            Resolution::ViaImport(nid(1))
+        );
+        assert_eq!(
+            table.resolve_imported("convert", ".money", Path::new("billing/orders.py")),
+            Resolution::ViaImport(nid(0))
+        );
+        assert_eq!(
+            table.resolve_imported("convert", "..money", Path::new("billing/api/orders.py")),
+            Resolution::ViaImport(nid(0))
+        );
+        assert_eq!(
+            table.resolve_imported("convert", ".", Path::new("legacy/money.py")),
+            Resolution::Unresolved
+        );
+        // `shop/money.py` does not exist; `billing` and `legacy` are not it.
+        assert_eq!(
+            table.resolve_imported("convert", ".money", Path::new("shop/orders.py")),
+            Resolution::Unresolved
+        );
+    }
+
+    #[test]
+    fn a_relative_typescript_alias_is_read_from_the_importing_directory() {
+        let mut table = SymbolTable::default();
+        table.insert(
+            "convert".to_string(),
+            nid(0),
+            PathBuf::from("src/format.ts"),
+        );
+        table.insert(
+            "convert".to_string(),
+            nid(1),
+            PathBuf::from("lib/format.ts"),
+        );
+        table.insert(
+            "convert".to_string(),
+            nid(2),
+            PathBuf::from("src/utils/index.ts"),
+        );
+        let caller = Path::new("src/app.ts");
+        assert_eq!(
+            table.resolve_imported("convert", "./format", caller),
+            Resolution::ViaImport(nid(0))
+        );
+        assert_eq!(
+            table.resolve_imported("convert", "../lib/format.js", caller),
+            Resolution::ViaImport(nid(1))
+        );
+        assert_eq!(
+            table.resolve_imported("convert", "./utils", caller),
+            Resolution::ViaImport(nid(2))
+        );
+        assert_eq!(
+            table.resolve_imported("convert", "./missing", caller),
+            Resolution::Unresolved
+        );
+        assert_eq!(
+            table.resolve_imported("convert", "../../../format", caller),
+            Resolution::Unresolved
+        );
+    }
+
+    #[test]
+    fn methods_and_other_languages_are_not_imported_names() {
+        let mut table = SymbolTable::default();
+        table.insert(
+            "Ledger.convert".to_string(),
+            nid(0),
+            PathBuf::from("money.py"),
+        );
+        table.insert("convert".to_string(), nid(1), PathBuf::from("money.ts"));
+        assert_eq!(
+            table.resolve_imported("convert", "money", Path::new("orders.py")),
+            Resolution::Unresolved
+        );
     }
 }

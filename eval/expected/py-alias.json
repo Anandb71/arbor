@@ -1,0 +1,16 @@
+{
+  "corpus_version": 1,
+  "language": "python",
+  "covers": ["import alias resolution", "from X import Y as Z"],
+  "symbols": [
+    "orders.py::total_cents",
+    "money.py::money_to_minor_units"
+  ],
+  "edges_expected": [
+    ["orders.py::total_cents", "money.py::money_to_minor_units"]
+  ],
+  "edges_forbidden": [],
+  "known_missing": [],
+  "known_extra": [],
+  "notes": "orders.py imports money_to_minor_units AS to_minor and calls to_minor(). Arbor 3.0.3 to 3.0.5 recorded no edge because the import kept only the local name; since #258 the import records the imported name too, so the alias call reaches money.py."
+}

@@ -1,0 +1,160 @@
+{
+  "corpus_version": 1,
+  "suite": "usages",
+  "language": "python",
+  "covers": [
+    "the findings of the third review of #276, one shape each",
+    "nonlocal rebinding of a client and of a model, a match capture, an except target, globals() writes at module level and from a function, and a wildcard import from another module",
+    "constructor calls weighed against __init__ defaults (a model stored on self, a client default), a subclass overriding a class attribute and the client, outside writes (obj.attr, setattr with a run-time name) and setattr(client, \"base_url\", ...)",
+    "functions passed to an executor, functools.partial, map or a task queue keep an unseen_callers gap on their defaults; a public function's client default keeps a parameter_default gap",
+    "a client constructor chosen at run time against a factory, an unbound name, functools.partial or a non-SDK import is ambiguous",
+    "dicts aliased through a chained assignment, a class attribute, self and globals() are never read; a dict that is only read still resolves",
+    "candidate values from a loop over a literal list, a dict key that is not an identifier, a conditional and branches, none of them credential-shaped; a long import path is clipped"
+  ],
+  "usages_expected": [
+    {"at": "app/agent.py:13", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "app/agent.py:24", "chain": "self.c.chat.completions.create", "routing": "unknown", "values": {"model": "gpt-4"}},
+    {"at": "app/agent.py:35", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o-mini"}},
+
+    {"at": "app/bindings.py:18", "chain": "c.chat.completions.create", "routing": "unknown", "values": {"model": "gpt-4o"}},
+    {"at": "app/bindings.py:29", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/bindings.py:36", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/bindings.py:43", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/bindings.py:47", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "o3-mini"}},
+    {"at": "app/bindings.py:55", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+
+    {"at": "app/candidates.py:11", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/candidates.py:14", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/candidates.py:19", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/candidates.py:21", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/candidates.py:24", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+
+    {"at": "app/credentials.py:11", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/credentials.py:18", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/credentials.py:20", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/credentials.py:30", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+
+    {"at": "app/dicts.py:15", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/dicts.py:20", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/dicts.py:32", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/dicts.py:36", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/dicts.py:41", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+
+    {"at": "app/escapes.py:13", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "app/escapes.py:21", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "app/escapes.py:28", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "app/escapes.py:40", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "app/escapes.py:47", "chain": "c.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4"}},
+    {"at": "app/escapes.py:54", "chain": "c.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4"}},
+    {"at": "app/escapes.py:58", "chain": "c.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4"}},
+
+    {"at": "app/factories.py:15", "chain": "c1.chat.completions.create", "routing": "unknown", "values": {"model": "gpt-4"}},
+    {"at": "app/factories.py:19", "chain": "c2.chat.completions.create", "routing": "unknown", "values": {"model": "gpt-4"}},
+    {"at": "app/factories.py:23", "chain": "c3.chat.completions.create", "routing": "unknown", "values": {"model": "gpt-4"}},
+    {"at": "app/factories.py:30", "chain": "c4.chat.completions.create", "routing": "unknown", "values": {"model": "gpt-4"}},
+
+    {"at": "app/imports.py:5", "chain": "OpenAI().chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4"}},
+
+    {"at": "app/outside.py:12", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "app/outside.py:28", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"engine": "gpt-4o"}},
+    {"at": "app/outside.py:33", "chain": "router.chat.completions.create", "routing": "unknown", "values": {"model": "gpt-4"}},
+
+    {"at": "app/overrides.py:8", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "app/overrides.py:10", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4.1"}},
+
+    {"at": "app/subclass.py:11", "chain": "self.client.chat.completions.create", "routing": "unknown"},
+    {"at": "app/subclass.py:27", "chain": "self.client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4.1"}}
+  ],
+  "clients_expected": [
+    {"at": "app/agent.py:5", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "app/agent.py:27", "constructor": "openai.OpenAI", "routing": "custom_base_url"},
+    {"at": "app/bindings.py:7", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "app/bindings.py:11", "constructor": "openai.OpenAI", "binding": "c", "routing": "openai_direct"},
+    {"at": "app/bindings.py:15", "constructor": "openai.AzureOpenAI", "binding": "c", "routing": "azure_openai"},
+    {"at": "app/candidates.py:7", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "app/credentials.py:8", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "app/dicts.py:5", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "app/escapes.py:8", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "app/escapes.py:9", "constructor": "openai.OpenAI", "binding": "gw", "routing": "custom_base_url"},
+    {"at": "app/factories.py:10", "constructor": "openai.OpenAI", "routing": "custom_base_url"},
+    {"at": "app/imports.py:5", "constructor": "openai.OpenAI", "routing": "openai_direct"},
+    {"at": "app/outside.py:5", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "app/outside.py:31", "constructor": "openai.OpenAI", "binding": "router", "routing": "openai_direct"},
+    {"at": "app/overrides.py:7", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "app/subclass.py:8", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "app/subclass.py:16", "constructor": "openai.OpenAI", "binding": "client", "routing": "custom_base_url"},
+    {"at": "app/subclass.py:24", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"}
+  ],
+  "gaps_expected": [
+    {"at": "app/agent.py:13", "kind": "unresolved_model", "reason": "parameter_overridden"},
+    {"at": "app/agent.py:13", "kind": "unresolved_model", "reason": "subclass_override"},
+    {"at": "app/agent.py:24", "kind": "ambiguous_client", "reason": "multiple_assignments"},
+    {"at": "app/agent.py:35", "kind": "unresolved_model", "reason": "parameter_default"},
+    {"at": "app/agent.py:35", "kind": "unresolved_model", "reason": "subclass_override"},
+
+    {"at": "app/bindings.py:18", "kind": "ambiguous_client", "reason": "multiple_assignments"},
+    {"at": "app/bindings.py:29", "kind": "ambiguous_client", "reason": "dynamic_feature"},
+    {"at": "app/bindings.py:29", "kind": "unresolved_model", "reason": "reassigned"},
+    {"at": "app/bindings.py:36", "kind": "ambiguous_client", "reason": "dynamic_feature"},
+    {"at": "app/bindings.py:36", "kind": "unresolved_model", "reason": "reassigned"},
+    {"at": "app/bindings.py:43", "kind": "ambiguous_client", "reason": "dynamic_feature"},
+    {"at": "app/bindings.py:43", "kind": "unresolved_model", "reason": "reassigned"},
+    {"at": "app/bindings.py:47", "kind": "ambiguous_client", "reason": "dynamic_feature"},
+    {"at": "app/bindings.py:47", "kind": "unresolved_model", "reason": "dynamic_feature"},
+    {"at": "app/bindings.py:55", "kind": "ambiguous_client", "reason": "dynamic_feature"},
+    {"at": "app/bindings.py:55", "kind": "unresolved_model", "reason": "reassigned"},
+
+    {"at": "app/candidates.py:11", "kind": "unresolved_model", "reason": "reassigned"},
+    {"at": "app/candidates.py:14", "kind": "unresolved_model", "reason": "env_var"},
+    {"at": "app/candidates.py:19", "kind": "unresolved_model", "reason": "reassigned"},
+    {"at": "app/candidates.py:21", "kind": "unresolved_model", "reason": "env_var"},
+    {"at": "app/candidates.py:24", "kind": "unresolved_model", "reason": "non_literal"},
+
+    {"at": "app/credentials.py:11", "kind": "unresolved_model", "reason": "non_literal"},
+    {"at": "app/credentials.py:18", "kind": "unresolved_model", "reason": "env_var"},
+    {"at": "app/credentials.py:20", "kind": "unresolved_model", "reason": "env_var"},
+    {"at": "app/credentials.py:30", "kind": "unresolved_model", "reason": "dynamic_feature"},
+
+    {"at": "app/dicts.py:15", "kind": "ambiguous_client", "reason": "dynamic_feature"},
+    {"at": "app/dicts.py:15", "kind": "unresolved_model", "reason": "splat"},
+    {"at": "app/dicts.py:20", "kind": "ambiguous_client", "reason": "dynamic_feature"},
+    {"at": "app/dicts.py:20", "kind": "unresolved_model", "reason": "splat"},
+    {"at": "app/dicts.py:32", "kind": "ambiguous_client", "reason": "dynamic_feature"},
+    {"at": "app/dicts.py:32", "kind": "unresolved_model", "reason": "subscript"},
+    {"at": "app/dicts.py:36", "kind": "ambiguous_client", "reason": "dynamic_feature"},
+    {"at": "app/dicts.py:36", "kind": "unresolved_model", "reason": "splat"},
+    {"at": "app/dicts.py:41", "kind": "ambiguous_client", "reason": "dynamic_feature"},
+    {"at": "app/dicts.py:41", "kind": "unresolved_model", "reason": "splat"},
+
+    {"at": "app/escapes.py:13", "kind": "unresolved_model", "reason": "unseen_callers"},
+    {"at": "app/escapes.py:21", "kind": "unresolved_model", "reason": "unseen_callers"},
+    {"at": "app/escapes.py:28", "kind": "unresolved_model", "reason": "unseen_callers"},
+    {"at": "app/escapes.py:40", "kind": "unresolved_model", "reason": "unseen_callers"},
+    {"at": "app/escapes.py:47", "kind": "ambiguous_client", "reason": "unseen_callers"},
+    {"at": "app/escapes.py:54", "kind": "ambiguous_client", "reason": "parameter_default"},
+
+    {"at": "app/factories.py:15", "kind": "ambiguous_client", "reason": "multiple_assignments"},
+    {"at": "app/factories.py:19", "kind": "ambiguous_client", "reason": "multiple_assignments"},
+    {"at": "app/factories.py:23", "kind": "ambiguous_client", "reason": "multiple_assignments"},
+    {"at": "app/factories.py:30", "kind": "ambiguous_client", "reason": "multiple_assignments"},
+
+    {"at": "app/outside.py:12", "kind": "unresolved_model", "reason": "dynamic_feature"},
+    {"at": "app/outside.py:28", "kind": "unresolved_model", "reason": "dynamic_feature"},
+    {"at": "app/outside.py:33", "kind": "ambiguous_client", "reason": "base_url_assigned"},
+
+    {"at": "app/overrides.py:8", "kind": "unresolved_model", "reason": "reassigned"},
+
+    {"at": "app/subclass.py:11", "kind": "ambiguous_client", "reason": "multiple_assignments"},
+    {"at": "app/subclass.py:11", "kind": "unresolved_model", "reason": "reassigned"},
+    {"at": "app/subclass.py:27", "kind": "unresolved_model", "reason": "subclass_override"}
+  ],
+  "skipped_expected": {"vendored_files": 0, "vendored_calls": 0, "hidden_files": 0, "hidden_calls": 0},
+  "forbidden_in_output": [
+    "EVALRR3",
+    "sk-proj-",
+    "gateway.example"
+  ],
+  "known_missing": [],
+  "known_extra": [],
+  "notes": "Synthetic. Truth is what each line does at run time, except where a policy turns a value into a gap. agent.py:13 reports the __init__ default with a parameter_overridden gap because the constructor call passes o1-mini; agent.py:24 is public, so its client default and the constructor call's gateway are both possible; agent.py:35 is built without the argument, but Quiet is public, so another module may build it with another model: the default keeps a parameter_default gap (policy round). escapes.py:13, :21, :28 and :40 report their default with an unseen_callers gap (the function is passed to an executor, partially applied, mapped or decorated); escapes.py:47 keeps the client default's routing with an unseen_callers gap, :54 with a parameter_default gap (public), and _private_client at :58 has none. bindings.py:47 is globals()[\"MODEL7\"] = \"o3-mini\" at module level, which is MODEL7 = \"o3-mini\": the value is right; bindings.py:55 may be rebound by tune() at any time. overrides.py:10 is assigned after the wildcard import, so it resolves; overrides.py:8 is written before it. subclass.py:27 is a class with no subclass in the file; dicts.py:41 is only read through its aliases, but a dict reached through another name is outside the supported grammar (policy round), so it is a splat gap. Policy round: globals() in bindings.py and dicts.py may rebind anything in those files, so every route there, and every value not written at its call (bindings.py:47), keeps a dynamic_feature gap; outside.py:12 and :28 and credentials.py:30 read a class attribute that a write on another object (bot.model = ..., setattr(h, \"model\", ...)) or a setattr with a run-time name may change, so the class's own value is reported with a dynamic_feature gap and the outside writes are no longer copied into the lookup. Gap values (the models a run-time choice may give) and values_complete are not compared here; the unit tests check them. credentials.py lists no credential-shaped value anywhere: the loop item, the dict entries under a non-identifier, a secret-named and a credential-shaped key, the conditional's side and the setattr value are all refused, and imports.py's clipped module path drops its middle marker. Policy round 2 (lead decision 8): agent.py:13 and :35 and subclass.py:27 read model and MODEL through self in public classes (Agent, Quiet, Plain), which another module may subclass and override, so each value also keeps a subclass_override gap."
+}

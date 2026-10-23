@@ -34,8 +34,12 @@ pub fn parse_request_meta(params: &Value) -> RequestMeta {
     };
 
     RequestMeta {
+        // The 2026-07-28 protocol namespaces its stateless key
+        // (`io.modelcontextprotocol/protocolVersion`); flat keys stay as
+        // fallbacks for clients that already send them.
         protocol_version: meta
-            .get("protocolVersion")
+            .get("io.modelcontextprotocol/protocolVersion")
+            .or_else(|| meta.get("protocolVersion"))
             .or_else(|| meta.get("protocol_version"))
             .and_then(|v| v.as_str())
             .map(str::to_string),
@@ -54,16 +58,36 @@ pub fn parse_request_meta(params: &Value) -> RequestMeta {
     }
 }
 
+/// Classify a client-reported protocol version.
+///
+/// `YYYY-*` versions at or after the latest release year map to the current
+/// protocol (a client built against a newer spec gets our best version, not a
+/// silent downgrade), earlier valid versions map to the legacy protocol, and
+/// anything that does not look like an ISO-date version returns `None` so the
+/// caller can reject it explicitly.
+pub fn classify_protocol_version(version: &str) -> Option<&'static str> {
+    let year: u32 = version.get(..4)?.parse().ok()?;
+    if !version
+        .get(..4)
+        .is_some_and(|y| y.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(if year >= 2026 {
+        PROTOCOL_VERSION_LATEST
+    } else {
+        PROTOCOL_VERSION_LEGACY
+    })
+}
+
 /// Resolve protocol version: prefer client `_meta`, fall back to initialize negotiation.
 pub fn resolve_protocol_version(meta: &RequestMeta, negotiated: Option<&str>) -> &'static str {
-    if let Some(v) = meta.protocol_version.as_deref() {
-        if v == PROTOCOL_VERSION_LATEST || v.starts_with("2026-") {
-            return PROTOCOL_VERSION_LATEST;
-        }
-    }
-    if let Some(v) = negotiated {
-        if v == PROTOCOL_VERSION_LATEST || v.starts_with("2026-") {
-            return PROTOCOL_VERSION_LATEST;
+    for v in [meta.protocol_version.as_deref(), negotiated]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(protocol) = classify_protocol_version(v) {
+            return protocol;
         }
     }
     PROTOCOL_VERSION_LEGACY
@@ -78,15 +102,40 @@ pub fn with_cache_meta(mut value: Value, ttl_ms: u64) -> Value {
     value
 }
 
-/// Server capabilities for MCP 2026-07-28.
+/// Extensions this server actually implements. Anything else a client asks
+/// for is not an optional extra it silently accepts — it is not advertised.
+pub const IMPLEMENTED_EXTENSIONS: &[&str] = &[EXT_TASKS, EXT_APPS];
+
+/// Extensions the client declared support for in `capabilities.extensions`.
+/// Returns `None` when the client did not declare the field at all, so the
+/// caller can keep advertising the full set for backward compatibility.
+pub fn client_declared_extensions(params: &Value) -> Option<Vec<String>> {
+    let ext = params.get("capabilities")?.get("extensions")?.as_object()?;
+    Some(ext.keys().cloned().collect())
+}
+
+/// Server capabilities for MCP 2026-07-28, narrowed to the extensions the
+/// client declared it understands when it declared any.
 pub fn server_capabilities() -> Value {
+    server_capabilities_for(None)
+}
+
+pub fn server_capabilities_for(client_extensions: Option<&[String]>) -> Value {
+    let supported: Vec<&&str> = match client_extensions {
+        Some(declared) => IMPLEMENTED_EXTENSIONS
+            .iter()
+            .filter(|ext| declared.iter().any(|d| d.as_str() == **ext))
+            .collect(),
+        None => IMPLEMENTED_EXTENSIONS.iter().collect(),
+    };
+    let extensions: serde_json::Map<String, Value> = supported
+        .into_iter()
+        .map(|ext| (ext.to_string(), json!({ "version": "1.0.0" })))
+        .collect();
     json!({
         "tools": { "listChanged": false },
         "resources": { "subscribe": false, "listChanged": false },
-        "extensions": {
-            EXT_TASKS: { "version": "1.0.0" },
-            EXT_APPS: { "version": "1.0.0" }
-        },
+        "extensions": Value::Object(extensions),
         "streaming": false,
         "pagination": true,
         "json": true

@@ -1,0 +1,29 @@
+{
+  "states": {
+    "before": {
+      "symbols": [
+        "app.py::start",
+        "pkg/core.py::run"
+      ],
+      "edges_expected": [
+        [
+          "app.py::start",
+          "pkg/core.py::run"
+        ]
+      ]
+    },
+    "after": {
+      "symbols": [
+        "app.py::start",
+        "pkg/core.py::run"
+      ],
+      "edges_expected": [],
+      "known_extra": [
+        [
+          "app.py::start",
+          "pkg/core.py::run"
+        ]
+      ]
+    }
+  }
+}

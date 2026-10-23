@@ -29,10 +29,45 @@ inputs:
     description: "The GITHUB_TOKEN secret, needed to post PR comments."
     required: false
     default: "${{ github.token }}"
+  mode:
+    description: "'command' (default) runs the command input. Any other value fails the step before anything is installed. 'retirements' finds direct SDK calls to AI models their provider has retired or is retiring, writes a job summary and annotates the affected lines (up to GitHub's 10 warnings per step; the summary lists every call). It runs on the runner; no code is sent anywhere."
+    required: false
+    default: command
+  retirements-path:
+    description: "Retirements mode: the directory or file to check, relative to working-directory."
+    required: false
+    default: .
+  retirements-fail-on:
+    description: "Retirements mode: 'never' (default; warnings only), 'retired' (fail when a confirmed call uses a model that is already retired), or a number of days (also fail when a model retires within that many days). A check that cannot run (exit 2) fails the step whatever this says."
+    required: false
+    default: never
+  retirements-include-routed:
+    description: "Retirements mode: also list calls through Azure, another host in base_url or another cloud, where the provider's dates may not apply, and let them fail the check."
+    required: false
+    default: "false"
+  retirements-count-unconfirmed:
+    description: "Retirements mode: also let unconfirmed calls fail the check (environment or config fallbacks, parameter defaults, possible values, unresolved clients, unknown routing). They are always listed."
+    required: false
+    default: "false"
 
 runs:
   using: composite
   steps:
+    # Before anything is installed: a typo such as `mode: retirement` would
+    # otherwise run command mode (and its PR comment) without a word.
+    - name: Check the mode input
+      shell: bash
+      env:
+        ARBOR_MODE: ${{ inputs.mode }}
+      run: |
+        case "$ARBOR_MODE" in
+          command|retirements) ;;
+          *)
+            echo "::error title=Arbor::mode must be 'command' or 'retirements', not '${ARBOR_MODE//[$'\r\n%']/}'"
+            exit 2
+            ;;
+        esac
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
@@ -62,40 +97,54 @@ runs:
           
           DOWNLOADED=false
           if [[ -n "$VERSION" ]]; then
-            ARCH=$(uname -m || echo "x86_64")
-            OS="unknown-linux-gnu"
-            if [[ "$OSTYPE" == "darwin"* ]]; then
-              OS="apple-darwin"
-            elif [[ "$OSTYPE" == "msys"* || "$OSTYPE" == "win32"* ]]; then
-              OS="pc-windows-msvc"
+            # Release assets are named arbor-<os>-<arch> (arbor-linux-x86_64.tar.gz,
+            # arbor-macos-aarch64.tar.gz, arbor-windows-x86_64.zip). This used to
+            # build Rust target triples instead, which matched no asset, so every
+            # run silently fell back to compiling whatever crates.io had.
+            case "$(uname -m 2>/dev/null || echo x86_64)" in
+              arm64|aarch64) ARCH="aarch64" ;;
+              *) ARCH="x86_64" ;;
+            esac
+            case "$RUNNER_OS" in
+              macOS) OS="macos" ;;
+              Windows) OS="windows" ;;
+              *) OS="linux" ;;
+            esac
+
+            TARBALL="arbor-${OS}-${ARCH}.tar.gz"
+            if [[ "$OS" == "windows" ]]; then
+              TARBALL="arbor-${OS}-${ARCH}.zip"
             fi
-            
-            TARBALL="arbor-${ARCH}-${OS}.tar.gz"
-            if [[ "$OS" == "pc-windows-msvc" ]]; then
-              TARBALL="arbor-${ARCH}-${OS}.zip"
-            fi
-            
+
             DOWNLOAD_URL="https://github.com/Anandb71/arbor/releases/download/v${VERSION}/${TARBALL}"
             echo "Attempting to download pre-built binary: $DOWNLOAD_URL"
-            
+
             if curl -fsSL -o "$TARBALL" "$DOWNLOAD_URL"; then
               echo "Extracting..."
               if [[ "$TARBALL" == *.zip ]]; then
-                unzip -q "$TARBALL" || true
+                unzip -q -o "$TARBALL" 2>/dev/null \
+                  || powershell -NoProfile -Command "Expand-Archive -Force -Path '$TARBALL' -DestinationPath ." \
+                  || true
               else
                 tar -xzf "$TARBALL" || true
               fi
-              
+
               BINARY="arbor"
-              if [[ "$OS" == "pc-windows-msvc" ]]; then
+              if [[ "$OS" == "windows" ]]; then
                 BINARY="arbor.exe"
               fi
               
               if [[ -f "$BINARY" ]]; then
                 mkdir -p "$HOME/.arbor-bin"
                 mv "$BINARY" "$HOME/.arbor-bin/"
-                echo "Adding $HOME/.arbor-bin to GITHUB_PATH"
-                echo "$HOME/.arbor-bin" >> $GITHUB_PATH
+                PATH_ENTRY="$HOME/.arbor-bin"
+                # GITHUB_PATH is read by the runner, which needs a native
+                # path on Windows rather than Git Bash's /c/... form.
+                if command -v cygpath >/dev/null 2>&1; then
+                  PATH_ENTRY="$(cygpath -w "$PATH_ENTRY")"
+                fi
+                echo "Adding $PATH_ENTRY to GITHUB_PATH"
+                echo "$PATH_ENTRY" >> "$GITHUB_PATH"
                 export PATH="$HOME/.arbor-bin:$PATH"
                 rm -f "$TARBALL"
                 DOWNLOADED=true
@@ -105,16 +154,78 @@ runs:
           fi
           
           if [[ "$DOWNLOADED" == "false" ]]; then
-            echo "Could not download pre-built binary. Installing via cargo instead (this might take a few minutes)..."
-            if [[ "${{ inputs.arbor-version }}" == "latest" ]]; then
-              cargo install arbor-graph-cli --force
+            echo "Could not download pre-built binary. Building with cargo instead (this might take a few minutes)..."
+            # Build the resolved release tag rather than whatever crates.io
+            # has: crates.io can lag the GitHub releases.
+            if [[ -n "$VERSION" ]]; then
+              cargo install --git https://github.com/Anandb71/arbor --tag "v${VERSION}" arbor-graph-cli --locked --force
             else
-              cargo install arbor-graph-cli --version "${{ inputs.arbor-version }}" --force
+              cargo install arbor-graph-cli --force
             fi
           fi
         fi
 
+    - name: Check model retirements
+      if: inputs.mode == 'retirements'
+      shell: bash
+      env:
+        RET_WORKDIR: ${{ inputs.working-directory }}
+        RET_PATH: ${{ inputs.retirements-path }}
+        RET_FAIL_ON: ${{ inputs.retirements-fail-on }}
+        RET_ROUTED: ${{ inputs.retirements-include-routed }}
+        RET_UNCONFIRMED: ${{ inputs.retirements-count-unconfirmed }}
+      run: |
+        set -uo pipefail
+        # Run from the repository root so annotation paths match the repository.
+        TARGET="$RET_PATH"
+        if [[ -n "$RET_WORKDIR" && "$RET_WORKDIR" != "." ]]; then
+          if [[ "$RET_PATH" == "." ]]; then TARGET="$RET_WORKDIR"; else TARGET="${RET_WORKDIR%/}/$RET_PATH"; fi
+        fi
+
+        ARGS=()
+        if [[ "$RET_ROUTED" == "true" ]]; then ARGS+=(--include-routed); fi
+        if [[ "$RET_UNCONFIRMED" == "true" ]]; then ARGS+=(--count-unconfirmed); fi
+        case "$RET_FAIL_ON" in
+          never|retired) ;;
+          ''|*[!0-9]*)
+            echo "::error title=Arbor retirements::retirements-fail-on must be 'never', 'retired' or a number of days, not '$RET_FAIL_ON'"
+            exit 2
+            ;;
+          *) ARGS+=(--fail-within "$RET_FAIL_ON") ;;
+        esac
+
+        # One scan for both outputs: warning annotations on stdout (GitHub
+        # shows at most 10 per step, so Arbor prints 10 and one notice for
+        # the rest) and the Markdown report, which lists every call, for the
+        # job summary. The exit code says whether anything is failing:
+        # 0 nothing, 1 retired (or retiring within the window), 2 error.
+        # (`shell: bash` runs with -e, so the exit code is caught, not fatal.)
+        REPORT="$(mktemp)"
+        CODE=0
+        arbor retirements "$TARGET" --annotations --markdown-out "$REPORT" ${ARGS[@]+"${ARGS[@]}"} || CODE=$?
+        if [[ -s "$REPORT" ]]; then
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+          else
+            cat "$REPORT"
+          fi
+        fi
+        rm -f "$REPORT"
+
+        # A check that could not run fails the step even with
+        # retirements-fail-on: never: a missing report must not pass quietly.
+        if [[ $CODE -ge 2 ]]; then
+          echo "::error title=Arbor retirements::the check could not run (exit $CODE); this fails the step whatever retirements-fail-on says"
+          exit 2
+        fi
+        if [[ $CODE -eq 1 && "$RET_FAIL_ON" != "never" ]]; then
+          echo "::error title=Arbor retirements::calls use models that are retired or retire within the configured window; see the job summary"
+          exit 1
+        fi
+        exit 0
+
     - name: Run Arbor and Comment on PR
+      if: inputs.mode != 'retirements'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}

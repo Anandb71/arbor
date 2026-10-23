@@ -210,11 +210,18 @@ Examples:
 
 All tools return a standard envelope:
 ```json
-{ "ok": true, "tool": "...", "arbor_version": "2.2.0", "data": {...}, "meta": { "node_count": N, "suggested_next_tool": "...", "suggested_next_args": {...} } }
+{ "ok": true, "tool": "...", "arbor_version": "3.1.0", "data": {...}, "meta": { "node_count": N, "suggested_next_tool": "...", "suggested_next_args": {...} } }
 ```
 Errors return `{ "ok": false, "error": "..." }`.
 
-### Surgical tools (v2.1.0)
+### Orientation
+
+| Tool | Description |
+|------|-------------|
+| `get_map` | Ranked, token-budgeted skeleton of the codebase. Recommended first call |
+| `get_architecture_overview` | Hotspots, module boundaries, entry points, languages detected, graph statistics |
+
+### Surgical tools
 
 | Tool | Description |
 |------|-------------|
@@ -224,8 +231,11 @@ Errors return `{ "ok": false, "error": "..." }`.
 | `search_symbols` | Fuzzy search across all symbol names |
 | `get_file_graph` | Returns all nodes and intra-file edges for a given file path |
 | `get_node_detail` | Returns full detail for a node by ID or name |
+| `explain_symbol` | Token-bounded explanation of a symbol: role, callers, callees, centrality |
+| `batch_query` | Several symbols in one call, optionally with callers and callees |
+| `find_api_usages` | OpenAI, Anthropic and Gemini SDK call sites (Python): file, line, enclosing symbol, client routing, model IDs from literals, same-file constants, dict literals and parameter defaults (env/config fallbacks as `env_default`, with a gap), and typed gaps. Never returns credential values. Usages paginate with `offset`/`limit`, clients and gaps with `clients_offset`/`gaps_offset`; `skipped` carries counts on every page and the first 20 entries of each list on the first page; filter with `sdk` and `path`. A value or route with no gap is confirmed only inside the grammar in [SDK_USAGES.md](SDK_USAGES.md) |
 
-### Broad tools (existing)
+### Broad tools
 
 | Tool | Description |
 |------|-------------|
@@ -233,6 +243,8 @@ Errors return `{ "ok": false, "error": "..." }`.
 | `analyze_impact` | Blast radius with confidence levels and role classification |
 | `find_path` | Shortest path between two symbols |
 | `get_knowledge_path` | Knowledge graph path with wiki-link causality explanation |
+| `get_blast_radius` | Blast radius of the current uncommitted git changes |
+| `audit_security` | Execution paths from a symbol to sensitive sinks (queries, file I/O, network, exec) |
 
 ### Example: get_callers
 

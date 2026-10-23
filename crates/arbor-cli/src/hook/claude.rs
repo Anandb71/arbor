@@ -2,6 +2,7 @@
 //! arbor command permissions.
 
 use super::{Harness, Result, Scope};
+use crate::commands::write_error;
 use colored::Colorize;
 use serde_json::{json, Value};
 use std::fs;
@@ -26,6 +27,10 @@ const PERMISSIONS: &[&str] = &[
     "Bash(arbor entry-points *)",
     "Bash(arbor refactor *)",
     "Bash(arbor export *)",
+    // Reading receipts is safe to run unprompted. `undo` changes files (and
+    // `--force` can discard later work), so Claude asks before running it.
+    "Bash(arbor receipt list *)",
+    "Bash(arbor receipt show *)",
 ];
 
 pub struct Claude;
@@ -77,10 +82,10 @@ fn claude_md_path(root: &Path, scope: &Scope) -> PathBuf {
 fn apply_directives(root: &Path, scope: &Scope) -> Result<()> {
     let path = claude_md_path(root, scope);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|e| write_error(parent, e))?;
     }
 
-    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let existing = read_existing(&path)?;
     let updated = upsert_block(&existing, &directives_block());
 
     if updated == existing {
@@ -93,7 +98,7 @@ fn apply_directives(root: &Path, scope: &Scope) -> Result<()> {
     } else {
         "updated"
     };
-    fs::write(&path, updated)?;
+    fs::write(&path, updated).map_err(|e| write_error(&path, e))?;
     println!("  {} {} {}", "✓".green(), verb, path.display());
     Ok(())
 }
@@ -208,6 +213,27 @@ When `arbor query` returns test files but you need production code, do NOT fall 
 // .claude/settings.json — hooks + permissions
 // ---------------------------------------------------------------------------
 
+/// Read a file this command is about to rewrite. Only a missing file counts
+/// as empty: treating an unreadable one as empty would overwrite the user's
+/// content with Arbor's alone.
+fn read_existing(path: &Path) -> Result<String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(format!(
+            "{} is not UTF-8 text, so Arbor left it untouched.\n  \
+             Save it as UTF-8, then run this command again.",
+            path.display()
+        )
+        .into()),
+        Err(e) => Err(format!(
+            "Arbor could not read {}: {e}. It was left untouched.",
+            path.display()
+        )
+        .into()),
+    }
+}
+
 fn settings_path(root: &Path) -> PathBuf {
     root.join(".claude").join("settings.json")
 }
@@ -215,13 +241,15 @@ fn settings_path(root: &Path) -> PathBuf {
 fn apply_settings(root: &Path) -> Result<()> {
     let path = settings_path(root);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|e| write_error(parent, e))?;
     }
 
-    let mut settings: Value = match fs::read_to_string(&path) {
-        Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)
-            .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?,
-        _ => json!({}),
+    let text = read_existing(&path)?;
+    let mut settings: Value = if text.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(&text)
+            .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?
     };
 
     if !settings.is_object() {
@@ -236,7 +264,8 @@ fn apply_settings(root: &Path) -> Result<()> {
         return Ok(());
     }
 
-    fs::write(&path, serde_json::to_string_pretty(&settings)? + "\n")?;
+    fs::write(&path, serde_json::to_string_pretty(&settings)? + "\n")
+        .map_err(|e| write_error(&path, e))?;
     println!("  {} settings written to {}", "✓".green(), path.display());
     Ok(())
 }
@@ -285,7 +314,34 @@ fn ensure_hooks(settings: &mut Value) -> bool {
 
     let pre = add_bash_hooks(hooks, "PreToolUse", &[init, block]);
     let post = add_bash_hooks(hooks, "PostToolUse", &[map]);
-    pre || post
+    // A receipt after every turn: snapshot when a request is sent, explain
+    // the difference when Claude finishes.
+    let begin = add_event_hook(hooks, "UserPromptSubmit", RECEIPT_BEGIN);
+    let end = add_event_hook(hooks, "Stop", RECEIPT_END);
+    pre || post || begin || end
+}
+
+const RECEIPT_BEGIN: &str = "arbor receipt begin";
+const RECEIPT_END: &str = "arbor receipt end --hook";
+
+/// Ensure `command` runs on `event` (an event without a tool matcher).
+/// Returns true if it was added.
+fn add_event_hook(hooks: &mut serde_json::Map<String, Value>, event: &str, command: &str) -> bool {
+    let entries = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
+    if !entries.is_array() {
+        *entries = json!([]);
+    }
+    let entries = entries.as_array_mut().unwrap();
+    let present = entries
+        .iter()
+        .flat_map(|group| group.get("hooks").and_then(|h| h.as_array()))
+        .flatten()
+        .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(command));
+    if present {
+        return false;
+    }
+    entries.push(json!({ "hooks": [{ "type": "command", "command": command }] }));
+    true
 }
 
 /// Ensure each command in `cmds` is registered under `event` for the Bash
@@ -377,4 +433,65 @@ fn ensure_permissions(settings: &mut Value) -> bool {
         }
     }
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_directives, apply_settings, claude_md_path, settings_path, PERMISSIONS};
+    use crate::hook::Scope;
+
+    /// "# Team rules" as UTF-16 LE with a BOM, as Windows PowerShell 5 writes it.
+    fn utf16_file() -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend("# Team rules".encode_utf16().flat_map(u16::to_le_bytes));
+        bytes
+    }
+
+    #[test]
+    fn an_unreadable_claude_md_is_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = Scope::Project(dir.path().to_path_buf());
+        let path = claude_md_path(dir.path(), &scope);
+        std::fs::write(&path, utf16_file()).unwrap();
+
+        let error = apply_directives(dir.path(), &scope)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is not UTF-8 text"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), utf16_file());
+    }
+
+    #[test]
+    fn an_unreadable_settings_json_is_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, utf16_file()).unwrap();
+
+        let error = apply_settings(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("is not UTF-8 text"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), utf16_file());
+    }
+
+    #[test]
+    fn missing_files_are_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = Scope::Project(dir.path().to_path_buf());
+        apply_directives(dir.path(), &scope).unwrap();
+        apply_settings(dir.path()).unwrap();
+        assert!(claude_md_path(dir.path(), &scope).is_file());
+        assert!(settings_path(dir.path()).is_file());
+    }
+
+    #[test]
+    fn receipts_are_readable_without_a_prompt_but_undo_asks() {
+        assert!(PERMISSIONS.contains(&"Bash(arbor receipt list *)"));
+        assert!(PERMISSIONS.contains(&"Bash(arbor receipt show *)"));
+        // `undo` rewrites files (and `--force` can discard later work), so no
+        // allow-list entry may match it.
+        assert!(PERMISSIONS
+            .iter()
+            .all(|entry| !entry.starts_with("Bash(arbor receipt *")
+                && !entry.contains("receipt undo")));
+    }
 }

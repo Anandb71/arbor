@@ -70,7 +70,6 @@ jobs:
           python3 - <<'PY'
           import json
           import pathlib
-          import re
           import tomllib
           import sys
 
@@ -92,19 +91,15 @@ jobs:
           if vscode_ext != expected:
               mismatches.append(("extensions/arbor-vscode/package.json version", vscode_ext, expected))
 
-          scoop_version = json.loads((root / 'packaging' / 'scoop' / 'arbor.json').read_text(encoding='utf-8')).get('version')
-          if scoop_version != expected:
-              mismatches.append(("packaging/scoop/arbor.json version", scoop_version, expected))
-
           agent_card = json.loads((root / 'agent-card.json').read_text(encoding='utf-8')).get('version')
           if agent_card != expected:
               mismatches.append(("agent-card.json version", agent_card, expected))
 
-          homebrew_text = (root / 'packaging' / 'homebrew' / 'arbor.rb').read_text(encoding='utf-8')
-          m = re.search(r'^\s*version\s+"([^"]+)"\s*$', homebrew_text, flags=re.MULTILINE)
-          homebrew_version = m.group(1) if m else None
-          if homebrew_version != expected:
-              mismatches.append(("packaging/homebrew/arbor.rb version", homebrew_version, expected))
+          # The Homebrew formula and Scoop manifest are not checked here: their
+          # version and checksums describe published assets, so the
+          # update-checksums job writes them after the build. Bumping them by
+          # hand before the tag advertised the new version with the previous
+          # release's checksums until that job's pull request merged.
 
           if mismatches:
               print("::error::Version sync check failed.")
@@ -144,85 +139,28 @@ jobs:
         run: cargo test --workspace
 
   build:
-    name: Build (${{ matrix.target }})
+    name: Build
     needs: [prepare, verify-version-sync]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact: arbor-linux-x86_64
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact: arbor-linux-aarch64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            artifact: arbor-macos-x86_64
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            artifact: arbor-macos-aarch64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            artifact: arbor-windows-x86_64
+    uses: ./.github/workflows/release-build.yml
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: bash scripts/ci/install-linux-deps.sh pkg-config libssl-dev build-essential cmake
-
-      - name: Install Linux aarch64 cross toolchain
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: bash scripts/ci/install-linux-deps.sh gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-
-      - name: Configure aarch64 linker
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} -p arbor-graph-cli
-
-      - name: Package artifact (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/arbor" "dist/arbor"
-          chmod +x dist/arbor
-          tar -C dist -czf "${{ matrix.artifact }}.tar.gz" arbor
-
-      - name: Package artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/arbor.exe" "dist/arbor.exe"
-          Compress-Archive -Path "dist/arbor.exe" -DestinationPath "${{ matrix.artifact }}.zip" -Force
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: |
-            ${{ matrix.artifact }}.tar.gz
-            ${{ matrix.artifact }}.zip
-          if-no-files-found: error
+  # Nothing is published until every binary has run on its own platform, so
+  # a binary that cannot start there never reaches a channel.
+  smoke:
+    name: Smoke test
+    needs: [prepare, build]
+    uses: ./.github/workflows/release-smoke.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
 
   publish-crates:
     name: Publish crates to crates.io
-    needs: [prepare, build]
+    needs: [prepare, build, smoke]
     runs-on: ubuntu-latest
+    # A crates.io failure shows as a failed job with an error annotation, but
+    # it must not fail the run: GHCR, npm and the VS Code extension publish
+    # only after a successful Release run, so v3.0.0's expired token cost
+    # every one of those channels.
+    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -240,9 +178,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          # An unset or empty secret is a failed publish, not a skip: `gh secret
+          # set` stores an empty value when nothing reaches its prompt, and the
+          # job then reported success while publishing nothing.
           if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "CARGO_REGISTRY_TOKEN not set; skipping crates.io publish."
-            exit 0
+            echo "::error title=crates.io publish skipped::CARGO_REGISTRY_TOKEN is unset or empty. Set it, then re-run this job."
+            exit 1
           fi
 
           crates=(
@@ -255,20 +196,39 @@ jobs:
             arbor-gui
           )
 
+          # Only "this version is already on crates.io" is safe to skip, so a
+          # re-run after a partial publish can finish the rest. Anything else,
+          # such as an expired token's 403, used to be printed as a warning and
+          # dropped, which left crates.io several releases behind unnoticed.
+          failed=()
           for crate in "${crates[@]}"; do
             echo "Publishing ${crate}..."
-            if cargo publish -p "${crate}" --allow-dirty; then
+            if output=$(cargo publish -p "${crate}" --allow-dirty 2>&1); then
               echo "Published ${crate}"
+            elif grep -Eqi 'already (exists|uploaded)' <<< "$output"; then
+              echo "${crate} ${{ needs.prepare.outputs.version }} is already on crates.io; skipping."
             else
-              echo "Warning: publish failed for ${crate} (may already exist). Continuing."
+              echo "$output"
+              echo "::error title=crates.io publish failed::${crate}: $(grep -m1 -i 'error' <<< "$output" || echo 'see log')"
+              failed+=("${crate}")
             fi
             sleep 20
           done
 
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::Not published to crates.io: ${failed[*]}. A 403 means CARGO_REGISTRY_TOKEN expired or lacks publish scope; rotate it, then re-run this job."
+            exit 1
+          fi
+
   release:
     name: Create GitHub Release
-    needs: [prepare, build, publish-crates]
+    needs: [prepare, build, smoke]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Signing and storing the build provenance attestations.
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -284,7 +244,19 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets
           find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release-assets/ \;
+          # Published next to the archives so installers and users can check
+          # a download with `sha256sum -c SHA256SUMS --ignore-missing`.
+          (cd release-assets && sha256sum -- *.tar.gz *.zip > SHA256SUMS)
+          cat release-assets/SHA256SUMS
           ls -la release-assets
+
+      # A signed SLSA provenance statement for every archive in SHA256SUMS,
+      # tying it to this workflow run and commit. Check a download with
+      # `gh attestation verify <archive> --repo Anandb71/arbor`.
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-checksums: release-assets/SHA256SUMS
 
       - name: Generate release notes
         shell: bash
@@ -299,18 +271,17 @@ jobs:
           ### Installation
 
           \`\`\`bash
-          # Cargo
-          cargo install arbor-graph-cli --version ${VERSION}
+          # macOS / Linux (prebuilt binary)
+          curl -fsSL https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.sh | bash -s -- --version ${TAG}
 
-          # Homebrew (macOS/Linux)
-          brew install Anandb71/tap/arbor
+          # Windows (PowerShell)
+          iwr https://raw.githubusercontent.com/Anandb71/arbor/main/scripts/install.ps1 -OutFile install.ps1; .\install.ps1 -Version ${TAG}
 
-          # Scoop (Windows)
-          scoop bucket add arbor https://github.com/Anandb71/arbor
-          scoop install arbor
+          # Cargo (builds from this tag)
+          cargo install --git https://github.com/Anandb71/arbor --tag ${TAG} arbor-graph-cli
 
           # npm
-          npx @anandb71/arbor-cli
+          npx @anandb71/arbor-cli@${VERSION}
 
           # Docker
           docker pull ghcr.io/anandb71/arbor:${TAG}
@@ -325,6 +296,14 @@ jobs:
           | macOS | x86_64 | \`arbor-macos-x86_64.tar.gz\` |
           | macOS | Apple Silicon | \`arbor-macos-aarch64.tar.gz\` |
           | Windows | x86_64 | \`arbor-windows-x86_64.zip\` |
+
+          ### Verify a download
+
+          \`\`\`bash
+          sha256sum -c SHA256SUMS --ignore-missing
+          # Check that an archive was built by this repository's release workflow
+          gh attestation verify arbor-linux-x86_64.tar.gz --repo Anandb71/arbor
+          \`\`\`
           EOF
 
       - name: Create/Update GitHub release
@@ -343,6 +322,9 @@ jobs:
     name: Update Homebrew & Scoop checksums
     needs: [prepare, release]
     runs-on: ubuntu-latest
+    # Same reasoning as publish-crates: a failure here is reported, but the
+    # release itself is out, and the downstream channels must still publish.
+    continue-on-error: true
     permissions:
       contents: write
       pull-requests: write
@@ -429,10 +411,16 @@ jobs:
           BRANCH="chore/manifest-checksums-v${VERSION}"
           git push --force origin "HEAD:${BRANCH}"
 
-          gh pr create \
+          # Opening the PR needs "Allow GitHub Actions to create and approve
+          # pull requests" (Settings > Actions > General). Without it the
+          # branch is still pushed, so point at it and fail visibly.
+          if ! gh pr create \
             --base main \
             --head "${BRANCH}" \
             --title "chore: update package manifests for v${VERSION}" \
-            --body "Homebrew and Scoop checksums for the v${VERSION} release assets, generated by the release workflow. Merge to keep \`brew install\` and \`scoop install\` working on the new version."
+            --body "Homebrew and Scoop checksums for the v${VERSION} release assets, generated by the release workflow. Merge to keep \`scoop install\` and the Homebrew formula working on the new version."; then
+            echo "::error title=Manifest PR not opened::Branch ${BRANCH} holds the v${VERSION} checksums. Open it: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/main...${BRANCH}"
+            exit 1
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
