@@ -8,8 +8,8 @@ use crate::edge::{Edge, EdgeKind};
 use crate::graph::{ArborGraph, NodeId};
 use crate::symbol_table::{Resolution, SymbolTable};
 use arbor_core::{
-    clean_type_name, field_type_ref, import_alias, return_type_ref, type_relation_ref,
-    typed_receiver, CodeNode, NodeKind, TypeRelationKind,
+    clean_type_name, field_type_ref, import_alias, local_binding, return_type_ref, runtime_binding,
+    type_relation_ref, typed_receiver, CodeNode, NodeKind, TypeRelationKind,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -87,6 +87,22 @@ pub struct GraphBuilder {
     /// Files with at least one exported definition. A JavaScript or
     /// TypeScript file with none, and no imports, may be a classic script.
     exporting_files: HashSet<String>,
+
+    /// Names a JavaScript or TypeScript file binds from a value one of its
+    /// project modules produced: file → local name → (name to look for,
+    /// module). `const { setFilters } = useListFilters()` after importing the
+    /// hook from `./hooks` → `("setFilters", "./hooks")`.
+    runtime_bindings: HashMap<String, HashMap<String, (String, String)>>,
+
+    /// Names a JavaScript or TypeScript file binds itself: variables,
+    /// parameters, destructured values. A call to one may reach whatever
+    /// function the value holds.
+    local_bindings: HashMap<String, HashSet<String>>,
+
+    /// Names a JavaScript or TypeScript file binds from two different modules
+    /// (in two function scopes), which one file-level map can't hold. They
+    /// are treated as local bindings, never as imports.
+    conflicting_bindings: HashMap<String, HashSet<String>>,
 }
 
 impl Default for GraphBuilder {
@@ -106,6 +122,9 @@ impl GraphBuilder {
             import_aliases: HashMap::new(),
             go_packages: HashMap::new(),
             exporting_files: HashSet::new(),
+            runtime_bindings: HashMap::new(),
+            local_bindings: HashMap::new(),
+            conflicting_bindings: HashMap::new(),
         }
     }
 
@@ -130,8 +149,32 @@ impl GraphBuilder {
             if node.kind == NodeKind::Import {
                 let file = node.file.clone();
                 let module = node.name.clone();
+                let js = is_js_family_file(Path::new(&file));
 
                 for imported_name in &node.references {
+                    if let Some(name) = local_binding(imported_name) {
+                        self.local_bindings
+                            .entry(file.clone())
+                            .or_default()
+                            .insert(name.to_string());
+                        continue;
+                    }
+                    if let Some((local, name)) = runtime_binding(imported_name) {
+                        self.bind_at_run_time(&file, local, name, &module);
+                        continue;
+                    }
+                    let local = import_alias(imported_name)
+                        .map_or(imported_name.as_str(), |(local, _)| local);
+                    if js && local != "*" && !imported_name.starts_with("*as:") {
+                        if self.binds_from_another_module(&file, local, &module) {
+                            self.mark_conflicting(&file, local);
+                            continue;
+                        }
+                        // An import of the name outranks a run-time binding.
+                        if let Some(bindings) = self.runtime_bindings.get_mut(&file) {
+                            bindings.remove(local);
+                        }
+                    }
                     if let Some(alias) = imported_name.strip_prefix("*as:") {
                         // `import * as alias from 'module'`
                         self.namespace_imports
@@ -281,10 +324,18 @@ impl GraphBuilder {
                 } else {
                     self.resolve_alias(lookup, &from_file, &from_file_str)
                 };
+                // `setFilters()` after `const { setFilters } = useListFilters()`
+                // reaches the hook module's function when that module has one.
+                let runtime = if receiver_unknown || alias.is_some() {
+                    None
+                } else {
+                    self.resolve_runtime_binding(lookup, &from_file, &from_file_str)
+                };
+                let bound_at_run_time = runtime.is_some();
                 // `jobs::enqueue` / `Provider::new` name where the definition
                 // lives; matching only the last segment would drop the call or
                 // bind it to a same-named function in the wrong module.
-                let resolution = match alias {
+                let resolution = match alias.or(runtime) {
                     Some(resolution) => resolution,
                     None if !receiver_unknown && lookup.contains("::") => {
                         self.symbol_table.resolve_path(lookup, &from_file)
@@ -358,7 +409,9 @@ impl GraphBuilder {
                     // Method names are never in the import map — importing
                     // `UserService` does not import `findOne` — so import
                     // validation only applies to bare and qualified references.
-                    let confidence = if receiver_unknown {
+                    // A run-time binding was found in its own module, which
+                    // is all the corroboration it can get.
+                    let confidence = if receiver_unknown || bound_at_run_time {
                         base_confidence
                     } else {
                         self.apply_import_validation(
@@ -413,51 +466,128 @@ impl GraphBuilder {
         )
     }
 
-    /// Is this a JavaScript or TypeScript file that binds no name from another
-    /// module: no `import`, `require` or `import()` binding at all?
+    /// Resolves `reference` inside the module a run-time binding of it came
+    /// from: `setFilters()` after `const { setFilters } = useListFilters()`
+    /// reaches the hook module's `setFilters`.
     ///
-    /// Such a file may be a classic script, whose top-level functions are
-    /// globals shared with every other script on the page, so a bare call to
-    /// another file's function can be real. Python has no globals shared
-    /// across modules, so a Python file never qualifies.
-    fn is_import_free_script(&self, from_file: &Path, from_file_str: &str) -> bool {
-        is_js_family_file(from_file)
-            && self
-                .import_map
-                .get(from_file_str)
-                .is_none_or(HashMap::is_empty)
-            && self
-                .namespace_imports
-                .get(from_file_str)
-                .is_none_or(HashMap::is_empty)
+    /// `None` when the name is no such binding, when the caller's own file
+    /// defines it, or when that module defines no such name (a hook kept apart
+    /// from the provider whose function it returns). The call then resolves
+    /// as any other local binding does.
+    fn resolve_runtime_binding(
+        &self,
+        reference: &str,
+        from_file: &Path,
+        from_file_str: &str,
+    ) -> Option<Resolution> {
+        let (name, module) = self.runtime_bindings.get(from_file_str)?.get(reference)?;
+        let defined_here = self
+            .symbol_table
+            .get_file_exports(&from_file.to_path_buf())
+            .is_some_and(|fqns| fqns.iter().any(|fqn| fqn == reference));
+        if defined_here {
+            return None;
+        }
+        Some(self.symbol_table.resolve_imported(name, module, from_file))
+            .filter(Resolution::is_resolved)
     }
 
-    /// Can another JavaScript or TypeScript module reach this definition by a
-    /// bare name that no recorded import binds?
+    /// Records `local` as bound from a value `module` produced, unless the
+    /// file imports that name from the same module (an import says more) or
+    /// binds it from another module (then the name conflicts).
+    fn bind_at_run_time(&mut self, file: &str, local: &str, name: &str, module: &str) {
+        if self.binds_from_another_module(file, local, module) {
+            self.mark_conflicting(file, local);
+            return;
+        }
+        if self
+            .import_map
+            .get(file)
+            .is_some_and(|imports| imports.contains_key(local))
+        {
+            return;
+        }
+        self.runtime_bindings
+            .entry(file.to_string())
+            .or_default()
+            .insert(local.to_string(), (name.to_string(), module.to_string()));
+    }
+
+    /// Does `file` already bind `local` from a module other than `module`, or
+    /// has the name already conflicted?
+    fn binds_from_another_module(&self, file: &str, local: &str, module: &str) -> bool {
+        self.import_map
+            .get(file)
+            .and_then(|imports| imports.get(local))
+            .is_some_and(|bound| bound != module)
+            || self
+                .runtime_bindings
+                .get(file)
+                .and_then(|bindings| bindings.get(local))
+                .is_some_and(|(_, bound)| bound != module)
+            || self
+                .conflicting_bindings
+                .get(file)
+                .is_some_and(|names| names.contains(local))
+    }
+
+    /// Stops treating `local` as an import or a run-time binding in `file`.
+    fn mark_conflicting(&mut self, file: &str, local: &str) {
+        if let Some(imports) = self.import_map.get_mut(file) {
+            imports.remove(local);
+        }
+        if let Some(aliases) = self.import_aliases.get_mut(file) {
+            aliases.remove(local);
+        }
+        if let Some(bindings) = self.runtime_bindings.get_mut(file) {
+            bindings.remove(local);
+        }
+        self.conflicting_bindings
+            .entry(file.to_string())
+            .or_default()
+            .insert(local.to_string());
+    }
+
+    /// Does this JavaScript or TypeScript file bind `name` itself, so that a
+    /// call to it may reach whatever function the value holds?
+    fn binds_locally(&self, file: &str, name: &str) -> bool {
+        let has = |names: Option<&HashSet<String>>| names.is_some_and(|n| n.contains(name));
+        has(self.local_bindings.get(file))
+            || has(self.conflicting_bindings.get(file))
+            || self
+                .runtime_bindings
+                .get(file)
+                .is_some_and(|bindings| bindings.contains_key(name))
+    }
+
+    /// Is this a JavaScript or TypeScript file that binds nothing from another
+    /// module and exports nothing?
     ///
-    /// An exported function can be bound at run time in ways the parser does
-    /// not record: `const { f } = await loadModule()` around an `import()`,
-    /// Next.js `dynamic(() => import("./f"))`, `jest.requireActual("./f")`.
-    /// A classic script's top-level functions are globals. A module-private
-    /// function can't be called from another module by a bare name at all.
-    fn reachable_without_import(&self, to_node: &CodeNode) -> bool {
-        let to_file = Path::new(&to_node.file);
-        is_js_family_file(to_file)
-            && (to_node.is_exported
-                || (self.is_import_free_script(to_file, &to_node.file)
-                    && !self.exporting_files.contains(&to_node.file)))
+    /// Such a file may be a classic script, whose top-level functions are
+    /// globals shared with every other script on the page. Python has no
+    /// globals shared across modules, so a Python file never qualifies.
+    fn is_possible_script(&self, file: &str) -> bool {
+        is_js_family_file(Path::new(file))
+            && !self.exporting_files.contains(file)
+            && self.import_map.get(file).is_none_or(HashMap::is_empty)
+            && self
+                .namespace_imports
+                .get(file)
+                .is_none_or(HashMap::is_empty)
+            && self
+                .runtime_bindings
+                .get(file)
+                .is_none_or(HashMap::is_empty)
     }
 
     /// Decides whether a resolved reference may become an edge.
     ///
     /// Python and JavaScript/TypeScript bare names are file-scoped: a cross-file
     /// call is kept only when this file defines the name or its import map
-    /// contains that local name (or `*`). In JavaScript and TypeScript, a call
-    /// to a function another module could reach without a recorded import (an
-    /// exported one, or a classic script's) keeps the downgrade
-    /// ([`Self::reachable_without_import`]), and a file that binds no name from
-    /// another module may itself be a classic script, so it keeps the downgrade
-    /// too ([`Self::is_import_free_script`]). A Go bare name is kept
+    /// contains that local name (or `*`, at the downgrade). JavaScript and
+    /// TypeScript also keep the downgrade for a name the file binds itself
+    /// and for a classic script's function, see
+    /// [`Self::validate_bare_import_visibility`]. A Go bare name is kept
     /// across files only inside the caller's package (same directory and the
     /// same package clause). Other languages keep the confidence downgrade.
     ///
@@ -484,9 +614,7 @@ impl GraphBuilder {
             );
         }
 
-        if bare_name_requires_import(from_file)
-            && !self.is_import_free_script(from_file, from_file_str)
-        {
+        if bare_name_requires_import(from_file) {
             return self.validate_bare_import_visibility(
                 reference,
                 from_file,
@@ -530,10 +658,16 @@ impl GraphBuilder {
     ///
     /// Same-file definitions stay. An import-map entry for the local name stays,
     /// boosted the same way an explicit import always was. `*` (`from m import *`)
-    /// stays at the resolution's own confidence, because the map does not say
-    /// which names the star brought in. A JavaScript or TypeScript definition
-    /// another module could reach without a recorded import keeps the
-    /// downgrade every unimported name used to get.
+    /// keeps the downgrade an unimported name gets, because the map does not
+    /// say which names the star brought in.
+    ///
+    /// In JavaScript and TypeScript a bare name resolves to a binding of the
+    /// file or to a global. So a name the file binds itself (a variable, a
+    /// parameter, a destructured value, a run-time binding its module didn't
+    /// define) keeps the downgrade: the value may hold any function. A
+    /// classic script's function is a global, and keeps it too; between two
+    /// possible scripts the call keeps its full confidence, as before. Any
+    /// other name is a global, which can't be another module's function.
     fn validate_bare_import_visibility(
         &self,
         reference: &str,
@@ -555,18 +689,24 @@ impl GraphBuilder {
                 return base_confidence.max(0.95);
             }
             if file_imports.contains_key("*") {
-                return base_confidence;
+                return unimported_confidence(from_file, &to_file, base_confidence);
             }
         }
 
-        if is_js_family_file(from_file) && self.reachable_without_import(to_node) {
-            debug!(
-                "Downgrading unimported reference '{}' in {} → {}, reachable without an import",
-                reference,
-                from_file.display(),
-                to_file.display()
-            );
-            return unimported_confidence(from_file, &to_file, base_confidence);
+        if is_js_family_file(from_file) {
+            let to_script = self.is_possible_script(&to_node.file);
+            if to_script && self.is_possible_script(from_file_str) {
+                return base_confidence;
+            }
+            if to_script || self.binds_locally(from_file_str, reference) {
+                debug!(
+                    "Downgrading unimported reference '{}' in {} → {}, a local binding or a script's global",
+                    reference,
+                    from_file.display(),
+                    to_file.display()
+                );
+                return unimported_confidence(from_file, &to_file, base_confidence);
+            }
         }
 
         debug!(

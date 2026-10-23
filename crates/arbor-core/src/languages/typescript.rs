@@ -7,7 +7,10 @@
 //! files anyway.
 
 use crate::languages::LanguageParser;
-use crate::node::{import_alias, import_alias_ref, CodeNode, NodeKind, Visibility};
+use crate::node::{
+    import_alias, import_alias_ref, local_binding_ref, runtime_binding, runtime_binding_ref,
+    CodeNode, NodeKind, Visibility,
+};
 use tree_sitter::{Language, Node, Tree};
 
 pub struct TypeScriptParser;
@@ -26,8 +29,8 @@ impl LanguageParser for TypeScriptParser {
         let root = tree.root_node();
         extract_from_node(&root, source, file_path, &mut nodes, None);
         distinguish_repeated_tests(&mut nodes, file_path);
-        let pinned = extract_bindings_from_imported_values(&root, source, file_path, &nodes);
-        nodes.extend(pinned);
+        let bindings = extract_file_bindings(&root, source, file_path, &nodes);
+        nodes.extend(bindings);
         nodes
     }
 }
@@ -554,16 +557,16 @@ fn import_binding(local: &str, exported: &str) -> String {
 ///   - `const M = require('m')`           → "M", "*as:M"
 ///   - `const { A } = await import('m')`  → "A"
 ///   - `const M = await import('m')`      → "*as:M"
-///   - `const { A } = require('m').make(deps)`, `require('m')(deps)` → "alias:A:A"
+///   - `const { A } = require('./m').make(deps)`, `require('./m')(deps)` → "bound:A:A"
 ///
 /// A required module is `module.exports`, which may be the function itself,
 /// so `M()` is a call to it as with a default import. An ES module namespace
 /// is never callable, so a dynamic import binds only the namespace. Names
-/// destructured from a value computed from the module (a factory it exports,
-/// the module called, a property of an export) are pinned to the module, see
-/// [`destructured_names`]; an identifier bound to such a value is not one of
-/// its names. Only a string-literal module is read, and nested or `...rest`
-/// patterns bind objects rather than exports, so they record nothing.
+/// destructured from a value computed from a project module (a factory it
+/// exports, the module called, a property of an export) are run-time
+/// bindings of that module, see [`NameMode::RuntimeBinding`]. Only a
+/// string-literal module is read, and nested or `...rest` patterns bind
+/// objects rather than exports, so they record nothing here.
 fn extract_require_bindings(node: &Node, source: &str, file_path: &str) -> Vec<CodeNode> {
     let mut imports = Vec::new();
     for i in 0..node.named_child_count() {
@@ -591,8 +594,10 @@ fn extract_require_bindings(node: &Node, source: &str, file_path: &str) -> Vec<C
             ("identifier", 1, Some(export)) => {
                 vec![import_binding(&get_text(&pattern, source), &export)]
             }
-            ("object_pattern", 0, _) => destructured_names(&pattern, source, false),
-            ("object_pattern", _, _) => destructured_names(&pattern, source, true),
+            ("object_pattern", 0, _) => destructured_names(&pattern, source, NameMode::Import),
+            ("object_pattern", _, _) if is_relative_module(&module) => {
+                destructured_names(&pattern, source, NameMode::RuntimeBinding)
+            }
             _ => continue,
         };
         if !names.is_empty() {
@@ -602,17 +607,24 @@ fn extract_require_bindings(node: &Node, source: &str, file_path: &str) -> Vec<C
     imports
 }
 
-/// Names destructured from a value computed from something the file already
-/// binds from another module: `const { setFilters } = useListFilters()` after
-/// `import { useListFilters } from './hooks'`, `const { load } = config.make()`
-/// after `const config = require('./config')`, `const { get } = api` after
-/// `import * as api from './api'`. One `Import` node per declarator, pinned to
-/// that module (see [`destructured_names`]).
+/// The names a file binds itself, and the run-time bindings it takes from a
+/// project module's values. Runs after the main pass, over the `Import` nodes
+/// that pass found, so a binding is recognised wherever its import sits, and
+/// walks the tree with a cursor rather than recursion.
 ///
-/// It runs after the main pass, over the `Import` nodes that pass found, so a
-/// binding is recognised wherever the import sits in the file. The tree is
-/// walked with a cursor, not recursion.
-fn extract_bindings_from_imported_values(
+/// - **Local bindings:** every name a variable declaration (any pattern), a
+///   parameter, a `catch` or `for` binding, or a function or class
+///   declaration introduces, as `local:name` on one `Import` node with an
+///   empty module. A call to one of these may reach whatever function the
+///   value holds; a call to any other name the file doesn't import can only
+///   reach a global.
+/// - **Run-time bindings:** names destructured from a value computed from an
+///   identifier the file binds from a project module (`./`, `../`):
+///   `const { setFilters } = useListFilters()` after
+///   `import { useListFilters } from './hooks'`, `const { load } =
+///   config.make()` after `const config = require('./config')`. One `Import`
+///   node per declarator, for that module (see [`NameMode::RuntimeBinding`]).
+fn extract_file_bindings(
     root: &Node,
     source: &str,
     file_path: &str,
@@ -621,7 +633,10 @@ fn extract_bindings_from_imported_values(
     let mut modules: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for import in nodes.iter().filter(|n| n.kind == NodeKind::Import) {
         for reference in &import.references {
-            let local = match (reference.strip_prefix("*as:"), import_alias(reference)) {
+            let local = match (
+                reference.strip_prefix("*as:"),
+                import_alias(reference).or_else(|| runtime_binding(reference)),
+            ) {
                 (Some(namespace), _) => namespace,
                 (None, Some((local, _))) => local,
                 (None, None) => reference.as_str(),
@@ -629,38 +644,116 @@ fn extract_bindings_from_imported_values(
             modules.insert(local, import.name.as_str());
         }
     }
+
     let mut imports = Vec::new();
-    if modules.is_empty() {
-        return imports;
-    }
+    let mut locals = std::collections::BTreeSet::new();
     let mut cursor = root.walk();
     loop {
         let node = cursor.node();
-        if let Some((pattern, value)) = declarator_parts(&node) {
-            if pattern.kind() == "object_pattern" {
-                if let Some(Chain {
-                    root: ChainRoot::Identifier(binding),
-                    ..
-                }) = value_chain(&value, source)
-                {
-                    if let Some(module) = modules.get(binding.as_str()) {
-                        let names = destructured_names(&pattern, source, true);
-                        if !names.is_empty() {
-                            imports.push(import_node(module, names, &node, file_path));
+        match node.kind() {
+            "variable_declarator" => {
+                if let Some((pattern, value)) = declarator_parts(&node) {
+                    pattern_names(pattern, source, &mut locals);
+                    if pattern.kind() == "object_pattern" {
+                        if let Some(Chain {
+                            root: ChainRoot::Identifier(binding),
+                            ..
+                        }) = value_chain(&value, source)
+                        {
+                            if let Some(module) = modules
+                                .get(binding.as_str())
+                                .filter(|module| is_relative_module(module))
+                            {
+                                let names =
+                                    destructured_names(&pattern, source, NameMode::RuntimeBinding);
+                                if !names.is_empty() {
+                                    imports.push(import_node(module, names, &node, file_path));
+                                }
+                            }
                         }
+                    }
+                } else if let Some(name) = node.child_by_field_name("name") {
+                    pattern_names(name, source, &mut locals);
+                }
+            }
+            "formal_parameters" => {
+                for i in 0..node.named_child_count() {
+                    if let Some(parameter) = node.named_child(i) {
+                        pattern_names(parameter, source, &mut locals);
                     }
                 }
             }
+            "arrow_function" => {
+                if let Some(parameter) = node.child_by_field_name("parameter") {
+                    pattern_names(parameter, source, &mut locals);
+                }
+            }
+            "catch_clause" => {
+                if let Some(parameter) = node.child_by_field_name("parameter") {
+                    pattern_names(parameter, source, &mut locals);
+                }
+            }
+            "for_in_statement" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    pattern_names(left, source, &mut locals);
+                }
+            }
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function"
+            | "function_expression"
+            | "class_declaration"
+            | "class" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    pattern_names(name, source, &mut locals);
+                }
+            }
+            _ => {}
         }
         if cursor.goto_first_child() {
             continue;
         }
         while !cursor.goto_next_sibling() {
             if !cursor.goto_parent() {
+                if !locals.is_empty() {
+                    let names = locals.iter().map(|name| local_binding_ref(name)).collect();
+                    imports.push(import_node("", names, root, file_path));
+                }
                 return imports;
             }
         }
     }
+}
+
+/// Adds every name `pattern` binds: an identifier, or each name inside an
+/// object or array pattern, a default (`a = 1`), a `...rest` or a TypeScript
+/// parameter (`a: T`, `b?: T`). Property keys and types bind nothing. Walked
+/// with a stack, not recursion.
+fn pattern_names(pattern: Node, source: &str, names: &mut std::collections::BTreeSet<String>) {
+    let mut stack = vec![pattern];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" | "type_identifier" => {
+                names.insert(get_text(&node, source));
+            }
+            "pair_pattern" => stack.extend(node.child_by_field_name("value")),
+            "object_assignment_pattern" | "assignment_pattern" => {
+                stack.extend(node.child_by_field_name("left"));
+            }
+            "required_parameter" | "optional_parameter" => {
+                stack.extend(node.child_by_field_name("pattern"));
+            }
+            "object_pattern" | "array_pattern" | "rest_pattern" => {
+                stack.extend((0..node.named_child_count()).filter_map(|i| node.named_child(i)));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `./m`, `../m`: a module in this project, as opposed to a package.
+fn is_relative_module(module: &str) -> bool {
+    module.starts_with('.')
 }
 
 /// The pattern and value of a `variable_declarator`: `const <pattern> = <value>`.
@@ -756,24 +849,26 @@ fn sole_string_argument(call: &Node, source: &str) -> Option<String> {
     string_literal(&module, source)
 }
 
+/// How [`destructured_names`] records each name.
+#[derive(Clone, Copy)]
+enum NameMode {
+    /// Destructuring a module itself (`require('m')`, `await import('m')`)
+    /// reads its exports, recorded as `import` statements record them.
+    Import,
+    /// Destructuring a value computed from a project module (a hook's or
+    /// factory's return value, a property of an export): `bound:A:A`. The
+    /// names need not be the module's top-level ones, so the graph builder
+    /// looks for each inside that module first, and otherwise treats it as a
+    /// local binding.
+    RuntimeBinding,
+}
+
 /// The names an object pattern binds: `{ A }`, `{ A = d }`, `{ B: C }`,
-/// `{ 'B': C }` and `{ B: C = d }`.
-///
-/// Destructuring a module itself (`require('m')`, `await import('m')`) reads
-/// its exports, recorded as `import` statements record them. A `pinned`
-/// pattern destructures a value computed from the module instead (a hook's or
-/// factory's return value, a property of an export), whose names need not be
-/// the module's top-level ones. Each is recorded as an alias even when the
-/// local name matches (`alias:A:A`), so the graph builder links the call only
-/// to a definition of that name in that module, never to a same-named
-/// function elsewhere.
-fn destructured_names(pattern: &Node, source: &str, pinned: bool) -> Vec<String> {
-    let binding = |local: &str, exported: &str| {
-        if pinned {
-            import_alias_ref(local, exported)
-        } else {
-            import_binding(local, exported)
-        }
+/// `{ 'B': C }` and `{ B: C = d }`, recorded as `mode` says.
+fn destructured_names(pattern: &Node, source: &str, mode: NameMode) -> Vec<String> {
+    let binding = |local: &str, exported: &str| match mode {
+        NameMode::Import => import_binding(local, exported),
+        NameMode::RuntimeBinding => runtime_binding_ref(local, exported),
     };
     let mut names = Vec::new();
     for i in 0..pattern.named_child_count() {
@@ -1366,7 +1461,10 @@ it('works', () => { again(); });
     fn ordinary_calls_with_callbacks_are_not_tests() {
         let source =
             "items.forEach((item) => { use(item); });\nsetTimeout(() => { tick(); }, 10);\n";
-        let nodes = parse(source, "src/a.ts");
+        let nodes: Vec<_> = parse(source, "src/a.ts")
+            .into_iter()
+            .filter(|n| n.kind != NodeKind::Import)
+            .collect();
         assert!(
             nodes.is_empty(),
             "{:?}",
@@ -1385,7 +1483,7 @@ import * as types from '@babel/types';
 ";
         let imports: Vec<(String, Vec<String>)> = parse(source, "src/app.ts")
             .into_iter()
-            .filter(|n| n.kind == NodeKind::Import)
+            .filter(|n| n.kind == NodeKind::Import && !n.name.is_empty())
             .map(|n| (n.name, n.references))
             .collect();
         let owned = |refs: &[&str]| refs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
@@ -1404,10 +1502,11 @@ import * as types from '@babel/types';
         );
     }
 
-    /// Names destructured from a value computed from a required module (a
-    /// factory call, a property of an export) come from that module too, but
-    /// not necessarily from its top level, so each is pinned to the module as
-    /// an alias. An identifier bound to such a value is not one of its names.
+    /// Names destructured from a value computed from a required project
+    /// module (a factory call, a property of an export) come from that module
+    /// too, but not necessarily from its top level, so each is a run-time
+    /// binding of the module. An identifier bound to such a value records
+    /// nothing here.
     #[test]
     fn names_destructured_from_a_required_module_value_are_recorded() {
         let source = "\
@@ -1424,7 +1523,7 @@ export async function load() {
 ";
         let imports: Vec<(String, Vec<String>)> = parse(source, "src/app.ts")
             .into_iter()
-            .filter(|n| n.kind == NodeKind::Import)
+            .filter(|n| n.kind == NodeKind::Import && !n.name.is_empty())
             .map(|n| (n.name, n.references))
             .collect();
         let owned = |refs: &[&str]| refs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
@@ -1434,35 +1533,39 @@ export async function load() {
                 (
                     "./paged".to_string(),
                     owned(&[
-                        "alias:getOrderPage:getOrderPage",
-                        "alias:detail:getOrderDetail"
+                        "bound:getOrderPage:getOrderPage",
+                        "bound:detail:getOrderDetail"
                     ])
                 ),
-                ("./factory".to_string(), owned(&["alias:a:a"])),
-                ("./m".to_string(), owned(&["alias:x:x"])),
+                ("./factory".to_string(), owned(&["bound:a:a"])),
+                ("./m".to_string(), owned(&["bound:x:x"])),
                 ("./p".to_string(), owned(&["alias:c:q"])),
-                ("./p".to_string(), owned(&["alias:t:t"])),
+                ("./p".to_string(), owned(&["bound:t:t"])),
             ]
         );
     }
 
-    /// Names destructured from a value computed from an imported binding (a
-    /// hook, a factory, an object) are pinned to that binding's module.
+    /// Names destructured from a value computed from a binding of a project
+    /// module (a hook, a factory, an object) are run-time bindings of that
+    /// module. A package's value (`useForm()`) and an unimported root record
+    /// none: those names are only local bindings.
     #[test]
-    fn names_destructured_from_an_imported_binding_are_pinned_to_its_module() {
+    fn names_destructured_from_a_project_binding_are_runtime_bindings() {
         let source = "\
 import { useListFilters } from './hooks';
 import * as api from './api';
+import { useForm } from 'react-hook-form';
 const config = require('./config');
 const { setFilters, reset: clear } = useListFilters();
 const { load } = config.make();
 const { get } = api;
+const { handleSubmit } = useForm();
 const { other } = notImported();
 const value = useListFilters();
 ";
         let imports: Vec<(String, Vec<String>)> = parse(source, "src/app.ts")
             .into_iter()
-            .filter(|n| n.kind == NodeKind::Import)
+            .filter(|n| n.kind == NodeKind::Import && !n.name.is_empty())
             .map(|n| (n.name, n.references))
             .collect();
         let owned = |refs: &[&str]| refs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
@@ -1471,15 +1574,52 @@ const value = useListFilters();
             vec![
                 ("./hooks".to_string(), owned(&["useListFilters"])),
                 ("./api".to_string(), owned(&["*as:api"])),
+                ("react-hook-form".to_string(), owned(&["useForm"])),
                 ("./config".to_string(), owned(&["config", "*as:config"])),
                 (
                     "./hooks".to_string(),
-                    owned(&["alias:setFilters:setFilters", "alias:clear:reset"])
+                    owned(&["bound:setFilters:setFilters", "bound:clear:reset"])
                 ),
-                ("./config".to_string(), owned(&["alias:load:load"])),
-                ("./api".to_string(), owned(&["alias:get:get"])),
+                ("./config".to_string(), owned(&["bound:load:load"])),
+                ("./api".to_string(), owned(&["bound:get:get"])),
             ]
         );
+    }
+
+    /// Every name the file binds itself is recorded once, sorted, on one
+    /// import node with an empty module. Property keys, types and the names a
+    /// file merely calls are not bindings.
+    #[test]
+    fn local_bindings_are_recorded_on_one_import_node() {
+        let source = "\
+import { imported } from './m';
+const plain = 1, { a, b: c, d = 2, ...rest } = make();
+let [first, , third = 3, ...others] = list;
+var later;
+function outer(param, { opt }: Options, [arr]: number[], deflt = 1, ...tail: string[]) {
+  const inner = (x) => x;
+  const single = y => y;
+  try { called(); } catch (err) { report(err); }
+  for (const item of items) {}
+  for (let key in object) {}
+  return function named() {};
+}
+class Shape {}
+";
+        let locals: Vec<String> = parse(source, "src/app.ts")
+            .into_iter()
+            .filter(|n| n.kind == NodeKind::Import && n.name.is_empty())
+            .flat_map(|n| n.references)
+            .collect();
+        let expected: Vec<String> = [
+            "Shape", "a", "arr", "c", "d", "deflt", "err", "first", "inner", "item", "key",
+            "later", "named", "opt", "others", "outer", "param", "plain", "rest", "single", "tail",
+            "third", "x", "y",
+        ]
+        .iter()
+        .map(|name| format!("local:{name}"))
+        .collect();
+        assert_eq!(locals, expected);
     }
 
     /// A comment beside the module, such as webpack's magic comments, is
@@ -1496,7 +1636,7 @@ const two = require('./c', './d');
 ";
         let imports: Vec<(String, Vec<String>)> = parse(source, "src/app.ts")
             .into_iter()
-            .filter(|n| n.kind == NodeKind::Import)
+            .filter(|n| n.kind == NodeKind::Import && !n.name.is_empty())
             .map(|n| (n.name, n.references))
             .collect();
         let owned = |refs: &[&str]| refs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
@@ -1516,7 +1656,7 @@ const two = require('./c', './d');
         let source = format!("const x = a{};\n", ".b".repeat(20_000));
         let imports = parse(&source, "src/long.ts")
             .into_iter()
-            .filter(|n| n.kind == NodeKind::Import)
+            .filter(|n| n.kind == NodeKind::Import && !n.name.is_empty())
             .count();
         assert_eq!(imports, 0);
     }
@@ -1541,7 +1681,7 @@ export async function load() {
 ";
         let imports: Vec<(String, Vec<String>)> = parse(source, "src/app.ts")
             .into_iter()
-            .filter(|n| n.kind == NodeKind::Import)
+            .filter(|n| n.kind == NodeKind::Import && !n.name.is_empty())
             .map(|n| (n.name, n.references))
             .collect();
         let owned = |refs: &[&str]| refs.iter().map(|r| r.to_string()).collect::<Vec<_>>();
