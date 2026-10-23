@@ -113,14 +113,15 @@ impl GraphBuilder {
     /// Call this for all files before calling `build()`.
     pub fn add_nodes(&mut self, nodes: Vec<CodeNode>) {
         for node in nodes {
-            // Import nodes carry the import map — process them but don't add to graph
-            // (they are not code entities we want in centrality analysis)
+            // A Go file's package clause decides which bare calls it can see.
             if node.kind == NodeKind::Module && is_go_file(Path::new(&node.file)) {
                 self.go_packages
                     .entry(node.file.clone())
                     .or_insert_with(|| node.name.clone());
             }
 
+            // Import nodes carry the import map — process them but don't add to graph
+            // (they are not code entities we want in centrality analysis)
             if node.kind == NodeKind::Import {
                 let file = node.file.clone();
                 let module = node.name.clone();
@@ -900,16 +901,18 @@ impl GraphBuilder {
     }
 }
 
-/// Languages whose parsers record imported local names.
-///
-/// A bare call in one of these files is visible only when the file defines
-/// the name or imports it.
+/// Go files: a bare call is visible inside the caller's package.
 fn is_go_file(file: &Path) -> bool {
     file.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("go"))
 }
 
+/// Languages whose parsers record imported local names.
+///
+/// A bare call in one of these files is visible only when the file defines
+/// the name or imports it (a JavaScript or TypeScript file that imports
+/// nothing is exempt, see `GraphBuilder::is_import_free_script`).
 fn bare_name_requires_import(file: &Path) -> bool {
     let Some(ext) = file.extension().and_then(|ext| ext.to_str()) else {
         return false;
@@ -920,6 +923,7 @@ fn bare_name_requires_import(file: &Path) -> bool {
     )
 }
 
+/// JavaScript and TypeScript, which share one parser.
 fn is_js_family_file(file: &Path) -> bool {
     let Some(ext) = file.extension().and_then(|ext| ext.to_str()) else {
         return false;
@@ -2248,8 +2252,13 @@ mod tests {
         assert_eq!(other[0].name, "other_caller");
     }
 
+    /// Torture section D. The parser records `from hard.reexport_base import
+    /// original_function as renamed` as `alias:renamed:original_function`, so
+    /// the alias reaches the function (#258). A call through a module alias
+    /// (`base_mod.original_function()`) is dotted, outside this rule, and
+    /// still has no edge.
     #[test]
-    fn alias_and_dotted_call_do_not_reach_original_function() {
+    fn an_alias_reaches_the_original_function_and_a_module_alias_call_does_not() {
         let mut b = GraphBuilder::new();
         b.add_nodes(vec![CodeNode::new(
             "original_function",
@@ -2263,7 +2272,10 @@ mod tests {
             NodeKind::Import,
             "hard/aliased.py",
         )
-        .with_references(vec!["renamed".to_string()]);
+        .with_references(vec![arbor_core::import_alias_ref(
+            "renamed",
+            "original_function",
+        )]);
         let via_alias = CodeNode::new(
             "via_alias",
             "via_alias",
@@ -2281,10 +2293,11 @@ mod tests {
         b.add_nodes(vec![import, via_alias, via_module]);
         let graph = b.build();
 
-        assert!(
-            callers_of(&graph, "original_function", "reexport_base.py").is_empty(),
-            "alias and qualified calls are a separate resolution gap"
-        );
+        let callers: Vec<&str> = callers_of(&graph, "original_function", "reexport_base.py")
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(callers, vec!["via_alias"]);
     }
 
     fn callers_of<'a>(
