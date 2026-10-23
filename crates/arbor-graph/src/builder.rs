@@ -2223,6 +2223,9 @@ mod tests {
         let graph = b.build();
 
         assert_eq!(callers_of(&graph, "len", "stdlib_shadow.py").len(), 1);
+        // `*` doesn't say `len` came from `helpers`: the edge stays as weak
+        // as main made it, never raised to the resolution's full confidence.
+        assert!(only_edge_confidence(&graph) < Edge::CONFIDENT_THRESHOLD);
     }
 
     #[test]
@@ -3197,6 +3200,11 @@ export async function postsTheForm(req: Request) {
 mod commonjs_visibility_tests {
     use super::import_alias_tests::{calls, edges, index};
 
+    /// A private `helper` in another directory's module, so the tests that use
+    /// it pass only when the import, not a fallback, picks the target.
+    const DECOY_HELPER_JS: &str =
+        "const fs = require(\"fs\");\n\nfunction helper(x) {\n  return fs.existsSync(x);\n}\n";
+
     const UTILS: &str = "\
 function helper(x) {
   return x * 2;
@@ -3289,6 +3297,7 @@ function main() {
                 "helper.js",
                 "function helper(x) {\n  return x * 2;\n}\n\nmodule.exports = helper;\n",
             ),
+            ("lib/helper.js", DECOY_HELPER_JS),
             (
                 "index.js",
                 "\
@@ -3304,6 +3313,7 @@ function main() {
             calls(&graph),
             edges(&["index.js::main -> helper.js::helper"])
         );
+        assert!(confidence(&graph, "index.js::main", "helper.js::helper").unwrap() >= 0.95);
     }
 
     /// Dependency injection through a factory the module exports: the names
@@ -3386,10 +3396,11 @@ export function Orders() {
         );
     }
 
-    /// A name from an external hook's return value is that package's, so it
-    /// never binds to a project function that shares it.
+    /// A name destructured from an external hook's return value may hold any
+    /// function, so a call to it keeps the weak edge main gave it, and never
+    /// an import's confidence.
     #[test]
-    fn names_destructured_from_an_external_hook_link_nothing() {
+    fn names_destructured_from_an_external_hook_keep_only_a_weak_edge() {
         let graph = index(&[
             (
                 "components/Other.jsx",
@@ -3407,7 +3418,199 @@ export function Form({ save }) {
 ",
             ),
         ]);
-        assert_eq!(calls(&graph), edges(&[]));
+        assert_eq!(
+            calls(&graph),
+            edges(&["components/Form.jsx::Form -> components/Other.jsx::handleSubmit"])
+        );
+        let weak = confidence(
+            &graph,
+            "components/Form.jsx::Form",
+            "components/Other.jsx::handleSubmit",
+        )
+        .unwrap();
+        assert!(weak < super::Edge::CONFIDENT_THRESHOLD, "{weak}");
+    }
+
+    const AUTH_CONTEXT: &str = "\
+import { createContext } from \"react\";
+
+export const AuthContext = createContext(null);
+
+export function AuthProvider({ children }) {
+  function login(email) {
+    return email;
+  }
+  return <AuthContext.Provider value={{ login }}>{children}</AuthContext.Provider>;
+}
+";
+
+    /// `useContext(AuthContext)` hands out the provider's inner `login`. The
+    /// name is bound from React's hook, so it can't be pinned, but the file
+    /// binds it, so the call keeps main's weak edge.
+    #[test]
+    fn a_name_from_use_context_keeps_a_weak_edge_to_the_provider() {
+        let graph = index(&[
+            ("context/AuthContext.jsx", AUTH_CONTEXT),
+            (
+                "pages/Login.jsx",
+                "\
+import { useContext } from \"react\";
+import { AuthContext } from \"../context/AuthContext\";
+
+export function Login() {
+  const { login } = useContext(AuthContext);
+  return login(\"a@b.c\");
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["pages/Login.jsx::Login -> context/AuthContext.jsx::login"])
+        );
+        let weak = confidence(
+            &graph,
+            "pages/Login.jsx::Login",
+            "context/AuthContext.jsx::login",
+        )
+        .unwrap();
+        assert!(weak < super::Edge::CONFIDENT_THRESHOLD, "{weak}");
+    }
+
+    /// The hook lives apart from the provider, so its module doesn't define
+    /// `login`. The pinned lookup finds nothing there, and the call falls back
+    /// to main's weak edge instead of disappearing.
+    #[test]
+    fn a_hook_apart_from_its_provider_keeps_a_weak_edge() {
+        let graph = index(&[
+            ("context/AuthContext.jsx", AUTH_CONTEXT),
+            (
+                "hooks/useAuth.js",
+                "\
+import { useContext } from \"react\";
+import { AuthContext } from \"../context/AuthContext\";
+
+export function useAuth() {
+  return useContext(AuthContext);
+}
+",
+            ),
+            (
+                "pages/Login.jsx",
+                "\
+import { useAuth } from \"../hooks/useAuth\";
+
+export function Login() {
+  const { login } = useAuth();
+  return login(\"a@b.c\");
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "pages/Login.jsx::Login -> context/AuthContext.jsx::login",
+                "pages/Login.jsx::Login -> hooks/useAuth.js::useAuth",
+            ])
+        );
+        let weak = confidence(
+            &graph,
+            "pages/Login.jsx::Login",
+            "context/AuthContext.jsx::login",
+        )
+        .unwrap();
+        assert!(weak < super::Edge::CONFIDENT_THRESHOLD, "{weak}");
+    }
+
+    /// Two functions bind `handler` from two modules. One file-level map can
+    /// hold only one, so neither is trusted: both callers keep weak edges to
+    /// both handlers, as on main, instead of both going to the last module at
+    /// an import's confidence.
+    #[test]
+    fn a_name_bound_from_two_modules_in_two_functions_is_not_pinned() {
+        let handler = "const fs = require(\"fs\");\n\nasync function handler(event) {\n  return fs.existsSync(event);\n}\n\nmodule.exports = { handler };\n";
+        let graph = index(&[
+            ("lambdas/a.js", handler),
+            ("lambdas/b.js", handler),
+            (
+                "test/handlers.test.js",
+                "\
+const assert = require(\"assert\");
+
+async function runA() {
+  const { handler } = require(\"../lambdas/a\");
+  return handler({});
+}
+
+async function runB() {
+  const { handler } = require(\"../lambdas/b\");
+  return handler({});
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "test/handlers.test.js::runA -> lambdas/a.js::handler",
+                "test/handlers.test.js::runA -> lambdas/b.js::handler",
+                "test/handlers.test.js::runB -> lambdas/a.js::handler",
+                "test/handlers.test.js::runB -> lambdas/b.js::handler",
+            ])
+        );
+        for run in ["runA", "runB"] {
+            for module in ["a", "b"] {
+                let weak = confidence(
+                    &graph,
+                    &format!("test/handlers.test.js::{run}"),
+                    &format!("lambdas/{module}.js::handler"),
+                )
+                .unwrap();
+                assert!(
+                    weak < super::Edge::CONFIDENT_THRESHOLD,
+                    "{run} -> {module}: {weak}"
+                );
+            }
+        }
+    }
+
+    /// A function parameter is a binding too: `onSave` holds whatever the
+    /// caller passed, so the call keeps main's weak edge.
+    #[test]
+    fn a_call_through_a_parameter_keeps_a_weak_edge() {
+        let graph = index(&[
+            (
+                "components/Editor.jsx",
+                "\
+import { useState } from \"react\";
+
+export function Editor() {
+  function onSave(value) {
+    return value;
+  }
+  return <Button onSave={onSave} />;
+}
+",
+            ),
+            (
+                "components/Button.jsx",
+                "\
+import { useRef } from \"react\";
+
+export function Button({ onSave }) {
+  return onSave(1);
+}
+",
+            ),
+        ]);
+        let weak = confidence(
+            &graph,
+            "components/Button.jsx::Button",
+            "components/Editor.jsx::onSave",
+        )
+        .expect("the parameter call keeps an edge");
+        assert!(weak < super::Edge::CONFIDENT_THRESHOLD, "{weak}");
     }
 
     /// TypeScript's own CommonJS import form.
@@ -3417,6 +3620,10 @@ export function Form({ save }) {
             (
                 "helper.ts",
                 "function helper(x: number): number {\n  return x * 2;\n}\n\nexport = helper;\n",
+            ),
+            (
+                "lib/helper.ts",
+                "import fs from \"fs\";\n\nfunction helper(x: number): number {\n  return x;\n}\n",
             ),
             (
                 "index.ts",
@@ -3433,6 +3640,7 @@ export function main(): number {
             calls(&graph),
             edges(&["index.ts::main -> helper.ts::helper"])
         );
+        assert!(confidence(&graph, "index.ts::main", "helper.ts::helper").unwrap() >= 0.95);
     }
 
     /// An awaited `import()` destructures named exports like `require` does.
@@ -3442,6 +3650,10 @@ export function main(): number {
             (
                 "utils.mjs",
                 "export function helper(x) {\n  return x * 2;\n}\n",
+            ),
+            (
+                "lib/other.mjs",
+                "import fs from \"fs\";\n\nexport function helper(x) {\n  return x;\n}\n",
             ),
             (
                 "index.mjs",
@@ -3457,6 +3669,7 @@ export async function main() {
             calls(&graph),
             edges(&["index.mjs::main -> utils.mjs::helper"])
         );
+        assert!(confidence(&graph, "index.mjs::main", "utils.mjs::helper").unwrap() >= 0.95);
     }
 
     /// Requiring some names does not make every other name visible.
@@ -3590,6 +3803,13 @@ export function TrendsPage() {
             calls(&graph),
             edges(&["app/trends/page.tsx::TrendsPage -> components/TrendsChart.tsx::TrendsChart"])
         );
+        let weak = confidence(
+            &graph,
+            "app/trends/page.tsx::TrendsPage",
+            "components/TrendsChart.tsx::TrendsChart",
+        )
+        .unwrap();
+        assert!(weak < super::Edge::CONFIDENT_THRESHOLD, "{weak}");
     }
 
     /// A function a module doesn't export can't be called from another
