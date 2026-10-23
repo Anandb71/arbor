@@ -9,7 +9,7 @@
 use crate::languages::LanguageParser;
 use crate::node::{
     import_alias, import_alias_ref, import_qualified_name, local_binding_ref, runtime_binding,
-    runtime_binding_ref, CodeNode, NodeKind, Visibility,
+    runtime_binding_ref, CodeNode, NodeKind, Visibility, ES_MODULE_REF,
 };
 use tree_sitter::{Language, Node, Tree};
 
@@ -620,6 +620,8 @@ fn extract_require_bindings(node: &Node, source: &str, file_path: &str) -> Vec<C
 /// `Import` nodes by [`FileBindings::into_nodes`] once the file's imports are
 /// all known (a binding may come before the import it depends on).
 ///
+/// - **Module or script:** whether the file has a top-level `import` or
+///   `export` statement, as [`ES_MODULE_REF`] on the same node.
 /// - **Local bindings:** every name a variable declaration (any pattern), a
 ///   parameter, a `catch` or `for` binding, or a function or class
 ///   declaration introduces, as `local:name` on one `Import` node with an
@@ -635,6 +637,8 @@ fn extract_require_bindings(node: &Node, source: &str, file_path: &str) -> Vec<C
 #[derive(Default)]
 struct FileBindings<'s> {
     locals: std::collections::BTreeSet<&'s str>,
+    /// The file has a top-level `import` or `export` statement.
+    es_module: bool,
     /// Object patterns destructured from a value whose chain starts at an
     /// identifier, waiting to learn whether that identifier is imported.
     pending: Vec<PendingRuntimeBinding>,
@@ -680,6 +684,14 @@ impl<'s> FileBindings<'s> {
                         ),
                         bytes: (node.start_byte() as u32, node.end_byte() as u32),
                     });
+                }
+            }
+            "import_statement" | "export_statement" => {
+                if node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "program")
+                {
+                    self.es_module = true;
                 }
             }
             "formal_parameters" => {
@@ -750,12 +762,15 @@ impl<'s> FileBindings<'s> {
                 .with_references(pending.names),
             );
         }
-        if !self.locals.is_empty() {
-            let names = self
-                .locals
-                .iter()
-                .map(|name| local_binding_ref(name))
-                .collect();
+        let mut names: Vec<String> = self
+            .locals
+            .iter()
+            .map(|name| local_binding_ref(name))
+            .collect();
+        if self.es_module {
+            names.push(ES_MODULE_REF.to_string());
+        }
+        if !names.is_empty() {
             out.push(import_node("", names, root, file_path));
         }
         out
@@ -1652,7 +1667,7 @@ class Shape {}
             .filter(|n| n.kind == NodeKind::Import && n.name.is_empty())
             .flat_map(|n| n.references)
             .collect();
-        let expected: Vec<String> = [
+        let mut expected: Vec<String> = [
             "Shape", "a", "arr", "c", "d", "deflt", "err", "first", "inner", "item", "key",
             "later", "named", "opt", "others", "outer", "param", "plain", "rest", "single", "tail",
             "third", "x", "y",
@@ -1660,7 +1675,40 @@ class Shape {}
         .iter()
         .map(|name| format!("local:{name}"))
         .collect();
+        // The top-level import makes the file an ES module.
+        expected.push("module:".to_string());
         assert_eq!(locals, expected);
+    }
+
+    /// A file is an ES module when it has a top-level `import` or `export`
+    /// statement, in any form. A namespace member's `export` doesn't count:
+    /// a file whose code sits only in `namespace` blocks is a script.
+    #[test]
+    fn a_top_level_import_or_export_makes_the_file_a_module() {
+        let marked = |source: &str| {
+            parse(source, "src/app.ts")
+                .into_iter()
+                .filter(|n| n.kind == NodeKind::Import && n.name.is_empty())
+                .flat_map(|n| n.references)
+                .any(|reference| reference == "module:")
+        };
+        for module in [
+            "import './polyfill';\n",
+            "import { a } from './a';\n",
+            "export function f() {}\n",
+            "function f() {}\nexport { f };\n",
+            "const f = 1;\nexport default f;\n",
+            "import x = require('./x');\n",
+        ] {
+            assert!(marked(module), "{module}");
+        }
+        for script in [
+            "function f() {}\n",
+            "namespace ts {\n  export function f() {}\n}\n",
+            "const fs = require('fs');\nmodule.exports = { fs };\n",
+        ] {
+            assert!(!marked(script), "{script}");
+        }
     }
 
     /// A comment beside the module, such as webpack's magic comments, is
