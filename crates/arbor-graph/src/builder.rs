@@ -4032,33 +4032,182 @@ export function render(): string {
         );
     }
 
-    /// A namespace import binds a name too, so the file is a module and an
-    /// unimported bare name stays dropped.
+    /// A file whose only import is a namespace import, and which exports
+    /// nothing, is still a module: its private function can't be reached by
+    /// another module's bare call.
     #[test]
-    fn a_namespace_import_makes_the_file_a_module() {
+    fn a_file_with_only_a_namespace_import_is_a_module() {
         let graph = index(&[
             (
                 "format.ts",
                 "export function pad(x: string): string {\n  return x;\n}\n",
             ),
             (
-                "other.ts",
-                "export function shown(x: string): string {\n  return other(x);\n}\n\nfunction other(x: string): string {\n  return x;\n}\n",
+                "helpers.ts",
+                "import * as fmt from \"./format\";\n\nfunction other(x: string): string {\n  return fmt.pad(x);\n}\n",
             ),
             (
                 "app.ts",
                 "\
-import * as fmt from \"./format\";
+import { pad } from \"./format\";
 
 export function show(x: string): string {
-  return other(x);
+  return other(pad(x));
 }
 ",
             ),
         ]);
+        assert!(
+            confidence(&graph, "app.ts::show", "helpers.ts::other").is_none(),
+            "{:?}",
+            calls(&graph)
+        );
+    }
+
+    /// TypeScript files whose code sits only in `namespace` blocks have no
+    /// top-level import or export: they are global scripts, and same-named
+    /// namespaces merge across files. A namespace member's `export` doesn't
+    /// make the file a module, so the merged calls keep their edges.
+    #[test]
+    fn merged_namespace_members_in_script_files_keep_their_calls() {
+        let graph = index(&[
+            (
+                "src/factory.ts",
+                "namespace ts {\n  export function createNode(kind: number) {\n    return { kind };\n  }\n}\n",
+            ),
+            (
+                "src/parser.ts",
+                "namespace ts {\n  export function parseSourceFile() {\n    return createNode(1);\n  }\n}\n",
+            ),
+        ]);
         assert_eq!(
             calls(&graph),
-            edges(&["other.ts::shown -> other.ts::other"])
+            edges(&["src/parser.ts::parseSourceFile -> src/factory.ts::createNode"])
         );
+    }
+
+    /// A run-time binding is looked up in the module itself. `'..'` names a
+    /// barrel that only re-exports the hook, so a same-named function
+    /// elsewhere in that directory is not the hook's: the call keeps only the
+    /// weak edges of a local binding.
+    #[test]
+    fn a_binding_from_a_barrel_is_not_pinned_to_a_sibling_file() {
+        let graph = index(&[
+            ("src/app/index.ts", "export { useApp } from \"./context\";\n"),
+            (
+                "src/app/context.tsx",
+                "import { useContext } from \"react\";\n\nexport function useApp() {\n  return useContext(AppContext);\n}\n",
+            ),
+            (
+                "src/app/admin/session.ts",
+                "export function logout() {\n  return 1;\n}\n",
+            ),
+            (
+                "src/lib/auth/session.ts",
+                "export async function logout() {\n  return 2;\n}\n",
+            ),
+            (
+                "src/app/settings/Account.tsx",
+                "\
+import { useApp } from \"..\";
+
+export function Account() {
+  const { logout } = useApp();
+  return logout();
+}
+",
+            ),
+        ]);
+        let account = "src/app/settings/Account.tsx::Account";
+        for target in [
+            "src/app/admin/session.ts::logout",
+            "src/lib/auth/session.ts::logout",
+        ] {
+            let weak = confidence(&graph, account, target)
+                .unwrap_or_else(|| panic!("{target}: {:?}", calls(&graph)));
+            assert!(weak < super::Edge::CONFIDENT_THRESHOLD, "{target}: {weak}");
+        }
+    }
+
+    /// Build tools can inject imports (Nuxt's `composables/`,
+    /// unplugin-auto-import), so a call to a name the file doesn't bind may
+    /// reach another module's exported function. It keeps a weak edge.
+    #[test]
+    fn a_global_call_to_an_exported_function_keeps_a_weak_edge() {
+        let graph = index(&[
+            (
+                "composables/useUser.ts",
+                "export const useUser = () => useState(\"user\", () => null);\n",
+            ),
+            (
+                "composables/useCart.ts",
+                "export const useCart = () => {\n  const user = useUser();\n  return { user };\n};\n",
+            ),
+        ]);
+        let weak = confidence(
+            &graph,
+            "composables/useCart.ts::useCart",
+            "composables/useUser.ts::useUser",
+        )
+        .unwrap_or_else(|| panic!("{:?}", calls(&graph)));
+        assert!(weak < super::Edge::CONFIDENT_THRESHOLD, "{weak}");
+    }
+
+    /// The index cache stores nodes by id. Two imports of one module in one
+    /// file (an import and a run-time binding of it, `import` and
+    /// `import type`, two Python `from` lines) must both survive a round trip
+    /// through it, or the next `arbor index` loses a binding and drops calls.
+    #[test]
+    fn imports_of_one_module_survive_the_cache() {
+        let files = [
+            (
+                "hooks.ts",
+                "export function useListFilters() {\n  function setFilters(patch: object) {\n    return patch;\n  }\n  return { setFilters };\n}\n",
+            ),
+            (
+                "List.tsx",
+                "import { useListFilters } from \"./hooks\";\n\nexport function List() {\n  const { setFilters } = useListFilters();\n  return setFilters({});\n}\n",
+            ),
+            (
+                "api.ts",
+                "export function fetchUser() {\n  return 1;\n}\n\nexport interface User {\n  id: number;\n}\n",
+            ),
+            (
+                "load.ts",
+                "import { fetchUser } from \"./api\";\nimport type { User } from \"./api\";\n\nexport function load(): User {\n  return { id: fetchUser() };\n}\n",
+            ),
+            ("money.py", "def a():\n    return 1\n\n\ndef b():\n    return 2\n"),
+            (
+                "orders.py",
+                "from money import a\n\n\ndef first():\n    return a()\n\n\nfrom money import b\n\n\ndef second():\n    return b()\n",
+            ),
+        ];
+        let fresh = calls(&index(&files));
+        for expected in [
+            "List.tsx::List -> hooks.ts::useListFilters",
+            "List.tsx::List -> hooks.ts::setFilters",
+            "load.ts::load -> api.ts::fetchUser",
+            "orders.py::first -> money.py::a",
+            "orders.py::second -> money.py::b",
+        ] {
+            assert!(fresh.contains(expected), "{expected}: {fresh:?}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::GraphStore::open(dir.path()).unwrap();
+        for (path, source) in &files {
+            let ext = std::path::Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap();
+            let parser = arbor_core::languages::get_parser(ext).unwrap();
+            let nodes = arbor_core::parse_source(source, path, parser.as_ref()).unwrap();
+            store.update_file(path, &nodes, 1).unwrap();
+        }
+        let mut builder = super::GraphBuilder::new();
+        for (path, _) in &files {
+            builder.add_nodes(store.get_file_nodes(path).unwrap().unwrap());
+        }
+        assert_eq!(calls(&builder.build()), fresh);
     }
 }
