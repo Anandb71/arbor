@@ -2975,6 +2975,50 @@ def build(values):
         assert_eq!(calls(&graph), edges(&[]));
     }
 
+    /// A typed package's `__init__.pyi` is a stub, not the module that runs:
+    /// `__init__.py` re-exports the implementation from a submodule. The stub
+    /// doesn't outrank the implementation, so the alias reaches what the
+    /// plain import reaches.
+    #[test]
+    fn a_package_stub_does_not_hide_the_implementation_from_an_alias() {
+        let graph = index(&[
+            ("attr/__init__.pyi", "def evolve(inst, **changes): ...\n"),
+            ("attr/__init__.py", "from ._funcs import evolve\n"),
+            (
+                "attr/_funcs.py",
+                "def evolve(inst, **changes):\n    return inst\n",
+            ),
+            (
+                "app.py",
+                "\
+from attr import evolve as ev
+
+
+def run(x):
+    return ev(x)
+",
+            ),
+            (
+                "plain.py",
+                "\
+from attr import evolve
+
+
+def run2(x):
+    return evolve(x)
+",
+            ),
+        ]);
+        let reached = |caller: &str| -> BTreeSet<String> {
+            calls(&graph)
+                .into_iter()
+                .filter_map(|e| e.strip_prefix(&format!("{caller} -> ")).map(str::to_string))
+                .collect()
+        };
+        assert!(reached("app.py::run").contains("attr/_funcs.py::evolve"));
+        assert_eq!(reached("app.py::run"), reached("plain.py::run2"));
+    }
+
     /// Known limit: a module is matched by name, so an external module (Node's
     /// `http`) that shares its name with a project file binds to that file.
     /// The alias binds exactly as the unaliased import does, no further.
