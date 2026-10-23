@@ -742,13 +742,18 @@ fn value_chain(value: &Node, source: &str) -> Option<Chain> {
 }
 
 /// The module a `require` or `import()` call names: its one argument, when
-/// that is a string literal.
+/// that is a string literal. Comments (webpack's magic comments) are not
+/// arguments.
 fn sole_string_argument(call: &Node, source: &str) -> Option<String> {
     let arguments = call.child_by_field_name("arguments")?;
-    if arguments.named_child_count() != 1 {
+    let mut values = (0..arguments.named_child_count())
+        .filter_map(|i| arguments.named_child(i))
+        .filter(|argument| argument.kind() != "comment");
+    let module = values.next()?;
+    if values.next().is_some() {
         return None;
     }
-    string_literal(&arguments.named_child(0)?, source)
+    string_literal(&module, source)
 }
 
 /// The names an object pattern binds: `{ A }`, `{ A = d }`, `{ B: C }`,
