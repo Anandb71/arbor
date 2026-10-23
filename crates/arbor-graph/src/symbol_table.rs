@@ -330,10 +330,11 @@ impl SymbolTable {
     /// (`from money import money_to_minor_units as to_minor`).
     ///
     /// The import says where the definition lives, so only definitions of
-    /// `name` in that module are candidates: the module's own file first, then
-    /// anything inside a package of that name. A same-named function elsewhere
-    /// is not the target, and a module this project doesn't define (`numpy`)
-    /// leaves the call unresolved.
+    /// `name` in that module are candidates: the module's own file first
+    /// (`money.py`, or a package's `__init__.py` or `index.ts`), then anything
+    /// inside a package of that name. A same-named function elsewhere is not
+    /// the target, and a module this project doesn't define (`numpy`) leaves
+    /// the call unresolved.
     ///
     /// A relative module (`./format`, `../route`, `.money`, `..core.money`)
     /// names one place, read from the importing file's directory, so a
@@ -383,7 +384,7 @@ impl SymbolTable {
         let in_module: Vec<&SymbolEntry> = defined
             .iter()
             .copied()
-            .filter(|e| module_is(e, &wanted))
+            .filter(|e| module_is(e, &wanted) || package_init_is(e, &wanted))
             .collect();
         if !in_module.is_empty() {
             return pick(in_module, context_file, Resolution::ViaImport);
@@ -617,6 +618,20 @@ fn pick(
 fn module_is(entry: &SymbolEntry, module: &str) -> bool {
     let file_norm = normalize_module_path(&entry.file.to_string_lossy());
     file_norm == module || file_norm.ends_with(&format!(".{module}"))
+}
+
+/// Is this symbol defined in the package `module`'s own `__init__.py`?
+///
+/// `module_is` already matches `pkg/index.ts` and `pkg/mod.rs`, because
+/// `normalize_module_path` drops `index` and `mod`, but `pkg/__init__.py`
+/// normalizes to `pkg.__init__`. The package directory is compared the way
+/// `module_is` compares a file.
+fn package_init_is(entry: &SymbolEntry, module: &str) -> bool {
+    entry.file.file_stem().and_then(|s| s.to_str()) == Some("__init__")
+        && entry.file.parent().is_some_and(|dir| {
+            let dir_norm = normalize_module_path(&dir.to_string_lossy());
+            dir_norm == module || dir_norm.ends_with(&format!(".{module}"))
+        })
 }
 
 /// Source languages that can call each other directly. Calls are never
