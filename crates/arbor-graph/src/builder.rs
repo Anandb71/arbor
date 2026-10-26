@@ -84,6 +84,10 @@ pub struct GraphBuilder {
     /// `Module` node, and a bare call is visible only inside that package.
     go_packages: HashMap<String, String>,
 
+    /// Every import node added, handed to the graph by `build`, so a graph
+    /// rebuilt from this one keeps each file's imports.
+    import_nodes: Vec<CodeNode>,
+
     /// JavaScript and TypeScript files that are modules: a top-level `import`
     /// or `export` statement, or a top-level CommonJS `module.exports` /
     /// `exports.f` assignment. A file that isn't one, and binds nothing from
@@ -123,6 +127,7 @@ impl GraphBuilder {
             namespace_imports: HashMap::new(),
             import_aliases: HashMap::new(),
             go_packages: HashMap::new(),
+            import_nodes: Vec::new(),
             module_files: HashSet::new(),
             runtime_bindings: HashMap::new(),
             local_bindings: HashMap::new(),
@@ -213,7 +218,9 @@ impl GraphBuilder {
                 // Import nodes are intentionally NOT added to the graph.
                 // They caused misleading centrality scores (e.g. "psycopg.types.range [Import]
                 // 330 callers") because every call to a symbol named after the import path
-                // was attributed to the import node itself.
+                // was attributed to the import node itself. They are kept
+                // beside it instead (`ArborGraph::import_nodes`).
+                self.import_nodes.push(node);
                 continue;
             }
 
@@ -1074,11 +1081,13 @@ impl GraphBuilder {
     pub fn build(mut self) -> ArborGraph {
         self.resolve_edges();
         self.resolve_inheritance();
+        self.graph.set_import_nodes(self.import_nodes);
         self.graph
     }
 
     /// Builds without resolving edges (for incremental updates).
-    pub fn build_without_resolve(self) -> ArborGraph {
+    pub fn build_without_resolve(mut self) -> ArborGraph {
+        self.graph.set_import_nodes(self.import_nodes);
         self.graph
     }
 }

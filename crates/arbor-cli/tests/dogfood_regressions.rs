@@ -226,7 +226,11 @@ fn an_incremental_index_keeps_the_imports_of_unchanged_files() {
     git(dir, &["config", "user.email", "arbor-tests@example.com"]);
     git(dir, &["config", "user.name", "Arbor Tests"]);
     write(dir, "app/__init__.py", "");
-    write(dir, "app/money.py", "def to_cents(x):\n    return x * 100\n");
+    write(
+        dir,
+        "app/money.py",
+        "def to_cents(x):\n    return x * 100\n",
+    );
     write(
         dir,
         "app/orders.py",
