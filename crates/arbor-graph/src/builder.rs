@@ -490,8 +490,11 @@ impl GraphBuilder {
         if defined_here {
             return None;
         }
-        Some(self.symbol_table.resolve_imported(name, module, from_file))
-            .filter(Resolution::is_resolved)
+        Some(
+            self.symbol_table
+                .resolve_in_module_file(name, module, from_file),
+        )
+        .filter(Resolution::is_resolved)
     }
 
     /// Records `local` as bound from a value `module` produced, unless the
