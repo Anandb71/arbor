@@ -1113,8 +1113,8 @@ fn is_go_file(file: &Path) -> bool {
 /// Languages whose parsers record imported local names.
 ///
 /// A bare call in one of these files is visible only when the file defines
-/// the name or imports it (a JavaScript or TypeScript file that imports
-/// nothing is exempt, see `GraphBuilder::is_import_free_script`).
+/// the name or imports it; JavaScript and TypeScript add local bindings and
+/// globals, see `GraphBuilder::validate_bare_import_visibility`.
 fn bare_name_requires_import(file: &Path) -> bool {
     let Some(ext) = file.extension().and_then(|ext| ext.to_str()) else {
         return false;
