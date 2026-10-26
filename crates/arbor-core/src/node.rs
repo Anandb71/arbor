@@ -197,10 +197,11 @@ pub fn runtime_binding(reference: &str) -> Option<(&str, &str)> {
 }
 
 /// A reference on the empty-module import node of a JavaScript or
-/// TypeScript file that is an ES module: it has a top-level `import` or
-/// `export` statement. A file without one is a script, whose top-level names
-/// are globals; TypeScript draws the line the same way.
-pub const ES_MODULE_REF: &str = "module:";
+/// TypeScript file that is a module: it has a top-level `import` or `export`
+/// statement (TypeScript draws the line the same way), or a top-level
+/// CommonJS `module.exports` / `exports.f` assignment. A file without one is
+/// a script, whose top-level names are globals.
+pub const MODULE_FILE_REF: &str = "module:";
 
 /// Prefix for a name the file binds itself (a variable, a parameter, a
 /// destructured value), recorded on an import node with an empty module.

@@ -9,7 +9,7 @@ use crate::graph::{ArborGraph, NodeId};
 use crate::symbol_table::{Resolution, SymbolTable};
 use arbor_core::{
     clean_type_name, field_type_ref, import_alias, local_binding, return_type_ref, runtime_binding,
-    type_relation_ref, typed_receiver, CodeNode, NodeKind, TypeRelationKind, ES_MODULE_REF,
+    type_relation_ref, typed_receiver, CodeNode, NodeKind, TypeRelationKind, MODULE_FILE_REF,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -84,10 +84,11 @@ pub struct GraphBuilder {
     /// `Module` node, and a bare call is visible only inside that package.
     go_packages: HashMap<String, String>,
 
-    /// JavaScript and TypeScript files with a top-level `import` or `export`
-    /// statement: ES modules. A file that isn't one, and binds nothing from
+    /// JavaScript and TypeScript files that are modules: a top-level `import`
+    /// or `export` statement, or a top-level CommonJS `module.exports` /
+    /// `exports.f` assignment. A file that isn't one, and binds nothing from
     /// another module, may be a classic script.
-    es_module_files: HashSet<String>,
+    module_files: HashSet<String>,
 
     /// Names a JavaScript or TypeScript file binds from a value one of its
     /// project modules produced: file → local name → (name to look for,
@@ -122,7 +123,7 @@ impl GraphBuilder {
             namespace_imports: HashMap::new(),
             import_aliases: HashMap::new(),
             go_packages: HashMap::new(),
-            es_module_files: HashSet::new(),
+            module_files: HashSet::new(),
             runtime_bindings: HashMap::new(),
             local_bindings: HashMap::new(),
             conflicting_bindings: HashMap::new(),
@@ -153,8 +154,8 @@ impl GraphBuilder {
                 let js = is_js_family_file(Path::new(&file));
 
                 for imported_name in &node.references {
-                    if imported_name == ES_MODULE_REF {
-                        self.es_module_files.insert(file.clone());
+                    if imported_name == MODULE_FILE_REF {
+                        self.module_files.insert(file.clone());
                         continue;
                     }
                     if let Some(name) = local_binding(imported_name) {
@@ -565,8 +566,8 @@ impl GraphBuilder {
                 .is_some_and(|bindings| bindings.contains_key(name))
     }
 
-    /// Is this a JavaScript or TypeScript file with no top-level `import` or
-    /// `export` that binds nothing from another module?
+    /// Is this a JavaScript or TypeScript file with no top-level `import`,
+    /// `export` or CommonJS export that binds nothing from another module?
     ///
     /// Such a file may be a classic script, whose top-level functions are
     /// globals shared with every other script on the page, including files
@@ -575,7 +576,7 @@ impl GraphBuilder {
     /// a Python file never qualifies.
     fn is_possible_script(&self, file: &str) -> bool {
         is_js_family_file(Path::new(file))
-            && !self.es_module_files.contains(file)
+            && !self.module_files.contains(file)
             && self.import_map.get(file).is_none_or(HashMap::is_empty)
             && self
                 .namespace_imports

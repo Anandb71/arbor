@@ -9,7 +9,7 @@
 use crate::languages::LanguageParser;
 use crate::node::{
     import_alias, import_alias_ref, import_qualified_name, local_binding_ref, runtime_binding,
-    runtime_binding_ref, CodeNode, NodeKind, Visibility, ES_MODULE_REF,
+    runtime_binding_ref, CodeNode, NodeKind, Visibility, MODULE_FILE_REF,
 };
 use tree_sitter::{Language, Node, Tree};
 
@@ -621,7 +621,7 @@ fn extract_require_bindings(node: &Node, source: &str, file_path: &str) -> Vec<C
 /// all known (a binding may come before the import it depends on).
 ///
 /// - **Module or script:** whether the file has a top-level `import` or
-///   `export` statement, as [`ES_MODULE_REF`] on the same node.
+///   `export` statement, as [`MODULE_FILE_REF`] on the same node.
 /// - **Local bindings:** every name a variable declaration (any pattern), a
 ///   parameter, a `catch` or `for` binding, or a function or class
 ///   declaration introduces, as `local:name` on one `Import` node with an
@@ -637,8 +637,9 @@ fn extract_require_bindings(node: &Node, source: &str, file_path: &str) -> Vec<C
 #[derive(Default)]
 struct FileBindings<'s> {
     locals: std::collections::BTreeSet<&'s str>,
-    /// The file has a top-level `import` or `export` statement.
-    es_module: bool,
+    /// The file is a module: a top-level `import` or `export` statement, or a
+    /// top-level CommonJS `module.exports` / `exports.f` assignment.
+    module_file: bool,
     /// Object patterns destructured from a value whose chain starts at an
     /// identifier, waiting to learn whether that identifier is imported.
     pending: Vec<PendingRuntimeBinding>,
@@ -691,7 +692,16 @@ impl<'s> FileBindings<'s> {
                     .parent()
                     .is_some_and(|parent| parent.kind() == "program")
                 {
-                    self.es_module = true;
+                    self.module_file = true;
+                }
+            }
+            "expression_statement" => {
+                if node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "program")
+                    && assigns_commonjs_exports(node, source)
+                {
+                    self.module_file = true;
                 }
             }
             "formal_parameters" => {
@@ -767,14 +777,32 @@ impl<'s> FileBindings<'s> {
             .iter()
             .map(|name| local_binding_ref(name))
             .collect();
-        if self.es_module {
-            names.push(ES_MODULE_REF.to_string());
+        if self.module_file {
+            names.push(MODULE_FILE_REF.to_string());
         }
         if !names.is_empty() {
             out.push(import_node("", names, root, file_path));
         }
         out
     }
+}
+
+/// `module.exports = ...`, `module.exports.f = ...` or `exports.f = ...` as a
+/// statement of its own: how a CommonJS file exports. A UMD file assigns
+/// `module.exports` inside an `if`, and a browser loads it as a script, so
+/// only a top-level statement counts (the caller checks that).
+fn assigns_commonjs_exports(statement: &Node, source: &str) -> bool {
+    let Some(left) = statement
+        .named_child(0)
+        .filter(|expression| expression.kind() == "assignment_expression")
+        .and_then(|assignment| assignment.child_by_field_name("left"))
+    else {
+        return false;
+    };
+    let target = &source[left.byte_range()];
+    target == "module.exports"
+        || target.starts_with("module.exports.")
+        || target.starts_with("exports.")
 }
 
 /// Adds every name `pattern` binds: an identifier, or each name inside an
@@ -1675,7 +1703,7 @@ class Shape {}
         .iter()
         .map(|name| format!("local:{name}"))
         .collect();
-        // The top-level import makes the file an ES module.
+        // The top-level import makes the file a module.
         expected.push("module:".to_string());
         assert_eq!(locals, expected);
     }
