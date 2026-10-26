@@ -673,8 +673,10 @@ impl GraphBuilder {
     /// parameter, a destructured value, a run-time binding its module didn't
     /// define) keeps the downgrade: the value may hold any function. A
     /// classic script's function is a global, and keeps it too; between two
-    /// possible scripts the call keeps its full confidence, as before. Any
-    /// other name is a global, which can't be another module's function.
+    /// possible scripts the call keeps its full confidence, as before. A
+    /// global can't be another module's private function, so that edge is
+    /// dropped; an exported one keeps the downgrade, since build tools inject
+    /// imports for exports (Nuxt's `composables/`, unplugin-auto-import).
     fn validate_bare_import_visibility(
         &self,
         reference: &str,
@@ -705,7 +707,7 @@ impl GraphBuilder {
             if to_script && self.is_possible_script(from_file_str) {
                 return base_confidence;
             }
-            if to_script || self.binds_locally(from_file_str, reference) {
+            if to_script || to_node.is_exported || self.binds_locally(from_file_str, reference) {
                 debug!(
                     "Downgrading unimported reference '{}' in {} → {}, a local binding or a script's global",
                     reference,
