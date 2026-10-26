@@ -1680,9 +1680,10 @@ class Shape {}
         assert_eq!(locals, expected);
     }
 
-    /// A file is an ES module when it has a top-level `import` or `export`
-    /// statement, in any form. A namespace member's `export` doesn't count:
-    /// a file whose code sits only in `namespace` blocks is a script.
+    /// A file is a module when it has a top-level `import` or `export`
+    /// statement, in any form, or assigns CommonJS's `module.exports` or
+    /// `exports.f` at the top level. A namespace member's `export` doesn't
+    /// count, and neither does a UMD guard: those files are scripts.
     #[test]
     fn a_top_level_import_or_export_makes_the_file_a_module() {
         let marked = |source: &str| {
@@ -1699,13 +1700,17 @@ class Shape {}
             "function f() {}\nexport { f };\n",
             "const f = 1;\nexport default f;\n",
             "import x = require('./x');\n",
+            "function f() {}\nmodule.exports = { f };\n",
+            "module.exports.f = function () {};\n",
+            "exports.f = function () {};\n",
         ] {
             assert!(marked(module), "{module}");
         }
         for script in [
             "function f() {}\n",
             "namespace ts {\n  export function f() {}\n}\n",
-            "const fs = require('fs');\nmodule.exports = { fs };\n",
+            // UMD: a browser loads this file as a script too.
+            "function f() {}\nif (typeof module !== 'undefined') {\n  module.exports = f;\n}\n",
         ] {
             assert!(!marked(script), "{script}");
         }

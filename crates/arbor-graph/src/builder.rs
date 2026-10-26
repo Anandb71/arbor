@@ -3762,6 +3762,37 @@ export function Button({ onSave }) {
         assert!(weak < super::Edge::CONFIDENT_THRESHOLD, "{weak}");
     }
 
+    /// A CommonJS module that requires nothing is still a module: its
+    /// functions aren't globals, so Jest's global `expect()` doesn't reach
+    /// its private `expect` helper.
+    #[test]
+    fn a_commonjs_module_without_requires_is_not_a_script() {
+        let graph = index(&[
+            (
+                "scripts/verify.cjs",
+                "function expect(path, status) {\n  return path;\n}\n\nmodule.exports = { expect };\n",
+            ),
+            (
+                "src/add.ts",
+                "export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+            ),
+            (
+                "src/__tests__/add.test.ts",
+                "\
+import { add } from \"../add\";
+
+export function addsTwoNumbers() {
+  return expect(add(1, 2)).toBe(3);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["src/__tests__/add.test.ts::addsTwoNumbers -> src/add.ts::add"])
+        );
+    }
+
     /// TypeScript's own CommonJS import form.
     #[test]
     fn a_typescript_import_require_keeps_the_call() {
