@@ -268,8 +268,9 @@ LangChain's helpers report nothing.
     deployment, so a missing `model` there is not a gap.
 
   The classes are pydantic models that take keyword arguments only, so a
-  positional argument is not read. A built model's requests read its model
-  field when they are sent, so a write of `model` or `model_name` on any
+  positional argument is not read. A built model's requests send its model
+  field, read when they are sent, unless the call passes its own `model`
+  (see the calls below). So a write of `model` or `model_name` on any
   object other than `self` or a same-file class (`llm.model_name = ...`,
   `settings.model = ...`), or of an attribute with a run-time name, gives
   every LangChain chat model's value in the file a `dynamic_feature` gap.
@@ -300,6 +301,11 @@ LangChain's helpers report nothing.
   `llm.with_structured_output(...)`) are recorded with its routing, as calls on
   a client are. What such a call returns, including a copy
   (`llm.copy(update=...)`, which may change any field), is not followed.
+  LangChain sends a call's keyword arguments over the model's own parameters,
+  so a call may pass its own `model` (`llm.invoke(q, model=...)`,
+  `llm.bind(model=...)`), which is sent in place of the field: a literal is
+  read under the value rules above, a parameter is a gap, and a `**` expansion
+  the file cannot read is a `splat` gap on `model`, as for an SDK request.
   LangChain's run options (`config`, `configurable`, `metadata`, `tags`,
   `callbacks`, `run_name`) and a call's positional input never reach the
   provider's request, so a `model` key inside them is not read.
