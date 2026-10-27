@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`arbor retirements` offers a readiness review:** when the human report lists a call to a retired or retiring model, its closing offer is a readiness review with a link that carries only the number of listed calls, how many are already retired and the next shutdown date (`&review=1&calls=4&retired=1&next=2027-01-14`), never code, paths, file, repository or model names. Arbor still makes no network requests: nothing is sent unless you open the link. Other findings keep the fix-PR line; `--json`, `--markdown`, `--annotations`, `--quiet` and CI print no offer, as before.
+
 ### Fixed
 - **`arbor refactor` exited 0 for a missing symbol (#195):** it now exits 1 and prints `error: Symbol '<name>' not found` to stderr after the "Did you mean" suggestions, matching `inspect` and `callers`.
 

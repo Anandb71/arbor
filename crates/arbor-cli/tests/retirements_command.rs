@@ -677,7 +677,7 @@ fn errors_exit_two_with_json_on_stdout() {
 }
 
 #[test]
-fn human_report_reads_plainly_and_offers_fix_prs_once() {
+fn human_report_reads_plainly_and_offers_a_review_once() {
     let dir = project(APP);
     let output = arbor(dir.path(), &["retirements", ".", "--today", TODAY]);
     let text = stdout(&output);
@@ -705,12 +705,52 @@ fn human_report_reads_plainly_and_offers_fix_prs_once() {
     assert!(text.contains("Runs locally: no code leaves this machine."));
     // No line ends in a space.
     assert!(text.lines().all(|l| !l.ends_with(' ')), "{text}");
-    assert_eq!(
-        text.matches("https://getarbor.dev/retirements?utm_source=arbor-cli\n")
-            .count(),
-        1,
-        "{text}"
+    // 4 listed calls, 1 already retired, the next shutdown on 14 Jan 2027:
+    // the counts and the date the summary line shows, and nothing else.
+    assert!(text.contains(
+        "Summary: 4 calls in 1 file use retired or retiring models: 1 already retired, 3 retiring (next: 14 Jan 2027, 88 days)."
+    ));
+    let review = "https://getarbor.dev/retirements?utm_source=arbor-cli&review=1&calls=4&retired=1&next=2027-01-14";
+    assert_eq!(text.matches("getarbor.dev").count(), 1, "{text}");
+    assert!(text.contains(&format!(
+        "\nWant these calls ready before 14 Jan 2027? Ask for a readiness review: Arbor writes the fix pull requests with you and lists every call it could not check.\n{review}\nArbor has sent nothing. Opening this link shares only how many calls are listed, how many are already retired and the next shutdown date: no code, paths, file names or model names. Your email reaches Arbor only if you submit the form there.\n"
+    )), "{text}");
+    assert!(text.ends_with("submit the form there.\n"), "{text}");
+    // The link names no file, path, directory or model from the scan.
+    let link = text.lines().find(|l| l.contains("getarbor.dev")).unwrap();
+    let dir_name = dir.path().file_name().unwrap().to_string_lossy();
+    for leak in [
+        "app.py",
+        dir_name.as_ref(),
+        "gpt",
+        "claude",
+        "MODEL",
+        "answer",
+        "openai",
+        "anthropic",
+    ] {
+        assert!(!link.contains(leak), "{leak} in {link}");
+    }
+
+    // Retired calls only: no date in the link.
+    let retired = project(
+        "from anthropic import Anthropic\n\nclaude = Anthropic()\n\n\ndef legacy(text):\n    return claude.messages.create(model=\"claude-3-5-sonnet-20241022\", max_tokens=512, messages=[])\n",
     );
+    let text = stdout(&arbor(
+        retired.path(),
+        &["retirements", ".", "--today", TODAY],
+    ));
+    assert!(text.contains(
+        "\nWant this call fixed? Ask for a readiness review: Arbor writes the fix pull requests with you and lists every call it could not check.\nhttps://getarbor.dev/retirements?utm_source=arbor-cli&review=1&calls=1&retired=1\n"
+    ), "{text}");
+
+    // Nothing found: no offer and no link, as before.
+    let clean = project(CURRENT);
+    let text = stdout(&arbor(
+        clean.path(),
+        &["retirements", ".", "--today", TODAY],
+    ));
+    assert!(!text.contains("getarbor.dev"), "{text}");
 
     // Never in CI, with --quiet, or in machine-readable output.
     for output in [

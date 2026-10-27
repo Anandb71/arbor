@@ -214,8 +214,15 @@ arguments, and credential-shaped strings are never captured or printed. For a cl
 given a `base_url`, Arbor reads that argument to tell the provider's own host from a
 proxy; it reports only that class, never the URL.
 
-The human report ends with one line offering automated fix pull requests. That line is
-never printed with `--json`, `--markdown`, `--annotations`, `--quiet`, or when `CI` is set.
-Its link (`https://getarbor.dev/retirements?utm_source=arbor-cli`) carries only that
-`utm_source` tag, so a fix-PR signup from the page can be credited to the CLI; nothing
-about your code or the run is in it, and Arbor opens nothing itself.
+The human report can end with an offer of help. It is never printed with `--json`,
+`--markdown`, `--annotations`, `--quiet`, or when `CI` is set, and Arbor opens nothing
+itself. When the report lists at least one call to a retired or retiring model, the offer
+is a readiness review, and its link
+(`https://getarbor.dev/retirements?utm_source=arbor-cli&review=1&calls=4&retired=1&next=2027-01-14`,
+for example) carries only the number of calls in the summary, how many of them are already
+retired and the soonest shutdown date among the retiring ones, never code, paths, file
+names, repository names or model names; opening it sends those values to getarbor.dev like
+any page visit, and your email only if you submit the form. For any other listed or routed
+call the offer is automated fix pull requests, and its link
+(`https://getarbor.dev/retirements?utm_source=arbor-cli`) carries only the `utm_source` tag
+that credits a signup to the CLI. A clean report has no offer.
