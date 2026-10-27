@@ -1594,10 +1594,139 @@ fn wrapped_client_shapes_keep_their_arguments_checked() {
     assert_eq!(text.matches(unseen).count(), 1, "{text}");
     let unnamed = "let the model reason (could not check the arguments spread in with **)";
     assert_eq!(text.matches(unnamed).count(), 1, "{text}");
+    // The Responses API's temperature was never checked there.
+    assert!(
+        text.contains("let the model reason (could not check temperature)"),
+        "{text}"
+    );
     assert_eq!(
         text.matches("let the model reason (remove temperature)")
             .count(),
         1,
         "{text}"
+    );
+}
+
+/// Calls whose decide line said "(no change)" next to a check line saying
+/// otherwise (#291 round 3), a `**` dict Arbor can read, one it cannot, and
+/// `temperature=1`.
+const CHECK_LINES: &str = r#"import anthropic
+from openai import OpenAI
+
+client = OpenAI()
+claude = anthropic.Anthropic()
+
+PARAMS = {"model": "gpt-4o-mini", "temperature": 0.1}
+
+
+def respond(text):
+    return client.responses.create(model="gpt-4o-mini", temperature=0.1, input=text)
+
+
+def reply(text):
+    return claude.messages.create(model="claude-3-5-sonnet-20241022", max_tokens=512, temperature=0.3, messages=[])
+
+
+def stop_early(text):
+    return client.chat.completions.create(model="gpt-4o-mini", stop=["\n"], messages=[])
+
+
+def from_params(messages):
+    return client.chat.completions.create(messages=messages, **PARAMS)
+
+
+def from_settings(messages, settings):
+    return client.chat.completions.create(model="gpt-4.1-mini", messages=messages, **settings.llm_options)
+
+
+def default_temperature(text):
+    return client.chat.completions.create(model="gpt-4.1-mini", temperature=1, messages=[])
+"#;
+
+#[test]
+fn no_option_reads_no_change_next_to_a_check_line_that_says_otherwise() {
+    let dir = project(CHECK_LINES);
+    let (_, report) = run_json(dir.path(), &[]);
+    let at = |symbol: &str| -> Value {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["symbol"] == symbol)
+            .cloned()
+            .unwrap_or_else(|| panic!("no finding for {symbol}: {report:#}"))
+    };
+    let option = |symbol: &str, id: &str| -> Value {
+        at(symbol)["decisions"][0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no option {id} for {symbol}"))
+    };
+    let json = |names: &[&str]| serde_json::json!(names);
+
+    // The Responses API: no live call checked temperature there, so the
+    // Chat Completions rule is not applied and neither option vouches for it.
+    for id in ["reasoning_none", "model_default"] {
+        assert_eq!(option("respond", id)["unverified"], json(&["temperature"]));
+        assert!(option("respond", id).get("check").is_none());
+    }
+    // Claude: temperature returns 400 whichever way the thinking goes.
+    for id in ["thinking_between_tools", "model_default"] {
+        assert_eq!(option("reply", id)["check"], json(&["temperature"]));
+    }
+    assert_eq!(
+        option("stop_early", "model_default")["check"],
+        json(&["stop"])
+    );
+    // `**PARAMS`, a dict literal in this file: its temperature is checked.
+    assert_eq!(
+        option("from_params", "model_default")["remove"],
+        json(&["temperature"])
+    );
+    assert!(at("from_params")["decisions"][0]
+        .get("unchecked_args")
+        .is_none());
+    // `**settings.llm_options` cannot be read: named, not "**kwargs".
+    let settings = &at("from_settings")["decisions"][0];
+    assert_eq!(settings["unchecked_args"], "splat");
+    assert_eq!(settings["unread_spreads"], json(&["settings.llm_options"]));
+    // Arbor reads argument names, not values: temperature=1 is still
+    // removed for letting the model reason (no live call sent 1).
+    assert_eq!(
+        option("default_temperature", "model_default")["remove"],
+        json(&["temperature"])
+    );
+
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    for line in [
+        "decide: keep reasoning off (add reasoning={\"effort\": \"none\"}; could not check temperature) or let the model reason (could not check temperature)",
+        "check: Whether gpt-6-luna accepts temperature, top_p or logprobs on the Responses API is not verified.",
+        "decide: think only between tools (add thinking={\"type\": \"between_tools\"}; check temperature) or let the model think (check temperature)",
+        "check: Non-default temperature, top_p or top_k return 400 on claude-sonnet-5-5",
+        "decide: keep reasoning off (add reasoning_effort=\"none\"; check stop) or let the model reason (check stop)",
+        "decide: keep reasoning off (add reasoning_effort=\"none\"; keep temperature) or let the model reason (remove temperature)",
+        "decide: keep reasoning off (add reasoning_effort=\"none\") or let the model reason (could not check the arguments from **settings.llm_options)",
+        "check: Some arguments come from `**settings.llm_options`, so Arbor could not check them all.",
+    ] {
+        assert!(text.contains(line), "missing {line:?} in\n{text}");
+    }
+    // Every call here sends something a check names: none reads no change.
+    assert!(!text.contains("(no change)"), "{text}");
+    assert!(!text.contains("**kwargs"), "{text}");
+
+    let markdown = stdout(&arbor(
+        dir.path(),
+        &["retirements", ".", "--markdown", "--today", TODAY],
+    ));
+    assert!(
+        markdown.contains("could not check the arguments from `**settings.llm_options`"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("let the model think (check temperature)"),
+        "{markdown}"
     );
 }

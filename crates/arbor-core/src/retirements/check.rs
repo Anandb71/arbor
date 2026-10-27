@@ -255,6 +255,17 @@ pub struct DecisionOption {
     pub remove: Vec<String>,
     /// The call's parameters to keep.
     pub keep: Vec<String>,
+    /// The call's parameters a check line flags (they fail or change on the
+    /// replacement) and this option leaves as they are: someone has to look
+    /// at them whichever way the choice goes, so the option is never "no
+    /// change".
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub check: Vec<String>,
+    /// The call's parameters this option leaves as they are, whose support
+    /// on the replacement no check verified for this API (a check line says
+    /// so): Arbor cannot say whether they work.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unverified: Vec<String>,
     pub effects: Vec<OptionEffect>,
 }
 
@@ -2017,7 +2028,41 @@ fn apply_rules<'r>(
             None => out.notes.push(note),
         }
     }
+    flag_checked_arguments(&mut out);
     out
+}
+
+/// A check line about an argument the call sends holds whichever option is
+/// chosen: `temperature` returns 400 on claude-sonnet-5-5 with or without
+/// thinking, and whether gpt-6-luna takes it on the Responses API is not
+/// verified at any effort. Each option that neither removes, keeps nor sets
+/// that argument lists it, so no option reads "no change" next to a check
+/// line that says otherwise.
+fn flag_checked_arguments(out: &mut Outcome) {
+    for item in out.review.iter().filter(|r| r.rule.is_some()) {
+        let unverified = item.verified == Some(Verified::Unverified);
+        for option in out.decisions.iter_mut().flat_map(|d| &mut d.options) {
+            for name in &item.because {
+                let settled = option.remove.contains(name)
+                    || option.keep.contains(name)
+                    || option.add.iter().any(|a| &a.name == name);
+                if settled {
+                    continue;
+                }
+                let list = if unverified {
+                    &mut option.unverified
+                } else {
+                    &mut option.check
+                };
+                push_unique(list, name.clone());
+            }
+        }
+    }
+    // An argument flagged both ways reads once, as the firmer check.
+    for option in out.decisions.iter_mut().flat_map(|d| &mut d.options) {
+        let check = option.check.clone();
+        option.unverified.retain(|name| !check.contains(name));
+    }
 }
 
 /// Adds a choice rule's options to the call's decision for that choice. A
@@ -2067,6 +2112,8 @@ fn add_choice(rule: &ParamRule, context: &RuleContext<'_>, out: &mut Outcome) {
                         add: Vec::new(),
                         remove: Vec::new(),
                         keep: Vec::new(),
+                        check: Vec::new(),
+                        unverified: Vec::new(),
                         effects: Vec::new(),
                     })
                     .collect(),
@@ -4144,6 +4191,100 @@ def run():
             .review
             .iter()
             .any(|r| r.message == UncheckedArgs::ExtraBody.message(&[])));
+    }
+
+    #[test]
+    fn an_argument_a_check_line_flags_is_named_on_every_option() {
+        // #291 round 3: "let the model reason (no change)" sat next to "Whether
+        // gpt-6-luna accepts temperature ... on the Responses API is not
+        // verified", and "let the model think (no change)" next to "Non-default
+        // temperature ... return 400 on claude-sonnet-5-5".
+        let flags = |finding: &Finding| -> Vec<(String, Vec<String>, Vec<String>)> {
+            finding.decisions[0]
+                .options
+                .iter()
+                .map(|o| (o.id.clone(), o.check.clone(), o.unverified.clone()))
+                .collect()
+        };
+        let both = |a: (&str, Vec<String>, Vec<String>), b: (&str, Vec<String>, Vec<String>)| {
+            vec![(a.0.to_string(), a.1, a.2), (b.0.to_string(), b.1, b.2)]
+        };
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Responses API: the sampling rule is not verified there (no live
+        // call went to /v1/responses), so neither option can vouch for it.
+        let responses = one(&[call(
+            Sdk::Openai,
+            Routing::OpenaiDirect,
+            "client.responses.create",
+            "gpt-4o-mini",
+            &["temperature", "input"],
+            10,
+        )]);
+        assert!(responses
+            .review
+            .iter()
+            .any(|r| r.rule.as_deref() == Some("G6-SAMPLING-RESPONSES")));
+        assert_eq!(
+            flags(&responses),
+            both(
+                ("reasoning_none", vec![], names(&["temperature"])),
+                ("model_default", vec![], names(&["temperature"])),
+            )
+        );
+
+        // Claude: a non-default temperature returns 400 whichever way the
+        // thinking choice goes.
+        let claude = one(&[call(
+            Sdk::Anthropic,
+            Routing::AnthropicDirect,
+            "claude.messages.create",
+            "claude-3-5-sonnet-20241022",
+            &["max_tokens", "temperature", "messages"],
+            20,
+        )]);
+        assert_eq!(claude.decisions[0].choice, "ANT-THINKING-DEFAULT");
+        assert_eq!(
+            flags(&claude),
+            both(
+                ("thinking_between_tools", names(&["temperature"]), vec![]),
+                ("model_default", names(&["temperature"]), vec![]),
+            )
+        );
+
+        // Chat Completions `stop` returns 400 on gpt-6-luna (live).
+        let stop = one(&[openai("gpt-4o-mini", &["stop", "messages"])]);
+        assert_eq!(
+            flags(&stop),
+            both(
+                ("reasoning_none", names(&["stop"]), vec![]),
+                ("model_default", names(&["stop"]), vec![]),
+            )
+        );
+
+        // An argument the choice settles is not flagged again: Chat
+        // Completions temperature is kept or removed by the options.
+        let sampled = one(&[openai("gpt-4o-mini", &["temperature", "messages"])]);
+        assert!(flags(&sampled)
+            .iter()
+            .all(|(_, check, unverified)| check.is_empty() && unverified.is_empty()));
+        // Claude's thinking=... is removed by both options: not flagged.
+        let thinking = one(&[call(
+            Sdk::Anthropic,
+            Routing::AnthropicDirect,
+            "claude.messages.create",
+            "claude-3-5-sonnet-20241022",
+            &["max_tokens", "thinking", "messages"],
+            20,
+        )]);
+        assert!(flags(&thinking)
+            .iter()
+            .all(|(_, check, unverified)| check.is_empty() && unverified.is_empty()));
+        // A call with nothing a check names keeps both lists empty.
+        let plain = one(&[openai("gpt-4o-mini", &["messages"])]);
+        assert!(flags(&plain)
+            .iter()
+            .all(|(_, check, unverified)| check.is_empty() && unverified.is_empty()));
     }
 
     #[test]

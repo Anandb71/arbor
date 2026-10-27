@@ -381,6 +381,13 @@ fn describe_decision(decision: &Decision, code: bool) -> String {
             if !removed.is_empty() {
                 edits.push(format!("remove {}", removed.join(", ")));
             }
+            // Arguments a check line flags whichever way the choice goes.
+            if !option.check.is_empty() {
+                edits.push(format!("check {}", option.check.join(", ")));
+            }
+            if !option.unverified.is_empty() {
+                edits.push(format!("could not check {}", option.unverified.join(", ")));
+            }
             // An option that adds nothing relies on what the call does not
             // send: when Arbor could not read every argument, it cannot say
             // the call needs no change.
