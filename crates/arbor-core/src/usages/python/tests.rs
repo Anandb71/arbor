@@ -917,6 +917,119 @@ def passthrough(text, **options):
 }
 
 #[test]
+fn a_spread_is_named_and_a_same_file_dict_is_read() {
+    // #291 round 3: `**PARAMS` read "could not check the arguments from
+    // **kwargs", although PARAMS is a dict literal in the same file.
+    let found = usages(
+        r#"
+from openai import OpenAI
+from tracing_sdk.ai.openai import OpenAI as Traced
+
+client = OpenAI()
+traced = Traced(tracker=None)
+PARAMS = {"model": "gpt-4o-mini", "temperature": 0.1}
+OPEN = {"temperature": 0.2, **EXTRA}
+SECRET_OPTIONS = {"model": "gpt-4o-mini"}
+
+def from_params(messages):
+    return client.chat.completions.create(messages=messages, **PARAMS)
+
+def inline(messages):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, **{"top_p": 0.5})
+
+def open_dict(messages):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, **OPEN)
+
+def forwarded(messages, settings, **kwargs):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, **settings.llm, **kwargs)
+
+def conditional(messages, tools=None):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, **({"tools": tools} if tools else {}))
+
+def credential_named(messages):
+    return client.chat.completions.create(messages=messages, **SECRET_OPTIONS)
+
+def wrapped(messages):
+    return traced.chat.completions.create(messages=messages, **PARAMS)
+"#,
+    );
+    let spreads_of = |line: u32| -> Vec<(Option<String>, Vec<String>, bool)> {
+        found
+            .calls
+            .iter()
+            .find(|c| c.span.line == line)
+            .map(|c| c.spreads.clone())
+            .or_else(|| {
+                found
+                    .gaps
+                    .iter()
+                    .find(|g| g.span.is_some_and(|s| s.line == line) && g.args.is_some())
+                    .map(|g| g.args.clone().unwrap().spreads)
+            })
+            .unwrap_or_else(|| panic!("no call on line {line}: {found:#?}"))
+            .into_iter()
+            .map(|s| (s.name, s.keys, s.complete))
+            .collect()
+    };
+    let owned = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+
+    // A same-file literal: every key, in order, and complete.
+    assert_eq!(
+        spreads_of(12),
+        [(
+            Some("PARAMS".into()),
+            owned(&["model", "temperature"]),
+            true
+        )]
+    );
+    // Inline: no name, but read.
+    assert_eq!(spreads_of(15), [(None, owned(&["top_p"]), true)]);
+    // A dict that spreads another: its own keys are sent, the rest unseen.
+    assert_eq!(
+        spreads_of(18),
+        [(Some("OPEN".into()), owned(&["temperature"]), false)]
+    );
+    // Not a same-file literal: named only.
+    assert_eq!(
+        spreads_of(21),
+        [
+            (Some("settings.llm".into()), Vec::new(), false),
+            (Some("kwargs".into()), Vec::new(), false),
+        ]
+    );
+    // A conditional is read as neither.
+    assert_eq!(spreads_of(24), [(None, Vec::new(), false)]);
+    // A credential-shaped name is never repeated, and its dict never read.
+    assert_eq!(spreads_of(27), [(None, Vec::new(), false)]);
+    // A wrapped client's call records them too.
+    assert_eq!(
+        spreads_of(30),
+        [(
+            Some("PARAMS".into()),
+            owned(&["model", "temperature"]),
+            true
+        )]
+    );
+
+    // Names only: never a value.
+    let json = serde_json::to_string(&found).unwrap();
+    assert!(
+        json.contains(
+            r#""spreads":[{"name":"PARAMS","keys":["model","temperature"],"complete":true}]"#
+        ),
+        "{json}"
+    );
+    for value in ["0.1", "0.2", "0.5"] {
+        assert!(!json.contains(value), "{value} in {json}");
+    }
+    // A call that spreads nothing has no `spreads`.
+    let plain = usages(
+        "from openai import OpenAI\nclient = OpenAI()\nclient.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+    );
+    assert!(!serde_json::to_string(&plain).unwrap().contains("spreads"));
+}
+
+#[test]
 fn messages_create_counts_only_where_anthropic_is_imported() {
     let twilio = usages(
         r#"

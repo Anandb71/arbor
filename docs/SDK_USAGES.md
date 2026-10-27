@@ -14,6 +14,12 @@ values. A consumer (a codemod, a reviewer) should treat the report this way:
   whose client is not resolved (`unknown_client_factory`) also lists its
   argument names in `args` (names only, never values, and `splat` when some
   come from `**`), so its arguments can be checked like a resolved call's.
+- **A `**` expression is listed in `spreads`**, on a call and in a gap's
+  `args`: its `name` as written (`PARAMS`, `kwargs`, `self.options`; omitted
+  for a dict written inline, a conditional, or a credential-shaped name), the
+  argument names it sends (`keys`) when it is a dict literal in the same file,
+  and `complete` when those are all of them (no `**` or computed key inside,
+  and the dict is never changed or passed on). Names only, never values.
 
 Python is too dynamic to resolve every shape soundly. Rather than adding a
 special case for each one, the extractor resolves a small grammar exactly, and

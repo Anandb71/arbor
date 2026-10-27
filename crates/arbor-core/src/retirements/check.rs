@@ -2456,6 +2456,7 @@ mod tests {
             kwargs: all,
             positional: 0,
             splat: false,
+            spreads: Vec::new(),
             values: vec![value(model, ValueOrigin::Literal, line)],
         }
     }
@@ -3989,6 +3990,7 @@ def run():
             Some(CallArgs {
                 kwargs: kwargs.iter().map(|k| k.to_string()).collect(),
                 splat,
+                spreads: Vec::new(),
             })
         };
         let finding = |gap: UsageGap| {

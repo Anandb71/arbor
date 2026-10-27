@@ -395,8 +395,34 @@ pub struct SdkCall {
     /// Whether arguments were spread into the call (`**kwargs`; TypeScript
     /// `...opts` in the options object).
     pub splat: bool,
+    /// Each expression spread into the call with `**`, in source order:
+    /// its name and the argument names it was read to hold. Empty when
+    /// nothing is spread, or when the extractor does not record them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spreads: Vec<Spread>,
     /// Values for allowlisted keys that resolved to string literals.
     pub values: Vec<CapturedValue>,
+}
+
+/// An expression spread into a call with `**`: names only, never values.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Spread {
+    /// The expression as written, values elided (`PARAMS`, `kwargs`,
+    /// `self.options`). `None` (omitted from JSON) for an expression with no
+    /// name (`{...}` written inline, a conditional) or a credential-named
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The argument names it sends, in source order, read from a dict
+    /// literal in the same file. A literal key is sent whatever an
+    /// unreadable entry next to it holds, so these are listed even when
+    /// [`Self::complete`] is `false`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+    /// `keys` are every argument it sends: a same-file dict literal with
+    /// only string keys and no `**` of its own. `false` for a parameter
+    /// (`**kwargs`), an attribute or anything else Arbor cannot read.
+    pub complete: bool,
 }
 
 /// Why something was reported as a gap instead of a usage.
@@ -514,6 +540,9 @@ pub struct CallArgs {
     /// Whether arguments were spread into the call (`**kwargs`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub splat: bool,
+    /// What each `**` expression is (see [`SdkCall::spreads`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spreads: Vec<Spread>,
 }
 
 /// Everything one file says about tracked SDKs.
