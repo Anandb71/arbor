@@ -136,6 +136,29 @@ pub fn typed_receiver(reference: &str) -> Option<(&str, &str)> {
     (!method.is_empty() && !receiver.is_empty()).then_some((method, receiver))
 }
 
+/// Prefix on an import node's references for a name imported under another
+/// name: `alias:to_minor:money_to_minor_units` for
+/// `from money import money_to_minor_units as to_minor`.
+///
+/// Calls use the local name; the module defines the imported one. Recording
+/// both lets the graph builder resolve `to_minor()` to the definition instead
+/// of looking for a function called `to_minor`.
+pub const IMPORT_ALIAS_REF_PREFIX: &str = "alias:";
+
+/// Encodes an aliased import as a reference on the import node.
+pub fn import_alias_ref(local: &str, imported: &str) -> String {
+    format!("{IMPORT_ALIAS_REF_PREFIX}{local}:{imported}")
+}
+
+/// Splits an `alias:local:imported` reference into the local name and the
+/// imported name.
+pub fn import_alias(reference: &str) -> Option<(&str, &str)> {
+    let (local, imported) = reference
+        .strip_prefix(IMPORT_ALIAS_REF_PREFIX)?
+        .split_once(':')?;
+    (!local.is_empty() && !imported.is_empty()).then_some((local, imported))
+}
+
 /// A type relationship stored on a node until the graph builder resolves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeRelationKind {
@@ -602,6 +625,20 @@ mod tests {
             typed_receiver(".run_started@mac::Draft::capture().load()"),
             Some(("run_started", "mac::Draft::capture().load()"))
         );
+    }
+
+    #[test]
+    fn import_alias_refs_round_trip() {
+        assert_eq!(
+            import_alias(&import_alias_ref("to_minor", "money_to_minor_units")),
+            Some(("to_minor", "money_to_minor_units"))
+        );
+        assert_eq!(import_alias("alias:to_minor"), None);
+        assert_eq!(import_alias("alias::money_to_minor_units"), None);
+        assert_eq!(import_alias("alias:to_minor:"), None);
+        // Plain and namespace imports are not aliases.
+        assert_eq!(import_alias("to_minor"), None);
+        assert_eq!(import_alias("*as:types"), None);
     }
 
     #[test]
