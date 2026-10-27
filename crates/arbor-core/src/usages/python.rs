@@ -7298,6 +7298,8 @@ impl<'t> Ctx<'t> {
         // `**PARAMS` where `PARAMS` is a same-file dict literal.
         let mut opaque_splat = false;
         let mut expanded: Vec<usize> = Vec::new();
+        // The model keys the expanded same-file dicts give.
+        let mut expanded_keys: HashSet<&'static str> = HashSet::new();
         for splat in &args.splats {
             let Some(expansion) = self.expand_splat(*splat, scope) else {
                 opaque_splat = true;
@@ -7314,6 +7316,12 @@ impl<'t> Ctx<'t> {
                     continue;
                 }
                 keyed = true;
+                if let Some(known) = ["model", "model_name"]
+                    .into_iter()
+                    .find(|k| *k == key.as_str())
+                {
+                    expanded_keys.insert(known);
+                }
                 let label = expansion.name.as_ref().map(|n| format!("{n}[\"{key}\"]"));
                 let mut result = self
                     .resolve_value(*value, expansion.scope, 0)
@@ -7399,9 +7407,22 @@ impl<'t> Ctx<'t> {
             self.unresolved_gap(&site, model_key, &unresolved, None);
         }
         // A LangChain chat model takes its model as `model` or as
-        // `model_name`; given both, which one it keeps is not confirmed.
-        let named = |key: &str| args.kwargs.iter().any(|k| k == key);
-        if target.pkg.is_langchain() && named("model") && named("model_name") {
+        // `model_name`. Given both, which one it keeps is not confirmed;
+        // given one, an opaque `**` expansion may hold the other, which
+        // (unlike a second `model=` in an SDK call) is no `TypeError`.
+        let given = |key: &str| args.kwargs.iter().any(|k| k == key) || expanded_keys.contains(key);
+        let aliased = match (given("model"), given("model_name")) {
+            (true, true) => Some((
+                "reassigned",
+                "is given its model twice, as `model` and as `model_name`",
+            )),
+            (true, false) | (false, true) if opaque_splat => Some((
+                "splat",
+                "is given its model and a `**` expansion that may hold it under its other name (`model` or `model_name`)",
+            )),
+            _ => None,
+        };
+        if let (true, Some((reason, what))) = (target.pkg.is_langchain(), aliased) {
             self.out.gaps.push(UsageGap {
                 kind: GapKind::UnresolvedModel,
                 sdk: Some(sdk),
@@ -7410,10 +7431,8 @@ impl<'t> Ctx<'t> {
                 symbol: symbol.clone(),
                 chain: Some(chain.clone()),
                 key: None,
-                reason: "reassigned".to_string(),
-                detail: format!(
-                    "`{chain}` is given its model twice, as `model` and as `model_name`, so which one LangChain uses is not confirmed"
-                ),
+                reason: reason.to_string(),
+                detail: format!("`{chain}` {what}, so which one LangChain uses is not confirmed"),
                 values: Vec::new(),
                 values_complete: false,
             });

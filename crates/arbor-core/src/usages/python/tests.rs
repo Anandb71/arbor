@@ -6330,6 +6330,40 @@ azure = AzureChatOpenAI(azure_deployment="prod-4o")
     // An Azure chat model serves its deployment: no model is not a gap.
     assert!(gaps_on(&found, 8).is_empty(), "{:?}", gaps_on(&found, 8));
     assert_eq!(call_on(&found, 8).routing, Routing::AzureOpenai);
+
+    // The other name may come through `**`: from a same-file dict, or from
+    // an expansion the file cannot read. A second `model=` there would be a
+    // `TypeError`, but `model_name` is not.
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI
+
+DEFAULTS = {"model_name": "gpt-4o-mini", "temperature": 0}
+OPTIONS = {"temperature": 0}
+
+def build(**kwargs):
+    return ChatOpenAI(model="gpt-4o", **kwargs)
+
+both = ChatOpenAI(model="gpt-4o", **DEFAULTS)
+plain = ChatOpenAI(model="gpt-4o", **OPTIONS)
+"#,
+    );
+    let unresolved = |line: u32| -> Vec<(String, Option<String>)> {
+        found
+            .gaps
+            .iter()
+            .filter(|g| g.span.unwrap().line == line && g.kind == GapKind::UnresolvedModel)
+            .map(|g| (g.reason.clone(), g.key.clone()))
+            .collect()
+    };
+    assert_eq!(value(call_on(&found, 8), "model"), Some("gpt-4o"));
+    assert_eq!(unresolved(8), vec![("splat".to_string(), None)]);
+    assert_eq!(
+        value(call_on(&found, 10), "model_name"),
+        Some("gpt-4o-mini")
+    );
+    assert_eq!(unresolved(10), vec![("reassigned".to_string(), None)]);
+    assert!(unresolved(11).is_empty(), "{:?}", found.gaps);
 }
 
 #[test]
