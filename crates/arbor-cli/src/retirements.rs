@@ -736,7 +736,7 @@ fn join_and(names: &[&str]) -> String {
 
 fn data_line(report: &RetirementReport) -> String {
     format!(
-        "Retirement data from the providers' deprecation pages: {}. Days are counted in UTC. Python and direct SDK calls only for now. Runs locally: no code leaves this machine.",
+        "Retirement data from the providers' deprecation pages: {}. Days are counted in UTC. Python only for now: direct SDK calls and LangChain chat models. Runs locally: no code leaves this machine.",
         provider_dates(report)
     )
 }
