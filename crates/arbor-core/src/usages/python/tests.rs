@@ -6104,3 +6104,408 @@ fn exports_built_from_names_mangled_getattr_and_exported_private_classes_count()
         vec![(5, vec!["gpt-4o".to_string()], vec![])]
     );
 }
+
+// ---------------------------------------------------------------------------
+// LangChain chat models
+// ---------------------------------------------------------------------------
+
+/// The call recorded on `line`.
+fn call_on(found: &FileUsages, line: u32) -> &SdkCall {
+    found
+        .calls
+        .iter()
+        .find(|c| c.span.line == line)
+        .unwrap_or_else(|| {
+            let lines: Vec<(u32, &str)> = found
+                .calls
+                .iter()
+                .map(|c| (c.span.line, c.chain.as_str()))
+                .collect();
+            panic!("no call on line {line}; calls: {lines:?}")
+        })
+}
+
+/// `kind/reason` of every gap on `line`.
+fn gaps_on(found: &FileUsages, line: u32) -> Vec<String> {
+    found
+        .gaps
+        .iter()
+        .filter(|g| g.span.is_some_and(|s| s.line == line))
+        .map(|g| format!("{}/{}", g.kind.as_str(), g.reason))
+        .collect()
+}
+
+#[test]
+fn langchain_chat_models_bind_their_model_and_route_like_their_client() {
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI, AzureChatOpenAI as Azure
+from langchain_anthropic import ChatAnthropic
+
+MODEL = "gpt-4o-mini"
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+small = ChatOpenAI(model_name=MODEL, max_tokens=256)
+claude = ChatAnthropic(model_name="claude-3-5-sonnet-20241022")
+azure = Azure(azure_deployment="prod-4o", model="gpt-4o", api_version="2024-06-01")
+"#,
+    );
+    let import = |name: &str| found.imports.iter().find(|i| i.local == name).unwrap();
+    assert_eq!(import("ChatOpenAI").package, "langchain_openai");
+    assert_eq!(import("ChatOpenAI").sdk, Sdk::Openai);
+    assert_eq!(import("ChatOpenAI").kind, BindingKind::ClientClass);
+    assert_eq!(import("Azure").name.as_deref(), Some("AzureChatOpenAI"));
+    assert_eq!(import("ChatAnthropic").package, "langchain_anthropic");
+    assert_eq!(import("ChatAnthropic").sdk, Sdk::Anthropic);
+
+    assert_eq!(found.clients[0].constructor, "langchain_openai.ChatOpenAI");
+    assert_eq!(found.clients[0].package, "langchain_openai");
+    assert_eq!(routing_of(&found, "llm"), Routing::OpenaiDirect);
+    assert_eq!(routing_of(&found, "small"), Routing::OpenaiDirect);
+    assert_eq!(routing_of(&found, "claude"), Routing::AnthropicDirect);
+    assert_eq!(routing_of(&found, "azure"), Routing::AzureOpenai);
+
+    // The constructor binds the model its requests use.
+    let llm = call_on(&found, 6);
+    assert_eq!(llm.chain, "ChatOpenAI");
+    assert_eq!(llm.member, "ChatOpenAI");
+    assert_eq!(llm.package, "langchain_openai");
+    assert_eq!(llm.sdk, Sdk::Openai);
+    assert!(!llm.request);
+    assert_eq!(llm.receiver, Receiver::Symbol);
+    assert_eq!(llm.routing, Routing::OpenaiDirect);
+    assert_eq!(llm.client_line, Some(6));
+    assert_eq!(llm.kwargs, vec!["model", "temperature"]);
+    assert_eq!(value(llm, "model"), Some("gpt-4o"));
+    assert_eq!(llm.values[0].origin, ValueOrigin::Literal);
+
+    let small = call_on(&found, 7);
+    assert_eq!(value(small, "model_name"), Some("gpt-4o-mini"));
+    assert_eq!(small.values[0].origin, ValueOrigin::ModuleConstant);
+    assert_eq!(small.values[0].name.as_deref(), Some("MODEL"));
+
+    let claude = call_on(&found, 8);
+    assert_eq!(claude.sdk, Sdk::Anthropic);
+    assert_eq!(claude.routing, Routing::AnthropicDirect);
+    assert_eq!(
+        value(claude, "model_name"),
+        Some("claude-3-5-sonnet-20241022")
+    );
+
+    let azure = call_on(&found, 9);
+    assert_eq!(azure.chain, "Azure");
+    assert_eq!(azure.member, "AzureChatOpenAI");
+    assert_eq!(azure.routing, Routing::AzureOpenai);
+    assert_eq!(value(azure, "model"), Some("gpt-4o"));
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn langchain_endpoints_route_by_host() {
+    let found = usages(
+        r#"
+import os
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+router = ChatOpenAI(model="gpt-4o", base_url="https://openrouter.ai/api/v1")
+legacy_name = ChatOpenAI(model="gpt-4o", openai_api_base="http://localhost:4000/v1")
+own_host = ChatOpenAI(model="gpt-4o", openai_api_base="https://api.openai.com/v1")
+none = ChatOpenAI(model="gpt-4o", base_url=None)
+proxy = ChatAnthropic(model="claude-3-5-haiku-20241022", anthropic_api_url="http://litellm:4000")
+env = ChatOpenAI(model="gpt-4o", base_url=os.environ["GATEWAY_URL"])
+
+def build(options):
+    return ChatOpenAI(**options)
+"#,
+    );
+    assert_eq!(routing_of(&found, "router"), Routing::CustomBaseUrl);
+    assert_eq!(routing_of(&found, "legacy_name"), Routing::CustomBaseUrl);
+    assert_eq!(routing_of(&found, "own_host"), Routing::OpenaiDirect);
+    assert_eq!(routing_of(&found, "none"), Routing::OpenaiDirect);
+    assert_eq!(routing_of(&found, "proxy"), Routing::CustomBaseUrl);
+    assert_eq!(call_on(&found, 6).routing, Routing::CustomBaseUrl);
+    assert_eq!(call_on(&found, 10).routing, Routing::CustomBaseUrl);
+    for line in [6, 7, 8, 9, 10] {
+        assert!(gaps_on(&found, line).is_empty(), "line {line}");
+    }
+    // An environment lookup with no fallback: not known.
+    assert_eq!(call_on(&found, 11).routing, Routing::Unknown);
+    assert_eq!(
+        gaps_on(&found, 11),
+        vec!["ambiguous_client/base_url_env".to_string()]
+    );
+    // `**options` may hold the model and the endpoint.
+    let built = call_on(&found, 14);
+    assert_eq!(built.routing, Routing::Unknown);
+    let mut gaps = gaps_on(&found, 14);
+    gaps.sort();
+    assert_eq!(
+        gaps,
+        vec![
+            "ambiguous_client/base_url_unresolved".to_string(),
+            "unresolved_model/splat".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn langchain_endpoint_variables_leave_the_route_unconfirmed() {
+    for (var, openai, anthropic) in [
+        ("OPENAI_API_BASE", true, false),
+        ("OPENAI_BASE_URL", true, false),
+        ("ANTHROPIC_API_URL", false, true),
+        ("ANTHROPIC_BASE_URL", false, true),
+        ("LANGSMITH_GATEWAY", true, true),
+    ] {
+        let source = format!(
+            "import os\nfrom langchain_openai import ChatOpenAI\nfrom langchain_anthropic import ChatAnthropic\nos.environ[\"{var}\"] = \"http://gateway:4000\"\nllm = ChatOpenAI(model=\"gpt-4o\")\nclaude = ChatAnthropic(model=\"claude-3-5-haiku-20241022\")\nrouted = ChatOpenAI(model=\"gpt-4o\", base_url=\"https://api.openai.com/v1\")\n"
+        );
+        let found = usages(&source);
+        let endpoint_env = vec!["ambiguous_client/endpoint_env".to_string()];
+        let (routing, gaps) = if openai {
+            (Routing::Unknown, endpoint_env.clone())
+        } else {
+            (Routing::OpenaiDirect, Vec::new())
+        };
+        assert_eq!(call_on(&found, 5).routing, routing, "{var}");
+        assert_eq!(gaps_on(&found, 5), gaps, "{var}");
+        let (routing, gaps) = if anthropic {
+            (Routing::Unknown, endpoint_env.clone())
+        } else {
+            (Routing::AnthropicDirect, Vec::new())
+        };
+        assert_eq!(call_on(&found, 6).routing, routing, "{var}");
+        assert_eq!(gaps_on(&found, 6), gaps, "{var}");
+        // An endpoint given to the constructor wins over the environment.
+        assert_eq!(call_on(&found, 7).routing, Routing::OpenaiDirect, "{var}");
+        assert!(gaps_on(&found, 7).is_empty(), "{var}");
+    }
+    // `OPENAI_API_BASE` is LangChain's: the SDK's own client ignores it.
+    let found = usages(
+        "import os\nfrom openai import OpenAI\nos.environ[\"OPENAI_API_BASE\"] = \"http://gateway:4000\"\nclient = OpenAI()\nclient.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+    );
+    assert_eq!(call_on(&found, 5).routing, Routing::OpenaiDirect);
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn langchain_models_that_are_missing_or_given_twice_are_gaps() {
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI, AzureChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+default = ChatOpenAI(temperature=0)
+both = ChatOpenAI(model="gpt-4o", model_name="gpt-4o-mini")
+claude = ChatAnthropic(model=pick_model())
+azure = AzureChatOpenAI(azure_deployment="prod-4o")
+"#,
+    );
+    // `ChatOpenAI()` uses LangChain's default model.
+    let missing = gaps(&found, GapKind::UnresolvedModel)
+        .into_iter()
+        .find(|g| g.span.unwrap().line == 5)
+        .unwrap();
+    assert_eq!(missing.reason, "missing_model");
+    assert_eq!(missing.key.as_deref(), Some("model"));
+    // Given both names, either value may be the one LangChain keeps: both
+    // are listed, and a gap with no key leaves both unconfirmed.
+    let both = call_on(&found, 6);
+    assert_eq!(value(both, "model"), Some("gpt-4o"));
+    assert_eq!(value(both, "model_name"), Some("gpt-4o-mini"));
+    let twice = found
+        .gaps
+        .iter()
+        .find(|g| g.span.unwrap().line == 6)
+        .unwrap();
+    assert_eq!(twice.kind, GapKind::UnresolvedModel);
+    assert_eq!(twice.reason, "reassigned");
+    assert_eq!(twice.key, None);
+    assert!(twice.chain.is_some());
+    assert_eq!(gaps_on(&found, 6).len(), 1);
+    assert_eq!(
+        gaps_on(&found, 7),
+        vec!["unresolved_model/function_call".to_string()]
+    );
+    // An Azure chat model serves its deployment: no model is not a gap.
+    assert!(gaps_on(&found, 8).is_empty(), "{:?}", gaps_on(&found, 8));
+    assert_eq!(call_on(&found, 8).routing, Routing::AzureOpenai);
+}
+
+#[test]
+fn deprecated_langchain_chat_models_are_tracked_by_class() {
+    let found = usages(
+        r#"
+from langchain.chat_models import ChatOpenAI, ChatAnthropic
+from langchain_community.chat_models.openai import ChatOpenAI as CommunityOpenAI
+from langchain_community.chat_models import AzureChatOpenAI, ChatOllama
+import langchain_community.chat_models as chat_models
+
+old = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0)
+claude = ChatAnthropic(model="claude-2.1")
+community = CommunityOpenAI(model="gpt-4")
+azure = AzureChatOpenAI(deployment_name="gpt35", openai_api_version="2023-05-15")
+local = ChatOllama(model="llama3")
+followed_not = chat_models.ChatOpenAI(model="gpt-4-0613")
+"#,
+    );
+    let import = |name: &str| found.imports.iter().find(|i| i.local == name);
+    assert_eq!(import("ChatOpenAI").unwrap().package, "langchain");
+    assert_eq!(
+        import("ChatOpenAI").unwrap().module,
+        "langchain.chat_models"
+    );
+    assert_eq!(import("ChatAnthropic").unwrap().sdk, Sdk::Anthropic);
+    assert_eq!(
+        import("CommunityOpenAI").unwrap().package,
+        "langchain_community"
+    );
+    assert_eq!(
+        import("CommunityOpenAI").unwrap().name.as_deref(),
+        Some("ChatOpenAI")
+    );
+    assert!(import("ChatOllama").is_none());
+    assert!(import("chat_models").is_none());
+
+    let old = call_on(&found, 7);
+    assert_eq!(old.package, "langchain");
+    assert_eq!(old.routing, Routing::OpenaiDirect);
+    assert_eq!(value(old, "model_name"), Some("gpt-3.5-turbo"));
+    assert_eq!(found.clients[0].constructor, "langchain.ChatOpenAI");
+    let claude = call_on(&found, 8);
+    assert_eq!(claude.sdk, Sdk::Anthropic);
+    assert_eq!(claude.routing, Routing::AnthropicDirect);
+    assert_eq!(value(claude, "model"), Some("claude-2.1"));
+    assert_eq!(call_on(&found, 9).package, "langchain_community");
+    assert_eq!(value(call_on(&found, 9), "model"), Some("gpt-4"));
+    assert_eq!(call_on(&found, 10).routing, Routing::AzureOpenai);
+    // Other providers' chat models, and the re-exporting modules
+    // themselves, are not followed.
+    assert_eq!(found.calls.len(), 4, "{:?}", found.calls);
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn deprecated_langchain_openai_follows_the_module_configuration() {
+    let found = usages(
+        r#"
+import openai
+from langchain.chat_models import ChatOpenAI
+from langchain_community.chat_models import ChatOpenAI as CommunityOpenAI
+from langchain_openai import ChatOpenAI as PartnerOpenAI
+
+openai.api_type = "azure"
+openai.api_base = "https://example.openai.azure.com/"
+
+old = ChatOpenAI(model_name="gpt-35-turbo")
+community = CommunityOpenAI(model_name="gpt-35-turbo")
+given = ChatOpenAI(model_name="gpt-35-turbo", openai_api_base="http://localhost:4000")
+partner = PartnerOpenAI(model="gpt-4o")
+"#,
+    );
+    // On the pre-1.0 SDK their requests go through the module-level API.
+    for line in [10, 11] {
+        assert_eq!(
+            call_on(&found, line).routing,
+            Routing::Unknown,
+            "line {line}"
+        );
+        assert_eq!(
+            gaps_on(&found, line),
+            vec!["ambiguous_client/module_config".to_string()],
+            "line {line}"
+        );
+    }
+    assert_eq!(call_on(&found, 12).routing, Routing::CustomBaseUrl);
+    assert!(gaps_on(&found, 12).is_empty());
+    // `langchain_openai` needs openai>=1, whose module-level settings do
+    // not reach a client built with its own options.
+    assert_eq!(call_on(&found, 13).routing, Routing::OpenaiDirect);
+    assert!(gaps_on(&found, 13).is_empty());
+
+    // With no routing setting they are direct.
+    let found = usages(
+        "import openai\nfrom langchain.chat_models import ChatOpenAI\nopenai.api_key = \"placeholder\"\nllm = ChatOpenAI(model_name=\"gpt-4\")\n",
+    );
+    assert_eq!(call_on(&found, 4).routing, Routing::OpenaiDirect);
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn only_langchain_chat_models_and_their_objects_are_followed() {
+    let found = usages(
+        r#"
+import langchain_openai
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_anthropic import convert_to_anthropic_tool
+
+module_form = langchain_openai.ChatOpenAI(model="gpt-4o")
+embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
+other = langchain_openai.OpenAIEmbeddings(model="text-embedding-3-small")
+tool = convert_to_anthropic_tool(search)
+checked = ChatOpenAI.model_validate({"model": "gpt-4"})
+
+llm = ChatOpenAI(model="gpt-4o-mini", base_url="https://openrouter.ai/api/v1")
+llm.invoke("hi")
+structured = llm.with_structured_output(Answer)
+structured.invoke("hi")
+gateway.messages.create(model="claude-3-haiku-20240307", messages=[])
+"#,
+    );
+    let module_form = call_on(&found, 6);
+    assert_eq!(module_form.chain, "langchain_openai.ChatOpenAI");
+    assert_eq!(module_form.receiver, Receiver::Module);
+    assert_eq!(value(module_form, "model"), Some("gpt-4o"));
+    let import = |name: &str| found.imports.iter().find(|i| i.local == name);
+    assert_eq!(
+        import("langchain_openai").unwrap().kind,
+        BindingKind::Module
+    );
+    assert!(import("OpenAIEmbeddings").is_none());
+    assert!(import("convert_to_anthropic_tool").is_none());
+    for line in [7, 8, 9, 10, 15, 16] {
+        assert!(
+            found.calls.iter().all(|c| c.span.line != line),
+            "line {line}: {:?}",
+            found.calls
+        );
+    }
+    // A call on the chat model keeps its routing.
+    let invoke = call(&found, "llm.invoke");
+    assert_eq!(invoke.receiver, Receiver::Client);
+    assert_eq!(invoke.routing, Routing::CustomBaseUrl);
+    assert_eq!(invoke.client_line, Some(12));
+    assert_eq!(invoke.package, "langchain_openai");
+    assert!(!invoke.request);
+    assert!(invoke.values.is_empty());
+    // Importing LangChain's Anthropic package does not make an unknown
+    // receiver's `messages.create` the Anthropic SDK's.
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn langchain_chat_models_rerouted_or_replaced_after_they_are_built() {
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+llm = ChatOpenAI(model="gpt-4o")
+llm.openai_api_base = "http://localhost:4000"
+llm.invoke("hi")
+
+claude = ChatAnthropic(model="claude-3-5-haiku-20241022")
+claude._client = Recorder()
+claude.invoke("hi")
+"#,
+    );
+    assert_eq!(call(&found, "llm.invoke").routing, Routing::Unknown);
+    assert_eq!(
+        gaps_on(&found, 7),
+        vec!["ambiguous_client/base_url_assigned".to_string()]
+    );
+    assert_eq!(
+        gaps_on(&found, 11),
+        vec!["ambiguous_client/dynamic_feature".to_string()]
+    );
+}
