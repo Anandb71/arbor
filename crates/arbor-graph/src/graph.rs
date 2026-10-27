@@ -39,6 +39,12 @@ pub struct ArborGraph {
     #[serde(default)]
     centrality_raw: HashMap<NodeId, f64>,
 
+    /// Each file's import nodes, kept beside the graph rather than in it.
+    /// Calls resolve against them, so a re-index that rebuilds untouched
+    /// files from this graph (`arbor index --changed-only`) needs them back.
+    #[serde(default)]
+    import_nodes: Vec<CodeNode>,
+
     /// Search index for fast substring queries.
     #[serde(skip)]
     search_index: SearchIndex,
@@ -60,8 +66,20 @@ impl ArborGraph {
             file_index: HashMap::new(),
             centrality: HashMap::new(),
             centrality_raw: HashMap::new(),
+            import_nodes: Vec::new(),
             search_index: SearchIndex::new(),
         }
+    }
+
+    /// The import nodes of the files this graph was built from. They are not
+    /// vertices; [`GraphBuilder::add_nodes`](crate::GraphBuilder::add_nodes)
+    /// takes them back when a graph is rebuilt from this one.
+    pub fn import_nodes(&self) -> &[CodeNode] {
+        &self.import_nodes
+    }
+
+    pub(crate) fn set_import_nodes(&mut self, nodes: Vec<CodeNode>) {
+        self.import_nodes = nodes;
     }
 
     /// Rebuilds the search index from existing graph nodes.

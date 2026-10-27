@@ -8,8 +8,8 @@ use crate::edge::{Edge, EdgeKind};
 use crate::graph::{ArborGraph, NodeId};
 use crate::symbol_table::{Resolution, SymbolTable};
 use arbor_core::{
-    clean_type_name, field_type_ref, import_alias, return_type_ref, type_relation_ref,
-    typed_receiver, CodeNode, NodeKind, TypeRelationKind,
+    clean_type_name, field_type_ref, import_alias, local_binding, return_type_ref, runtime_binding,
+    type_relation_ref, typed_receiver, CodeNode, NodeKind, TypeRelationKind, MODULE_FILE_REF,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -79,6 +79,36 @@ pub struct GraphBuilder {
     ///
     /// The module is in `import_map` under the same local name.
     import_aliases: HashMap<String, HashMap<String, String>>,
+
+    /// Go package clause per file. The parser stores `package name` as a
+    /// `Module` node, and a bare call is visible only inside that package.
+    go_packages: HashMap<String, String>,
+
+    /// Every import node added, handed to the graph by `build`, so a graph
+    /// rebuilt from this one keeps each file's imports.
+    import_nodes: Vec<CodeNode>,
+
+    /// JavaScript and TypeScript files that are modules: a top-level `import`
+    /// or `export` statement, or a top-level CommonJS `module.exports` /
+    /// `exports.f` assignment. A file that isn't one, and binds nothing from
+    /// another module, may be a classic script.
+    module_files: HashSet<String>,
+
+    /// Names a JavaScript or TypeScript file binds from a value one of its
+    /// project modules produced: file → local name → (name to look for,
+    /// module). `const { setFilters } = useListFilters()` after importing the
+    /// hook from `./hooks` → `("setFilters", "./hooks")`.
+    runtime_bindings: HashMap<String, HashMap<String, (String, String)>>,
+
+    /// Names a JavaScript or TypeScript file binds itself: variables,
+    /// parameters, destructured values. A call to one may reach whatever
+    /// function the value holds.
+    local_bindings: HashMap<String, HashSet<String>>,
+
+    /// Names a JavaScript or TypeScript file binds from two different modules
+    /// (in two function scopes), which one file-level map can't hold. They
+    /// are treated as local bindings, never as imports.
+    conflicting_bindings: HashMap<String, HashSet<String>>,
 }
 
 impl Default for GraphBuilder {
@@ -96,6 +126,12 @@ impl GraphBuilder {
             import_map: HashMap::new(),
             namespace_imports: HashMap::new(),
             import_aliases: HashMap::new(),
+            go_packages: HashMap::new(),
+            import_nodes: Vec::new(),
+            module_files: HashSet::new(),
+            runtime_bindings: HashMap::new(),
+            local_bindings: HashMap::new(),
+            conflicting_bindings: HashMap::new(),
         }
     }
 
@@ -108,13 +144,48 @@ impl GraphBuilder {
     /// Call this for all files before calling `build()`.
     pub fn add_nodes(&mut self, nodes: Vec<CodeNode>) {
         for node in nodes {
+            // A Go file's package clause decides which bare calls it can see.
+            if node.kind == NodeKind::Module && is_go_file(Path::new(&node.file)) {
+                self.go_packages
+                    .entry(node.file.clone())
+                    .or_insert_with(|| node.name.clone());
+            }
+
             // Import nodes carry the import map — process them but don't add to graph
             // (they are not code entities we want in centrality analysis)
             if node.kind == NodeKind::Import {
                 let file = node.file.clone();
                 let module = node.name.clone();
+                let js = is_js_family_file(Path::new(&file));
 
                 for imported_name in &node.references {
+                    if imported_name == MODULE_FILE_REF {
+                        self.module_files.insert(file.clone());
+                        continue;
+                    }
+                    if let Some(name) = local_binding(imported_name) {
+                        self.local_bindings
+                            .entry(file.clone())
+                            .or_default()
+                            .insert(name.to_string());
+                        continue;
+                    }
+                    if let Some((local, name)) = runtime_binding(imported_name) {
+                        self.bind_at_run_time(&file, local, name, &module);
+                        continue;
+                    }
+                    let local = import_alias(imported_name)
+                        .map_or(imported_name.as_str(), |(local, _)| local);
+                    if js && local != "*" && !imported_name.starts_with("*as:") {
+                        if self.binds_from_another_module(&file, local, &module) {
+                            self.mark_conflicting(&file, local);
+                            continue;
+                        }
+                        // An import of the name outranks a run-time binding.
+                        if let Some(bindings) = self.runtime_bindings.get_mut(&file) {
+                            bindings.remove(local);
+                        }
+                    }
                     if let Some(alias) = imported_name.strip_prefix("*as:") {
                         // `import * as alias from 'module'`
                         self.namespace_imports
@@ -147,7 +218,9 @@ impl GraphBuilder {
                 // Import nodes are intentionally NOT added to the graph.
                 // They caused misleading centrality scores (e.g. "psycopg.types.range [Import]
                 // 330 callers") because every call to a symbol named after the import path
-                // was attributed to the import node itself.
+                // was attributed to the import node itself. They are kept
+                // beside it instead (`ArborGraph::import_nodes`).
+                self.import_nodes.push(node);
                 continue;
             }
 
@@ -261,10 +334,18 @@ impl GraphBuilder {
                 } else {
                     self.resolve_alias(lookup, &from_file, &from_file_str)
                 };
+                // `setFilters()` after `const { setFilters } = useListFilters()`
+                // reaches the hook module's function when that module has one.
+                let runtime = if receiver_unknown || alias.is_some() {
+                    None
+                } else {
+                    self.resolve_runtime_binding(lookup, &from_file, &from_file_str)
+                };
+                let bound_at_run_time = runtime.is_some();
                 // `jobs::enqueue` / `Provider::new` name where the definition
                 // lives; matching only the last segment would drop the call or
                 // bind it to a same-named function in the wrong module.
-                let resolution = match alias {
+                let resolution = match alias.or(runtime) {
                     Some(resolution) => resolution,
                     None if !receiver_unknown && lookup.contains("::") => {
                         self.symbol_table.resolve_path(lookup, &from_file)
@@ -338,7 +419,9 @@ impl GraphBuilder {
                     // Method names are never in the import map — importing
                     // `UserService` does not import `findOne` — so import
                     // validation only applies to bare and qualified references.
-                    let confidence = if receiver_unknown {
+                    // A run-time binding was found in its own module, which
+                    // is all the corroboration it can get.
+                    let confidence = if receiver_unknown || bound_at_run_time {
                         base_confidence
                     } else {
                         self.apply_import_validation(
@@ -393,16 +476,137 @@ impl GraphBuilder {
         )
     }
 
-    /// Downgrades (rather than drops) an edge whose name is not imported.
+    /// Resolves `reference` inside the module a run-time binding of it came
+    /// from: `setFilters()` after `const { setFilters } = useListFilters()`
+    /// reaches the hook module's `setFilters`.
     ///
-    /// If the referencing file declares imports and this bare name is not among
-    /// them, a cross-module match is probably a same-name coincidence. The old
-    /// behaviour dropped such edges unless the target was in the same directory
-    /// — which meant that in a flat `src/` layout, the common case for JS and
-    /// Python projects, the check never fired at all. Confidence-weighting
-    /// applies the same suspicion uniformly instead of exempting whole layouts.
+    /// `None` when the name is no such binding, when the caller's own file
+    /// defines it, or when that module defines no such name (a hook kept apart
+    /// from the provider whose function it returns). The call then resolves
+    /// as any other local binding does.
+    fn resolve_runtime_binding(
+        &self,
+        reference: &str,
+        from_file: &Path,
+        from_file_str: &str,
+    ) -> Option<Resolution> {
+        let (name, module) = self.runtime_bindings.get(from_file_str)?.get(reference)?;
+        let defined_here = self
+            .symbol_table
+            .get_file_exports(&from_file.to_path_buf())
+            .is_some_and(|fqns| fqns.iter().any(|fqn| fqn == reference));
+        if defined_here {
+            return None;
+        }
+        Some(
+            self.symbol_table
+                .resolve_in_module_file(name, module, from_file),
+        )
+        .filter(Resolution::is_resolved)
+    }
+
+    /// Records `local` as bound from a value `module` produced, unless the
+    /// file imports that name from the same module (an import says more) or
+    /// binds it from another module (then the name conflicts).
+    fn bind_at_run_time(&mut self, file: &str, local: &str, name: &str, module: &str) {
+        if self.binds_from_another_module(file, local, module) {
+            self.mark_conflicting(file, local);
+            return;
+        }
+        if self
+            .import_map
+            .get(file)
+            .is_some_and(|imports| imports.contains_key(local))
+        {
+            return;
+        }
+        self.runtime_bindings
+            .entry(file.to_string())
+            .or_default()
+            .insert(local.to_string(), (name.to_string(), module.to_string()));
+    }
+
+    /// Does `file` already bind `local` from a module other than `module`, or
+    /// has the name already conflicted?
+    fn binds_from_another_module(&self, file: &str, local: &str, module: &str) -> bool {
+        self.import_map
+            .get(file)
+            .and_then(|imports| imports.get(local))
+            .is_some_and(|bound| bound != module)
+            || self
+                .runtime_bindings
+                .get(file)
+                .and_then(|bindings| bindings.get(local))
+                .is_some_and(|(_, bound)| bound != module)
+            || self
+                .conflicting_bindings
+                .get(file)
+                .is_some_and(|names| names.contains(local))
+    }
+
+    /// Stops treating `local` as an import or a run-time binding in `file`.
+    fn mark_conflicting(&mut self, file: &str, local: &str) {
+        if let Some(imports) = self.import_map.get_mut(file) {
+            imports.remove(local);
+        }
+        if let Some(aliases) = self.import_aliases.get_mut(file) {
+            aliases.remove(local);
+        }
+        if let Some(bindings) = self.runtime_bindings.get_mut(file) {
+            bindings.remove(local);
+        }
+        self.conflicting_bindings
+            .entry(file.to_string())
+            .or_default()
+            .insert(local.to_string());
+    }
+
+    /// Does this JavaScript or TypeScript file bind `name` itself, so that a
+    /// call to it may reach whatever function the value holds?
+    fn binds_locally(&self, file: &str, name: &str) -> bool {
+        let has = |names: Option<&HashSet<String>>| names.is_some_and(|n| n.contains(name));
+        has(self.local_bindings.get(file))
+            || has(self.conflicting_bindings.get(file))
+            || self
+                .runtime_bindings
+                .get(file)
+                .is_some_and(|bindings| bindings.contains_key(name))
+    }
+
+    /// Is this a JavaScript or TypeScript file with no top-level `import`,
+    /// `export` or CommonJS export that binds nothing from another module?
     ///
-    /// Returns `0.0` to drop the edge entirely.
+    /// Such a file may be a classic script, whose top-level functions are
+    /// globals shared with every other script on the page, including files
+    /// whose code sits only in `namespace` blocks (a member's `export` is
+    /// not a module export). Python has no globals shared across modules, so
+    /// a Python file never qualifies.
+    fn is_possible_script(&self, file: &str) -> bool {
+        is_js_family_file(Path::new(file))
+            && !self.module_files.contains(file)
+            && self.import_map.get(file).is_none_or(HashMap::is_empty)
+            && self
+                .namespace_imports
+                .get(file)
+                .is_none_or(HashMap::is_empty)
+            && self
+                .runtime_bindings
+                .get(file)
+                .is_none_or(HashMap::is_empty)
+    }
+
+    /// Decides whether a resolved reference may become an edge.
+    ///
+    /// Python and JavaScript/TypeScript bare names are file-scoped: a cross-file
+    /// call is kept only when this file defines the name or its import map
+    /// contains that local name (or `*`, at the downgrade). JavaScript and
+    /// TypeScript also keep the downgrade for a name the file binds itself
+    /// and for a classic script's function, see
+    /// [`Self::validate_bare_import_visibility`]. A Go bare name is kept
+    /// across files only inside the caller's package (same directory and the
+    /// same package clause). Other languages keep the confidence downgrade.
+    ///
+    /// Dotted references are not bare-name visibility. Returns `0.0` to drop.
     fn apply_import_validation(
         &self,
         reference: &str,
@@ -411,10 +615,34 @@ impl GraphBuilder {
         to_idx: NodeId,
         base_confidence: f32,
     ) -> f32 {
+        if reference.contains('.') || reference.contains("::") {
+            return base_confidence;
+        }
+
+        if is_go_file(from_file) {
+            return self.validate_go_package_visibility(
+                reference,
+                from_file,
+                from_file_str,
+                to_idx,
+                base_confidence,
+            );
+        }
+
+        if bare_name_requires_import(from_file) {
+            return self.validate_bare_import_visibility(
+                reference,
+                from_file,
+                from_file_str,
+                to_idx,
+                base_confidence,
+            );
+        }
+
         let Some(file_imports) = self.import_map.get(from_file_str) else {
             return base_confidence;
         };
-        if file_imports.is_empty() || reference.contains('.') || reference.contains("::") {
+        if file_imports.is_empty() {
             return base_confidence;
         }
         if file_imports.contains_key(reference) {
@@ -432,20 +660,122 @@ impl GraphBuilder {
             return base_confidence;
         }
 
-        if to_file.parent() == from_file.parent() {
-            // Same directory but never imported. Plausible in languages with
-            // implicit module scope, suspicious everywhere else.
-            return base_confidence * 0.6;
-        }
-
-        // Different module and not imported: almost certainly a name collision.
         debug!(
             "Downgrading unimported cross-module reference '{}' in {} → {}",
             reference,
             from_file.display(),
             to_file.display()
         );
-        base_confidence * 0.3
+        unimported_confidence(from_file, &to_file, base_confidence)
+    }
+
+    /// Drops a bare cross-file name the caller cannot see.
+    ///
+    /// Same-file definitions stay. An import-map entry for the local name stays,
+    /// boosted the same way an explicit import always was. `*` (`from m import *`)
+    /// keeps the downgrade an unimported name gets, because the map does not
+    /// say which names the star brought in.
+    ///
+    /// In JavaScript and TypeScript a bare name resolves to a binding of the
+    /// file or to a global. So a name the file binds itself (a variable, a
+    /// parameter, a destructured value, a run-time binding its module didn't
+    /// define) keeps the downgrade: the value may hold any function. A
+    /// classic script's function is a global, and keeps it too; between two
+    /// possible scripts the call keeps its full confidence, as before. A
+    /// global can't be another module's private function, so that edge is
+    /// dropped; an exported one keeps the downgrade, since build tools inject
+    /// imports for exports (Nuxt's `composables/`, unplugin-auto-import).
+    fn validate_bare_import_visibility(
+        &self,
+        reference: &str,
+        from_file: &Path,
+        from_file_str: &str,
+        to_idx: NodeId,
+        base_confidence: f32,
+    ) -> f32 {
+        let Some(to_node) = self.graph.get(to_idx) else {
+            return 0.0;
+        };
+        let to_file = PathBuf::from(&to_node.file);
+        if to_file == from_file {
+            return base_confidence;
+        }
+
+        if let Some(file_imports) = self.import_map.get(from_file_str) {
+            if file_imports.contains_key(reference) {
+                return base_confidence.max(0.95);
+            }
+            if file_imports.contains_key("*") {
+                return unimported_confidence(from_file, &to_file, base_confidence);
+            }
+        }
+
+        if is_js_family_file(from_file) {
+            let to_script = self.is_possible_script(&to_node.file);
+            if to_script && self.is_possible_script(from_file_str) {
+                return base_confidence;
+            }
+            if to_script || to_node.is_exported || self.binds_locally(from_file_str, reference) {
+                debug!(
+                    "Downgrading unimported reference '{}' in {} → {}, a local binding or a script's global",
+                    reference,
+                    from_file.display(),
+                    to_file.display()
+                );
+                return unimported_confidence(from_file, &to_file, base_confidence);
+            }
+        }
+
+        debug!(
+            "Dropping unimported cross-file reference '{}' in {} → {}",
+            reference,
+            from_file.display(),
+            to_file.display()
+        );
+        0.0
+    }
+
+    /// Keeps a bare Go call that stays inside the caller's package.
+    ///
+    /// The parser records `package name` as a `Module` node in that file, not
+    /// as a field on the function. Same package means that clause matches and
+    /// the files share a directory. A matching clause in another directory
+    /// (`package main` in two commands) is a different package.
+    fn validate_go_package_visibility(
+        &self,
+        reference: &str,
+        from_file: &Path,
+        from_file_str: &str,
+        to_idx: NodeId,
+        base_confidence: f32,
+    ) -> f32 {
+        let Some(to_node) = self.graph.get(to_idx) else {
+            return 0.0;
+        };
+        let to_file = PathBuf::from(&to_node.file);
+        if to_file == from_file {
+            return base_confidence;
+        }
+
+        let to_file_str = to_file.to_string_lossy().to_string();
+        let same_package = self
+            .go_packages
+            .get(from_file_str)
+            .zip(self.go_packages.get(&to_file_str))
+            .is_some_and(|(caller_pkg, callee_pkg)| {
+                caller_pkg == callee_pkg && to_file.parent() == from_file.parent()
+            });
+        if same_package {
+            return base_confidence;
+        }
+
+        debug!(
+            "Dropping bare Go reference '{}' in {} → {}",
+            reference,
+            from_file.display(),
+            to_file.display()
+        );
+        0.0
     }
 
     /// Emits `extends` / `implements` edges and inherited-method reachability.
@@ -751,13 +1081,59 @@ impl GraphBuilder {
     pub fn build(mut self) -> ArborGraph {
         self.resolve_edges();
         self.resolve_inheritance();
+        self.graph.set_import_nodes(self.import_nodes);
         self.graph
     }
 
     /// Builds without resolving edges (for incremental updates).
-    pub fn build_without_resolve(self) -> ArborGraph {
+    pub fn build_without_resolve(mut self) -> ArborGraph {
+        self.graph.set_import_nodes(self.import_nodes);
         self.graph
     }
+}
+
+/// The confidence of a bare cross-file call the caller never imported, where
+/// the call is kept: plausible in the same directory (languages with
+/// implicit module scope), most likely a name collision anywhere else.
+fn unimported_confidence(from_file: &Path, to_file: &Path, base_confidence: f32) -> f32 {
+    if to_file.parent() == from_file.parent() {
+        base_confidence * 0.6
+    } else {
+        base_confidence * 0.3
+    }
+}
+
+/// Go files: a bare call is visible inside the caller's package.
+fn is_go_file(file: &Path) -> bool {
+    file.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("go"))
+}
+
+/// Languages whose parsers record imported local names.
+///
+/// A bare call in one of these files is visible only when the file defines
+/// the name or imports it; JavaScript and TypeScript add local bindings and
+/// globals, see `GraphBuilder::validate_bare_import_visibility`.
+fn bare_name_requires_import(file: &Path) -> bool {
+    let Some(ext) = file.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "py" | "pyi" | "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs"
+    )
+}
+
+/// JavaScript and TypeScript, which share one parser.
+fn is_js_family_file(file: &Path) -> bool {
+    let Some(ext) = file.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs"
+    )
 }
 
 struct InheritedType {
@@ -1142,6 +1518,7 @@ mod tests {
     use super::*;
     use arbor_core::NodeKind;
     use petgraph::visit::{EdgeRef, IntoEdgeReferences};
+    use std::path::Path;
 
     #[test]
     fn test_builder_adds_nodes() {
@@ -1557,8 +1934,7 @@ mod tests {
     }
 
     #[test]
-    fn colliding_symbols_both_remain_reachable() {
-        // The old table overwrote one of these, orphaning it with zero callers.
+    fn unimported_python_bare_call_links_neither_definition() {
         let mut b = GraphBuilder::new();
         let caller = CodeNode::new("main", "main", NodeKind::Function, "src/main.py")
             .with_references(vec!["process".to_string()]);
@@ -1577,32 +1953,30 @@ mod tests {
         )]);
         let graph = b.build();
 
-        // Both candidates are linked, each flagged as uncertain.
-        assert_eq!(graph.edge_count(), 2);
-        for weight in graph.graph.edge_weights() {
-            assert!(
-                !weight.is_confident(),
-                "ambiguous resolution must not claim certainty"
-            );
-        }
+        assert_eq!(graph.node_count(), 3, "both definitions stay in the graph");
+        assert_eq!(
+            graph.edge_count(),
+            0,
+            "an unimported bare call links to neither"
+        );
     }
 
+    /// `far.ts` imports something, so it is a module, and its unexported
+    /// `validate` can't be called from another file by a bare name.
     #[test]
-    fn unimported_cross_module_reference_is_downgraded_not_dropped() {
+    fn unimported_ts_cross_file_call_to_a_private_function_is_dropped() {
         let mut b = GraphBuilder::new();
         let import = CodeNode::new("./other", "./other", NodeKind::Import, "src/a/main.ts")
             .with_references(vec!["somethingElse".to_string()]);
         let caller = CodeNode::new("main", "main", NodeKind::Function, "src/a/main.ts")
             .with_references(vec!["validate".to_string()]);
+        let callee_import = CodeNode::new("./util", "./util", NodeKind::Import, "src/z/far.ts")
+            .with_references(vec!["util".to_string()]);
         let callee = CodeNode::new("validate", "validate", NodeKind::Function, "src/z/far.ts");
-        b.add_nodes(vec![import, caller, callee]);
+        b.add_nodes(vec![import, caller, callee_import, callee]);
         let graph = b.build();
 
-        let confidence = only_edge_confidence(&graph);
-        assert!(
-            confidence > 0.0 && confidence < 0.5,
-            "not imported and in another module — weak, got {confidence}"
-        );
+        assert_eq!(graph.edge_count(), 0);
     }
 
     #[test]
@@ -1623,23 +1997,31 @@ mod tests {
     }
 
     #[test]
-    fn same_dir_unimported_reference_is_no_longer_a_free_pass() {
-        // Flat `src/` layouts made the old filter a no-op, so same-name
-        // collisions sailed through at full strength.
+    fn unimported_ts_same_dir_call_to_a_private_function_is_dropped() {
         let mut b = GraphBuilder::new();
         let import = CodeNode::new("./x", "./x", NodeKind::Import, "src/main.ts")
             .with_references(vec!["other".to_string()]);
         let caller = CodeNode::new("main", "main", NodeKind::Function, "src/main.ts")
             .with_references(vec!["validate".to_string()]);
+        let callee_import = CodeNode::new("./util", "./util", NodeKind::Import, "src/sibling.ts")
+            .with_references(vec!["util".to_string()]);
         let callee = CodeNode::new("validate", "validate", NodeKind::Function, "src/sibling.ts");
-        b.add_nodes(vec![import, caller, callee]);
+        b.add_nodes(vec![import, caller, callee_import, callee]);
         let graph = b.build();
 
-        let confidence = only_edge_confidence(&graph);
-        assert!(
-            confidence < Edge::CONFIDENT_THRESHOLD,
-            "same-dir but unimported should carry doubt, got {confidence}"
-        );
+        assert_eq!(graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn ts_same_file_bare_call_binds() {
+        let mut b = GraphBuilder::new();
+        let callee = CodeNode::new("validate", "validate", NodeKind::Function, "src/main.ts");
+        let caller = CodeNode::new("main", "main", NodeKind::Function, "src/main.ts")
+            .with_references(vec!["validate".to_string()]);
+        b.add_nodes(vec![callee, caller]);
+        let graph = b.build();
+
+        assert_eq!(graph.edge_count(), 1);
     }
 
     #[test]
@@ -1898,6 +2280,412 @@ mod tests {
             "super() must not skip B and land on A"
         );
     }
+
+    #[test]
+    fn python_unimported_len_has_no_callers() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![CodeNode::new(
+            "len",
+            "len",
+            NodeKind::Function,
+            "hard/stdlib_shadow.py",
+        )]);
+        b.add_nodes(vec![CodeNode::new(
+            "process",
+            "process",
+            NodeKind::Function,
+            "hard/shadowed.py",
+        )
+        .with_references(vec!["len".to_string()])]);
+        let import = CodeNode::new(
+            "app.core.db",
+            "app.core.db",
+            NodeKind::Import,
+            "app/services/auth.py",
+        )
+        .with_references(vec!["connect".to_string()]);
+        let verify = CodeNode::new(
+            "verify_token",
+            "verify_token",
+            NodeKind::Function,
+            "app/services/auth.py",
+        )
+        .with_references(vec!["len".to_string()]);
+        b.add_nodes(vec![import, verify]);
+        let graph = b.build();
+
+        assert!(
+            callers_of(&graph, "len", "stdlib_shadow.py").is_empty(),
+            "a user len must not absorb builtin-shaped calls"
+        );
+    }
+
+    #[test]
+    fn python_local_len_binds_to_its_own_definition() {
+        let mut b = GraphBuilder::new();
+        let len_def = CodeNode::new("len", "len", NodeKind::Function, "hard/stdlib_shadow.py");
+        let uses = CodeNode::new(
+            "uses_len",
+            "uses_len",
+            NodeKind::Function,
+            "hard/stdlib_shadow.py",
+        )
+        .with_references(vec!["len".to_string()]);
+        b.add_nodes(vec![len_def, uses]);
+        let graph = b.build();
+
+        let callers = callers_of(&graph, "len", "stdlib_shadow.py");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].name, "uses_len");
+    }
+
+    #[test]
+    fn python_imported_len_binds_to_the_imported_definition() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![CodeNode::new(
+            "len",
+            "len",
+            NodeKind::Function,
+            "hard/stdlib_shadow.py",
+        )]);
+        let import = CodeNode::new(
+            "hard.stdlib_shadow",
+            "hard.stdlib_shadow",
+            NodeKind::Import,
+            "app/caller.py",
+        )
+        .with_references(vec!["len".to_string()]);
+        let caller = CodeNode::new("use", "use", NodeKind::Function, "app/caller.py")
+            .with_references(vec!["len".to_string()]);
+        b.add_nodes(vec![import, caller]);
+        let graph = b.build();
+
+        let callers = callers_of(&graph, "len", "stdlib_shadow.py");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].name, "use");
+    }
+
+    #[test]
+    fn python_star_import_keeps_a_bare_cross_file_call() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![CodeNode::new(
+            "len",
+            "len",
+            NodeKind::Function,
+            "hard/stdlib_shadow.py",
+        )]);
+        let import = CodeNode::new("helpers", "helpers", NodeKind::Import, "app/caller.py")
+            .with_references(vec!["*".to_string()]);
+        let caller = CodeNode::new("use", "use", NodeKind::Function, "app/caller.py")
+            .with_references(vec!["len".to_string()]);
+        b.add_nodes(vec![import, caller]);
+        let graph = b.build();
+
+        assert_eq!(callers_of(&graph, "len", "stdlib_shadow.py").len(), 1);
+        // `*` doesn't say `len` came from `helpers`: the edge stays as weak
+        // as main made it, never raised to the resolution's full confidence.
+        assert!(only_edge_confidence(&graph) < Edge::CONFIDENT_THRESHOLD);
+    }
+
+    #[test]
+    fn qualified_module_call_does_not_bind_bare_len() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![CodeNode::new(
+            "len",
+            "len",
+            NodeKind::Function,
+            "hard/stdlib_shadow.py",
+        )]);
+        // `import len_module` records the module, not a local name.
+        let import = CodeNode::new(
+            "len_module",
+            "len_module",
+            NodeKind::Import,
+            "app/caller.py",
+        );
+        let caller = CodeNode::new("use", "use", NodeKind::Function, "app/caller.py")
+            .with_references(vec!["len_module.len".to_string()]);
+        b.add_nodes(vec![import, caller]);
+        let graph = b.build();
+
+        assert!(callers_of(&graph, "len", "stdlib_shadow.py").is_empty());
+    }
+
+    #[test]
+    fn shadowed_process_keeps_local_and_explicitly_imported_callers() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![
+            CodeNode::new("process", "process", NodeKind::Function, "hard/shadowed.py"),
+            CodeNode::new("caller", "caller", NodeKind::Function, "hard/shadowed.py")
+                .with_references(vec!["process".to_string()]),
+            CodeNode::new(
+                "process",
+                "process",
+                NodeKind::Function,
+                "hard/shadow_other.py",
+            ),
+            CodeNode::new(
+                "other_caller",
+                "other_caller",
+                NodeKind::Function,
+                "hard/shadow_other.py",
+            )
+            .with_references(vec!["process".to_string()]),
+        ]);
+        let import = CodeNode::new(
+            "hard.shadowed",
+            "hard.shadowed",
+            NodeKind::Import,
+            "hard/conditional.py",
+        )
+        .with_references(vec!["process".to_string()]);
+        let imported_caller = CodeNode::new(
+            "function_local_import",
+            "function_local_import",
+            NodeKind::Function,
+            "hard/conditional.py",
+        )
+        .with_references(vec!["process".to_string()]);
+        b.add_nodes(vec![import, imported_caller]);
+        let graph = b.build();
+
+        let shadowed = callers_of(&graph, "process", "hard/shadowed.py");
+        let other = callers_of(&graph, "process", "hard/shadow_other.py");
+        assert_eq!(shadowed.len(), 2, "local caller plus the explicit import");
+        assert_eq!(
+            other.len(),
+            1,
+            "the sibling call stays on its own definition"
+        );
+        let mut shadowed_names: Vec<&str> = shadowed.iter().map(|n| n.name.as_str()).collect();
+        shadowed_names.sort();
+        assert_eq!(shadowed_names, vec!["caller", "function_local_import"]);
+        assert_eq!(other[0].name, "other_caller");
+    }
+
+    /// Torture section D. The parser records `from hard.reexport_base import
+    /// original_function as renamed` as `alias:renamed:original_function`, so
+    /// the alias reaches the function (#258). A call through a module alias
+    /// (`base_mod.original_function()`) is dotted, outside this rule, and
+    /// still has no edge.
+    #[test]
+    fn an_alias_reaches_the_original_function_and_a_module_alias_call_does_not() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![CodeNode::new(
+            "original_function",
+            "original_function",
+            NodeKind::Function,
+            "hard/reexport_base.py",
+        )]);
+        let import = CodeNode::new(
+            "hard.reexport_base",
+            "hard.reexport_base",
+            NodeKind::Import,
+            "hard/aliased.py",
+        )
+        .with_references(vec![arbor_core::import_alias_ref(
+            "renamed",
+            "original_function",
+        )]);
+        let via_alias = CodeNode::new(
+            "via_alias",
+            "via_alias",
+            NodeKind::Function,
+            "hard/aliased.py",
+        )
+        .with_references(vec!["renamed".to_string()]);
+        let via_module = CodeNode::new(
+            "via_module_alias",
+            "via_module_alias",
+            NodeKind::Function,
+            "hard/aliased.py",
+        )
+        .with_references(vec!["base_mod.original_function".to_string()]);
+        b.add_nodes(vec![import, via_alias, via_module]);
+        let graph = b.build();
+
+        let callers: Vec<&str> = callers_of(&graph, "original_function", "reexport_base.py")
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(callers, vec!["via_alias"]);
+    }
+
+    fn callers_of<'a>(
+        graph: &'a ArborGraph,
+        name: &str,
+        file_frag: &str,
+    ) -> Vec<&'a arbor_core::CodeNode> {
+        graph
+            .node_indexes()
+            .filter_map(|idx| {
+                let node = graph.get(idx)?;
+                if node.name == name && node.file.contains(file_frag) {
+                    Some(graph.get_callers(idx))
+                } else {
+                    None
+                }
+            })
+            .next()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn go_same_package_bare_call_is_kept() {
+        let mut b = GraphBuilder::new();
+        let import = CodeNode::new("fmt", "fmt", NodeKind::Import, "pkg/a.go");
+        let caller = CodeNode::new("main", "main", NodeKind::Function, "pkg/a.go")
+            .with_references(vec!["helper".to_string()]);
+        let callee = CodeNode::new("helper", "helper", NodeKind::Function, "pkg/b.go");
+        b.add_nodes(vec![
+            go_package("handler", "pkg/a.go"),
+            go_package("handler", "pkg/b.go"),
+            import,
+            caller,
+            callee,
+        ]);
+        let graph = b.build();
+
+        assert_eq!(graph.edge_count(), 1);
+    }
+
+    #[test]
+    fn go_same_clause_in_another_directory_is_dropped() {
+        let mut b = GraphBuilder::new();
+        let caller = CodeNode::new("main", "main", NodeKind::Function, "cmd/a.go")
+            .with_references(vec!["helper".to_string()]);
+        let callee = CodeNode::new("helper", "helper", NodeKind::Function, "pkg/b.go");
+        b.add_nodes(vec![
+            go_package("main", "cmd/a.go"),
+            go_package("main", "pkg/b.go"),
+            caller,
+            callee,
+        ]);
+        let graph = b.build();
+
+        assert_eq!(graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn go_external_test_package_does_not_bind_a_bare_name() {
+        let mut b = GraphBuilder::new();
+        let caller = CodeNode::new(
+            "TestHelper",
+            "TestHelper",
+            NodeKind::Function,
+            "pkg/a_test.go",
+        )
+        .with_references(vec!["helper".to_string()]);
+        let callee = CodeNode::new("helper", "helper", NodeKind::Function, "pkg/a.go");
+        b.add_nodes(vec![
+            go_package("foo_test", "pkg/a_test.go"),
+            go_package("foo", "pkg/a.go"),
+            caller,
+            callee,
+        ]);
+        let graph = b.build();
+
+        assert_eq!(graph.edge_count(), 0);
+    }
+
+    #[test]
+    fn go_len_does_not_bind_to_a_python_definition() {
+        let mut b = GraphBuilder::new();
+        b.add_nodes(vec![CodeNode::new(
+            "len",
+            "len",
+            NodeKind::Function,
+            "hard/stdlib_shadow.py",
+        )]);
+        let caller = CodeNode::new(
+            "HandleRequest",
+            "HandleRequest",
+            NodeKind::Function,
+            "poly/go/handler/handler.go",
+        )
+        .with_references(vec!["len".to_string()]);
+        b.add_nodes(vec![
+            go_package("handler", "poly/go/handler/handler.go"),
+            caller,
+        ]);
+        let graph = b.build();
+
+        assert!(callers_of(&graph, "len", "stdlib_shadow.py").is_empty());
+    }
+
+    #[test]
+    fn rust_use_does_not_drop_a_bare_cross_file_call() {
+        assert_residual_bare_call_links("crate::helper", "src/main.rs", "src/helper.rs");
+    }
+
+    #[test]
+    fn c_include_does_not_drop_a_bare_cross_file_call() {
+        assert_residual_bare_call_links("foo.h", "src/main.c", "src/foo.c");
+    }
+
+    #[test]
+    fn java_import_does_not_drop_a_bare_cross_file_call() {
+        assert_residual_bare_call_links("com.example.Helper", "src/Main.java", "src/Helper.java");
+    }
+
+    #[test]
+    fn csharp_using_does_not_drop_a_bare_cross_file_call() {
+        assert_residual_bare_call_links("Example", "src/Main.cs", "src/Helper.cs");
+    }
+
+    #[test]
+    fn dart_import_does_not_drop_a_bare_cross_file_call() {
+        assert_residual_bare_call_links(
+            "package:app/helper.dart",
+            "lib/main.dart",
+            "lib/helper.dart",
+        );
+    }
+
+    fn go_package(name: &str, file: &str) -> CodeNode {
+        CodeNode::new(name, name, NodeKind::Module, file)
+    }
+
+    /// An import node whose name is the module path and whose references do
+    /// not include `helper`. The bare call must still link.
+    fn assert_residual_bare_call_links(import_name: &str, caller_file: &str, callee_file: &str) {
+        let mut b = GraphBuilder::new();
+        let import = CodeNode::new(import_name, import_name, NodeKind::Import, caller_file);
+        let caller = CodeNode::new("main", "main", NodeKind::Function, caller_file)
+            .with_references(vec!["helper".to_string()]);
+        let callee = CodeNode::new("helper", "helper", NodeKind::Function, callee_file);
+        b.add_nodes(vec![import, caller, callee]);
+        let graph = b.build();
+        assert_eq!(
+            graph.edge_count(),
+            1,
+            "{caller_file} should still call {callee_file}"
+        );
+    }
+
+    #[test]
+    fn bare_name_visibility_matches_python_and_js_extensions() {
+        assert!(bare_name_requires_import(Path::new(
+            "hard/stdlib_shadow.py"
+        )));
+        assert!(bare_name_requires_import(Path::new("stubs/mod.pyi")));
+        assert!(bare_name_requires_import(Path::new("HARD/LEN.PY")));
+        assert!(bare_name_requires_import(Path::new("src/main.ts")));
+        assert!(bare_name_requires_import(Path::new("src/App.tsx")));
+        assert!(bare_name_requires_import(Path::new("src/app.js")));
+        assert!(bare_name_requires_import(Path::new("src/app.jsx")));
+        assert!(bare_name_requires_import(Path::new("src/app.mts")));
+        assert!(bare_name_requires_import(Path::new("src/app.cts")));
+        assert!(bare_name_requires_import(Path::new("src/app.mjs")));
+        assert!(bare_name_requires_import(Path::new("src/app.cjs")));
+        assert!(!bare_name_requires_import(Path::new("pkg/a.go")));
+        assert!(!bare_name_requires_import(Path::new("src/main.rs")));
+        assert!(!bare_name_requires_import(Path::new("src/Main.java")));
+        assert!(!bare_name_requires_import(Path::new("src/Main.cs")));
+        assert!(!bare_name_requires_import(Path::new("lib/main.dart")));
+        assert!(!bare_name_requires_import(Path::new("src/main.c")));
+        assert!(!bare_name_requires_import(Path::new("Makefile")));
+    }
 }
 
 #[cfg(test)]
@@ -2083,7 +2871,7 @@ mod import_alias_tests {
 
     /// Parses each `(path, source)` with its real language parser and builds
     /// the graph, as `arbor index` does.
-    fn index(files: &[(&str, &str)]) -> ArborGraph {
+    pub(super) fn index(files: &[(&str, &str)]) -> ArborGraph {
         let mut builder = GraphBuilder::new();
         for (path, source) in files {
             let ext = Path::new(path)
@@ -2098,7 +2886,7 @@ mod import_alias_tests {
     }
 
     /// Every call edge, as `file::name -> file::name`.
-    fn calls(graph: &ArborGraph) -> BTreeSet<String> {
+    pub(super) fn calls(graph: &ArborGraph) -> BTreeSet<String> {
         graph
             .graph
             .edge_references()
@@ -2111,7 +2899,7 @@ mod import_alias_tests {
             .collect()
     }
 
-    fn edges(expected: &[&str]) -> BTreeSet<String> {
+    pub(super) fn edges(expected: &[&str]) -> BTreeSet<String> {
         expected.iter().map(|e| e.to_string()).collect()
     }
 
@@ -2560,5 +3348,916 @@ export async function postsTheForm(req: Request) {
             ),
         ]);
         assert_eq!(calls(&graph), edges(&[]));
+    }
+}
+
+/// The bare-name visibility rule keeps a JavaScript or TypeScript call to
+/// another file only when the caller imports the name. CommonJS `require`,
+/// TypeScript's `import x = require()` and an awaited `import()` bind names
+/// too, so they have to reach the import map like an ES `import` does.
+#[cfg(test)]
+mod commonjs_visibility_tests {
+    use super::import_alias_tests::{calls, edges, index};
+
+    /// A private `helper` in another directory's module, so the tests that use
+    /// it pass only when the import, not a fallback, picks the target.
+    const DECOY_HELPER_JS: &str =
+        "const fs = require(\"fs\");\n\nfunction helper(x) {\n  return fs.existsSync(x);\n}\n";
+
+    const UTILS: &str = "\
+function helper(x) {
+  return x * 2;
+}
+
+module.exports = { helper };
+";
+
+    /// The repro from review: one caller on main, none with the rule alone.
+    #[test]
+    fn a_destructured_require_keeps_the_call() {
+        let graph = index(&[
+            ("utils.js", UTILS),
+            (
+                "index.js",
+                "\
+const { helper } = require(\"./utils\");
+
+function main() {
+  return helper(21);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["index.js::main -> utils.js::helper"])
+        );
+    }
+
+    /// `{ helper: twice }` is `import { helper as twice }`: the call reaches
+    /// `helper`, not a function that happens to be named `twice`.
+    #[test]
+    fn a_renamed_destructured_require_reaches_the_exported_name() {
+        let graph = index(&[
+            ("utils.js", UTILS),
+            (
+                "legacy/twice.js",
+                "function twice(x) {\n  return x + x;\n}\n",
+            ),
+            (
+                "index.js",
+                "\
+const { helper: twice } = require(\"./utils\");
+
+function main() {
+  return twice(21);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["index.js::main -> utils.js::helper"])
+        );
+    }
+
+    /// `const twice = require("./utils").helper` names one export too.
+    #[test]
+    fn a_property_of_a_required_module_reaches_that_export() {
+        let graph = index(&[
+            ("utils.js", UTILS),
+            (
+                "legacy/twice.js",
+                "function twice(x) {\n  return x + x;\n}\n",
+            ),
+            (
+                "index.js",
+                "\
+const twice = require(\"./utils\").helper;
+
+function main() {
+  return twice(21);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["index.js::main -> utils.js::helper"])
+        );
+    }
+
+    /// `module.exports = helper`: the required value is the function itself,
+    /// as with a default import.
+    #[test]
+    fn a_required_module_called_directly_keeps_the_call() {
+        let graph = index(&[
+            (
+                "helper.js",
+                "function helper(x) {\n  return x * 2;\n}\n\nmodule.exports = helper;\n",
+            ),
+            ("lib/helper.js", DECOY_HELPER_JS),
+            (
+                "index.js",
+                "\
+const helper = require(\"./helper\");
+
+function main() {
+  return helper(21);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["index.js::main -> helper.js::helper"])
+        );
+        assert!(confidence(&graph, "index.js::main", "helper.js::helper").unwrap() >= 0.95);
+    }
+
+    /// Dependency injection through a factory the module exports: the names
+    /// come from a call on the required module, so they are the module's.
+    #[test]
+    fn names_destructured_from_a_required_factory_keep_the_call() {
+        let graph = index(&[
+            (
+                "services/paged.js",
+                "\
+const db = require(\"./db\");
+
+function createPagedReads(prisma) {
+  async function getOrderDetail(id) {
+    return prisma.find(id);
+  }
+  return { getOrderDetail };
+}
+
+module.exports = { createPagedReads };
+",
+            ),
+            (
+                "services/orders.js",
+                "\
+const prisma = require(\"./prisma\");
+const { getOrderDetail } = require(\"./paged\").createPagedReads(prisma);
+
+async function getOrderById(id) {
+  return getOrderDetail(id);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["services/orders.js::getOrderById -> services/paged.js::getOrderDetail"])
+        );
+    }
+
+    /// A React custom hook: the setter comes from the return value of a hook
+    /// the file imports, so it is the hook module's function, not the
+    /// exported function of the same name in another file.
+    #[test]
+    fn names_destructured_from_an_imported_hook_reach_the_hook_module() {
+        let graph = index(&[
+            (
+                "hooks/useListState.js",
+                "\
+export function useListFilters(defaults) {
+  function setFilters(patch) {
+    return { ...defaults, ...patch };
+  }
+  return { setFilters };
+}
+",
+            ),
+            (
+                "components/Search.jsx",
+                "export function setFilters(event) {\n  return event;\n}\n",
+            ),
+            (
+                "pages/Orders.jsx",
+                "\
+import { useListFilters } from \"../hooks/useListState\";
+
+export function Orders() {
+  const { setFilters } = useListFilters({});
+  return setFilters({ q: \"\" });
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "pages/Orders.jsx::Orders -> hooks/useListState.js::setFilters",
+                "pages/Orders.jsx::Orders -> hooks/useListState.js::useListFilters",
+            ])
+        );
+    }
+
+    /// A name destructured from an external hook's return value may hold any
+    /// function, so a call to it keeps the weak edge main gave it, and never
+    /// an import's confidence.
+    #[test]
+    fn names_destructured_from_an_external_hook_keep_only_a_weak_edge() {
+        let graph = index(&[
+            (
+                "components/Other.jsx",
+                "export function handleSubmit(event) {\n  return event;\n}\n",
+            ),
+            (
+                "components/Form.jsx",
+                "\
+import { useForm } from \"react-hook-form\";
+
+export function Form({ save }) {
+  const { handleSubmit } = useForm();
+  return handleSubmit(save);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["components/Form.jsx::Form -> components/Other.jsx::handleSubmit"])
+        );
+        let weak = confidence(
+            &graph,
+            "components/Form.jsx::Form",
+            "components/Other.jsx::handleSubmit",
+        )
+        .unwrap();
+        assert!(weak < super::Edge::CONFIDENT_THRESHOLD, "{weak}");
+    }
+
+    const AUTH_CONTEXT: &str = "\
+import { createContext } from \"react\";
+
+export const AuthContext = createContext(null);
+
+export function AuthProvider({ children }) {
+  function login(email) {
+    return email;
+  }
+  return <AuthContext.Provider value={{ login }}>{children}</AuthContext.Provider>;
+}
+";
+
+    /// `useContext(AuthContext)` hands out the provider's inner `login`. The
+    /// name is bound from React's hook, so it can't be pinned, but the file
+    /// binds it, so the call keeps main's weak edge.
+    #[test]
+    fn a_name_from_use_context_keeps_a_weak_edge_to_the_provider() {
+        let graph = index(&[
+            ("context/AuthContext.jsx", AUTH_CONTEXT),
+            (
+                "pages/Login.jsx",
+                "\
+import { useContext } from \"react\";
+import { AuthContext } from \"../context/AuthContext\";
+
+export function Login() {
+  const { login } = useContext(AuthContext);
+  return login(\"a@b.c\");
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["pages/Login.jsx::Login -> context/AuthContext.jsx::login"])
+        );
+        let weak = confidence(
+            &graph,
+            "pages/Login.jsx::Login",
+            "context/AuthContext.jsx::login",
+        )
+        .unwrap();
+        assert!(weak < super::Edge::CONFIDENT_THRESHOLD, "{weak}");
+    }
+
+    /// The hook lives apart from the provider, so its module doesn't define
+    /// `login`. The pinned lookup finds nothing there, and the call falls back
+    /// to main's weak edge instead of disappearing.
+    #[test]
+    fn a_hook_apart_from_its_provider_keeps_a_weak_edge() {
+        let graph = index(&[
+            ("context/AuthContext.jsx", AUTH_CONTEXT),
+            (
+                "hooks/useAuth.js",
+                "\
+import { useContext } from \"react\";
+import { AuthContext } from \"../context/AuthContext\";
+
+export function useAuth() {
+  return useContext(AuthContext);
+}
+",
+            ),
+            (
+                "pages/Login.jsx",
+                "\
+import { useAuth } from \"../hooks/useAuth\";
+
+export function Login() {
+  const { login } = useAuth();
+  return login(\"a@b.c\");
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "pages/Login.jsx::Login -> context/AuthContext.jsx::login",
+                "pages/Login.jsx::Login -> hooks/useAuth.js::useAuth",
+            ])
+        );
+        let weak = confidence(
+            &graph,
+            "pages/Login.jsx::Login",
+            "context/AuthContext.jsx::login",
+        )
+        .unwrap();
+        assert!(weak < super::Edge::CONFIDENT_THRESHOLD, "{weak}");
+    }
+
+    /// Two functions bind `handler` from two modules. One file-level map can
+    /// hold only one, so neither is trusted: both callers keep weak edges to
+    /// both handlers, as on main, instead of both going to the last module at
+    /// an import's confidence.
+    #[test]
+    fn a_name_bound_from_two_modules_in_two_functions_is_not_pinned() {
+        let handler = "const fs = require(\"fs\");\n\nasync function handler(event) {\n  return fs.existsSync(event);\n}\n\nmodule.exports = { handler };\n";
+        let graph = index(&[
+            ("lambdas/a.js", handler),
+            ("lambdas/b.js", handler),
+            (
+                "test/handlers.test.js",
+                "\
+const assert = require(\"assert\");
+
+async function runA() {
+  const { handler } = require(\"../lambdas/a\");
+  return handler({});
+}
+
+async function runB() {
+  const { handler } = require(\"../lambdas/b\");
+  return handler({});
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "test/handlers.test.js::runA -> lambdas/a.js::handler",
+                "test/handlers.test.js::runA -> lambdas/b.js::handler",
+                "test/handlers.test.js::runB -> lambdas/a.js::handler",
+                "test/handlers.test.js::runB -> lambdas/b.js::handler",
+            ])
+        );
+        for run in ["runA", "runB"] {
+            for module in ["a", "b"] {
+                let weak = confidence(
+                    &graph,
+                    &format!("test/handlers.test.js::{run}"),
+                    &format!("lambdas/{module}.js::handler"),
+                )
+                .unwrap();
+                assert!(
+                    weak < super::Edge::CONFIDENT_THRESHOLD,
+                    "{run} -> {module}: {weak}"
+                );
+            }
+        }
+    }
+
+    /// A function parameter is a binding too: `onSave` holds whatever the
+    /// caller passed, so the call keeps main's weak edge.
+    #[test]
+    fn a_call_through_a_parameter_keeps_a_weak_edge() {
+        let graph = index(&[
+            (
+                "components/Editor.jsx",
+                "\
+import { useState } from \"react\";
+
+export function Editor() {
+  function onSave(value) {
+    return value;
+  }
+  return <Button onSave={onSave} />;
+}
+",
+            ),
+            (
+                "components/Button.jsx",
+                "\
+import { useRef } from \"react\";
+
+export function Button({ onSave }) {
+  return onSave(1);
+}
+",
+            ),
+        ]);
+        let weak = confidence(
+            &graph,
+            "components/Button.jsx::Button",
+            "components/Editor.jsx::onSave",
+        )
+        .expect("the parameter call keeps an edge");
+        assert!(weak < super::Edge::CONFIDENT_THRESHOLD, "{weak}");
+    }
+
+    /// A CommonJS module that requires nothing is still a module: its
+    /// functions aren't globals, so Jest's global `expect()` doesn't reach
+    /// its private `expect` helper.
+    #[test]
+    fn a_commonjs_module_without_requires_is_not_a_script() {
+        let graph = index(&[
+            (
+                "scripts/verify.cjs",
+                "function expect(path, status) {\n  return path;\n}\n\nmodule.exports = { expect };\n",
+            ),
+            (
+                "src/add.ts",
+                "export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+            ),
+            (
+                "src/__tests__/add.test.ts",
+                "\
+import { add } from \"../add\";
+
+export function addsTwoNumbers() {
+  return expect(add(1, 2)).toBe(3);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["src/__tests__/add.test.ts::addsTwoNumbers -> src/add.ts::add"])
+        );
+    }
+
+    /// TypeScript's own CommonJS import form.
+    #[test]
+    fn a_typescript_import_require_keeps_the_call() {
+        let graph = index(&[
+            (
+                "helper.ts",
+                "function helper(x: number): number {\n  return x * 2;\n}\n\nexport = helper;\n",
+            ),
+            (
+                "lib/helper.ts",
+                "import fs from \"fs\";\n\nfunction helper(x: number): number {\n  return x;\n}\n",
+            ),
+            (
+                "index.ts",
+                "\
+import helper = require(\"./helper\");
+
+export function main(): number {
+  return helper(21);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["index.ts::main -> helper.ts::helper"])
+        );
+        assert!(confidence(&graph, "index.ts::main", "helper.ts::helper").unwrap() >= 0.95);
+    }
+
+    /// An awaited `import()` destructures named exports like `require` does.
+    #[test]
+    fn a_destructured_dynamic_import_keeps_the_call() {
+        let graph = index(&[
+            (
+                "utils.mjs",
+                "export function helper(x) {\n  return x * 2;\n}\n",
+            ),
+            (
+                "lib/other.mjs",
+                "import fs from \"fs\";\n\nexport function helper(x) {\n  return x;\n}\n",
+            ),
+            (
+                "index.mjs",
+                "\
+export async function main() {
+  const { helper } = await import(\"./utils.mjs\");
+  return helper(21);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["index.mjs::main -> utils.mjs::helper"])
+        );
+        assert!(confidence(&graph, "index.mjs::main", "utils.mjs::helper").unwrap() >= 0.95);
+    }
+
+    /// Requiring some names does not make every other name visible.
+    #[test]
+    fn a_name_the_file_does_not_require_is_still_dropped() {
+        let graph = index(&[
+            ("utils.js", UTILS),
+            (
+                "other.js",
+                "const path = require(\"path\");\n\nfunction other(x) {\n  return path.basename(x);\n}\n\nmodule.exports = { other };\n",
+            ),
+            (
+                "index.js",
+                "\
+const { helper } = require(\"./utils\");
+
+function main() {
+  return other(helper(21));
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["index.js::main -> utils.js::helper"])
+        );
+    }
+
+    /// A file with no import or `require` may be a classic script, whose
+    /// top-level functions are globals shared with the page's other scripts.
+    #[test]
+    fn a_script_with_no_imports_keeps_its_bare_calls() {
+        let graph = index(&[
+            (
+                "legacy/format.js",
+                "function formatPrice(x) {\n  return \"$\" + x;\n}\n",
+            ),
+            (
+                "legacy/cart.js",
+                "function render(total) {\n  return formatPrice(total);\n}\n",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["legacy/cart.js::render -> legacy/format.js::formatPrice"])
+        );
+    }
+
+    /// The confidence of the call edge `from -> to`, written as in [`calls`].
+    fn confidence(graph: &super::ArborGraph, from: &str, to: &str) -> Option<f32> {
+        use petgraph::visit::{EdgeRef, IntoEdgeReferences};
+        graph
+            .graph
+            .edge_references()
+            .filter(|e| e.weight().kind == super::EdgeKind::Calls)
+            .find(|e| {
+                let source = &graph.graph[e.source()];
+                let target = &graph.graph[e.target()];
+                format!("{}::{}", source.file, source.name) == from
+                    && format!("{}::{}", target.file, target.name) == to
+            })
+            .map(|e| e.weight().confidence)
+    }
+
+    /// Jest's `jest.resetModules()` pattern: the test binds the export from
+    /// an `await import()` inside a helper, which no import records. The
+    /// function is exported, so another module can reach it this way; the
+    /// call keeps a weak edge, as on main.
+    #[test]
+    fn an_exported_function_bound_through_a_helper_keeps_a_weak_edge() {
+        let graph = index(&[
+            (
+                "lib/razorpay.ts",
+                "export function verifyPaymentSignature(sig: string): boolean {\n  return sig.length > 0;\n}\n",
+            ),
+            (
+                "lib/__tests__/razorpay.test.ts",
+                "\
+import crypto from \"crypto\";
+
+async function loadModule() {
+  return await import(\"../razorpay\");
+}
+
+export async function acceptsAValidSignature() {
+  const { verifyPaymentSignature } = await loadModule();
+  return verifyPaymentSignature(crypto.randomUUID());
+}
+",
+            ),
+        ]);
+        let test = "lib/__tests__/razorpay.test.ts::acceptsAValidSignature";
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "lib/__tests__/razorpay.test.ts::acceptsAValidSignature -> lib/__tests__/razorpay.test.ts::loadModule",
+                "lib/__tests__/razorpay.test.ts::acceptsAValidSignature -> lib/razorpay.ts::verifyPaymentSignature",
+            ])
+        );
+        let weak = confidence(&graph, test, "lib/razorpay.ts::verifyPaymentSignature").unwrap();
+        assert!(
+            weak > 0.0 && weak < super::Edge::CONFIDENT_THRESHOLD,
+            "unproven, so weak: {weak}"
+        );
+    }
+
+    /// Next.js `dynamic()` loads a component without a static import.
+    #[test]
+    fn an_exported_component_loaded_with_next_dynamic_keeps_a_weak_edge() {
+        let graph = index(&[
+            (
+                "components/TrendsChart.tsx",
+                "export function TrendsChart({ points }: { points: number[] }) {\n  return <svg>{points.length}</svg>;\n}\n",
+            ),
+            (
+                "app/trends/page.tsx",
+                "\
+import dynamic from \"next/dynamic\";
+
+const TrendsChart = dynamic(() =>
+  import(\"../../components/TrendsChart\").then((m) => ({ default: m.TrendsChart })),
+);
+
+export function TrendsPage() {
+  return <TrendsChart points={[]} />;
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["app/trends/page.tsx::TrendsPage -> components/TrendsChart.tsx::TrendsChart"])
+        );
+        let weak = confidence(
+            &graph,
+            "app/trends/page.tsx::TrendsPage",
+            "components/TrendsChart.tsx::TrendsChart",
+        )
+        .unwrap();
+        assert!(weak < super::Edge::CONFIDENT_THRESHOLD, "{weak}");
+    }
+
+    /// A function a module doesn't export can't be called from another
+    /// module by a bare name: a Jest test's global `expect` is not a script's
+    /// private `expect` helper.
+    #[test]
+    fn a_module_private_function_is_not_reached_from_another_module() {
+        let graph = index(&[
+            (
+                "scripts/verify-site.mjs",
+                "\
+import { strict as assert } from \"node:assert\";
+
+async function expect(path, status) {
+  assert.ok(path, status);
+}
+",
+            ),
+            (
+                "src/add.ts",
+                "export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+            ),
+            (
+                "src/__tests__/add.test.ts",
+                "\
+import { add } from \"../add\";
+
+export function addsTwoNumbers() {
+  return expect(add(1, 2)).toBe(3);
+}
+",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["src/__tests__/add.test.ts::addsTwoNumbers -> src/add.ts::add"])
+        );
+    }
+
+    /// A classic script's top-level functions are page globals, so a module
+    /// can call one by a bare name. Unproven, so the edge is weak.
+    #[test]
+    fn a_classic_script_function_keeps_a_weak_edge_from_a_module() {
+        let graph = index(&[
+            (
+                "legacy/format.js",
+                "function formatPrice(x) {\n  return \"$\" + x;\n}\n",
+            ),
+            (
+                "src/cart.ts",
+                "\
+import { total } from \"./total\";
+
+export function render(): string {
+  return formatPrice(total());
+}
+",
+            ),
+            (
+                "src/total.ts",
+                "export function total(): number {\n  return 1;\n}\n",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&[
+                "src/cart.ts::render -> legacy/format.js::formatPrice",
+                "src/cart.ts::render -> src/total.ts::total",
+            ])
+        );
+        let weak = confidence(
+            &graph,
+            "src/cart.ts::render",
+            "legacy/format.js::formatPrice",
+        )
+        .unwrap();
+        assert!(
+            weak > 0.0 && weak < super::Edge::CONFIDENT_THRESHOLD,
+            "{weak}"
+        );
+    }
+
+    /// A file whose only import is a namespace import, and which exports
+    /// nothing, is still a module: its private function can't be reached by
+    /// another module's bare call.
+    #[test]
+    fn a_file_with_only_a_namespace_import_is_a_module() {
+        let graph = index(&[
+            (
+                "format.ts",
+                "export function pad(x: string): string {\n  return x;\n}\n",
+            ),
+            (
+                "helpers.ts",
+                "import * as fmt from \"./format\";\n\nfunction other(x: string): string {\n  return fmt.pad(x);\n}\n",
+            ),
+            (
+                "app.ts",
+                "\
+import { pad } from \"./format\";
+
+export function show(x: string): string {
+  return other(pad(x));
+}
+",
+            ),
+        ]);
+        assert!(
+            confidence(&graph, "app.ts::show", "helpers.ts::other").is_none(),
+            "{:?}",
+            calls(&graph)
+        );
+    }
+
+    /// TypeScript files whose code sits only in `namespace` blocks have no
+    /// top-level import or export: they are global scripts, and same-named
+    /// namespaces merge across files. A namespace member's `export` doesn't
+    /// make the file a module, so the merged calls keep their edges.
+    #[test]
+    fn merged_namespace_members_in_script_files_keep_their_calls() {
+        let graph = index(&[
+            (
+                "src/factory.ts",
+                "namespace ts {\n  export function createNode(kind: number) {\n    return { kind };\n  }\n}\n",
+            ),
+            (
+                "src/parser.ts",
+                "namespace ts {\n  export function parseSourceFile() {\n    return createNode(1);\n  }\n}\n",
+            ),
+        ]);
+        assert_eq!(
+            calls(&graph),
+            edges(&["src/parser.ts::parseSourceFile -> src/factory.ts::createNode"])
+        );
+    }
+
+    /// A run-time binding is looked up in the module itself. `'..'` names a
+    /// barrel that only re-exports the hook, so a same-named function
+    /// elsewhere in that directory is not the hook's: the call keeps only the
+    /// weak edges of a local binding.
+    #[test]
+    fn a_binding_from_a_barrel_is_not_pinned_to_a_sibling_file() {
+        let graph = index(&[
+            ("src/app/index.ts", "export { useApp } from \"./context\";\n"),
+            (
+                "src/app/context.tsx",
+                "import { useContext } from \"react\";\n\nexport function useApp() {\n  return useContext(AppContext);\n}\n",
+            ),
+            (
+                "src/app/admin/session.ts",
+                "export function logout() {\n  return 1;\n}\n",
+            ),
+            (
+                "src/lib/auth/session.ts",
+                "export async function logout() {\n  return 2;\n}\n",
+            ),
+            (
+                "src/app/settings/Account.tsx",
+                "\
+import { useApp } from \"..\";
+
+export function Account() {
+  const { logout } = useApp();
+  return logout();
+}
+",
+            ),
+        ]);
+        let account = "src/app/settings/Account.tsx::Account";
+        for target in [
+            "src/app/admin/session.ts::logout",
+            "src/lib/auth/session.ts::logout",
+        ] {
+            let weak = confidence(&graph, account, target)
+                .unwrap_or_else(|| panic!("{target}: {:?}", calls(&graph)));
+            assert!(weak < super::Edge::CONFIDENT_THRESHOLD, "{target}: {weak}");
+        }
+    }
+
+    /// Build tools can inject imports (Nuxt's `composables/`,
+    /// unplugin-auto-import), so a call to a name the file doesn't bind may
+    /// reach another module's exported function. It keeps a weak edge.
+    #[test]
+    fn a_global_call_to_an_exported_function_keeps_a_weak_edge() {
+        let graph = index(&[
+            (
+                "composables/useUser.ts",
+                "export const useUser = () => useState(\"user\", () => null);\n",
+            ),
+            (
+                "composables/useCart.ts",
+                "export const useCart = () => {\n  const user = useUser();\n  return { user };\n};\n",
+            ),
+        ]);
+        let weak = confidence(
+            &graph,
+            "composables/useCart.ts::useCart",
+            "composables/useUser.ts::useUser",
+        )
+        .unwrap_or_else(|| panic!("{:?}", calls(&graph)));
+        assert!(weak < super::Edge::CONFIDENT_THRESHOLD, "{weak}");
+    }
+
+    /// The index cache stores nodes by id. Two imports of one module in one
+    /// file (an import and a run-time binding of it, `import` and
+    /// `import type`, two Python `from` lines) must both survive a round trip
+    /// through it, or the next `arbor index` loses a binding and drops calls.
+    #[test]
+    fn imports_of_one_module_survive_the_cache() {
+        let files = [
+            (
+                "hooks.ts",
+                "export function useListFilters() {\n  function setFilters(patch: object) {\n    return patch;\n  }\n  return { setFilters };\n}\n",
+            ),
+            (
+                "List.tsx",
+                "import { useListFilters } from \"./hooks\";\n\nexport function List() {\n  const { setFilters } = useListFilters();\n  return setFilters({});\n}\n",
+            ),
+            (
+                "api.ts",
+                "export function fetchUser() {\n  return 1;\n}\n\nexport interface User {\n  id: number;\n}\n",
+            ),
+            (
+                "load.ts",
+                "import { fetchUser } from \"./api\";\nimport type { User } from \"./api\";\n\nexport function load(): User {\n  return { id: fetchUser() };\n}\n",
+            ),
+            ("money.py", "def a():\n    return 1\n\n\ndef b():\n    return 2\n"),
+            (
+                "orders.py",
+                "from money import a\n\n\ndef first():\n    return a()\n\n\nfrom money import b\n\n\ndef second():\n    return b()\n",
+            ),
+        ];
+        let fresh = calls(&index(&files));
+        for expected in [
+            "List.tsx::List -> hooks.ts::useListFilters",
+            "List.tsx::List -> hooks.ts::setFilters",
+            "load.ts::load -> api.ts::fetchUser",
+            "orders.py::first -> money.py::a",
+            "orders.py::second -> money.py::b",
+        ] {
+            assert!(fresh.contains(expected), "{expected}: {fresh:?}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::GraphStore::open(dir.path()).unwrap();
+        for (path, source) in &files {
+            let ext = std::path::Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap();
+            let parser = arbor_core::languages::get_parser(ext).unwrap();
+            let nodes = arbor_core::parse_source(source, path, parser.as_ref()).unwrap();
+            store.update_file(path, &nodes, 1).unwrap();
+        }
+        let mut builder = super::GraphBuilder::new();
+        for (path, _) in &files {
+            builder.add_nodes(store.get_file_nodes(path).unwrap().unwrap());
+        }
+        assert_eq!(calls(&builder.build()), fresh);
     }
 }

@@ -4,7 +4,7 @@
 //! straightforward with clear function and class boundaries.
 
 use crate::languages::LanguageParser;
-use crate::node::{import_alias_ref, CodeNode, NodeKind, Visibility};
+use crate::node::{import_alias_ref, import_qualified_name, CodeNode, NodeKind, Visibility};
 use crate::usages::FileUsages;
 use tree_sitter::{Language, Node, Tree};
 
@@ -285,13 +285,18 @@ fn extract_from_import(node: &Node, source: &str, file_path: &str) -> Option<Cod
     }
 
     Some(
-        CodeNode::new(&module_name, &module_name, NodeKind::Import, file_path)
-            .with_lines(
-                node.start_position().row as u32 + 1,
-                node.end_position().row as u32 + 1,
-            )
-            .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
-            .with_references(imported_names),
+        CodeNode::new(
+            &module_name,
+            import_qualified_name(&module_name, node.start_byte()),
+            NodeKind::Import,
+            file_path,
+        )
+        .with_lines(
+            node.start_position().row as u32 + 1,
+            node.end_position().row as u32 + 1,
+        )
+        .with_bytes(node.start_byte() as u32, node.end_byte() as u32)
+        .with_references(imported_names),
     )
 }
 

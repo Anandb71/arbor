@@ -348,6 +348,34 @@ impl SymbolTable {
     /// file: in a wrapper that keeps the imported function's name
     /// (`from money import f as _f` then `def f(): _f()`), `_f` is money's.
     pub fn resolve_imported(&self, name: &str, module: &str, context_file: &Path) -> Resolution {
+        self.resolve_in_module(name, module, context_file, true)
+    }
+
+    /// Resolves `name` in the module's own file only: `module.ts`, or a
+    /// package's `index.ts` or `__init__.py`, never another file inside the
+    /// package.
+    ///
+    /// For a name a file took from a value the module produced (a hook's or
+    /// factory's return value), not from its exports. A barrel that only
+    /// re-exports the hook says nothing about the other files under it.
+    pub fn resolve_in_module_file(
+        &self,
+        name: &str,
+        module: &str,
+        context_file: &Path,
+    ) -> Resolution {
+        self.resolve_in_module(name, module, context_file, false)
+    }
+
+    /// [`Self::resolve_imported`], and with `whole_package` false,
+    /// [`Self::resolve_in_module_file`].
+    fn resolve_in_module(
+        &self,
+        name: &str,
+        module: &str,
+        context_file: &Path,
+        whole_package: bool,
+    ) -> Resolution {
         let family = language_family(context_file);
         let defined: Vec<&SymbolEntry> = self
             .by_fqn
@@ -369,7 +397,7 @@ impl SymbolTable {
             if !in_module.is_empty() {
                 return pick(in_module, context_file, Resolution::ViaImport);
             }
-            if target.as_os_str().is_empty() {
+            if !whole_package || target.as_os_str().is_empty() {
                 return Resolution::Unresolved;
             }
             let in_package: Vec<&SymbolEntry> = defined
@@ -390,6 +418,9 @@ impl SymbolTable {
             .collect();
         if !in_module.is_empty() {
             return pick(in_module, context_file, Resolution::ViaImport);
+        }
+        if !whole_package {
+            return Resolution::Unresolved;
         }
         let in_package: Vec<&SymbolEntry> = defined
             .into_iter()
@@ -1133,6 +1164,37 @@ mod import_resolution_tests {
                 "root {root:?}: a dotted package's own __init__"
             );
         }
+    }
+
+    /// `resolve_in_module_file` stops at the module's own file. A barrel
+    /// (`index.ts`) that doesn't define the name leaves it unresolved, where
+    /// an import reaches into the package.
+    #[test]
+    fn a_module_file_lookup_never_reaches_into_the_package() {
+        let mut table = SymbolTable::default();
+        table.insert(
+            "logout".to_string(),
+            nid(0),
+            PathBuf::from("src/app/admin/session.ts"),
+        );
+        table.insert(
+            "useApp".to_string(),
+            nid(1),
+            PathBuf::from("src/app/index.ts"),
+        );
+        let caller = Path::new("src/app/settings/Account.tsx");
+        assert_eq!(
+            table.resolve_imported("logout", "..", caller),
+            Resolution::ViaImport(nid(0))
+        );
+        assert_eq!(
+            table.resolve_in_module_file("logout", "..", caller),
+            Resolution::Unresolved
+        );
+        assert_eq!(
+            table.resolve_in_module_file("useApp", "..", caller),
+            Resolution::ViaImport(nid(1))
+        );
     }
 
     /// Known limit: `flask` is not part of this project, but a checkout under
