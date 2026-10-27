@@ -30,8 +30,10 @@
 //! clean report never claims more than was read.
 //!
 //! Only SDK calls that send a request, bind a model for later requests
-//! (`genai.GenerativeModel(...)`) or set a model in a request parameter
-//! object (a tool config) are checked. Response and type objects built in
+//! (`genai.GenerativeModel(...)`, a LangChain chat model) or set a model in
+//! a request parameter object (a tool config) are checked. A LangChain chat
+//! model takes LangChain's arguments, so only the rules about its model
+//! apply there, and the finding says to check its parameters by hand. Response and type objects built in
 //! code (`ChatCompletion(...)`, `Message(...)`, `.model_validate(...)`) send
 //! nothing; they are counted in [`Summary::response_objects`] and skipped.
 
@@ -1369,6 +1371,13 @@ fn finding_for(
     // or an object of its own: the call's argument names and endpoint say
     // nothing about it, so only the rules about the model itself apply.
     let nested = value.key.rsplit_once('.').map(|(container, _)| container);
+    // A LangChain chat model takes LangChain's arguments, not the
+    // provider's, and builds the request itself: the same holds.
+    let wrapper = match site {
+        Site::Call(call, _) => langchain_package(call),
+        Site::Gap(_) => None,
+    };
+    let model_only = nested.is_some() || wrapper.is_some();
     let mut outcome = Outcome::default();
     if call_kind != CallKind::RequestParam {
         if let Some((rule_set, target, source_model, source_family)) = source {
@@ -1376,17 +1385,13 @@ fn finding_for(
                 target,
                 source_model,
                 source_family,
-                endpoint: if nested.is_some() { None } else { endpoint },
+                endpoint: if model_only { None } else { endpoint },
                 routing: &routing.routing,
-                kwargs: if nested.is_some() {
-                    &[]
-                } else {
-                    kwargs.as_slice()
-                },
+                kwargs: if model_only { &[] } else { kwargs.as_slice() },
             };
             let rules = data
                 .rules(rule_set)
-                .filter(|rule| nested.is_none() || about_the_model(rule));
+                .filter(|rule| !model_only || about_the_model(rule));
             outcome = apply_rules(rules, &context);
         }
     }
@@ -1427,6 +1432,20 @@ fn finding_for(
             rule: None,
             message: format!(
                 "The model is set in {container}, nested in this call's arguments: Arbor checked only the model there, not the parameters set next to it, so check those{against} by hand."
+            ),
+            because: Vec::new(),
+            verified: None,
+        });
+    }
+    if let Some(package) = wrapper {
+        let against = live
+            .as_deref()
+            .map(|m| format!(" against {m}"))
+            .unwrap_or_default();
+        reasons.push(ReviewItem {
+            rule: None,
+            message: format!(
+                "The call goes through LangChain ({package}), which takes its own arguments and builds the request: Arbor checked only the model, not the parameters sent with it, so check those{against} by hand."
             ),
             because: Vec::new(),
             verified: None,
@@ -1526,10 +1545,17 @@ fn finding_for(
     })
 }
 
+/// The LangChain package a call goes through (`langchain_openai`), when it
+/// builds a LangChain chat model or calls one.
+fn langchain_package(call: &SdkCall) -> Option<&str> {
+    let package = call.package.as_str();
+    (package == "langchain" || package.starts_with("langchain_")).then_some(package)
+}
+
 /// A rule about the model itself rather than the request that sends it: a
 /// check or a note with no endpoint and no argument condition. Only these
 /// apply to a model nested in a call's arguments, whose own request the
-/// call's argument names do not describe.
+/// call's argument names do not describe, and to a LangChain chat model.
 fn about_the_model(rule: &ParamRule) -> bool {
     matches!(rule.effect, RuleEffect::Review | RuleEffect::Note)
         && rule.endpoints.is_empty()
@@ -3216,6 +3242,76 @@ def tool_model(tools):
         let call = at("client.chat.completions.create(", "model");
         assert!(change(&call, "max_tokens").is_some(), "{call:#?}");
         assert_eq!(call.decisions.len(), 1);
+    }
+
+    #[test]
+    fn langchain_chat_models_get_only_the_rules_about_the_model() {
+        // `ChatOpenAI(max_tokens=...)` is LangChain's argument, which it
+        // maps to the request itself: the SDK's argument changes and
+        // reasoning choices are not the call's to make.
+        let source = r#"from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+from openai import OpenAI
+
+client = OpenAI()
+llm = ChatOpenAI(model="gpt-4o", max_tokens=256, temperature=0)
+claude = ChatAnthropic(model="claude-3-5-sonnet-20241022", temperature=0.2)
+old = ChatOpenAI(model_name="gpt-3.5-turbo")
+plain = client.chat.completions.create(model="gpt-4o", messages=[], max_tokens=256, temperature=0)
+"#;
+        let report = check_source(source, &options("2026-10-27"));
+        let at = |needle: &str| -> Finding {
+            let line = line_of(source, needle);
+            let found: Vec<&Finding> = report.findings.iter().filter(|f| f.line == line).collect();
+            assert_eq!(found.len(), 1, "{needle}: {:#?}", report.findings);
+            found[0].clone()
+        };
+        let data = bundled().unwrap();
+        for (needle, package) in [
+            ("llm = ", "langchain_openai"),
+            ("claude = ", "langchain_anthropic"),
+        ] {
+            let finding = at(needle);
+            assert_eq!(finding.call_kind, CallKind::ModelBinding, "{needle}");
+            assert_eq!(finding.confidence, Confidence::Confirmed, "{needle}");
+            assert_eq!(finding.routing_class, RoutingClass::Direct, "{needle}");
+            assert!(finding.changes.is_empty(), "{:#?}", finding.changes);
+            assert!(finding.decisions.is_empty(), "{:#?}", finding.decisions);
+            assert_eq!(finding.fix, FixKind::Manual, "{needle}");
+            let check = finding
+                .review
+                .iter()
+                .find(|r| r.message.contains("goes through LangChain"))
+                .expect("a check naming LangChain");
+            assert!(check.message.contains(package), "{}", check.message);
+            assert!(
+                check.message.contains(&format!(
+                    "check those against {} by hand",
+                    finding.live_replacement.as_deref().unwrap()
+                )),
+                "{}",
+                check.message
+            );
+            for item in &finding.review {
+                if let Some(id) = &item.rule {
+                    let rule = data.data.rules.iter().find(|r| &r.id == id).unwrap();
+                    assert!(about_the_model(rule), "{id} is about the request");
+                }
+            }
+        }
+        // A retired model still fails the check through LangChain.
+        let old = at("old = ");
+        assert_eq!(old.status, State::Retired);
+        assert!(old.fails);
+        assert_eq!(report.exit_code, 1);
+        // The same model at an SDK request keeps its argument rules.
+        let plain = at("plain = ");
+        assert!(change(&plain, "max_tokens").is_some(), "{plain:#?}");
+        assert_eq!(plain.decisions.len(), 1);
+        assert!(plain
+            .review
+            .iter()
+            .all(|r| !r.message.contains("LangChain")));
     }
 
     #[test]
