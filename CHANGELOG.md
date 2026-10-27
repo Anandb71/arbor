@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **`arbor refactor` exited 0 for a missing symbol (#195):** it now exits 1 and prints `error: Symbol '<name>' not found` to stderr after the "Did you mean" suggestions, matching `inspect` and `callers`.
+- **`npx @anandb71/arbor-cli` failed on npm 12 (#281):** npm 12 skips install scripts by default, so the binary was never downloaded and the wrapper printed "Arbor binary is not installed yet." The wrapper now downloads the release archive for the platform on first run, checks it against the release's `SHA256SUMS`, extracts only the binary and runs it; postinstall uses the same code and a failure there no longer fails `npm install`. Download problems (offline, DNS, untrusted TLS certificate, proxy, HTTP status, checksum mismatch) exit 2 with the reason and the manual steps. Proxies set in `HTTPS_PROXY` or npm's `https-proxy` are used on Node.js 22.21+ and 24.5+.
 
 ## [3.1.0] - 2026-10-20
 

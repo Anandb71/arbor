@@ -193,30 +193,31 @@ function download(url, env, redirects = 0) {
 // Plain-English reasons for a failed download. Never prints a proxy URL,
 // which can carry a password.
 function explainDownloadError(err, env = process.env) {
-  const host = err.url ? new URL(err.url).host : "";
+  const host = err.url ? new URL(err.url).host : "the download host";
   const code = err.code || "";
   const lines = [];
   if (err instanceof HttpStatusError) {
     if (err.status === 404) lines.push(`${err.url} was not found (HTTP 404). Is v${VERSION} released yet?`);
-    else if (err.status === 407) lines.push(`The proxy asked for credentials (HTTP 407). Put them in HTTPS_PROXY (http://user:password@host:port).`);
+    else if (err.status === 407) lines.push("The proxy asked for credentials (HTTP 407): put them in HTTPS_PROXY (http://user:password@host:port).");
     else lines.push(`${err.url} answered HTTP ${err.status}.`);
   } else if (err instanceof ArborInstallError) {
     lines.push(err.message);
   } else if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
-    lines.push(`Could not look up ${err.hostname || "the download host"}: this machine looks offline, or DNS is blocked.`);
+    lines.push(`Could not look up ${err.hostname || host}: this machine looks offline, or DNS is blocked.`);
   } else if (/CERT|SELF_SIGNED|UNABLE_TO_VERIFY|UNABLE_TO_GET_ISSUER/.test(code)) {
-    lines.push(`The download's TLS certificate was not trusted (${code}). A proxy that inspects HTTPS usually causes this:`);
-    lines.push("set NODE_EXTRA_CA_CERTS to the path of its CA certificate and run again.");
-  } else if (code) {
-    lines.push(`Could not download (${code}: ${err.message}). Check the network connection.`);
+    lines.push(`The TLS certificate ${host} presented is not trusted (${code}). A proxy that inspects HTTPS usually`);
+    lines.push("causes this: set NODE_EXTRA_CA_CERTS to the path of its CA certificate (PEM) and run again.");
   } else {
-    lines.push(`Could not download: ${err.message}`);
+    lines.push(`Could not download from ${host} (${code ? `${code}: ` : ""}${err.message}). Check the network connection.`);
   }
   const proxy = proxyEnvFrom(env);
-  if ((proxy.HTTPS_PROXY || proxy.https_proxy) && !nodeUsesProxyEnv()) {
-    lines.push(`A proxy is set, but Node.js ${process.version} does not use it for this download; Node.js 22.21+ and 24.5+ do.`);
+  if (proxy.HTTPS_PROXY || proxy.https_proxy) {
+    lines.push(
+      nodeUsesProxyEnv()
+        ? `A proxy is set in HTTPS_PROXY (or npm's https-proxy): check that it is reachable and lets ${host} through.`
+        : `A proxy is set in HTTPS_PROXY (or npm's https-proxy), but Node.js ${process.version} does not use it here; Node.js 22.21+ and 24.5+ do.`
+    );
   }
-  if (host) lines.push(`(host: ${host})`);
   return lines;
 }
 
@@ -432,18 +433,19 @@ async function ensureBinary(options = {}) {
   const fail = (lines) =>
     new ArborInstallError([`could not install the Arbor v${VERSION} binary for ${key}.`, ...lines, ...manual()].join("\n"));
 
-  const fetch = async (url) => {
+  const fetchOrFail = async (url) => {
     try {
       return await download(url, env);
     } catch (err) {
-      if (!err.url) err.url = url;
+      // Name the URL that was asked for, not a signed redirect target.
+      err.url = url;
       throw fail(explainDownloadError(err, env));
     }
   };
 
   log(`arbor: downloading Arbor v${VERSION} (${asset}) from ${new URL(base).host}, once...`);
-  const sums = (await fetch(sumsUrl)).toString("utf8");
-  const archive = await fetch(assetUrl);
+  const sums = (await fetchOrFail(sumsUrl)).toString("utf8");
+  const archive = await fetchOrFail(assetUrl);
 
   let binary;
   try {

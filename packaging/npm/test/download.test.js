@@ -331,19 +331,19 @@ test("an unreachable server is reported as a network error, not a crash", async 
     lib.ensureBinary({ env: cleanEnv({ ARBOR_NPM_DOWNLOAD_BASE: `${base}/r` }), platform: "linux", arch: "x64", dirs: [tmpDir(t)], log: quiet }),
     (err) => {
       assert.ok(err instanceof lib.ArborInstallError);
-      assert.match(err.message, /Could not download \(ECONNREFUSED/);
+      assert.match(err.message, /Could not download from 127\.0\.0\.1:\d+ \(ECONNREFUSED/);
       return true;
     }
   );
 });
 
-test("a proxy that Node.js will not use is named in the error, without its URL", () => {
+test("a configured proxy is named in the error, without its URL", () => {
   const lines = lib.explainDownloadError(Object.assign(new Error("x"), { code: "ECONNREFUSED" }), {
     HTTPS_PROXY: "http://user:secret@proxy:3128",
   });
   const text = lines.join("\n");
   assert.doesNotMatch(text, /secret/);
-  if (!lib.nodeUsesProxyEnv()) assert.match(text, /A proxy is set/);
+  assert.match(text, /A proxy is set in HTTPS_PROXY/);
 });
 
 test("an unsupported platform is refused before any download", async (t) => {
