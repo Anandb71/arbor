@@ -7446,7 +7446,11 @@ impl<'t> Ctx<'t> {
         } else {
             "model"
         };
-        if !keyed && opaque_splat && (request || model_bearing) {
+        // A call on a built LangChain chat model (`invoke`, `bind`, `batch`,
+        // `stream`...) sends its kwargs over the model's own parameters, so
+        // a `model` there replaces the field.
+        let on_chat_model = target.pkg.is_langchain() && target.receiver == Receiver::Client;
+        if !keyed && opaque_splat && (request || model_bearing || on_chat_model) {
             let unresolved = Unresolved::new("splat", "**kwargs".to_string());
             self.unresolved_gap(&site, model_key, &unresolved, None);
         } else if !keyed && model_bearing && !args.list_splat {
