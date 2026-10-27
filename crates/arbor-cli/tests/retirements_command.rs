@@ -1412,8 +1412,15 @@ fn arguments_that_need_reasoning_off_are_never_no_change() {
         text.contains("also change: max_tokens → max_completion_tokens"),
         "{text}"
     );
-    let unseen = "decide: keep reasoning off (add reasoning_effort=\"none\") or let the model reason (could not check the arguments from **kwargs)";
+    // Named as the code names them (`**options`), not "**kwargs".
+    let unseen = "decide: keep reasoning off (add reasoning_effort=\"none\") or let the model reason (could not check the arguments from **options)";
     assert_eq!(text.matches(unseen).count(), 2, "{text}");
+    assert!(
+        text.contains(
+            "check: Some arguments come from `**options`, so Arbor could not check them all."
+        ),
+        "{text}"
+    );
     assert!(
         text.contains("decide: keep reasoning off (add reasoning_effort=\"none\") or let the model reason (could not check the arguments in extra_body)"),
         "{text}"
@@ -1437,7 +1444,7 @@ fn arguments_that_need_reasoning_off_are_never_no_change() {
         &["retirements", ".", "--markdown", "--today", TODAY],
     ));
     assert!(
-        markdown.contains("let the model reason (could not check the arguments from `**kwargs`)"),
+        markdown.contains("let the model reason (could not check the arguments from `**options`)"),
         "{markdown}"
     );
 }
@@ -1582,8 +1589,11 @@ fn wrapped_client_shapes_keep_their_arguments_checked() {
     );
 
     let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    // A method's own `**kwargs` is named; a conditional has no name.
     let unseen = "let the model reason (could not check the arguments from **kwargs)";
-    assert_eq!(text.matches(unseen).count(), 2, "{text}");
+    assert_eq!(text.matches(unseen).count(), 1, "{text}");
+    let unnamed = "let the model reason (could not check the arguments spread in with **)";
+    assert_eq!(text.matches(unnamed).count(), 1, "{text}");
     assert_eq!(
         text.matches("let the model reason (remove temperature)")
             .count(),

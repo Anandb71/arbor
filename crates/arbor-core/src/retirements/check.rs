@@ -279,6 +279,11 @@ pub struct Decision {
     /// change". `None` (omitted from JSON) when every argument was read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unchecked_args: Option<UncheckedArgs>,
+    /// With `unchecked_args` `splat`: the `**` expressions Arbor could not
+    /// read, by name as written (`PARAMS`, `kwargs`). Empty (omitted from
+    /// JSON) when they have no name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unread_spreads: Vec<String>,
 }
 
 /// Why Arbor could not read every argument a call sends.
@@ -296,19 +301,46 @@ pub enum UncheckedArgs {
 }
 
 impl UncheckedArgs {
-    /// What a person has to check, for the report.
-    pub fn message(self) -> &'static str {
+    /// What a person has to check, for the report. `spreads` names the `**`
+    /// expressions Arbor could not read (`PARAMS`), for `Splat`.
+    pub fn message(self, spreads: &[String]) -> String {
         match self {
-            UncheckedArgs::Splat => {
-                "Some arguments come from `**kwargs`, so Arbor could not check them all."
+            UncheckedArgs::Splat if spreads.is_empty() => {
+                "Some arguments are spread into the call with `**`, so Arbor could not check them all."
+                    .to_string()
             }
+            UncheckedArgs::Splat => format!(
+                "Some arguments come from {}, so Arbor could not check them all.",
+                spread_list(spreads, true)
+            ),
             UncheckedArgs::ExtraBody => {
                 "The entries of `extra_body` are sent as request arguments, and Arbor could not check them."
+                    .to_string()
             }
             UncheckedArgs::NotRecorded => {
                 "Arbor did not record this call's arguments, so it could not check them."
+                    .to_string()
             }
         }
+    }
+}
+
+/// `**PARAMS and **overrides` (each in backticks with `code`).
+pub fn spread_list(names: &[String], code: bool) -> String {
+    let names: Vec<String> = names
+        .iter()
+        .map(|n| {
+            if code {
+                format!("`**{n}`")
+            } else {
+                format!("**{n}")
+            }
+        })
+        .collect();
+    match names.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -1333,7 +1365,7 @@ fn finding_for(
             Some(call.span),
             call.symbol.clone(),
             Some(call.chain.clone()),
-            Some((call.kwargs.clone(), call.splat)),
+            Some((call.kwargs.clone(), call.splat, call.spreads.clone())),
             // A parameter object's arguments are not the request's.
             (kind != CallKind::RequestParam)
                 .then(|| endpoint_of(&call.chain, &call.member))
@@ -1349,14 +1381,33 @@ fn finding_for(
                 gap.chain.clone(),
                 // A call whose client was not resolved still shows its
                 // arguments: the same rules apply to them.
-                gap.args.as_ref().map(|a| (a.kwargs.clone(), a.splat)),
+                gap.args
+                    .as_ref()
+                    .map(|a| (a.kwargs.clone(), a.splat, a.spreads.clone())),
                 endpoint_of(&chain, &chain),
                 CallKind::Request,
             )
         }
     };
     let recorded = args.is_some();
-    let (kwargs, splat) = args.unwrap_or_default();
+    let (mut kwargs, splat, spreads) = args.unwrap_or_default();
+    // A same-file dict spread in with `**` sends its keys as arguments: the
+    // rules check them like the call's own. A spread Arbor could not read in
+    // full, or a scan that recorded none, leaves arguments unseen.
+    for key in spreads.iter().flat_map(|s| &s.keys) {
+        if !kwargs.contains(key) {
+            kwargs.push(key.clone());
+        }
+    }
+    let unread_spread = splat && (spreads.is_empty() || spreads.iter().any(|s| !s.complete));
+    let mut unread_spreads: Vec<String> = Vec::new();
+    for name in spreads
+        .iter()
+        .filter(|s| !s.complete)
+        .filter_map(|s| s.name.clone())
+    {
+        push_unique(&mut unread_spreads, name);
+    }
     let gap_reason = match site {
         Site::Gap(gap) => Some(gap.reason.clone()),
         Site::Call(..) => None,
@@ -1437,7 +1488,7 @@ fn finding_for(
     // object are checked by hand anyway (see below).
     let unchecked = if !recorded {
         Some(UncheckedArgs::NotRecorded)
-    } else if splat {
+    } else if unread_spread {
         Some(UncheckedArgs::Splat)
     } else if nested.is_none()
         && call_kind != CallKind::RequestParam
@@ -1447,11 +1498,21 @@ fn finding_for(
     } else {
         None
     };
+    if unchecked != Some(UncheckedArgs::Splat) {
+        unread_spreads.clear();
+    }
     for decision in &mut outcome.decisions {
         decision.unchecked_args = unchecked;
+        decision.unread_spreads = unread_spreads.clone();
     }
 
-    let mut reasons = model_reasons(&hit, status, unchecked, source.is_some(), chained);
+    let mut reasons = model_reasons(
+        &hit,
+        status,
+        unchecked.map(|u| u.message(&unread_spreads)),
+        source.is_some(),
+        chained,
+    );
     if let Some(chain) = replacement_chain.as_ref().filter(|c| c.chained()) {
         reasons.push(ReviewItem {
             rule: None,
@@ -1662,7 +1723,7 @@ fn endpoint_of(chain: &str, member: &str) -> Option<&'static str> {
 fn model_reasons(
     hit: &Hit<'_>,
     status: State,
-    unchecked: Option<UncheckedArgs>,
+    unchecked: Option<String>,
     rules_known: bool,
     chained: bool,
 ) -> Vec<ReviewItem> {
@@ -1709,7 +1770,7 @@ fn model_reasons(
         );
     }
     if let Some(unchecked) = unchecked {
-        messages.push(unchecked.message().to_string());
+        messages.push(unchecked);
     }
     messages
         .into_iter()
@@ -2012,6 +2073,7 @@ fn add_choice(rule: &ParamRule, context: &RuleContext<'_>, out: &mut Outcome) {
                 notes: Vec::new(),
                 // Set by the caller, which knows what the scan read.
                 unchecked_args: None,
+                unread_spreads: Vec::new(),
             });
             out.decisions.len() - 1
         }
@@ -4024,7 +4086,7 @@ def run():
             let unseen = finding(at(args));
             assert_eq!(unseen.decisions[0].unchecked_args, Some(why));
             assert!(
-                unseen.review.iter().any(|r| r.message == why.message()),
+                unseen.review.iter().any(|r| r.message == why.message(&[])),
                 "{:#?}",
                 unseen.review
             );
@@ -4046,7 +4108,7 @@ def run():
             assert_eq!(finding.decisions[0].unchecked_args, why, "{finding:#?}");
             match why {
                 Some(why) => {
-                    assert!(finding.review.iter().any(|r| r.message == why.message()));
+                    assert!(finding.review.iter().any(|r| r.message == why.message(&[])));
                     assert_eq!(finding.fix, FixKind::Manual);
                 }
                 // Every argument was read and none conflicts: "no change"
@@ -4081,7 +4143,65 @@ def run():
         assert!(!finding
             .review
             .iter()
-            .any(|r| r.message == UncheckedArgs::ExtraBody.message()));
+            .any(|r| r.message == UncheckedArgs::ExtraBody.message(&[])));
+    }
+
+    #[test]
+    fn a_spread_dict_is_checked_and_one_arbor_cannot_read_is_named() {
+        let spread = |name: Option<&str>, keys: &[&str], complete: bool| crate::usages::Spread {
+            name: name.map(str::to_string),
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+            complete,
+        };
+        let with = |spreads: Vec<crate::usages::Spread>| {
+            let mut call = openai("gpt-4o-mini", &["messages"]);
+            call.splat = true;
+            call.spreads = spreads;
+            one(&[call])
+        };
+
+        // `**PARAMS`, a same-file literal holding temperature: checked like
+        // an argument written at the call, and nothing is left unseen.
+        let read = with(vec![spread(
+            Some("PARAMS"),
+            &["model", "temperature"],
+            true,
+        )]);
+        assert_eq!(read.decisions[0].unchecked_args, None);
+        assert_eq!(option(&read, "model_default").remove, ["temperature"]);
+        assert_eq!(option(&read, "reasoning_none").keep, ["temperature"]);
+        assert!(read.review.is_empty(), "{:#?}", read.review);
+
+        // Names it could not read are named, never "**kwargs" for all.
+        let unread = with(vec![
+            spread(Some("PARAMS"), &["temperature"], true),
+            spread(Some("settings.llm"), &[], false),
+            spread(Some("kwargs"), &[], false),
+        ]);
+        let decision = &unread.decisions[0];
+        assert_eq!(decision.unchecked_args, Some(UncheckedArgs::Splat));
+        assert_eq!(decision.unread_spreads, ["settings.llm", "kwargs"]);
+        // What it could read still counts.
+        assert_eq!(option(&unread, "model_default").remove, ["temperature"]);
+        let message = "Some arguments come from `**settings.llm` and `**kwargs`, so Arbor could not check them all.";
+        assert!(
+            unread.review.iter().any(|r| r.message == message),
+            "{:#?}",
+            unread.review
+        );
+        assert_eq!(unread.fix, FixKind::Manual);
+
+        // No name (a conditional), or a scan that recorded no spreads.
+        for spreads in [vec![spread(None, &[], false)], Vec::new()] {
+            let unnamed = with(spreads);
+            assert_eq!(
+                unnamed.decisions[0].unchecked_args,
+                Some(UncheckedArgs::Splat)
+            );
+            assert!(unnamed.decisions[0].unread_spreads.is_empty());
+            assert!(unnamed.review.iter().any(|r| r.message
+                == "Some arguments are spread into the call with `**`, so Arbor could not check them all."));
+        }
     }
 
     #[test]

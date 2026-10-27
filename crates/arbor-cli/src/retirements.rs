@@ -20,10 +20,10 @@
 //! `--include-routed`.
 
 use arbor_core::retirements::{
-    bundled, check, python_literal, routing_gap_text, value_gap_text, BaseUrl, CallKind, Change,
-    ChangeKind, CheckOptions, Confidence, Date, DateKind, Decision, Finding, MatchKind,
-    OptionStatus, RetirementReport, RoutingClass, ScanInput, State, UncheckedArgs, FINE_TUNING,
-    REPORT_VERSION,
+    bundled, check, python_literal, routing_gap_text, spread_list, value_gap_text, BaseUrl,
+    CallKind, Change, ChangeKind, CheckOptions, Confidence, Date, DateKind, Decision, Finding,
+    MatchKind, OptionStatus, RetirementReport, RoutingClass, ScanInput, State, UncheckedArgs,
+    FINE_TUNING, REPORT_VERSION,
 };
 use arbor_core::usages::{is_unsafe_char, ValueOrigin};
 use arbor_watcher::usages::{scan_usages, UsageScanOptions};
@@ -386,7 +386,7 @@ fn describe_decision(decision: &Decision, code: bool) -> String {
             // the call needs no change.
             if option.add.is_empty() {
                 if let Some(unchecked) = decision.unchecked_args {
-                    edits.push(unchecked_clause(unchecked, code));
+                    edits.push(unchecked_clause(unchecked, &decision.unread_spreads, code));
                 }
             }
             if edits.is_empty() {
@@ -398,13 +398,18 @@ fn describe_decision(decision: &Decision, code: bool) -> String {
         .join(" or ")
 }
 
-/// `could not check the arguments from **kwargs`: said in place of "no
+/// `could not check the arguments from **PARAMS`: said in place of "no
 /// change" when Arbor could not read every argument the call sends.
-fn unchecked_clause(unchecked: UncheckedArgs, code: bool) -> String {
+/// `spreads` names the `**` expressions it could not read.
+fn unchecked_clause(unchecked: UncheckedArgs, spreads: &[String], code: bool) -> String {
     match unchecked {
+        UncheckedArgs::Splat if spreads.is_empty() => format!(
+            "could not check the arguments spread in with {}",
+            tick("**", code)
+        ),
         UncheckedArgs::Splat => format!(
             "could not check the arguments from {}",
-            tick("**kwargs", code)
+            spread_list(spreads, code)
         ),
         UncheckedArgs::ExtraBody => format!(
             "could not check the arguments in {}",
