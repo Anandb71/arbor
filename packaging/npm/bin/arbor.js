@@ -9,7 +9,7 @@
 
 const { spawnSync } = require("child_process");
 const os = require("os");
-const { ArborInstallError, ensureBinary, findBinary } = require("../lib/download");
+const { ArborInstallError, ensureBinary, findBinary, redact } = require("../lib/download");
 
 async function main() {
   let target = findBinary();
@@ -17,7 +17,9 @@ async function main() {
     try {
       target = (await ensureBinary()).path;
     } catch (err) {
-      const message = err instanceof ArborInstallError ? err.message : err.stack || String(err);
+      // An ArborInstallError's message is already safe to print; anything
+      // else could quote a proxy URL with its password.
+      const message = err instanceof ArborInstallError ? err.message : redact(err.stack || String(err));
       process.stderr.write(`arbor: ${message}\n`);
       process.exit(2);
     }
@@ -26,6 +28,13 @@ async function main() {
   const result = spawnSync(target, process.argv.slice(2), { stdio: "inherit" });
   if (result.error) {
     process.stderr.write(`arbor: could not run ${target}: ${result.error.message}\n`);
+    if (result.error.code === "ENOENT" && process.platform === "linux") {
+      // The file is there, so what is missing is its loader: the prebuilt
+      // Linux binaries are built against glibc.
+      process.stderr.write(
+        "arbor: the prebuilt Linux binary needs glibc. On Alpine or another musl-based system, build it with Rust: cargo install arbor-graph-cli\n"
+      );
+    }
     process.exit(2);
   }
   if (result.signal) {

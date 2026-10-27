@@ -346,6 +346,66 @@ test("a configured proxy is named in the error, without its URL", () => {
   assert.match(text, /A proxy is set in HTTPS_PROXY/);
 });
 
+// Node's own proxy errors quote the proxy URL, password included.
+test("Node's proxy errors are explained without the proxy's password", () => {
+  const env = { HTTPS_PROXY: "http://user:s3cret@proxy.corp:3128" };
+  const explain = (message, code) =>
+    lib.explainDownloadError(Object.assign(new Error(message), { code, url: "https://github.com/x" }), env).join("\n");
+
+  const auth = explain("Failed to establish tunnel to github.com:443 via http://user:s3cret@proxy.corp:3128: HTTP/1.1 407 Proxy Authentication Required", "ERR_PROXY_TUNNEL");
+  assert.doesNotMatch(auth, /s3cret/);
+  assert.match(auth, /asked for credentials \(HTTP 407\)/);
+
+  const refused = explain("Failed to establish tunnel to github.com:443 via http://user:s3cret@proxy.corp:3128: HTTP/1.1 403 Forbidden", "ERR_PROXY_TUNNEL");
+  assert.doesNotMatch(refused, /s3cret/);
+  assert.match(refused, /would not open a connection to github\.com \(HTTP 403\)/);
+
+  const invalid = lib.explainDownloadError(
+    Object.assign(new Error("Invalid proxy URL: http://user:s3cret@bad host:3128"), { code: "ERR_PROXY_INVALID_CONFIG", url: "https://github.com/x" }),
+    { HTTPS_PROXY: "http://user:s3cret@bad host:3128" }
+  ).join("\n");
+  assert.doesNotMatch(invalid, /s3cret/);
+  assert.match(invalid, /is not a valid URL/);
+
+  // Any other message: the setting is hidden as written, and any
+  // user:password@ written another way too.
+  const other = explain("socket hang up via http://user:s3cret@proxy.corp:3128/ and HTTP://u:s3cret@other:1", "ECONNRESET");
+  assert.doesNotMatch(other, /s3cret/);
+  assert.equal(lib.redact("see https://github.com/Anandb71/arbor/releases/download/v1/SHA256SUMS", env), "see https://github.com/Anandb71/arbor/releases/download/v1/SHA256SUMS");
+});
+
+test("a proxy that refuses the tunnel fails cleanly, without its password", { skip: !lib.nodeUsesProxyEnv() && "this Node.js does not use HTTPS_PROXY" }, async (t) => {
+  const proxy = http.createServer((req, res) => res.writeHead(407).end());
+  proxy.on("connect", (req, socket) => {
+    socket.on("error", () => {});
+    socket.end('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="x"\r\nContent-Length: 0\r\n\r\n');
+  });
+  await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => proxy.close(resolve)));
+  const env = cleanEnv({
+    // Never reached: the proxy answers the CONNECT itself.
+    ARBOR_NPM_DOWNLOAD_BASE: "https://release.example.invalid/r",
+    HTTPS_PROXY: `http://user:s3cret@127.0.0.1:${proxy.address().port}`,
+  });
+  await assert.rejects(lib.ensureBinary({ env, platform: "linux", arch: "x64", dirs: [tmpDir(t)], log: quiet }), (err) => {
+    assert.ok(err instanceof lib.ArborInstallError);
+    assert.doesNotMatch(err.message, /s3cret/);
+    assert.match(err.message, /asked for credentials \(HTTP 407\)/);
+    return true;
+  });
+});
+
+test("the cache folder: absolute, and skipped when there is no home folder", () => {
+  const noHome = () => {
+    throw Object.assign(new Error("uv_os_homedir returned ENOENT"), { code: "ERR_SYSTEM_ERROR" });
+  };
+  assert.equal(lib.userCacheDir({}, "linux", noHome), null);
+  assert.equal(lib.userCacheDir({ XDG_CACHE_HOME: "/xdg" }, "linux", noHome), path.join("/xdg", "arbor", "npm", `v${lib.VERSION}`));
+  assert.equal(lib.userCacheDir({ LOCALAPPDATA: "C:\\Local" }, "win32", noHome), path.join("C:\\Local", "arbor", "npm", `v${lib.VERSION}`));
+  assert.equal(lib.userCacheDir({}, "darwin", () => "/Users/a"), path.join("/Users/a", "Library", "Caches", "arbor", "npm", `v${lib.VERSION}`));
+  assert.ok(path.isAbsolute(lib.userCacheDir({ ARBOR_NPM_CACHE_DIR: "relative/cache" }, "linux", noHome)));
+});
+
 test("an unsupported platform is refused before any download", async (t) => {
   const server = await serve({});
   t.after(server.close);

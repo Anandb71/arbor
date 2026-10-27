@@ -53,19 +53,33 @@ function assetFor(platform = process.platform, arch = process.arch) {
 
 // The binary may live in this package's bin/ folder (put there by
 // postinstall or an earlier first run) or, when that folder was not
-// writable, in a per-user cache folder for this version.
-function userCacheDir(env = process.env, platform = process.platform) {
-  if (env.ARBOR_NPM_CACHE_DIR) return path.join(env.ARBOR_NPM_CACHE_DIR, `v${VERSION}`);
-  const home = os.homedir();
+// writable, in a per-user cache folder for this version. Returns null when
+// there is no home folder to put one in (os.homedir() throws for a user
+// with no HOME and no passwd entry, as in some containers): the package
+// folder still works then.
+function userCacheDir(env = process.env, platform = process.platform, homedir = os.homedir) {
+  if (env.ARBOR_NPM_CACHE_DIR) return path.resolve(env.ARBOR_NPM_CACHE_DIR, `v${VERSION}`);
   let root;
-  if (platform === "win32") root = env.LOCALAPPDATA || path.join(home, "AppData", "Local");
-  else if (platform === "darwin") root = path.join(home, "Library", "Caches");
-  else root = env.XDG_CACHE_HOME || path.join(home, ".cache");
+  if (platform === "win32" && env.LOCALAPPDATA) root = env.LOCALAPPDATA;
+  else if (platform !== "win32" && platform !== "darwin" && env.XDG_CACHE_HOME) root = env.XDG_CACHE_HOME;
+  else {
+    let home;
+    try {
+      home = homedir();
+    } catch (_) {
+      return null;
+    }
+    if (!home) return null;
+    if (platform === "win32") root = path.join(home, "AppData", "Local");
+    else if (platform === "darwin") root = path.join(home, "Library", "Caches");
+    else root = path.join(home, ".cache");
+  }
   return path.join(root, "arbor", "npm", `v${VERSION}`);
 }
 
 function defaultDirs(env = process.env, platform = process.platform) {
-  return [PACKAGE_BIN_DIR, userCacheDir(env, platform)];
+  const cache = userCacheDir(env, platform);
+  return cache ? [PACKAGE_BIN_DIR, cache] : [PACKAGE_BIN_DIR];
 }
 
 function findBinary(dirs = defaultDirs(), platform = process.platform) {
@@ -190,6 +204,21 @@ function download(url, env, redirects = 0) {
   });
 }
 
+// Takes proxy URLs, which can carry a password, out of a message. Node's
+// own proxy errors quote the proxy URL in full ("Failed to establish tunnel
+// to github.com:443 via http://user:password@host:port: HTTP/1.1 407",
+// "Invalid proxy URL: <the setting as written>"), so any error text this
+// file did not write itself goes through this before it is printed.
+function redact(text, env = process.env) {
+  let out = String(text);
+  for (const [key, value] of Object.entries(proxyEnvFrom(env))) {
+    if (/^no_proxy$/i.test(key) || !value || value.length < 2) continue;
+    out = out.split(value).join("<proxy URL hidden>");
+  }
+  // Any user:password@ left, in a URL written differently from the setting.
+  return out.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/]*@/gi, "$1<credentials hidden>@");
+}
+
 // Plain-English reasons for a failed download. Never prints a proxy URL,
 // which can carry a password.
 function explainDownloadError(err, env = process.env) {
@@ -201,14 +230,25 @@ function explainDownloadError(err, env = process.env) {
     else if (err.status === 407) lines.push("The proxy asked for credentials (HTTP 407): put them in HTTPS_PROXY (http://user:password@host:port).");
     else lines.push(`${err.url} answered HTTP ${err.status}.`);
   } else if (err instanceof ArborInstallError) {
-    lines.push(err.message);
+    lines.push(redact(err.message, env));
+  } else if (code === "ERR_PROXY_INVALID_CONFIG") {
+    lines.push("The proxy setting (HTTPS_PROXY, or npm's https-proxy or proxy) is not a valid URL.");
+    lines.push("Expected http://host:port, or http://user:password@host:port with special characters percent-encoded.");
+  } else if (code === "ERR_PROXY_TUNNEL") {
+    const status = (/HTTP\/\d(?:\.\d)? (\d{3})/.exec(err.message || "") || [])[1];
+    if (status === "407") {
+      lines.push("The proxy asked for credentials (HTTP 407): put them in HTTPS_PROXY (http://user:password@host:port).");
+    } else {
+      lines.push(`The proxy would not open a connection to ${host}${status ? ` (HTTP ${status})` : ""}.`);
+      lines.push(`It has to let ${host} and release-assets.githubusercontent.com through.`);
+    }
   } else if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
     lines.push(`Could not look up ${err.hostname || host}: this machine looks offline, or DNS is blocked.`);
   } else if (/CERT|SELF_SIGNED|UNABLE_TO_VERIFY|UNABLE_TO_GET_ISSUER/.test(code)) {
     lines.push(`The TLS certificate ${host} presented is not trusted (${code}). A proxy that inspects HTTPS usually`);
     lines.push("causes this: set NODE_EXTRA_CA_CERTS to the path of its CA certificate (PEM) and run again.");
   } else {
-    lines.push(`Could not download from ${host} (${code ? `${code}: ` : ""}${err.message}). Check the network connection.`);
+    lines.push(`Could not download from ${host} (${code ? `${code}: ` : ""}${redact(err.message, env)}). Check the network connection.`);
   }
   const proxy = proxyEnvFrom(env);
   if (proxy.HTTPS_PROXY || proxy.https_proxy) {
@@ -361,9 +401,15 @@ function extractFromZip(zip, wanted, asset = "the archive") {
   return null;
 }
 
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 // Writes the binary under a temporary name, then renames it into place, so
 // a concurrent run never sees half a file. If another run got there first
-// (Windows will not replace an .exe that is running), its copy is used.
+// (Windows will not replace an .exe that is running), its copy is used. On
+// Windows an antivirus scan of the new file can hold it for a moment, so a
+// failed rename is retried briefly, as npm itself does.
 function installInto(dir, binary, platform = process.platform) {
   const crypto = require("crypto");
   fs.mkdirSync(dir, { recursive: true });
@@ -372,13 +418,17 @@ function installInto(dir, binary, platform = process.platform) {
   try {
     fs.writeFileSync(tmp, binary, { mode: 0o755 });
     fs.chmodSync(tmp, 0o755);
-    try {
-      fs.renameSync(tmp, target);
-    } catch (err) {
-      if (findBinary([dir], platform)) return target;
-      throw err;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        fs.renameSync(tmp, target);
+        return target;
+      } catch (err) {
+        if (findBinary([dir], platform)) return target;
+        const transient = process.platform === "win32" && ["EPERM", "EACCES", "EBUSY"].includes(err.code);
+        if (!transient || attempt >= 6) throw err;
+        sleepSync(100 * attempt);
+      }
     }
-    return target;
   } finally {
     try {
       fs.rmSync(tmp, { force: true });
@@ -486,6 +536,7 @@ module.exports = {
   findBinary,
   nodeUsesProxyEnv,
   proxyEnvFrom,
+  redact,
   releaseBase,
   userCacheDir,
   verifyChecksum,

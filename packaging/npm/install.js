@@ -6,14 +6,14 @@
 "use strict";
 
 const { execSync } = require("child_process");
-const { VERSION, ensureBinary } = require("./lib/download");
+const { ArborInstallError, VERSION, ensureBinary, redact } = require("./lib/download");
 
 async function main() {
   try {
     const { path: installed, downloaded } = await ensureBinary({ log: (line) => console.log(line) });
     console.log(downloaded ? "Arbor installed successfully!" : `Arbor v${VERSION} is already installed: ${installed}`);
   } catch (err) {
-    console.warn(`arbor: ${err.message}`);
+    console.warn(`arbor: ${err instanceof ArborInstallError ? err.message : redact(err.message)}`);
     console.warn("");
     console.warn("The npm install itself succeeded; `arbor` will try the download again on its first run.");
     return;
