@@ -261,7 +261,8 @@ completion models (`langchain_openai.OpenAI`, `BedrockLLM`),
 - **The constructor binds the model.** `ChatOpenAI(model="gpt-4o")` is a
   construction and a call (`request: false`) whose `model` or `model_name`
   value is read under the value rules above (`model_id` or `model` on the
-  Bedrock models). LangChain takes the model under either name:
+  Bedrock models, and no other key). LangChain takes the model under either
+  name:
   - given both (by keyword or through a same-file dict expanded with `**`),
     a `reassigned` gap with no key keeps both values unconfirmed;
   - given one next to a `**` expansion the file cannot read, a `splat` gap
@@ -344,23 +345,37 @@ session given `botocore_session` or a `**` expansion are not followed.
   expansion the file cannot read is a `splat` gap.
 - **The route** is `bedrock` for any model: Anthropic's, Amazon's, Meta's,
   Mistral's, an inference profile or an ARN. An `endpoint_url` routes by
-  host: a Bedrock runtime host on AWS (`bedrock-runtime.<region>.amazonaws.com`,
-  its FIPS and dual-stack forms, a VPC endpoint's
-  `vpce-....bedrock-runtime....vpce.amazonaws.com`) stays `bedrock`, any other
-  host is `custom_base_url`, and an environment lookup, a value that does not
+  host: a Bedrock runtime host of a region on AWS
+  (`bedrock-runtime.<region>.amazonaws.com`, its `.amazonaws.com.cn`,
+  dual-stack `.api.aws` and `bedrock-runtime-fips` forms, a VPC endpoint's
+  `vpce-<id>.bedrock-runtime.<region>.vpce.amazonaws.com`) stays `bedrock`,
+  any other host (a bucket named `bedrock-runtime` on S3 included) is
+  `custom_base_url`, and an environment lookup, a value that does not
   resolve or a `**` expansion routes `unknown` with a gap, as for a direct
-  client's `base_url` ([Routes](#routes)). A file that sets
+  client's `base_url` ([Routes](#routes)). `endpoint_url` is also boto3's
+  sixth positional argument: a client given six or more positional
+  arguments, or `*args`, routes `unknown` the same way. A file that sets
   `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` or `AWS_ENDPOINT_URL` is an
-  `endpoint_env` gap. Replacing a request or the constructor
-  (`client.converse = ...`, `boto3.client = ...`) or registering a botocore
-  event handler (`client.meta.events.register(...)`,
-  `session.events.register(...)`), which may rewrite a request's parameters
-  or send it elsewhere, is a `dynamic_feature` gap on every Bedrock route of
-  the file.
+  `endpoint_env` gap.
+- **Replaced or hooked.** Replacing a request or the constructor
+  (`client.converse = ...`, `boto3.client = ...`), or registering a
+  botocore event handler, which may rewrite a request's parameters or send
+  it elsewhere, is a `dynamic_feature` gap on every Bedrock route of the
+  file. A handler counts when it is registered on a Bedrock client's or a
+  session's events (`client.meta.events.register(...)`,
+  `session.events.register(...)`), when any `register`, `register_first`
+  or `register_last` call names a botocore event
+  (`"before-parameter-build.bedrock-runtime.Converse"`, wherever the
+  session comes from), and when the default session is set up from a
+  botocore session (`boto3.setup_default_session(botocore_session=...)`).
 - **Unknown receivers.** In a file that imports boto3, a Bedrock-shaped call
-  (`.converse(...)`, `.invoke_model(...)`) on a receiver that is not a
+  (`.converse(...)`, `.converse_stream(...)`, `.invoke_model(...)`,
+  `.invoke_model_with_response_stream(...)`) on a receiver that is not a
   tracked client (a parameter, a factory's result) is an
-  `unknown_client_factory` gap that lists the `modelId` it passes.
+  `unknown_client_factory` gap that lists the `modelId` it passes. A file
+  is read only when it names `bedrock-runtime`, `invoke_model`, `converse(`
+  or `converse_stream(` (or another SDK), so a service name built from parts
+  in a file that names none of them reports nothing.
 - **Not followed:** `aioboto3`, a botocore session or client built directly,
   the `bedrock-agent-runtime` client, the Anthropic SDK's `AnthropicBedrock`
   (routed `anthropic_bedrock`, above) and type annotations from
@@ -370,20 +385,30 @@ session given `botocore_session` or a `**` expansion are not followed.
 however they are imported (`from litellm import completion`,
 `litellm.main.completion`). The model is `model`, by keyword or as the first
 positional argument, read under the value rules; a `fallbacks=[{"model":
-...}]` entry is a nested value. No other LiteLLM function is followed
+...}]` entry is a nested value, while plain-string fallbacks
+(`fallbacks=["gpt-4o-mini"]`) and `litellm.model_fallbacks` are not read.
+No other LiteLLM function is followed
 (`embedding`, `text_completion`, `responses`, `Router`, `token_counter`,
 `supports_function_calling`...). A missing model is a `TypeError`, so it is
 not a gap.
 
 - **The route** is `litellm`. LiteLLM picks the provider and endpoint from
   the model string (`anthropic/...`, `azure/...`, `bedrock/...`) and its
-  configuration (`api_base=`, the environment, `litellm.api_base`), so the
-  report does not say which provider's API the call reaches. Replacing
-  `litellm.completion` is a `dynamic_feature` gap on the route; a setting
+  arguments and configuration (`custom_llm_provider=`, `api_base=`, the
+  environment, `litellm.api_base`), so the report does not say which
+  provider's API the call reaches. Replacing `litellm.completion` is a
+  `dynamic_feature` gap on the route; a setting
   (`litellm.drop_params = True`) changes nothing.
-- **Model aliases.** `litellm.model_alias_map` maps the model a call is given
-  to another one. A file that mentions it anywhere gives every LiteLLM model
-  value a `dynamic_feature` gap.
+- **Remapped models.** LiteLLM may send a model name it is given to another
+  model, and these gaps hold no key, so they cover every model value of the
+  call, nested fallbacks included:
+  - `litellm.model_alias_map` maps it process-wide: a file that mentions it
+    anywhere gives every LiteLLM call a `dynamic_feature` gap;
+  - a `model_list` passed to the call, by keyword or in a same-file dict
+    expanded with `**`, maps it to a deployment: a `model_list` gap, and the
+    list's entries are not read as models;
+  - a `**` expansion the file cannot read may hold a `model_list`: a
+    `splat` gap.
 
 `arbor retirements` lists both only with `--include-routed`. AWS keeps
 Bedrock's model schedule, which the bundled data does not hold, so a Bedrock
@@ -523,9 +548,11 @@ The report assumes the rest. In particular:
   `ANTHROPIC_BASE_URL` or `GOOGLE_GENAI_USE_VERTEXAI`, and for a LangChain
   chat model `OPENAI_API_BASE`, `ANTHROPIC_API_URL` or `LANGSMITH_GATEWAY`.
 - Where a Bedrock client sends its requests may also come from the AWS
-  configuration (an `endpoint_url` in `~/.aws/config`, the profile
-  `AWS_PROFILE` selects), and a LiteLLM call's from settings another module
-  makes (`litellm.api_base`, `litellm.model_alias_map`). Neither is seen.
+  configuration: an `endpoint_url` in `~/.aws/config`, under whichever
+  profile the environment or the file selects (`AWS_PROFILE`,
+  `boto3.Session(profile_name=...)`). A LiteLLM call's may come from
+  settings another module makes (`litellm.api_base`,
+  `litellm.model_alias_map`). Neither is seen.
 - A LangChain chat model's field names and aliases are those of the current
   `langchain-openai`, `langchain-anthropic` and `langchain-aws`; which LangChain version the
   project runs is not known. The deprecated classes are read the same way.
