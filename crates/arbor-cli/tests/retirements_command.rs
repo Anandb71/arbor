@@ -713,7 +713,7 @@ fn human_report_reads_plainly_and_offers_a_review_once() {
     let review = "https://getarbor.dev/retirements?utm_source=arbor-cli&review=1&calls=4&retired=1&next=2027-01-14";
     assert_eq!(text.matches("getarbor.dev").count(), 1, "{text}");
     assert!(text.contains(&format!(
-        "\nWant these calls ready before 14 Jan 2027? Ask for a readiness review: Arbor writes the fix pull requests with you and lists every call it could not check.\n{review}\nArbor has sent nothing. Opening this link shares only how many calls are listed, how many are already retired and the next shutdown date: no code, paths, file names or model names. Your email reaches Arbor only if you submit the form there.\n"
+        "\nWant these calls ready before 14 Jan 2027? Ask for a readiness review: Arbor writes the fix pull requests with you and lists every call it could not check.\n{review}\nArbor has sent nothing. From this run, opening the link shares only how many calls are listed, how many are already retired and the next shutdown date: no code, paths, file names or model names. Your email reaches Arbor only if you submit the form there.\n"
     )), "{text}");
     assert!(text.ends_with("submit the form there.\n"), "{text}");
     // The link names no file, path, directory or model from the scan.
@@ -773,6 +773,52 @@ fn human_report_reads_plainly_and_offers_a_review_once() {
         ),
     ] {
         assert!(!stdout(&output).contains("getarbor.dev"), "{output:?}");
+    }
+}
+
+#[test]
+fn the_review_link_ignores_hostile_names_and_matches_the_json_summary() {
+    // A directory and file named like query parameters and model names, and
+    // a model string shaped like a query string: none of it reaches the
+    // link, and the link's numbers are the JSON summary's.
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir
+        .path()
+        .join("acme-secret&calls=999&next=1999-01-01#frag");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("gpt-4o-2024-08-06&retired=7.py"), APP).unwrap();
+    fs::write(
+        nested.join("inject.py"),
+        "from openai import OpenAI\n\nclient = OpenAI()\n\n\ndef ask():\n    return client.chat.completions.create(model=\"gpt-4o-2024-08-06&calls=1\", messages=[])\n",
+    )
+    .unwrap();
+
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    let (_, report) = run_json(dir.path(), &[]);
+    let summary = &report["summary"];
+    let links: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("getarbor.dev"))
+        .collect();
+    assert_eq!(
+        links,
+        [format!(
+            "https://getarbor.dev/retirements?utm_source=arbor-cli&review=1&calls={}&retired={}&next={}",
+            summary["affected_calls"],
+            summary["retired"],
+            summary["next_shutdown"]["date"].as_str().unwrap()
+        )],
+        "{text}"
+    );
+    assert!(
+        links[0].ends_with("&review=1&calls=4&retired=1&next=2027-01-14"),
+        "{text}"
+    );
+    let query = links[0].split_once('?').unwrap().1;
+    for leak in [
+        "acme", "secret", "999", "frag", "#", "gpt", "claude", ".py", "=7", "inject",
+    ] {
+        assert!(!query.contains(leak), "{leak} in {}", links[0]);
     }
 }
 

@@ -223,7 +223,7 @@ fn offer_lines(s: &Summary, routed: bool) -> Vec<String> {
             ),
             url,
             format!(
-                "Arbor has sent nothing. Opening this link shares only {carries}: no code, paths, file names or model names. Your email reaches Arbor only if you submit the form there."
+                "Arbor has sent nothing. From this run, opening the link shares only {carries}: no code, paths, file names or model names. Your email reaches Arbor only if you submit the form there."
             ),
         ];
     }
