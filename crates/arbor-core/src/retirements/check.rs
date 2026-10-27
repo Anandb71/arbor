@@ -1379,9 +1379,10 @@ fn finding_for(
     // nothing about it, so only the rules about the model itself apply.
     let nested = value.key.rsplit_once('.').map(|(container, _)| container);
     // A LangChain chat model takes LangChain's arguments, not the
-    // provider's, and builds the request itself: the same holds.
+    // provider's, and builds the request itself: the same holds, and for
+    // LiteLLM and Amazon Bedrock too.
     let wrapper = match site {
-        Site::Call(call, _) => langchain_package(call),
+        Site::Call(call, _) => wrapper_of(call),
         Site::Gap(_) => None,
     };
     let model_only = nested.is_some() || wrapper.is_some();
@@ -1444,7 +1445,7 @@ fn finding_for(
             verified: None,
         });
     }
-    if let Some(package) = wrapper {
+    if let Some(through) = wrapper {
         let against = live
             .as_deref()
             .map(|m| format!(" against {m}"))
@@ -1452,7 +1453,7 @@ fn finding_for(
         reasons.push(ReviewItem {
             rule: None,
             message: format!(
-                "The call goes through LangChain ({package}), which takes its own arguments and builds the request: Arbor checked only the model, not the parameters sent with it, so check those{against} by hand."
+                "The call goes through {through}, which takes its own arguments and builds the request: Arbor checked only the model, not the parameters sent with it, so check those{against} by hand."
             ),
             because: Vec::new(),
             verified: None,
@@ -1552,11 +1553,18 @@ fn finding_for(
     })
 }
 
-/// The LangChain package a call goes through (`langchain_openai`), when it
-/// builds a LangChain chat model or calls one.
-fn langchain_package(call: &SdkCall) -> Option<&str> {
+/// What a call that is not the provider's own SDK goes through, as people
+/// say it: a LangChain chat model built or called (`LangChain
+/// (langchain_openai)`), LiteLLM, or Amazon Bedrock through boto3.
+fn wrapper_of(call: &SdkCall) -> Option<String> {
     let package = call.package.as_str();
-    (package == "langchain" || package.starts_with("langchain_")).then_some(package)
+    match package {
+        "langchain" => Some(format!("LangChain ({package})")),
+        _ if package.starts_with("langchain_") => Some(format!("LangChain ({package})")),
+        "litellm" => Some("LiteLLM".to_string()),
+        "boto3" => Some("Amazon Bedrock (boto3)".to_string()),
+        _ => None,
+    }
 }
 
 /// A rule about the model itself rather than the request that sends it: a
@@ -3249,6 +3257,65 @@ def tool_model(tools):
         let call = at("client.chat.completions.create(", "model");
         assert!(change(&call, "max_tokens").is_some(), "{call:#?}");
         assert_eq!(call.decisions.len(), 1);
+    }
+
+    #[test]
+    fn bedrock_and_litellm_calls_are_routed_and_checked_only_for_the_model() {
+        let source = r#"import boto3
+import litellm
+from langchain_aws import ChatBedrock
+
+bedrock = boto3.client("bedrock-runtime")
+nova = bedrock.converse(modelId="amazon.nova-pro-v1:0", messages=[])
+claude = bedrock.converse(modelId="anthropic.claude-3-5-sonnet-20240620-v1:0", messages=[])
+llm = ChatBedrock(model_id="us.anthropic.claude-3-5-sonnet-20241022-v2:0")
+old = litellm.completion(model="gpt-3.5-turbo", messages=[], max_tokens=256)
+routed = litellm.completion(model="anthropic/claude-3-5-sonnet-20241022", messages=[])
+"#;
+        // Routed calls are counted, and listed only on request.
+        let report = check_source(source, &options("2026-10-27"));
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        assert!(report.routed.is_empty());
+        assert_eq!(report.summary.routed_calls, 2);
+        assert_eq!(report.exit_code, 0);
+
+        let mut opts = options("2026-10-27");
+        opts.include_routed = true;
+        let report = check_source(source, &opts);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        // Bedrock keeps its own schedule, which the data does not hold, so
+        // its model IDs match nothing; LiteLLM's are looked up by their
+        // router prefix or their shape.
+        let mut lines: Vec<u32> = report.routed.iter().map(|f| f.line).collect();
+        lines.sort();
+        assert_eq!(
+            lines,
+            vec![line_of(source, "old = "), line_of(source, "routed = ")]
+        );
+        let at = |needle: &str| {
+            let line = line_of(source, needle);
+            report.routed.iter().find(|f| f.line == line).unwrap()
+        };
+        for finding in &report.routed {
+            assert_eq!(finding.routing, "litellm");
+            assert_eq!(finding.routing_class, RoutingClass::Routed);
+            assert_eq!(finding.call_kind, CallKind::Request);
+            assert!(finding.changes.is_empty(), "{:#?}", finding.changes);
+            assert!(finding.decisions.is_empty(), "{:#?}", finding.decisions);
+            assert_eq!(finding.fix, FixKind::Manual);
+            assert!(
+                finding
+                    .review
+                    .iter()
+                    .any(|r| r.message.contains("goes through LiteLLM")),
+                "{:#?}",
+                finding.review
+            );
+        }
+        assert_eq!(at("old = ").status, State::Retired);
+        assert!(at("old = ").fails);
+        assert_eq!(at("routed = ").match_kind, MatchKind::RouterPrefix);
+        assert_eq!(report.exit_code, 1);
     }
 
     #[test]
