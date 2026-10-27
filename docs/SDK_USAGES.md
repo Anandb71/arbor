@@ -3,8 +3,10 @@
 `arbor usages` and the MCP tool `find_api_usages` list where a Python project
 calls the OpenAI, Anthropic and Gemini SDKs, directly or through LangChain's
 OpenAI and Anthropic chat models ([LangChain chat
-models](#langchain-chat-models)), with each call's routing and model values. A
-consumer (a codemod, a reviewer) should treat the report this way:
+models](#langchain-chat-models)), and where it calls models on Amazon Bedrock
+or through LiteLLM ([Amazon Bedrock and LiteLLM](#amazon-bedrock-and-litellm)),
+with each call's routing and model values. A consumer (a codemod, a reviewer)
+should treat the report this way:
 
 - **A value or route with no gap at its call is confirmed.** It comes from one
   of the shapes in the supported grammar below, and nothing in the file can
@@ -25,7 +27,7 @@ gap inside this grammar is a bug. A shape outside it is reported as a gap.
 ### Model values
 
 These are reported with no gap (`model`, `engine`, `deployment_id`,
-`model_name`):
+`model_name`, and on a Bedrock call `modelId` or `model_id`):
 
 1. **A string literal at the call.** This covers a keyword argument, the
    positional model argument (`GenerativeModel("gemini-pro")`), and a dict or
@@ -241,23 +243,25 @@ follows these classes:
 | `ChatOpenAI` | `langchain_openai`, `langchain_community.chat_models`, `langchain.chat_models` | `OpenAI()` |
 | `AzureChatOpenAI` | the same | `AzureOpenAI()`: `azure_openai` |
 | `ChatAnthropic` | `langchain_anthropic`, `langchain_community.chat_models`, `langchain.chat_models` | `Anthropic()` |
+| `ChatBedrock`, `ChatBedrockConverse` | `langchain_aws` | `boto3.client("bedrock-runtime")`: `bedrock` ([below](#amazon-bedrock-and-litellm)) |
 
-The partner packages (`langchain_openai`, `langchain_anthropic`) are followed
-the way an SDK is: `from ... import`, `import langchain_openai` and a wildcard
-import. The deprecated `langchain_community.chat_models` and
-`langchain.chat_models` re-export other providers' models too, so they, and
-their submodules (`langchain_community.chat_models.openai`), are followed only
-through `from ... import` of one of these classes; `import
-langchain_community.chat_models as cm` is not followed. No other LangChain name
-is tracked: other providers' chat models (`ChatOllama`, `ChatBedrock`,
-`ChatGoogleGenerativeAI`, `ChatVertexAI`), embeddings (`OpenAIEmbeddings`),
-completion models (`langchain_openai.OpenAI`), `init_chat_model(...)` and
-LangChain's helpers report nothing.
+The partner packages (`langchain_openai`, `langchain_anthropic`,
+`langchain_aws`) are followed the way an SDK is: `from ... import`, `import
+langchain_openai` and a wildcard import. The deprecated
+`langchain_community.chat_models` and `langchain.chat_models` re-export other
+providers' models too, so they, and their submodules
+(`langchain_community.chat_models.openai`), are followed only through `from
+... import` of one of these classes; `import langchain_community.chat_models as
+cm` is not followed. No other LangChain name is tracked: other providers' chat
+models (`ChatOllama`, `ChatGoogleGenerativeAI`, `ChatVertexAI`, the deprecated
+`BedrockChat`), embeddings (`OpenAIEmbeddings`, `BedrockEmbeddings`),
+completion models (`langchain_openai.OpenAI`, `BedrockLLM`),
+`init_chat_model(...)` and LangChain's helpers report nothing.
 
 - **The constructor binds the model.** `ChatOpenAI(model="gpt-4o")` is a
   construction and a call (`request: false`) whose `model` or `model_name`
-  value is read under the value rules above. LangChain takes the model under
-  either name:
+  value is read under the value rules above (`model_id` or `model` on the
+  Bedrock models). LangChain takes the model under either name:
   - given both (by keyword or through a same-file dict expanded with `**`),
     a `reassigned` gap with no key keeps both values unconfirmed;
   - given one next to a `**` expansion the file cannot read, a `splat` gap
@@ -265,22 +269,27 @@ LangChain's helpers report nothing.
     which is no `TypeError` as a second `model=` would be;
   - given neither, `ChatOpenAI` and `ChatAnthropic` get a `missing_model` gap
     (LangChain's default model applies). `AzureChatOpenAI` serves its
-    deployment, so a missing `model` there is not a gap.
+    deployment, so a missing `model` there is not a gap, and the Bedrock
+    models fail to build without one, so neither is it there.
 
   The classes are pydantic models that take keyword arguments only, so a
   positional argument is not read. A built model's requests read its model
-  field when they are sent, so a write of `model` or `model_name` on any
-  object other than `self` or a same-file class (`llm.model_name = ...`,
-  `settings.model = ...`), or of an attribute with a run-time name, gives
-  every LangChain chat model's value in the file a `dynamic_feature` gap.
-  So does making the model configurable at run time
-  (`configurable_fields(model_name=...)`, `configurable_alternatives(...)`).
+  field when they are sent, so a write of either of its names (`model` or
+  `model_name`; `model_id` or `model`) on any object other than `self` or a
+  same-file class (`llm.model_name = ...`, `settings.model = ...`), or of an
+  attribute with a run-time name, gives the LangChain chat model values in
+  the file a `dynamic_feature` gap. So does making the model configurable at
+  run time (`configurable_fields(model_name=...)`,
+  `configurable_alternatives(...)`).
 - **The route.** A chat model routes like the SDK client it builds, under the
   client rules in [Routes](#routes). Its endpoint is `base_url` or LangChain's
   own name for it (`openai_api_base`, `anthropic_api_url`), routed by host.
   Given none, LangChain reads `OPENAI_API_BASE` or `ANTHROPIC_API_URL`, the SDK
   it builds then reads `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL`, and the
   partner packages fall back to the LangSmith gateway (`LANGSMITH_GATEWAY`). A
+  Bedrock model's endpoint is `endpoint_url` (`base_url` on
+  `ChatBedrockConverse`), routed like a `bedrock-runtime` client's, and its
+  variables are boto3's and `LANGSMITH_GATEWAY`. A
   file that sets any of these is an `endpoint_env` gap, as for an SDK client,
   and the client rules' other gaps apply as well (an environment written with
   a run-time name, a `**` expansion that may hold the endpoint). Two writes
@@ -307,6 +316,81 @@ LangChain's helpers report nothing.
 `arbor retirements` checks only the model of these calls: LangChain takes its
 own arguments and builds the request, so the SDK's argument rules do not
 describe them (see [RETIREMENTS.md](RETIREMENTS.md)).
+
+## Amazon Bedrock and LiteLLM
+
+Both send a request to whichever model their argument names, from many
+providers, so their calls have routings of their own: `bedrock` and
+`litellm`. Their records say `sdk: "aws"` (package `boto3` or
+`langchain_aws`) and `sdk: "litellm"`.
+
+**boto3.** Only Bedrock's runtime client is followed: `boto3.client(...)`
+(also imported, `from boto3 import client`, or through a session,
+`boto3.Session(...).client(...)` and `boto3.session.Session`) whose service
+name, the first argument or `service_name=`, resolves under the value rules
+to `"bedrock-runtime"`. A client for any other service, a service name the
+file cannot resolve, `boto3.resource(...)`, boto3's other functions, and a
+session given `botocore_session` or a `**` expansion are not followed.
+
+- **Requests.** `converse`, `converse_stream`, `invoke_model`,
+  `invoke_model_with_response_stream`, `invoke_model_with_bidirectional_stream`,
+  `start_async_invoke` and `count_tokens`. The model is `modelId`, read under
+  the value rules, by keyword (boto3 takes keyword arguments only) or from a
+  same-file dict expanded with `**`. Only `modelId` is read: botocore rejects
+  any other parameter, `model=` included, and the request's other fields
+  (`inferenceConfig`, `additionalModelRequestFields`, `requestMetadata`) do
+  not name the model it goes to, so nothing nested is read either. A request
+  with no `modelId` fails before it is sent, so it is not a gap; a `**`
+  expansion the file cannot read is a `splat` gap.
+- **The route** is `bedrock` for any model: Anthropic's, Amazon's, Meta's,
+  Mistral's, an inference profile or an ARN. An `endpoint_url` routes by
+  host: a Bedrock runtime host on AWS (`bedrock-runtime.<region>.amazonaws.com`,
+  its FIPS and dual-stack forms, a VPC endpoint's
+  `vpce-....bedrock-runtime....vpce.amazonaws.com`) stays `bedrock`, any other
+  host is `custom_base_url`, and an environment lookup, a value that does not
+  resolve or a `**` expansion routes `unknown` with a gap, as for a direct
+  client's `base_url` ([Routes](#routes)). A file that sets
+  `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` or `AWS_ENDPOINT_URL` is an
+  `endpoint_env` gap. Replacing a request or the constructor
+  (`client.converse = ...`, `boto3.client = ...`) or registering a botocore
+  event handler (`client.meta.events.register(...)`,
+  `session.events.register(...)`), which may rewrite a request's parameters
+  or send it elsewhere, is a `dynamic_feature` gap on every Bedrock route of
+  the file.
+- **Unknown receivers.** In a file that imports boto3, a Bedrock-shaped call
+  (`.converse(...)`, `.invoke_model(...)`) on a receiver that is not a
+  tracked client (a parameter, a factory's result) is an
+  `unknown_client_factory` gap that lists the `modelId` it passes.
+- **Not followed:** `aioboto3`, a botocore session or client built directly,
+  the `bedrock-agent-runtime` client, the Anthropic SDK's `AnthropicBedrock`
+  (routed `anthropic_bedrock`, above) and type annotations from
+  `mypy_boto3_bedrock_runtime`.
+
+**LiteLLM.** `litellm.completion(...)` and `litellm.acompletion(...)`,
+however they are imported (`from litellm import completion`,
+`litellm.main.completion`). The model is `model`, by keyword or as the first
+positional argument, read under the value rules; a `fallbacks=[{"model":
+...}]` entry is a nested value. No other LiteLLM function is followed
+(`embedding`, `text_completion`, `responses`, `Router`, `token_counter`,
+`supports_function_calling`...). A missing model is a `TypeError`, so it is
+not a gap.
+
+- **The route** is `litellm`. LiteLLM picks the provider and endpoint from
+  the model string (`anthropic/...`, `azure/...`, `bedrock/...`) and its
+  configuration (`api_base=`, the environment, `litellm.api_base`), so the
+  report does not say which provider's API the call reaches. Replacing
+  `litellm.completion` is a `dynamic_feature` gap on the route; a setting
+  (`litellm.drop_params = True`) changes nothing.
+- **Model aliases.** `litellm.model_alias_map` maps the model a call is given
+  to another one. A file that mentions it anywhere gives every LiteLLM model
+  value a `dynamic_feature` gap.
+
+`arbor retirements` lists both only with `--include-routed`. AWS keeps
+Bedrock's model schedule, which the bundled data does not hold, so a Bedrock
+model ID matches nothing. A LiteLLM model is looked up on the schedule its
+router prefix names (`openai/`, `anthropic/`, `gemini/`, `vertex_ai/`), else
+by its shape; as for LangChain, only the checks about the model apply (see
+[RETIREMENTS.md](RETIREMENTS.md)).
 
 ## Dynamic features
 
@@ -438,8 +522,12 @@ The report assumes the rest. In particular:
   `.env` file loaded with `load_dotenv`) may set `OPENAI_BASE_URL`,
   `ANTHROPIC_BASE_URL` or `GOOGLE_GENAI_USE_VERTEXAI`, and for a LangChain
   chat model `OPENAI_API_BASE`, `ANTHROPIC_API_URL` or `LANGSMITH_GATEWAY`.
+- Where a Bedrock client sends its requests may also come from the AWS
+  configuration (an `endpoint_url` in `~/.aws/config`, the profile
+  `AWS_PROFILE` selects), and a LiteLLM call's from settings another module
+  makes (`litellm.api_base`, `litellm.model_alias_map`). Neither is seen.
 - A LangChain chat model's field names and aliases are those of the current
-  `langchain-openai` and `langchain-anthropic`; which LangChain version the
+  `langchain-openai`, `langchain-anthropic` and `langchain-aws`; which LangChain version the
   project runs is not known. The deprecated classes are read the same way.
   Where they differ, that can only add a gap: the deprecated `ChatAnthropic`
   has no `base_url` alias and does not read `ANTHROPIC_BASE_URL`, so for it a

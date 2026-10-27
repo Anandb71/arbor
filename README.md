@@ -58,7 +58,7 @@ locally, with no account, API key or telemetry.
 |-----|--------------|
 | **`arbor retirements`** | Lists the direct `openai`, `anthropic` and Google SDK calls that use a model its provider has retired or is retiring: the date, the replacement the provider lists, the arguments that change with it and the choices your repo makes first. OpenAI shuts down `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` on 14 January 2027. [More below](#find-code-that-calls-retiring-ai-models) |
 | **GitHub Action `mode: retirements`** | The same check in CI: a job summary that lists every affected call, and warnings on the most urgent lines. It warns by default and fails the build only when you set `retirements-fail-on`, or when the check cannot run. |
-| **`arbor usages` and `find_api_usages`** | Every OpenAI, Anthropic and Gemini SDK call, and every LangChain OpenAI and Anthropic chat model, with its file and line, client routing (direct, Azure, custom `base_url`, Bedrock, Vertex) and model IDs, for people and agents. A value is confirmed only inside a small supported grammar; everything else carries a typed gap. [What a report confirms](docs/SDK_USAGES.md) |
+| **`arbor usages` and `find_api_usages`** | Every OpenAI, Anthropic and Gemini SDK call, every LangChain OpenAI, Anthropic and Bedrock chat model, and every call through Amazon Bedrock (`boto3`) or LiteLLM, with its file and line, client routing (direct, Azure, custom `base_url`, Bedrock, Vertex, LiteLLM) and model IDs, for people and agents. A value is confirmed only inside a small supported grammar; everything else carries a typed gap. [What a report confirms](docs/SDK_USAGES.md) |
 
 Python only for now; graph extraction is unchanged (a saved graph is rebuilt
 once on first use, as after every upgrade). See the
@@ -238,7 +238,7 @@ claude mcp add --transport stdio --scope project arbor -- arbor bridge
 
 ## Find code that calls retiring AI models
 
-OpenAI shuts down `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` on 14 January 2027, and Anthropic and Google retire models on their own dates. `arbor retirements` lists the direct `openai`, `anthropic` and Google SDK calls that use a retired or retiring model. For each one it shows the replacement the provider lists, the arguments that have to change with it, and the choices your repo makes first (such as whether gpt-6-luna should reason). LangChain's `ChatOpenAI`, `AzureChatOpenAI` and `ChatAnthropic` are checked too, for the model only; calls through LiteLLM or other wrappers are not checked yet.
+OpenAI shuts down `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` on 14 January 2027, and Anthropic and Google retire models on their own dates. `arbor retirements` lists the direct `openai`, `anthropic` and Google SDK calls that use a retired or retiring model. For each one it shows the replacement the provider lists, the arguments that have to change with it, and the choices your repo makes first (such as whether gpt-6-luna should reason). LangChain's `ChatOpenAI`, `AzureChatOpenAI` and `ChatAnthropic` are checked too, for the model only. Calls through LiteLLM are routed and listed with `--include-routed`; Bedrock's own schedule and other wrappers are not checked yet.
 
 ```bash
 npx @anandb71/arbor-cli retirements .
@@ -309,7 +309,7 @@ Templates: [`templates/mcp/`](templates/mcp/) · Setup scripts: `scripts/setup-m
 | **Surgical** | `list_entry_points` · `get_callers` · `get_callees` · `search_symbols` · `get_file_graph` · `get_node_detail` | Navigate to a specific symbol or file |
 | **Broad** | `get_logic_path` · `analyze_impact` · `find_path` · `get_knowledge_path` | Trace dependencies, blast radius, paths |
 | **Agent-native** | `get_blast_radius` · `explain_symbol` · `audit_security` · `get_architecture_overview` · `batch_query` | PR impact, onboarding, security audit, bulk lookup |
-| **SDK usage** | `find_api_usages` | Where the code calls the OpenAI, Anthropic or Gemini SDKs, directly or through LangChain's chat models, with routing and model IDs (Python) |
+| **SDK usage** | `find_api_usages` | Where the code calls the OpenAI, Anthropic or Gemini SDKs, directly or through LangChain's chat models, and models on Amazon Bedrock or through LiteLLM, with routing and model IDs (Python) |
 
 Every tool returns `{ ok, tool, data, meta: { suggested_next_tool, suggested_next_args } }` so agents chain calls without re-prompting.
 
@@ -330,7 +330,7 @@ Every tool returns `{ ok, tool, data, meta: { suggested_next_tool, suggested_nex
 | `arbor inspect <sym>` | Full symbol detail |
 | `arbor path <a> <b>` | Shortest call-graph path |
 | `arbor refactor <sym>` | Blast radius before refactoring |
-| `arbor usages` | OpenAI, Anthropic and Gemini SDK calls in Python, LangChain's OpenAI and Anthropic chat models included: client routing (direct, Azure, custom `base_url`, Bedrock, Vertex), model IDs and typed gaps; never prints credentials. `--sdk openai\|anthropic\|google`, `--json`. What a value with no gap confirms: [docs/SDK_USAGES.md](docs/SDK_USAGES.md) |
+| `arbor usages` | OpenAI, Anthropic and Gemini SDK calls in Python, LangChain's OpenAI, Anthropic and Bedrock chat models, `boto3` Bedrock runtime calls and LiteLLM included: client routing (direct, Azure, custom `base_url`, Bedrock, Vertex, LiteLLM), model IDs and typed gaps; never prints credentials. `--sdk openai\|anthropic\|google\|aws\|litellm`, `--json`. What a value with no gap confirms: [docs/SDK_USAGES.md](docs/SDK_USAGES.md) |
 | `arbor retirements` | Direct SDK calls to AI models their provider has retired or is retiring (Python): date and days left, listed replacement, the argument changes and per-repo choices it needs. `--fail-within <days>`, `--count-unconfirmed`, `--include-routed`, `--json`, `--markdown`, `--annotations` ([guide](docs/RETIREMENTS.md)) |
 | `arbor diff` | Git-change impact report, per symbol: new symbols carry no blast radius. `--base <ref>` compares against the merge base (what a PR shows), `--staged` only staged changes |
 | `arbor check` | CI safety gate (`--max-blast-radius N`, `--base <ref>`) |
