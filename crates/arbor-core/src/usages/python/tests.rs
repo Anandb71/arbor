@@ -6517,4 +6517,54 @@ claude.invoke("hi")
         gaps_on(&found, 11),
         vec!["ambiguous_client/dynamic_feature".to_string()]
     );
+    // The constructors route the same way; neither write touches the model.
+    assert_eq!(
+        gaps_on(&found, 5),
+        vec!["ambiguous_client/base_url_assigned".to_string()]
+    );
+    assert_eq!(
+        gaps_on(&found, 9),
+        vec!["ambiguous_client/dynamic_feature".to_string()]
+    );
+
+    // A copy may change any field: it is not followed.
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-4o")
+local = llm.copy(update={"openai_api_base": "http://localhost:4000"})
+local.invoke("hi")
+"#,
+    );
+    assert!(found.calls.iter().all(|c| c.chain != "local.invoke"));
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+
+    // Its requests read the model field when they are sent: a write of it,
+    // or of an attribute named at run time, after it is built.
+    for write in [
+        "llm.model_name = \"gpt-5\"",
+        "settings.model = choose()",
+        "setattr(llm, field, value)",
+    ] {
+        let source = format!(
+            "from langchain_openai import ChatOpenAI\nllm = ChatOpenAI(model=\"gpt-4o\")\n{write}\nllm.invoke(\"hi\")\n"
+        );
+        let found = usages(&source);
+        let built = call_on(&found, 2);
+        assert_eq!(value(built, "model"), Some("gpt-4o"), "{write}");
+        let rewritten = found
+            .gaps
+            .iter()
+            .find(|g| g.span.unwrap().line == 2 && g.kind == GapKind::UnresolvedModel)
+            .unwrap_or_else(|| panic!("{write}: {:?}", found.gaps));
+        assert_eq!(rewritten.reason, "dynamic_feature", "{write}");
+        assert_eq!(rewritten.key, None, "{write}");
+        assert!(rewritten.detail.contains("line 3"), "{}", rewritten.detail);
+    }
+    // A write on `self` of a same-file class is that class's attribute.
+    let found = usages(
+        "from langchain_openai import ChatOpenAI\nclass Bot:\n    def __init__(self):\n        self.model = \"gpt-4o\"\n        self.llm = ChatOpenAI(model=\"gpt-4o\")\n",
+    );
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
 }

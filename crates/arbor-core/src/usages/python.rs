@@ -554,13 +554,13 @@ const LANGCHAIN_REEXPORTS: &[(&str, [Pkg; 2])] = &[
 ];
 
 /// The packages of the [`LANGCHAIN_REEXPORTS`] module `module` is, or is a
-/// submodule of.
+/// submodule of. Only its first two segments are read.
 fn langchain_reexport(module: &str) -> Option<[Pkg; 2]> {
-    let module: Vec<&str> = module.split('.').map(str::trim).collect();
-    LANGCHAIN_REEXPORTS.iter().find_map(|(prefix, pkgs)| {
-        let prefix: Vec<&str> = prefix.split('.').collect();
-        module.starts_with(&prefix).then_some(*pkgs)
-    })
+    let mut parts = module.split('.').map(str::trim);
+    let head = (parts.next()?, parts.next()?);
+    LANGCHAIN_REEXPORTS
+        .iter()
+        .find_map(|(prefix, pkgs)| (prefix.split_once('.') == Some(head)).then_some(*pkgs))
 }
 
 fn client_class(pkg: Pkg, name: &str) -> Option<ClientClass> {
@@ -4358,6 +4358,11 @@ impl<'t> Ctx<'t> {
         } else {
             Pkg::of_module(written)
         };
+        let reexports = if relative {
+            None
+        } else {
+            langchain_reexport(written)
+        };
         if !relative {
             self.note_self_import(written, node);
         }
@@ -4447,10 +4452,8 @@ impl<'t> Ctx<'t> {
 
             // `from langchain_community.chat_models import ChatOpenAI`: the
             // class's provider decides its package.
-            let reexport = (!relative)
-                .then(|| langchain_reexport(written))
-                .flatten()
-                .and_then(|pkgs| pkgs.iter().find_map(|pkg| client_class(*pkg, &name)));
+            let reexport =
+                reexports.and_then(|pkgs| pkgs.iter().find_map(|pkg| client_class(*pkg, &name)));
             if let Some(class) = reexport {
                 let binding = Binding {
                     local: &local,
@@ -6016,7 +6019,9 @@ impl<'t> Ctx<'t> {
                 let joined = path.join(".");
                 match joined.as_str() {
                     // Copies of the same client, re-routed by their options.
-                    "with_options" | "copy" => Val::Client {
+                    // A LangChain chat model's `copy(update=...)` may change
+                    // any field, so its copy is not followed.
+                    "with_options" | "copy" if !pkg.is_langchain() => Val::Client {
                         client: self.copied_client(client, call, scope),
                         path: Vec::new(),
                     },
@@ -7102,6 +7107,34 @@ impl<'t> Ctx<'t> {
                     caveat: built.caveat,
                 };
                 self.record_call(call, function, scope, target);
+                // Its requests read the model field when they are sent, so
+                // `llm.model_name = ...` after it is built changes it. Any
+                // write of that name, or one with a run-time name, on an
+                // object other than `self` or a same-file class may be one.
+                let rewrite = self.wild_attr_any.or_else(|| {
+                    ["model", "model_name"]
+                        .iter()
+                        .find_map(|attr| self.outside_attr_writes.get(attr).copied())
+                });
+                if let Some(feature) = rewrite {
+                    let chain = self.render(function);
+                    self.out.gaps.push(UsageGap {
+                        kind: GapKind::UnresolvedModel,
+                        sdk: Some(class.pkg.sdk()),
+                        file: self.file.clone(),
+                        span: Some(self.span(call)),
+                        symbol: self.symbol(scope),
+                        chain: Some(chain.clone()),
+                        key: None,
+                        reason: "dynamic_feature".to_string(),
+                        detail: format!(
+                            "the LangChain chat model `{chain}` builds may be given another model after it is built ({})",
+                            feature.describe()
+                        ),
+                        values: Vec::new(),
+                        values_complete: false,
+                    });
+                }
             }
             Val::Class(class) => {
                 self.construction(call, class);
