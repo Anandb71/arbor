@@ -10,7 +10,10 @@ values. A consumer (a codemod, a reviewer) should treat the report this way:
 - **Anything else carries a gap.** The gap's `reason` says why, and the call
   needs a person to confirm it first. A gap may still list the value the code
   names (a parameter default, an environment fallback, a class attribute that
-  something else may overwrite), so it can be proposed for review.
+  something else may overwrite), so it can be proposed for review. A call
+  whose client is not resolved (`unknown_client_factory`) also lists its
+  argument names in `args` (names only, never values, and `splat` when some
+  come from `**`), so its arguments can be checked like a resolved call's.
 
 Python is too dynamic to resolve every shape soundly. Rather than adding a
 special case for each one, the extractor resolves a small grammar exactly, and
