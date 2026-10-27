@@ -265,7 +265,11 @@ LangChain's helpers report nothing.
     deployment, so a missing `model` there is not a gap.
 
   The classes are pydantic models that take keyword arguments only, so a
-  positional argument is not read.
+  positional argument is not read. A built model's requests read its model
+  field when they are sent, so a write of `model` or `model_name` on any
+  object other than `self` or a same-file class (`llm.model_name = ...`,
+  `settings.model = ...`), or of an attribute with a run-time name, gives
+  every LangChain chat model's value in the file a `dynamic_feature` gap.
 - **The route.** A chat model routes like the SDK client it builds, under the
   client rules in [Routes](#routes). Its endpoint is `base_url` or LangChain's
   own name for it (`openai_api_base`, `anthropic_api_url`), routed by host.
@@ -287,7 +291,8 @@ LangChain's helpers report nothing.
   apply to it.
 - **Calls on a chat model** (`llm.invoke(...)`,
   `llm.with_structured_output(...)`) are recorded with its routing, as calls on
-  a client are.
+  a client are. What such a call returns, including a copy
+  (`llm.copy(update=...)`, which may change any field), is not followed.
 
 `arbor retirements` checks only the model of these calls: LangChain takes its
 own arguments and builds the request, so the SDK's argument rules do not
