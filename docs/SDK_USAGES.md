@@ -273,6 +273,8 @@ LangChain's helpers report nothing.
   object other than `self` or a same-file class (`llm.model_name = ...`,
   `settings.model = ...`), or of an attribute with a run-time name, gives
   every LangChain chat model's value in the file a `dynamic_feature` gap.
+  So does making the model configurable at run time
+  (`configurable_fields(model_name=...)`, `configurable_alternatives(...)`).
 - **The route.** A chat model routes like the SDK client it builds, under the
   client rules in [Routes](#routes). Its endpoint is `base_url` or LangChain's
   own name for it (`openai_api_base`, `anthropic_api_url`), routed by host.
@@ -285,17 +287,22 @@ LangChain's helpers report nothing.
   after the model is built count too: an endpoint attribute
   (`llm.openai_api_base = ...`) is `base_url_assigned`, and replacing the SDK
   client it holds (`llm.client`, `root_client`, `_client` and their async
-  versions) is a `dynamic_feature` gap.
+  versions) is a `dynamic_feature` gap. Passing one of those to the
+  constructor (`ChatOpenAI(client=OpenAI(base_url=...).chat.completions)`)
+  routes it `unknown` with a `given_client` gap.
 - **The pre-1.0 SDK.** The deprecated `ChatOpenAI` also runs on `openai<1.0`,
   where a chat model given no endpoint sends its requests through the
   module-level API. In a file that configures the module-level API (any
   routing setting, anywhere in the file), such a model routes `unknown` with a
-  `module_config` gap. `langchain_openai` needs `openai>=1`, so this does not
-  apply to it.
+  `langchain_module_config` gap. `langchain_openai` needs `openai>=1`, so this
+  does not apply to it.
 - **Calls on a chat model** (`llm.invoke(...)`,
   `llm.with_structured_output(...)`) are recorded with its routing, as calls on
   a client are. What such a call returns, including a copy
   (`llm.copy(update=...)`, which may change any field), is not followed.
+  LangChain's run options (`config`, `configurable`, `metadata`, `tags`,
+  `callbacks`, `run_name`) and a call's positional input never reach the
+  provider's request, so a `model` key inside them is not read.
 
 `arbor retirements` checks only the model of these calls: LangChain takes its
 own arguments and builds the request, so the SDK's argument rules do not
@@ -432,8 +439,11 @@ The report assumes the rest. In particular:
   `ANTHROPIC_BASE_URL` or `GOOGLE_GENAI_USE_VERTEXAI`, and for a LangChain
   chat model `OPENAI_API_BASE`, `ANTHROPIC_API_URL` or `LANGSMITH_GATEWAY`.
 - A LangChain chat model's field names and aliases are those of the current
-  `langchain-openai` and `langchain-anthropic`, which the deprecated classes
-  share; which LangChain version the project runs is not known.
+  `langchain-openai` and `langchain-anthropic`; which LangChain version the
+  project runs is not known. The deprecated classes are read the same way.
+  Where they differ, that can only add a gap: the deprecated `ChatAnthropic`
+  has no `base_url` alias and does not read `ANTHROPIC_BASE_URL`, so for it a
+  `base_url=` or that variable is a gap or a custom route it does not need.
 - The module-level API's state is process-wide: in a file that does not
   configure it, a call is reported direct, although another module may
   configure it. A call that passes `engine` or `deployment_id` is the
