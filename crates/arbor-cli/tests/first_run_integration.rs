@@ -36,9 +36,19 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// A temp folder with no git that is its own project (an empty
+/// `pyproject.toml`), so Arbor never walks up from it to a marker in a parent
+/// folder, such as `~/.arbor` when the temp folder is under the home folder
+/// (#273).
+fn folder_without_git() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("pyproject.toml"), "").unwrap();
+    temp
+}
+
 #[test]
 fn outside_a_repository_diff_says_so_and_creates_nothing() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = folder_without_git();
     fs::write(
         temp.path().join("a.ts"),
         "export function a() { return 1; }\n",
@@ -81,6 +91,8 @@ fn a_repository_git_refuses_is_explained_in_git_s_words() {
     let temp = tempfile::tempdir().unwrap();
     git(temp.path(), &["init", "-q", "--bare", "repo.git"]);
     let bare = temp.path().join("repo.git");
+    // A bare repository has no `.git`; a marker keeps the walk in its folder.
+    fs::write(bare.join("pyproject.toml"), "").unwrap();
 
     let output = arbor(
         &bare,
@@ -103,7 +115,7 @@ fn a_repository_git_refuses_is_explained_in_git_s_words() {
 
 #[test]
 fn receipt_begin_outside_a_repository_explains_on_stderr_only() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = folder_without_git();
 
     let output = arbor(temp.path(), &["receipt", "begin", "."], &[]);
 
@@ -121,7 +133,7 @@ fn receipt_begin_outside_a_repository_explains_on_stderr_only() {
 
 #[test]
 fn hook_install_outside_a_repository_warns_that_receipts_will_not_record() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = folder_without_git();
 
     let output = arbor(temp.path(), &["hook", "claude", "."], &[]);
 
