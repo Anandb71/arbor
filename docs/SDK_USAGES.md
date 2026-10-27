@@ -1,8 +1,10 @@
 # SDK usages: what a report confirms
 
 `arbor usages` and the MCP tool `find_api_usages` list where a Python project
-calls the OpenAI, Anthropic and Gemini SDKs, with each call's routing and model
-values. A consumer (a codemod, a reviewer) should treat the report this way:
+calls the OpenAI, Anthropic and Gemini SDKs, directly or through LangChain's
+OpenAI and Anthropic chat models ([LangChain chat
+models](#langchain-chat-models)), with each call's routing and model values. A
+consumer (a codemod, a reviewer) should treat the report this way:
 
 - **A value or route with no gap at its call is confirmed.** It comes from one
   of the shapes in the supported grammar below, and nothing in the file can
@@ -228,6 +230,68 @@ The file must not do any of these:
   `client.chat = ...`), which makes every route of that SDK a
   `dynamic_feature` gap. Settings such as `openai.api_key` or
   `client.max_retries` change nothing.
+
+## LangChain chat models
+
+LangChain's chat models call the OpenAI and Anthropic SDKs for you. The report
+follows these classes:
+
+| Class | Imported from | Routes like |
+|---|---|---|
+| `ChatOpenAI` | `langchain_openai`, `langchain_community.chat_models`, `langchain.chat_models` | `OpenAI()` |
+| `AzureChatOpenAI` | the same | `AzureOpenAI()`: `azure_openai` |
+| `ChatAnthropic` | `langchain_anthropic`, `langchain_community.chat_models`, `langchain.chat_models` | `Anthropic()` |
+
+The partner packages (`langchain_openai`, `langchain_anthropic`) are followed
+the way an SDK is: `from ... import`, `import langchain_openai` and a wildcard
+import. The deprecated `langchain_community.chat_models` and
+`langchain.chat_models` re-export other providers' models too, so they, and
+their submodules (`langchain_community.chat_models.openai`), are followed only
+through `from ... import` of one of these classes; `import
+langchain_community.chat_models as cm` is not followed. No other LangChain name
+is tracked: other providers' chat models (`ChatOllama`, `ChatBedrock`,
+`ChatGoogleGenerativeAI`, `ChatVertexAI`), embeddings (`OpenAIEmbeddings`),
+completion models (`langchain_openai.OpenAI`), `init_chat_model(...)` and
+LangChain's helpers report nothing.
+
+- **The constructor binds the model.** `ChatOpenAI(model="gpt-4o")` is a
+  construction and a call (`request: false`) whose `model` or `model_name`
+  value is read under the value rules above. LangChain takes the model under
+  either name:
+  - given both, a `reassigned` gap with no key keeps both values
+    unconfirmed;
+  - given neither, `ChatOpenAI` and `ChatAnthropic` get a `missing_model` gap
+    (LangChain's default model applies). `AzureChatOpenAI` serves its
+    deployment, so a missing `model` there is not a gap.
+
+  The classes are pydantic models that take keyword arguments only, so a
+  positional argument is not read.
+- **The route.** A chat model routes like the SDK client it builds, under the
+  client rules in [Routes](#routes). Its endpoint is `base_url` or LangChain's
+  own name for it (`openai_api_base`, `anthropic_api_url`), routed by host.
+  Given none, LangChain reads `OPENAI_API_BASE` or `ANTHROPIC_API_URL`, the SDK
+  it builds then reads `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL`, and the
+  partner packages fall back to the LangSmith gateway (`LANGSMITH_GATEWAY`). A
+  file that sets any of these is an `endpoint_env` gap, as for an SDK client,
+  and the client rules' other gaps apply as well (an environment written with
+  a run-time name, a `**` expansion that may hold the endpoint). Two writes
+  after the model is built count too: an endpoint attribute
+  (`llm.openai_api_base = ...`) is `base_url_assigned`, and replacing the SDK
+  client it holds (`llm.client`, `root_client`, `_client` and their async
+  versions) is a `dynamic_feature` gap.
+- **The pre-1.0 SDK.** The deprecated `ChatOpenAI` also runs on `openai<1.0`,
+  where a chat model given no endpoint sends its requests through the
+  module-level API. In a file that configures the module-level API (any
+  routing setting, anywhere in the file), such a model routes `unknown` with a
+  `module_config` gap. `langchain_openai` needs `openai>=1`, so this does not
+  apply to it.
+- **Calls on a chat model** (`llm.invoke(...)`,
+  `llm.with_structured_output(...)`) are recorded with its routing, as calls on
+  a client are.
+
+`arbor retirements` checks only the model of these calls: LangChain takes its
+own arguments and builds the request, so the SDK's argument rules do not
+describe them (see [RETIREMENTS.md](RETIREMENTS.md)).
 
 ## Dynamic features
 

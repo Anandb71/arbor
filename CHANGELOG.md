@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **LangChain chat models in `arbor usages` and `arbor retirements` (Python):** `ChatOpenAI`, `AzureChatOpenAI` and `ChatAnthropic`, from `langchain_openai`, `langchain_anthropic` and the deprecated `langchain_community.chat_models` and `langchain.chat_models`, are recorded as a construction and a call that binds the model, like `genai.GenerativeModel(...)`. Their `model` or `model_name` is read under the same grammar as an SDK call (both given is a `reassigned` gap; neither is a `missing_model` gap, except on `AzureChatOpenAI`, which serves its deployment), and they route like the client each one builds: `base_url`, `openai_api_base` or `anthropic_api_url` by host, and `OPENAI_API_BASE`, `ANTHROPIC_API_URL` and `LANGSMITH_GATEWAY` set in the file next to the SDK's own variables (`endpoint_env`). A deprecated `ChatOpenAI` in a file that configures the module-level OpenAI API routes `unknown` with a `module_config` gap, since on `openai<1.0` its requests go through it. Calls on a built chat model (`llm.invoke(...)`) are recorded with its routing. No other LangChain name is tracked. `arbor retirements` lists these models with their date and replacement but applies only the checks about the model itself, with a check to review the parameters LangChain sends by hand, since LangChain takes its own arguments; a confirmed retired model there fails the check like any other. On the Track C real-code sample (166 hits, getArbor-dev/arbor-cloud#179) it finds 7 of the 8 LangChain misses (the 8th is `ChatBedrock`): recall on the 74 live calls goes from 35 to 42, and none of the 92 non-call files gains a value.
+
 ### Fixed
 - **`arbor refactor` exited 0 for a missing symbol (#195):** it now exits 1 and prints `error: Symbol '<name>' not found` to stderr after the "Did you mean" suggestions, matching `inspect` and `callers`.
 
