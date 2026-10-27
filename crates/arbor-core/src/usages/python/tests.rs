@@ -6383,6 +6383,15 @@ followed_not = chat_models.ChatOpenAI(model="gpt-4-0613")
     // themselves, are not followed.
     assert_eq!(found.calls.len(), 4, "{:?}", found.calls);
     assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+
+    // A file that names no SDK in lower case is still read.
+    let source = "from langchain.chat_models import ChatOpenAI\nllm = ChatOpenAI(model_name=\"gpt-3.5-turbo\")\n";
+    assert!(super::may_use_sdk(source));
+    let found = usages(source);
+    assert_eq!(
+        value(call_on(&found, 2), "model_name"),
+        Some("gpt-3.5-turbo")
+    );
 }
 
 #[test]

@@ -124,6 +124,9 @@ const PREFILTER: &[&str] = &[
     "embeddings.",
     "generate_content",
     "embed_content",
+    // `from langchain.chat_models import ChatOpenAI` names no SDK in lower
+    // case.
+    "langchain",
 ];
 
 /// Whether `source` mentions anything the extractor tracks. A file that does
