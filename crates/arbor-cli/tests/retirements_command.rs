@@ -889,6 +889,14 @@ fn annotations_stay_within_githubs_per_step_limit() {
         .collect();
     assert_eq!(notices.len(), 1, "{text}");
     assert!(notices[0].contains("2 more calls to retired or retiring models are not annotated"));
+    // The notice points to the report for the calls it found, and claims
+    // nothing about calls the scan missed.
+    assert!(
+        notices[0].ends_with("(at most 10 warnings per step); the full report lists them all."),
+        "{}",
+        notices[0]
+    );
+    assert!(!notices[0].contains("every call"), "{}", notices[0]);
 
     let text = stdout(&arbor(
         dir.path(),
