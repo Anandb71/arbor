@@ -1,27 +1,37 @@
 #!/usr/bin/env node
 "use strict";
 
+// Runs the Arbor binary. npm 12 skips install scripts unless they are
+// allowed, so postinstall may never have downloaded it: in that case it is
+// downloaded, checked against the release's SHA256SUMS and installed here
+// on the first run (#281). Progress and errors go to stderr only, so
+// `--json` output on stdout stays clean.
+
 const { spawnSync } = require("child_process");
-const path = require("path");
-const fs = require("fs");
+const os = require("os");
+const { ArborInstallError, ensureBinary, findBinary } = require("../lib/download");
 
-const binDir = __dirname;
-const unixBin = path.join(binDir, "arbor");
-const winBin = path.join(binDir, "arbor.exe");
+async function main() {
+  let target = findBinary();
+  if (!target) {
+    try {
+      target = (await ensureBinary()).path;
+    } catch (err) {
+      const message = err instanceof ArborInstallError ? err.message : err.stack || String(err);
+      process.stderr.write(`arbor: ${message}\n`);
+      process.exit(2);
+    }
+  }
 
-const target = process.platform === "win32" ? winBin : unixBin;
-
-if (!fs.existsSync(target)) {
-  console.error("Arbor binary is not installed yet.");
-  console.error("Run: npm rebuild @anandb71/arbor-cli or reinstall the package.");
-  process.exit(1);
+  const result = spawnSync(target, process.argv.slice(2), { stdio: "inherit" });
+  if (result.error) {
+    process.stderr.write(`arbor: could not run ${target}: ${result.error.message}\n`);
+    process.exit(2);
+  }
+  if (result.signal) {
+    process.exit(128 + (os.constants.signals[result.signal] || 0));
+  }
+  process.exit(result.status ?? 1);
 }
 
-const result = spawnSync(target, process.argv.slice(2), { stdio: "inherit" });
-
-if (result.error) {
-  console.error(result.error.message);
-  process.exit(1);
-}
-
-process.exit(result.status ?? 0);
+main();
