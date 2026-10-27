@@ -228,6 +228,10 @@ const MODEL_BEARING: &[&str] = &[
     "Completion.acreate",
     "Embedding.create",
     "GenerativeModel",
+    // LangChain chat models (`AzureChatOpenAI` is not: its deployment, not
+    // a `model`, decides what it serves).
+    "ChatOpenAI",
+    "ChatAnthropic",
 ];
 
 /// Members that wrap a resource without changing the request
@@ -348,13 +352,30 @@ enum Pkg {
     Anthropic,
     GoogleGenai,
     GoogleGenerativeai,
+    /// LangChain's chat models, which call a provider's SDK for you: the
+    /// partner packages (`langchain_openai`, `langchain_anthropic`), and the
+    /// deprecated copies in `langchain_community.chat_models` and
+    /// `langchain.chat_models`. Only their chat-model classes are tracked
+    /// (see [`LANGCHAIN_REEXPORTS`]).
+    LangchainOpenai,
+    LangchainAnthropic,
+    LangchainCommunityOpenai,
+    LangchainCommunityAnthropic,
+    LangchainLegacyOpenai,
+    LangchainLegacyAnthropic,
 }
 
 impl Pkg {
     fn sdk(self) -> Sdk {
         match self {
-            Pkg::Openai => Sdk::Openai,
-            Pkg::Anthropic => Sdk::Anthropic,
+            Pkg::Openai
+            | Pkg::LangchainOpenai
+            | Pkg::LangchainCommunityOpenai
+            | Pkg::LangchainLegacyOpenai => Sdk::Openai,
+            Pkg::Anthropic
+            | Pkg::LangchainAnthropic
+            | Pkg::LangchainCommunityAnthropic
+            | Pkg::LangchainLegacyAnthropic => Sdk::Anthropic,
             Pkg::GoogleGenai | Pkg::GoogleGenerativeai => Sdk::Google,
         }
     }
@@ -365,7 +386,33 @@ impl Pkg {
             Pkg::Anthropic => "anthropic",
             Pkg::GoogleGenai => "google.genai",
             Pkg::GoogleGenerativeai => "google.generativeai",
+            Pkg::LangchainOpenai => "langchain_openai",
+            Pkg::LangchainAnthropic => "langchain_anthropic",
+            Pkg::LangchainCommunityOpenai | Pkg::LangchainCommunityAnthropic => {
+                "langchain_community"
+            }
+            Pkg::LangchainLegacyOpenai | Pkg::LangchainLegacyAnthropic => "langchain",
         }
+    }
+
+    /// A LangChain package: only its chat-model classes are tracked, and
+    /// what they are built with is the model the requests use.
+    fn is_langchain(self) -> bool {
+        !matches!(
+            self,
+            Pkg::Openai | Pkg::Anthropic | Pkg::GoogleGenai | Pkg::GoogleGenerativeai
+        )
+    }
+
+    /// A LangChain OpenAI chat model that may run on the pre-1.0 `openai`
+    /// SDK: given no `base_url`, it sends its requests through the
+    /// module-level API, so the file's `openai.api_base` / `api_type`
+    /// settings apply to it. `langchain_openai` needs `openai>=1`.
+    fn reads_module_config(self) -> bool {
+        matches!(
+            self,
+            Pkg::LangchainCommunityOpenai | Pkg::LangchainLegacyOpenai
+        )
     }
 
     /// The package a dotted module path belongs to, and the rest of the
@@ -378,6 +425,8 @@ impl Pkg {
             (Some("anthropic"), _) => Pkg::Anthropic,
             (Some("google"), Some("genai")) => Pkg::GoogleGenai,
             (Some("google"), Some("generativeai")) => Pkg::GoogleGenerativeai,
+            (Some("langchain_openai"), _) => Pkg::LangchainOpenai,
+            (Some("langchain_anthropic"), _) => Pkg::LangchainAnthropic,
             _ => return None,
         };
         if matches!(pkg, Pkg::GoogleGenai | Pkg::GoogleGenerativeai) {
@@ -442,10 +491,73 @@ const CLASSES: &[ClientClass] = &[
         "GenerativeModel",
         Family::LegacyModel,
     ),
+    // LangChain chat models route like the client each one builds.
+    class(Pkg::LangchainOpenai, "ChatOpenAI", Family::OpenaiDirect),
+    class(Pkg::LangchainOpenai, "AzureChatOpenAI", Family::Azure),
+    class(
+        Pkg::LangchainAnthropic,
+        "ChatAnthropic",
+        Family::AnthropicDirect,
+    ),
+    class(
+        Pkg::LangchainCommunityOpenai,
+        "ChatOpenAI",
+        Family::OpenaiDirect,
+    ),
+    class(
+        Pkg::LangchainCommunityOpenai,
+        "AzureChatOpenAI",
+        Family::Azure,
+    ),
+    class(
+        Pkg::LangchainCommunityAnthropic,
+        "ChatAnthropic",
+        Family::AnthropicDirect,
+    ),
+    class(
+        Pkg::LangchainLegacyOpenai,
+        "ChatOpenAI",
+        Family::OpenaiDirect,
+    ),
+    class(Pkg::LangchainLegacyOpenai, "AzureChatOpenAI", Family::Azure),
+    class(
+        Pkg::LangchainLegacyAnthropic,
+        "ChatAnthropic",
+        Family::AnthropicDirect,
+    ),
 ];
 
 const fn class(pkg: Pkg, name: &'static str, family: Family) -> ClientClass {
     ClientClass { pkg, name, family }
+}
+
+/// The deprecated LangChain modules that re-export several providers' chat
+/// models, with the packages their OpenAI and Anthropic classes are
+/// recorded under. A name imported from one of them, or from a submodule
+/// (`langchain_community.chat_models.openai`), is tracked only when it is
+/// one of those classes; the modules themselves are not followed.
+const LANGCHAIN_REEXPORTS: &[(&str, [Pkg; 2])] = &[
+    (
+        "langchain_community.chat_models",
+        [
+            Pkg::LangchainCommunityOpenai,
+            Pkg::LangchainCommunityAnthropic,
+        ],
+    ),
+    (
+        "langchain.chat_models",
+        [Pkg::LangchainLegacyOpenai, Pkg::LangchainLegacyAnthropic],
+    ),
+];
+
+/// The packages of the [`LANGCHAIN_REEXPORTS`] module `module` is, or is a
+/// submodule of.
+fn langchain_reexport(module: &str) -> Option<[Pkg; 2]> {
+    let module: Vec<&str> = module.split('.').map(str::trim).collect();
+    LANGCHAIN_REEXPORTS.iter().find_map(|(prefix, pkgs)| {
+        let prefix: Vec<&str> = prefix.split('.').collect();
+        module.starts_with(&prefix).then_some(*pkgs)
+    })
 }
 
 fn client_class(pkg: Pkg, name: &str) -> Option<ClientClass> {
@@ -504,8 +616,13 @@ impl ClientClass {
     }
 }
 
+/// Keyword names that set a client's endpoint: the SDKs' own, and
+/// LangChain's field names for it (`base_url` is their alias).
 fn is_base_url_key(key: &str) -> bool {
-    key == "base_url" || key == "api_base"
+    matches!(
+        key,
+        "base_url" | "api_base" | "openai_api_base" | "anthropic_api_url"
+    )
 }
 
 /// The provider an SDK-shaped chain on an unknown receiver most likely
@@ -629,6 +746,10 @@ enum ClientCaveat {
     /// setup block (in a function, a branch, after a `def`...), so it may
     /// not hold when a call runs (see [`Ctx::module_openai_routing`]).
     ModuleSetup(Feature),
+    /// A LangChain OpenAI chat model that may run on the pre-1.0 SDK
+    /// ([`Pkg::reads_module_config`]) in a file that configures the
+    /// module-level API, which such a model's requests then go through.
+    LangchainModuleConfig,
 }
 
 /// A Python feature that can change what a name, attribute, dict or the
@@ -668,10 +789,10 @@ enum BaseUrl {
 
 /// The provider's own API host, for [`BaseUrl::Provider`].
 fn provider_host(pkg: Pkg) -> &'static str {
-    match pkg {
-        Pkg::Openai => "api.openai.com",
-        Pkg::Anthropic => "api.anthropic.com",
-        Pkg::GoogleGenai | Pkg::GoogleGenerativeai => "generativelanguage.googleapis.com",
+    match pkg.sdk() {
+        Sdk::Openai => "api.openai.com",
+        Sdk::Anthropic => "api.anthropic.com",
+        Sdk::Google => "generativelanguage.googleapis.com",
     }
 }
 
@@ -699,22 +820,46 @@ fn host_kind(pkg: Pkg, url: &str) -> BaseUrl {
 
 /// Environment variables an SDK reads its endpoint from when the
 /// constructor is not given one.
-const ENDPOINT_ENV: &[(Pkg, &str)] = &[
-    (Pkg::Openai, "OPENAI_BASE_URL"),
-    (Pkg::Anthropic, "ANTHROPIC_BASE_URL"),
-    // `google.genai.Client()` reads whether to use Vertex AI, and its
-    // endpoints, from these.
-    (Pkg::GoogleGenai, "GOOGLE_GENAI_USE_VERTEXAI"),
-    (Pkg::GoogleGenai, "GOOGLE_GEMINI_BASE_URL"),
-    (Pkg::GoogleGenai, "GOOGLE_VERTEX_BASE_URL"),
-];
+fn endpoint_env_vars(pkg: Pkg) -> &'static [&'static str] {
+    match pkg {
+        Pkg::Openai => &["OPENAI_BASE_URL"],
+        Pkg::Anthropic => &["ANTHROPIC_BASE_URL"],
+        // `google.genai.Client()` reads whether to use Vertex AI, and its
+        // endpoints, from these.
+        Pkg::GoogleGenai => &[
+            "GOOGLE_GENAI_USE_VERTEXAI",
+            "GOOGLE_GEMINI_BASE_URL",
+            "GOOGLE_VERTEX_BASE_URL",
+        ],
+        Pkg::GoogleGenerativeai => &[],
+        // LangChain reads its own variable first, then the SDK it builds
+        // reads the SDK's; the partner packages also fall back to the
+        // LangSmith gateway.
+        Pkg::LangchainOpenai | Pkg::LangchainCommunityOpenai | Pkg::LangchainLegacyOpenai => {
+            &["OPENAI_API_BASE", "OPENAI_BASE_URL", "LANGSMITH_GATEWAY"]
+        }
+        Pkg::LangchainAnthropic
+        | Pkg::LangchainCommunityAnthropic
+        | Pkg::LangchainLegacyAnthropic => &[
+            "ANTHROPIC_API_URL",
+            "ANTHROPIC_BASE_URL",
+            "LANGSMITH_GATEWAY",
+        ],
+    }
+}
 
 /// Environment variables the module-level OpenAI API (v0 and the v1 module
 /// client) reads its endpoint or API type from.
 const OPENAI_MODULE_ENV: &[&str] = &["OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_TYPE"];
 
 /// Attributes that re-route a built client when assigned.
-const BASE_URL_ATTRS: &[&str] = &["base_url", "api_base", "_base_url"];
+const BASE_URL_ATTRS: &[&str] = &[
+    "base_url",
+    "api_base",
+    "_base_url",
+    "openai_api_base",
+    "anthropic_api_url",
+];
 
 /// Where an untracked value came from, for gap details.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4297,12 +4442,36 @@ impl<'t> Ctx<'t> {
                 continue;
             }
 
+            // `from langchain_community.chat_models import ChatOpenAI`: the
+            // class's provider decides its package.
+            let reexport = (!relative)
+                .then(|| langchain_reexport(written))
+                .flatten()
+                .and_then(|pkgs| pkgs.iter().find_map(|pkg| client_class(*pkg, &name)));
+            if let Some(class) = reexport {
+                let binding = Binding {
+                    local: &local,
+                    pkg: class.pkg,
+                    module: &module,
+                    name: Some(name),
+                    kind: BindingKind::ClientClass,
+                };
+                self.add_import(binding, Val::Class(class), scope, item, place);
+                continue;
+            }
+
             let Some((pkg, rest)) = target.clone() else {
                 self.other_import(scope, local, &shared, place);
                 continue;
             };
             let (val, kind) = match client_class(pkg, &name) {
                 Some(class) => (Val::Class(class), BindingKind::ClientClass),
+                // Any other name from LangChain (`OpenAIEmbeddings`,
+                // `ChatOllama`) is not followed.
+                None if pkg.is_langchain() => {
+                    self.other_import(scope, local, &shared, place);
+                    continue;
+                }
                 None => {
                     let mut path = rest;
                     path.push(name.clone());
@@ -4342,7 +4511,10 @@ impl<'t> Ctx<'t> {
     }
 
     fn record_import(&mut self, binding: Binding<'_>, node: Node<'t>) {
-        self.sdk_imported.insert(binding.pkg.sdk());
+        // Only the SDK itself makes a bare `messages.create` its shape.
+        if !binding.pkg.is_langchain() {
+            self.sdk_imported.insert(binding.pkg.sdk());
+        }
         self.legacy_imported |= binding.pkg == Pkg::GoogleGenerativeai;
         let span = self.span(node);
         self.out.imports.push(SdkImport {
@@ -6180,10 +6352,10 @@ impl<'t> Ctx<'t> {
         {
             return None;
         }
-        ENDPOINT_ENV
+        endpoint_env_vars(class.pkg)
             .iter()
-            .find(|(pkg, var)| *pkg == class.pkg && self.env_writes.contains(*var))
-            .map(|(_, var)| ClientCaveat::EndpointEnv { var })
+            .find(|var| self.env_writes.contains(**var))
+            .map(|var| ClientCaveat::EndpointEnv { var })
             .or_else(|| self.env_wild.map(ClientCaveat::EnvWrite))
     }
 
@@ -6646,9 +6818,21 @@ impl<'t> Ctx<'t> {
             "generate_content",
             "generate_content_async",
         ];
+        // The SDK clients and resources a LangChain chat model sends its
+        // requests through.
+        const LANGCHAIN_RESOURCES: &[&str] = &[
+            "client",
+            "async_client",
+            "root_client",
+            "root_async_client",
+            "_client",
+            "_async_client",
+        ];
         let attr = assign.attr;
-        let resource =
-            RESOURCES.contains(&attr) || attr.starts_with(|c: char| c.is_ascii_uppercase());
+        let langchain = target.pkg().is_some_and(Pkg::is_langchain);
+        let resource = RESOURCES.contains(&attr)
+            || attr.starts_with(|c: char| c.is_ascii_uppercase())
+            || (langchain && LANGCHAIN_RESOURCES.contains(&attr));
         let pkg = match target {
             Val::Module { pkg, path } if !path.is_empty() || resource => *pkg,
             Val::Class(class) => class.pkg,
@@ -6717,6 +6901,20 @@ impl<'t> Ctx<'t> {
                 client.caveat = Some(caveat.clone());
             }
         }
+        // A deprecated LangChain OpenAI chat model on the pre-1.0 SDK sends
+        // its requests through the module-level API, which this file
+        // configures (`openai.api_type = "azure"`, `openai.api_base = ...`).
+        let module_configured =
+            self.openai_routing != Routing::OpenaiDirect || self.openai_caveat.is_some();
+        if client.pkg.reads_module_config()
+            && module_configured
+            && client.routing == Routing::OpenaiDirect
+            && client.caveat.is_none()
+            && !client.ambiguous
+        {
+            client.routing = Routing::Unknown;
+            client.caveat = Some(ClientCaveat::LangchainModuleConfig);
+        }
         let assigned = client
             .site
             .is_some_and(|site| self.rerouted.contains(&site))
@@ -6766,6 +6964,14 @@ impl<'t> Ctx<'t> {
             Pkg::GoogleGenai => Routing::GoogleGenai,
             Pkg::GoogleGenerativeai if self.legacy_caveat.is_some() => Routing::Unknown,
             Pkg::GoogleGenerativeai => Routing::GoogleGenerativeaiLegacy,
+            // Only LangChain's chat-model classes are followed, and each
+            // routes by its own construction.
+            Pkg::LangchainOpenai
+            | Pkg::LangchainAnthropic
+            | Pkg::LangchainCommunityOpenai
+            | Pkg::LangchainCommunityAnthropic
+            | Pkg::LangchainLegacyOpenai
+            | Pkg::LangchainLegacyAnthropic => Routing::Unknown,
         }
     }
 
@@ -6873,6 +7079,27 @@ impl<'t> Ctx<'t> {
 
         let callee = self.eval(function, scope, 0);
         match callee {
+            Val::Class(class) if class.pkg.is_langchain() => {
+                // A LangChain chat model is built with the model its
+                // requests use, and routes by the client it builds.
+                let built = self.construction(call, class);
+                let built = self.reroute(built);
+                let receiver = if function.kind() == "attribute" {
+                    Receiver::Module
+                } else {
+                    Receiver::Symbol
+                };
+                let target = CallTarget {
+                    pkg: class.pkg,
+                    member: class.name.to_string(),
+                    receiver,
+                    routing: built.routing,
+                    client_line: built.line,
+                    ambiguous: built.ambiguous,
+                    caveat: built.caveat,
+                };
+                self.record_call(call, function, scope, target);
+            }
             Val::Class(class) => {
                 self.construction(call, class);
                 if class.family == Family::LegacyModel {
@@ -6897,6 +7124,9 @@ impl<'t> Ctx<'t> {
                     self.record_call(call, function, scope, target);
                 }
             }
+            // LangChain is followed only through its chat-model classes
+            // (above) and the objects they build.
+            Val::Module { pkg, .. } | Val::Symbol { pkg, .. } if pkg.is_langchain() => {}
             Val::Module { pkg, path } if !path.is_empty() => {
                 let (routing, caveat) = self.module_target(pkg, call, scope);
                 let target = CallTarget {
@@ -6964,10 +7194,11 @@ impl<'t> Ctx<'t> {
         // An unresolved model matters where it reaches a request, a model
         // object, or any call on a client or SDK module; on an SDK type
         // (`ChatCompletion(model=model)`) the call still lists `model` in
-        // its kwargs, without a gap.
+        // its kwargs, without a gap. Every call recorded for LangChain
+        // builds a chat model or calls one.
         let on_sdk_object = matches!(target.receiver, Receiver::Client | Receiver::Module)
             && member.split('.').next() != Some("types");
-        let gap_worthy = request || model_bearing || on_sdk_object;
+        let gap_worthy = request || model_bearing || on_sdk_object || target.pkg.is_langchain();
         let site = Site {
             sdk,
             call,
@@ -7131,6 +7362,26 @@ impl<'t> Ctx<'t> {
             let unresolved = Unresolved::new("missing_model", String::new());
             self.unresolved_gap(&site, model_key, &unresolved, None);
         }
+        // A LangChain chat model takes its model as `model` or as
+        // `model_name`; given both, which one it keeps is not confirmed.
+        let named = |key: &str| args.kwargs.iter().any(|k| k == key);
+        if target.pkg.is_langchain() && named("model") && named("model_name") {
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::UnresolvedModel,
+                sdk: Some(sdk),
+                file: self.file.clone(),
+                span: Some(span),
+                symbol: symbol.clone(),
+                chain: Some(chain.clone()),
+                key: None,
+                reason: "reassigned".to_string(),
+                detail: format!(
+                    "`{chain}` is given its model twice, as `model` and as `model_name`, so which one LangChain uses is not confirmed"
+                ),
+                values: Vec::new(),
+                values_complete: false,
+            });
+        }
 
         if target.ambiguous {
             self.out.gaps.push(UsageGap {
@@ -7238,6 +7489,12 @@ impl<'t> Ctx<'t> {
                     "module_config",
                     format!(
                         "`{chain}` passes `engine` or `deployment_id`, which Azure deployments take, but this file does not configure the module-level API, so another module may route it to Azure"
+                    ),
+                ),
+                ClientCaveat::LangchainModuleConfig => (
+                    "module_config",
+                    format!(
+                        "this file configures the module-level OpenAI API, which the LangChain chat model behind `{chain}` sends its requests through when it runs on the pre-1.0 `openai` SDK, so its routing is not confirmed"
                     ),
                 ),
             };
