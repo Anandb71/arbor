@@ -874,6 +874,49 @@ shared.chat.completions.create(model="gpt-4", messages=[])
 }
 
 #[test]
+fn an_unresolved_client_call_keeps_its_argument_names() {
+    // #290: a package's subclass of `openai.OpenAI`, exported under the same
+    // name. The client is not resolved, but the retirement check needs the
+    // call's argument names (`temperature`, `tools`, `max_tokens`).
+    let found = usages(
+        r#"
+from tracing_sdk.ai.openai import OpenAI
+
+def explain(report):
+    return OpenAI(tracker=None).chat.completions.create(
+        model="gpt-4.1-2025-04-14",
+        temperature=0.1,
+        messages=[{"role": "user", "content": report}],
+    )
+
+def passthrough(text, **options):
+    return OpenAI(tracker=None).chat.completions.create(model="gpt-4o-mini", messages=[], **options)
+"#,
+    );
+    let unknown = gaps(&found, GapKind::UnknownClientFactory);
+    assert_eq!(unknown.len(), 2, "{unknown:#?}");
+    let explain = unknown[0].args.as_ref().expect("arguments recorded");
+    assert_eq!(explain.kwargs, ["model", "temperature", "messages"]);
+    assert!(!explain.splat);
+    let passthrough = unknown[1].args.as_ref().expect("arguments recorded");
+    assert_eq!(passthrough.kwargs, ["model", "messages"]);
+    assert!(passthrough.splat);
+    // Names only: never an argument's value.
+    let json = serde_json::to_string(&found).unwrap();
+    assert!(
+        json.contains(r#""args":{"kwargs":["model","temperature","messages"]}"#),
+        "{json}"
+    );
+    assert!(!json.contains("0.1"), "{json}");
+    // Other gaps record no arguments.
+    assert!(found
+        .gaps
+        .iter()
+        .filter(|g| g.kind != GapKind::UnknownClientFactory)
+        .all(|g| g.args.is_none()));
+}
+
+#[test]
 fn messages_create_counts_only_where_anthropic_is_imported() {
     let twilio = usages(
         r#"

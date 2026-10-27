@@ -1224,3 +1224,220 @@ fn the_docs_count_the_bundled_data() {
     );
     assert!(!docs.contains("283 model IDs"));
 }
+
+/// A package that subclasses `openai.OpenAI` and exports it under the same
+/// name (tracing, analytics), so Arbor cannot resolve the client (#290).
+const WRAPPED: &str = r#"from tracing_sdk.ai.openai import OpenAI
+
+SUGGESTION_MODEL = "gpt-4.1-mini"
+
+
+def explain(prompt, report):
+    return OpenAI(tracker=None).chat.completions.create(
+        model="gpt-4.1-2025-04-14",
+        temperature=0.1,
+        messages=[{"role": "system", "content": prompt}, {"role": "user", "content": report}],
+    )
+
+
+def label(text):
+    client = OpenAI(tracker=None)
+    return client.chat.completions.create(
+        model=SUGGESTION_MODEL,
+        temperature=0.2,
+        max_tokens=32,
+        messages=[{"role": "user", "content": text}],
+    )
+
+
+def plan(text, tools):
+    return OpenAI(tracker=None).chat.completions.create(
+        model="gpt-4o-mini",
+        tools=tools,
+        messages=[{"role": "user", "content": text}],
+    )
+
+
+def plain(text):
+    return OpenAI(tracker=None).chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": text}],
+    )
+
+
+def passthrough(text, **options):
+    return OpenAI(tracker=None).chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": text}],
+        **options,
+    )
+"#;
+
+/// A plain client whose arguments come from the caller, and one that sends
+/// some in `extra_body`.
+const UNSEEN: &str = r#"from openai import OpenAI
+
+client = OpenAI()
+
+
+def forward(text, **options):
+    return client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": text}],
+        **options,
+    )
+
+
+def raw(text, body):
+    return client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[{"role": "user", "content": text}],
+        extra_body=body,
+    )
+"#;
+
+/// A Claude client passed in as a parameter: not resolved either.
+const PASSED_IN: &str = r#"import anthropic
+
+
+def reply(client, text):
+    return client.messages.create(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=512,
+        temperature=0.3,
+        messages=[{"role": "user", "content": text}],
+    )
+"#;
+
+#[test]
+fn arguments_that_need_reasoning_off_are_never_no_change() {
+    // #290: a call through a wrapped client that sends temperature=0.1 read
+    // "let the model reason (no change)", and on gpt-6-luna a non-default
+    // temperature returns 400 unless reasoning_effort="none"
+    // (docs/LIVE_CHECKS_2026-10-18.md, E2).
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("wrapped.py"), WRAPPED).unwrap();
+    fs::write(dir.path().join("unseen.py"), UNSEEN).unwrap();
+    fs::write(dir.path().join("passed_in.py"), PASSED_IN).unwrap();
+    let (code, report) = run_json(dir.path(), &[]);
+    assert_eq!(code, Some(0), "{report:#}");
+    let at = |file: &str, symbol: &str| -> Value {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| {
+                f["file"].as_str().is_some_and(|p| p.ends_with(file)) && f["symbol"] == symbol
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("no finding for {file} {symbol}: {report:#}"))
+    };
+    let option = |finding: &Value, id: &str| -> Value {
+        finding["decisions"][0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no option {id}: {finding:#}"))
+    };
+
+    // The wrapped client is not resolved, but its arguments are checked as
+    // a plain client's would be.
+    for (symbol, removed) in [
+        ("explain", "temperature"),
+        ("label", "temperature"),
+        ("plan", "tools"),
+    ] {
+        let finding = at("wrapped.py", symbol);
+        assert_eq!(finding["confidence"], "gap", "{finding:#}");
+        assert_eq!(
+            option(&finding, "model_default")["remove"],
+            serde_json::json!([removed]),
+            "{finding:#}"
+        );
+        assert_eq!(
+            option(&finding, "reasoning_none")["keep"],
+            serde_json::json!([removed]),
+            "{finding:#}"
+        );
+        assert!(finding["decisions"][0].get("unchecked_args").is_none());
+    }
+    let label = at("wrapped.py", "label");
+    assert_eq!(label["changes"][0]["param"], "max_tokens");
+    assert_eq!(label["changes"][0]["to"], "max_completion_tokens");
+
+    // Every argument of this one was read, and none needs a change.
+    let plain = at("wrapped.py", "plain");
+    assert_eq!(
+        option(&plain, "model_default")["remove"],
+        serde_json::json!([])
+    );
+    assert!(plain["decisions"][0].get("unchecked_args").is_none());
+
+    // Arguments Arbor cannot see: never "no change".
+    for (file, symbol, why) in [
+        ("wrapped.py", "passthrough", "splat"),
+        ("unseen.py", "forward", "splat"),
+        ("unseen.py", "raw", "extra_body"),
+    ] {
+        let finding = at(file, symbol);
+        assert_eq!(
+            finding["decisions"][0]["unchecked_args"], why,
+            "{finding:#}"
+        );
+        assert_eq!(finding["fix"], "manual", "{finding:#}");
+        assert!(!finding["review"].as_array().unwrap().is_empty());
+    }
+
+    // The Claude call's temperature is checked too.
+    let reply = at("passed_in.py", "reply");
+    assert_eq!(reply["gap_reason"], "parameter");
+    assert!(
+        reply["review"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["rule"] == "ANT-SAMPLING"),
+        "{reply:#}"
+    );
+
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    let decide = |edits: &str| {
+        format!("decide: keep reasoning off (add reasoning_effort=\"none\"; keep {edits}) or let the model reason (remove {edits})")
+    };
+    assert_eq!(text.matches(&decide("temperature")).count(), 2, "{text}");
+    assert_eq!(text.matches(&decide("tools")).count(), 1, "{text}");
+    assert!(
+        text.contains("also change: max_tokens → max_completion_tokens"),
+        "{text}"
+    );
+    let unseen = "decide: keep reasoning off (add reasoning_effort=\"none\") or let the model reason (could not check the arguments from **kwargs)";
+    assert_eq!(text.matches(unseen).count(), 2, "{text}");
+    assert!(
+        text.contains("decide: keep reasoning off (add reasoning_effort=\"none\") or let the model reason (could not check the arguments in extra_body)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("check: The entries of `extra_body` are sent as request arguments, and Arbor could not check them."),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "check: Non-default temperature, top_p or top_k return 400 on claude-sonnet-5-5"
+        ),
+        "{text}"
+    );
+    // Only the call Arbor read in full, with nothing to change, says so.
+    let reasoning_no_change = "let the model reason (no change)";
+    assert_eq!(text.matches(reasoning_no_change).count(), 1, "{text}");
+
+    let markdown = stdout(&arbor(
+        dir.path(),
+        &["retirements", ".", "--markdown", "--today", TODAY],
+    ));
+    assert!(
+        markdown.contains("let the model reason (could not check the arguments from `**kwargs`)"),
+        "{markdown}"
+    );
+}

@@ -2405,7 +2405,7 @@ fn summarize(
 mod tests {
     use super::super::bundled;
     use super::*;
-    use crate::usages::{Receiver, Span};
+    use crate::usages::{CallArgs, Receiver, Span};
 
     fn span(line: u32) -> Span {
         Span {
@@ -3972,6 +3972,114 @@ def run():
             values_complete: false,
             args: None,
         }
+    }
+
+    #[test]
+    fn a_call_through_an_unresolved_client_is_checked_with_its_arguments() {
+        // #290: the arguments of a call whose client Arbor could not resolve
+        // (a subclass of `OpenAI` exported under the same name) were
+        // dropped, so `temperature`, `tools` and `max_tokens` went unchecked
+        // and the decision read "let the model reason (no change)".
+        let at = |args: Option<CallArgs>| UsageGap {
+            args,
+            values: vec![value("gpt-4.1-mini", ValueOrigin::Literal, 40)],
+            ..gap_at(GapKind::UnknownClientFactory, "factory_call", 40, None)
+        };
+        let read = |kwargs: &[&str], splat: bool| {
+            Some(CallArgs {
+                kwargs: kwargs.iter().map(|k| k.to_string()).collect(),
+                splat,
+            })
+        };
+        let finding = |gap: UsageGap| {
+            let report = run(&[], &[gap], &options("2026-10-18"));
+            assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
+            report.findings[0].clone()
+        };
+
+        let sampled = finding(at(read(
+            &["model", "temperature", "max_tokens", "messages"],
+            false,
+        )));
+        assert_eq!(sampled.confidence, Confidence::Gap);
+        assert_eq!(sampled.fix, FixKind::Manual, "a gap is never a swap");
+        assert_eq!(
+            change(&sampled, "max_tokens").and_then(|c| c.to).as_deref(),
+            Some("max_completion_tokens")
+        );
+        assert_eq!(sampled.decisions[0].unchecked_args, None);
+        assert_eq!(option(&sampled, "model_default").remove, ["temperature"]);
+        assert_eq!(option(&sampled, "reasoning_none").keep, ["temperature"]);
+
+        let tools = finding(at(read(&["model", "tools", "messages"], false)));
+        assert_eq!(option(&tools, "model_default").remove, ["tools"]);
+
+        // Arguments it cannot see: the decision says so, and a person checks.
+        for (args, why) in [
+            (read(&["model", "messages"], true), UncheckedArgs::Splat),
+            (None, UncheckedArgs::NotRecorded),
+        ] {
+            let unseen = finding(at(args));
+            assert_eq!(unseen.decisions[0].unchecked_args, Some(why));
+            assert!(
+                unseen.review.iter().any(|r| r.message == why.message()),
+                "{:#?}",
+                unseen.review
+            );
+        }
+    }
+
+    #[test]
+    fn a_decision_says_when_the_call_sends_arguments_arbor_did_not_read() {
+        let mut splat = openai("gpt-4o-mini", &["messages"]);
+        splat.splat = true;
+        let extra_body = openai("gpt-4o-mini", &["messages", "extra_body"]);
+        let plain = openai("gpt-4o-mini", &["messages"]);
+        for (call, why) in [
+            (splat, Some(UncheckedArgs::Splat)),
+            (extra_body, Some(UncheckedArgs::ExtraBody)),
+            (plain, None),
+        ] {
+            let finding = one(&[call]);
+            assert_eq!(finding.decisions[0].unchecked_args, why, "{finding:#?}");
+            match why {
+                Some(why) => {
+                    assert!(finding.review.iter().any(|r| r.message == why.message()));
+                    assert_eq!(finding.fix, FixKind::Manual);
+                }
+                // Every argument was read and none conflicts: "no change"
+                // holds for letting the model reason.
+                None => assert!(option(&finding, "model_default").remove.is_empty()),
+            }
+        }
+
+        // Claude's thinking choice is marked the same way.
+        let mut claude = call(
+            Sdk::Anthropic,
+            Routing::AnthropicDirect,
+            "claude.messages.create",
+            "claude-3-5-sonnet-20241022",
+            &["max_tokens", "messages"],
+            20,
+        );
+        claude.splat = true;
+        let finding = one(&[claude]);
+        assert_eq!(finding.decisions[0].choice, "ANT-THINKING-DEFAULT");
+        assert_eq!(
+            finding.decisions[0].unchecked_args,
+            Some(UncheckedArgs::Splat)
+        );
+
+        // A model nested in `extra_body` has no decision; the nested check
+        // already says to look at its parameters by hand.
+        let mut nested = openai("gpt-4o", &["messages", "extra_body"]);
+        nested.values[0].key = "extra_body.model".into();
+        let finding = one(&[nested]);
+        assert!(finding.decisions.is_empty());
+        assert!(!finding
+            .review
+            .iter()
+            .any(|r| r.message == UncheckedArgs::ExtraBody.message()));
     }
 
     #[test]
