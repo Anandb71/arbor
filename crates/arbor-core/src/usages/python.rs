@@ -103,8 +103,9 @@
 
 use super::{
     is_capturable_value, is_credential_value, is_identifier_key, is_secret_key, is_value_key,
-    model_family, BindingKind, CapturedValue, ClientConstruction, ClientScope, FileUsages, GapKind,
-    Receiver, Routing, Sdk, SdkCall, SdkImport, Span, UsageGap, ValueOrigin, VertexAi,
+    model_family, BindingKind, CallArgs, CapturedValue, ClientConstruction, ClientScope,
+    FileUsages, GapKind, Receiver, Routing, Sdk, SdkCall, SdkImport, Span, UsageGap, ValueOrigin,
+    VertexAi,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -6264,6 +6265,7 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
             return;
         }
@@ -6286,6 +6288,7 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         }
         self.settle_builtin_values();
@@ -6354,6 +6357,7 @@ impl<'t> Ctx<'t> {
             ),
             values: Vec::new(),
             values_complete: false,
+            args: None,
         });
     }
 
@@ -7113,6 +7117,7 @@ impl<'t> Ctx<'t> {
                     ),
                     values: Vec::new(),
                     values_complete: false,
+                    args: None,
                 });
             }
         }
@@ -7147,6 +7152,7 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         } else if let Some(caveat) = &target.caveat {
             let (reason, detail) = match caveat {
@@ -7253,6 +7259,7 @@ impl<'t> Ctx<'t> {
                 detail,
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         } else if let Some(feature) = self.file_dynamic {
             // Anything in this file may be rebound, the receiver and the
@@ -7272,6 +7279,7 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         }
 
@@ -7401,6 +7409,7 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         }
     }
@@ -7511,6 +7520,7 @@ impl<'t> Ctx<'t> {
             reason: unresolved.reason.to_string(),
             detail,
             values_complete: complete && !values.is_empty(),
+            args: None,
             values,
         });
     }
@@ -7570,6 +7580,7 @@ impl<'t> Ctx<'t> {
             ),
             values: Vec::new(),
             values_complete: false,
+            args: None,
         });
     }
 
@@ -7658,6 +7669,12 @@ impl<'t> Ctx<'t> {
             detail,
             values,
             values_complete: false,
+            // The arguments are known even when the client is not: the
+            // retirement check applies its argument rules to them.
+            args: Some(CallArgs {
+                kwargs: args.kwargs,
+                splat: args.splat,
+            }),
         });
     }
 
@@ -7688,6 +7705,7 @@ impl<'t> Ctx<'t> {
             ),
             values: Vec::new(),
             values_complete: false,
+            args: None,
         });
     }
 

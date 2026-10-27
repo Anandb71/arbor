@@ -299,6 +299,7 @@ pub fn scan_usages(root: &Path, options: &UsageScanOptions) -> std::io::Result<U
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         }
         report.skipped.vendored_roots.push(root_entry);

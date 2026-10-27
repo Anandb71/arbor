@@ -25,7 +25,7 @@ pub use check::{
     check, python_literal, CallKind, ChainStep, Change, ChangeKind, CheckOptions, Confidence,
     DataInfo, Decision, DecisionOption, Finding, FixKind, MatchKind, NextShutdown, OptionEffect,
     ParamValue, ProviderDate, RecipeRef, ReportOptions, RetirementReport, ReviewItem, RoutingClass,
-    ScanInput, State, Summary, Unreadable, FINE_TUNING, REPORT_VERSION,
+    ScanInput, State, Summary, UncheckedArgs, Unreadable, FINE_TUNING, REPORT_VERSION,
 };
 pub use date::Date;
 pub use gaps::{gap_text, routing_gap_text, value_gap_text, GAP_REASONS};

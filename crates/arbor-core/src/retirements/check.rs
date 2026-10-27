@@ -272,6 +272,44 @@ pub struct Decision {
     pub options: Vec<DecisionOption>,
     /// How the call's automatic changes depend on the choice.
     pub notes: Vec<String>,
+    /// Why Arbor could not read every argument the call sends. The options
+    /// then list changes only for the arguments it read: an option that
+    /// adds nothing (letting the model reason or think) may still need
+    /// arguments removed that Arbor could not see, so it is never "no
+    /// change". `None` (omitted from JSON) when every argument was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unchecked_args: Option<UncheckedArgs>,
+}
+
+/// Why Arbor could not read every argument a call sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UncheckedArgs {
+    /// Arguments are spread into the call with `**`.
+    Splat,
+    /// The call passes `extra_body`, whose entries the SDK sends as request
+    /// arguments.
+    ExtraBody,
+    /// The usage scan did not record the call's arguments (a call whose
+    /// client it could not resolve, from a scan that does not record them).
+    NotRecorded,
+}
+
+impl UncheckedArgs {
+    /// What a person has to check, for the report.
+    pub fn message(self) -> &'static str {
+        match self {
+            UncheckedArgs::Splat => {
+                "Some arguments come from `**kwargs`, so Arbor could not check them all."
+            }
+            UncheckedArgs::ExtraBody => {
+                "The entries of `extra_body` are sent as request arguments, and Arbor could not check them."
+            }
+            UncheckedArgs::NotRecorded => {
+                "Arbor did not record this call's arguments, so it could not check them."
+            }
+        }
+    }
 }
 
 /// One affected call site.
@@ -1287,14 +1325,15 @@ fn finding_for(
 ) -> Option<Finding> {
     let (hit, class) = resolve(data, routing, &value.value)?;
 
-    let (file, span, symbol, chain, kwargs, splat, endpoint, call_kind) = match site {
+    // `args`: the call's argument names and whether some are spread with
+    // `**`, or `None` when the usage scan did not record them.
+    let (file, span, symbol, chain, args, endpoint, call_kind) = match site {
         Site::Call(call, kind) => (
             call.file.clone(),
             Some(call.span),
             call.symbol.clone(),
             Some(call.chain.clone()),
-            call.kwargs.clone(),
-            call.splat,
+            Some((call.kwargs.clone(), call.splat)),
             // A parameter object's arguments are not the request's.
             (kind != CallKind::RequestParam)
                 .then(|| endpoint_of(&call.chain, &call.member))
@@ -1308,13 +1347,16 @@ fn finding_for(
                 gap.span,
                 gap.symbol.clone(),
                 gap.chain.clone(),
-                Vec::new(),
-                false,
+                // A call whose client was not resolved still shows its
+                // arguments: the same rules apply to them.
+                gap.args.as_ref().map(|a| (a.kwargs.clone(), a.splat)),
                 endpoint_of(&chain, &chain),
                 CallKind::Request,
             )
         }
     };
+    let recorded = args.is_some();
+    let (kwargs, splat) = args.unwrap_or_default();
     let gap_reason = match site {
         Site::Gap(gap) => Some(gap.reason.clone()),
         Site::Call(..) => None,
@@ -1390,8 +1432,26 @@ fn finding_for(
             outcome = apply_rules(rules, &context);
         }
     }
+    // Arguments the rules above could not see. `extra_body` is the call's
+    // own only for the call's own model: a nested model and a parameter
+    // object are checked by hand anyway (see below).
+    let unchecked = if !recorded {
+        Some(UncheckedArgs::NotRecorded)
+    } else if splat {
+        Some(UncheckedArgs::Splat)
+    } else if nested.is_none()
+        && call_kind != CallKind::RequestParam
+        && kwargs.iter().any(|k| k == "extra_body")
+    {
+        Some(UncheckedArgs::ExtraBody)
+    } else {
+        None
+    };
+    for decision in &mut outcome.decisions {
+        decision.unchecked_args = unchecked;
+    }
 
-    let mut reasons = model_reasons(&hit, status, splat, source.is_some(), chained);
+    let mut reasons = model_reasons(&hit, status, unchecked, source.is_some(), chained);
     if let Some(chain) = replacement_chain.as_ref().filter(|c| c.chained()) {
         reasons.push(ReviewItem {
             rule: None,
@@ -1602,7 +1662,7 @@ fn endpoint_of(chain: &str, member: &str) -> Option<&'static str> {
 fn model_reasons(
     hit: &Hit<'_>,
     status: State,
-    splat: bool,
+    unchecked: Option<UncheckedArgs>,
     rules_known: bool,
     chained: bool,
 ) -> Vec<ReviewItem> {
@@ -1648,10 +1708,8 @@ fn model_reasons(
                 .to_string(),
         );
     }
-    if splat {
-        messages.push(
-            "Some arguments come from `**kwargs`, so Arbor could not check them all.".to_string(),
-        );
+    if let Some(unchecked) = unchecked {
+        messages.push(unchecked.message().to_string());
     }
     messages
         .into_iter()
@@ -1952,6 +2010,8 @@ fn add_choice(rule: &ParamRule, context: &RuleContext<'_>, out: &mut Outcome) {
                     })
                     .collect(),
                 notes: Vec::new(),
+                // Set by the caller, which knows what the scan read.
+                unchecked_args: None,
             });
             out.decisions.len() - 1
         }
@@ -3388,6 +3448,7 @@ def known(model):
             detail: String::new(),
             values: Vec::new(),
             values_complete: false,
+            args: None,
         };
         let gaps = [
             gap(22, "base_url_env"),
@@ -3489,6 +3550,7 @@ def known(model):
             detail: String::new(),
             values: vec![value("gpt-4o-2024-08-06", ValueOrigin::Literal, 40)],
             values_complete: false,
+            args: None,
         };
         let report = run(&[], &[gap], &options("2026-10-18"));
         let finding = &report.findings[0];
@@ -3516,6 +3578,7 @@ def known(model):
             detail: String::new(),
             values: Vec::new(),
             values_complete: false,
+            args: None,
         };
         // Line 10 has a captured fallback; line 50 has nothing.
         let report = run(&[env], &[gap(10), gap(50), gap(50)], &options("2026-10-18"));
@@ -3860,6 +3923,7 @@ def run():
                 value("gpt-6-luna", ValueOrigin::Literal, 3),
             ],
             values_complete: true,
+            args: None,
         };
         let missing = UsageGap {
             kind: GapKind::UnresolvedModel,
@@ -3906,6 +3970,7 @@ def run():
             detail: String::new(),
             values: Vec::new(),
             values_complete: false,
+            args: None,
         }
     }
 

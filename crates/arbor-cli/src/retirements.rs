@@ -22,7 +22,8 @@
 use arbor_core::retirements::{
     bundled, check, python_literal, routing_gap_text, value_gap_text, BaseUrl, CallKind, Change,
     ChangeKind, CheckOptions, Confidence, Date, DateKind, Decision, Finding, MatchKind,
-    OptionStatus, RetirementReport, RoutingClass, ScanInput, State, FINE_TUNING, REPORT_VERSION,
+    OptionStatus, RetirementReport, RoutingClass, ScanInput, State, UncheckedArgs, FINE_TUNING,
+    REPORT_VERSION,
 };
 use arbor_core::usages::{is_unsafe_char, ValueOrigin};
 use arbor_watcher::usages::{scan_usages, UsageScanOptions};
@@ -380,6 +381,14 @@ fn describe_decision(decision: &Decision, code: bool) -> String {
             if !removed.is_empty() {
                 edits.push(format!("remove {}", removed.join(", ")));
             }
+            // An option that adds nothing relies on what the call does not
+            // send: when Arbor could not read every argument, it cannot say
+            // the call needs no change.
+            if option.add.is_empty() {
+                if let Some(unchecked) = decision.unchecked_args {
+                    edits.push(unchecked_clause(unchecked, code));
+                }
+            }
             if edits.is_empty() {
                 edits.push("no change".to_string());
             }
@@ -387,6 +396,22 @@ fn describe_decision(decision: &Decision, code: bool) -> String {
         })
         .collect::<Vec<_>>()
         .join(" or ")
+}
+
+/// `could not check the arguments from **kwargs`: said in place of "no
+/// change" when Arbor could not read every argument the call sends.
+fn unchecked_clause(unchecked: UncheckedArgs, code: bool) -> String {
+    match unchecked {
+        UncheckedArgs::Splat => format!(
+            "could not check the arguments from {}",
+            tick("**kwargs", code)
+        ),
+        UncheckedArgs::ExtraBody => format!(
+            "could not check the arguments in {}",
+            tick("extra_body", code)
+        ),
+        UncheckedArgs::NotRecorded => "could not check this call's arguments".to_string(),
+    }
 }
 
 /// What to keep in mind about how the value was found and where the call

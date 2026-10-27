@@ -497,6 +497,23 @@ pub struct UsageGap {
     /// may call the function, or a limit cut the list.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub values_complete: bool,
+    /// For an `unknown_client_factory` gap at a call: the call's argument
+    /// names, so the retirement check can apply its argument rules to a call
+    /// whose client was not resolved. `None` (omitted from JSON) when the
+    /// extractor did not record them; the check then says it could not
+    /// check the call's arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<CallArgs>,
+}
+
+/// The argument names of a call, as [`SdkCall`] records them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallArgs {
+    /// Argument names in source order (see [`SdkCall::kwargs`]).
+    pub kwargs: Vec<String>,
+    /// Whether arguments were spread into the call (`**kwargs`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub splat: bool,
 }
 
 /// Everything one file says about tracked SDKs.
