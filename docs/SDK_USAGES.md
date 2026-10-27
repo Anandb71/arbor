@@ -261,8 +261,8 @@ LangChain's helpers report nothing.
   - given both (by keyword or through a same-file dict expanded with `**`),
     a `reassigned` gap with no key keeps both values unconfirmed;
   - given one next to a `**` expansion the file cannot read, a `splat` gap
-    with no key does the same: the expansion may hold the other name, which
-    is no `TypeError` as a second `model=` would be;
+    on that name keeps it unconfirmed: the expansion may hold the other name,
+    which is no `TypeError` as a second `model=` would be;
   - given neither, `ChatOpenAI` and `ChatAnthropic` get a `missing_model` gap
     (LangChain's default model applies). `AzureChatOpenAI` serves its
     deployment, so a missing `model` there is not a gap.
