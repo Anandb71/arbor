@@ -1441,3 +1441,153 @@ fn arguments_that_need_reasoning_off_are_never_no_change() {
         "{markdown}"
     );
 }
+
+/// Other shapes of a wrapped client (#290 review): a class that keeps the
+/// client on `self` and forwards `**kwargs`, `tools` spread in only when
+/// given, the async client behind `await`, and the Responses API.
+const WRAPPER_SHAPES: &str = r#"from tracing_sdk.ai.openai import AsyncOpenAI, OpenAI
+
+traced = OpenAI(tracker=None)
+traced_async = AsyncOpenAI(tracker=None)
+
+
+class Assistant:
+    def __init__(self):
+        self.client = OpenAI(tracker=None)
+
+    def ask(self, prompt, **kwargs):
+        return self.client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            **kwargs,
+        )
+
+
+def ask_maybe_tools(prompt, tools=None):
+    return traced.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        **({"tools": tools} if tools else {}),
+    )
+
+
+async def ask_async(prompt, temperature=0.7):
+    return await traced_async.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=temperature,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+
+async def ask_async_plain(prompt):
+    return await traced_async.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+
+def respond(prompt):
+    return traced.responses.create(model="gpt-4o-mini", temperature=0.1, input=prompt)
+
+
+def respond_with_tools(prompt, tools):
+    return traced.responses.create(model="gpt-4o-mini", tools=tools, input=prompt)
+"#;
+
+#[test]
+fn wrapped_client_shapes_keep_their_arguments_checked() {
+    let dir = project(WRAPPER_SHAPES);
+    let (code, report) = run_json(dir.path(), &[]);
+    assert_eq!(code, Some(0), "{report:#}");
+    let at = |symbol: &str| -> Value {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["symbol"] == symbol)
+            .cloned()
+            .unwrap_or_else(|| panic!("no finding for {symbol}: {report:#}"))
+    };
+    let decision = |finding: &Value| -> Value {
+        assert_eq!(finding["confidence"], "gap", "{finding:#}");
+        let decisions = finding["decisions"].as_array().unwrap();
+        assert_eq!(decisions.len(), 1, "{finding:#}");
+        decisions[0].clone()
+    };
+    let option = |decision: &Value, id: &str| -> Value {
+        decision["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no option {id}: {decision:#}"))
+    };
+    let names = |list: &Value| -> Vec<String> {
+        list.as_array()
+            .map(|l| l.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+            .unwrap_or_default()
+    };
+    let rules = |finding: &Value| -> Vec<String> {
+        finding["review"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["rule"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    // `**kwargs` forwarded by a method, and `tools` spread in conditionally:
+    // Arbor cannot see them, so it never says "no change".
+    for symbol in ["Assistant.ask", "ask_maybe_tools"] {
+        let decision = decision(&at(symbol));
+        assert_eq!(decision["unchecked_args"], "splat", "{decision:#}");
+    }
+
+    // The async client behind `await`: a temperature from a parameter is
+    // checked like any other.
+    let ask_async = decision(&at("ask_async"));
+    assert!(ask_async.get("unchecked_args").is_none(), "{ask_async:#}");
+    assert_eq!(
+        names(&option(&ask_async, "model_default")["remove"]),
+        ["temperature"]
+    );
+    assert_eq!(
+        names(&option(&ask_async, "reasoning_none")["keep"]),
+        ["temperature"]
+    );
+
+    // Precision: a call that sends only defaults keeps "no change".
+    let plain = decision(&at("ask_async_plain"));
+    assert!(plain.get("unchecked_args").is_none(), "{plain:#}");
+    assert!(names(&option(&plain, "model_default")["remove"]).is_empty());
+
+    // The Responses API takes `reasoning={"effort": "none"}`; its sampling
+    // rule is a check (not verified live), and its tools need no change.
+    let respond = at("respond");
+    let respond_decision = decision(&respond);
+    let add = &option(&respond_decision, "reasoning_none")["add"];
+    assert_eq!(add[0]["name"], "reasoning", "{respond:#}");
+    assert!(
+        rules(&respond).contains(&"G6-SAMPLING-RESPONSES".to_string()),
+        "{respond:#}"
+    );
+    let tools = at("respond_with_tools");
+    let tools_decision = decision(&tools);
+    assert!(tools_decision.get("unchecked_args").is_none());
+    assert!(names(&option(&tools_decision, "model_default")["remove"]).is_empty());
+    assert!(
+        !rules(&tools).iter().any(|r| r.contains("TOOLS")),
+        "{tools:#}"
+    );
+
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    let unseen = "let the model reason (could not check the arguments from **kwargs)";
+    assert_eq!(text.matches(unseen).count(), 2, "{text}");
+    assert_eq!(
+        text.matches("let the model reason (remove temperature)")
+            .count(),
+        1,
+        "{text}"
+    );
+}
