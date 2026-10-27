@@ -258,8 +258,11 @@ LangChain's helpers report nothing.
   construction and a call (`request: false`) whose `model` or `model_name`
   value is read under the value rules above. LangChain takes the model under
   either name:
-  - given both, a `reassigned` gap with no key keeps both values
-    unconfirmed;
+  - given both (by keyword or through a same-file dict expanded with `**`),
+    a `reassigned` gap with no key keeps both values unconfirmed;
+  - given one next to a `**` expansion the file cannot read, a `splat` gap
+    with no key does the same: the expansion may hold the other name, which
+    is no `TypeError` as a second `model=` would be;
   - given neither, `ChatOpenAI` and `ChatAnthropic` get a `missing_model` gap
     (LangChain's default model applies). `AzureChatOpenAI` serves its
     deployment, so a missing `model` there is not a gap.
@@ -426,7 +429,11 @@ The report assumes the rest. In particular:
 - The process environment at run time is not known: a direct client built
   without a `base_url` is reported direct, although the deployment (or a
   `.env` file loaded with `load_dotenv`) may set `OPENAI_BASE_URL`,
-  `ANTHROPIC_BASE_URL` or `GOOGLE_GENAI_USE_VERTEXAI`.
+  `ANTHROPIC_BASE_URL` or `GOOGLE_GENAI_USE_VERTEXAI`, and for a LangChain
+  chat model `OPENAI_API_BASE`, `ANTHROPIC_API_URL` or `LANGSMITH_GATEWAY`.
+- A LangChain chat model's field names and aliases are those of the current
+  `langchain-openai` and `langchain-anthropic`, which the deprecated classes
+  share; which LangChain version the project runs is not known.
 - The module-level API's state is process-wide: in a file that does not
   configure it, a call is reported direct, although another module may
   configure it. A call that passes `engine` or `deployment_id` is the
