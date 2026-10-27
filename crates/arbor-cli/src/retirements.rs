@@ -549,7 +549,7 @@ fn summary_lines(report: &RetirementReport, markdown: bool) -> Vec<String> {
     let mut lines = Vec::new();
     if s.affected_calls == 0 {
         lines.push(format!(
-            "No direct openai/anthropic/google SDK calls to retired or retiring models in {} Python file{} (LangChain's ChatOpenAI and ChatAnthropic included). Calls through LiteLLM or other wrappers are not checked yet.",
+            "No direct openai/anthropic/google SDK calls to retired or retiring models in {} Python file{} (LangChain's ChatOpenAI and ChatAnthropic included). Calls through LiteLLM count as routed; Bedrock's own model schedule and other wrappers are not checked yet.",
             s.files_scanned,
             if s.files_scanned == 1 { "" } else { "s" }
         ));
@@ -642,7 +642,7 @@ fn not_checked_lines(report: &RetirementReport, markdown: bool) -> Vec<String> {
     }
     if s.routed_calls > 0 && !report.options.include_routed {
         lines.push(format!(
-            "Not listed: {} {} these models through Azure, another host in base_url or another cloud, where the provider's dates may not apply. Add {} to list {}.",
+            "Not listed: {} {} these models through Azure, another host in base_url, another cloud or LiteLLM, where the provider's dates may not apply. Add {} to list {}.",
             calls(s.routed_calls),
             verb(s.routed_calls, "reaches", "reach"),
             tick("--include-routed", markdown),
@@ -736,7 +736,7 @@ fn join_and(names: &[&str]) -> String {
 
 fn data_line(report: &RetirementReport) -> String {
     format!(
-        "Retirement data from the providers' deprecation pages: {}. Days are counted in UTC. Python only for now: direct SDK calls and LangChain chat models. Runs locally: no code leaves this machine.",
+        "Retirement data from the providers' deprecation pages: {}. Days are counted in UTC. Python only for now: direct SDK calls, LangChain chat models and LiteLLM (routed). Runs locally: no code leaves this machine.",
         provider_dates(report)
     )
 }
