@@ -1624,8 +1624,10 @@ fn index_changed_only(path: &Path, output: Option<&Path>, follow_symlinks: bool)
     );
     let base_graph = load_or_index_graph(path)?;
 
+    // Untouched files come back from the saved graph: their code nodes, and
+    // the import nodes kept beside it, which their calls resolve against.
     let mut retained_nodes = Vec::new();
-    for node in base_graph.nodes() {
+    for node in base_graph.nodes().chain(base_graph.import_nodes()) {
         let changed = changed_files
             .iter()
             .any(|f| node_matches_changed_file(&node.file, f, path));
