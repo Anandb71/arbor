@@ -1,0 +1,63 @@
+{
+  "corpus_version": 1,
+  "suite": "usages",
+  "language": "python",
+  "covers": [
+    "LangChain partner packages: ChatOpenAI with a model= literal and a model_name= module constant, ChatAnthropic, AzureChatOpenAI as azure_openai",
+    "each chat-model constructor is a client and a call record that carries its model; invoke/predict_messages on the built model keep its routing",
+    "a base_url from a module constant pointing at another host is custom_base_url",
+    "a ChatOpenAI with no model is a missing_model gap; an AzureChatOpenAI with no model= is not",
+    "the deprecated `from langchain.chat_models import ChatOpenAI` form",
+    "a file that sets OPENAI_API_BASE makes its OpenAI chat models unknown with an endpoint_env gap, not its ChatAnthropic",
+    "OpenAIEmbeddings and its calls are not tracked; an api_key and a gateway host never reach the output"
+  ],
+  "usages_expected": [
+    {"at": "app/chains.py:8", "chain": "ChatOpenAI", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "app/chains.py:9", "chain": "ChatOpenAI", "routing": "openai_direct", "values": {"model_name": "gpt-4o-mini"}},
+    {"at": "app/chains.py:10", "chain": "ChatAnthropic", "routing": "anthropic_direct", "values": {"model": "claude-3-5-sonnet-20241022"}},
+    {"at": "app/chains.py:15", "chain": "drafter.invoke", "routing": "openai_direct"},
+    {"at": "app/chains.py:19", "chain": "summarizer.invoke", "routing": "openai_direct"},
+    {"at": "app/chains.py:23", "chain": "reviewer.invoke", "routing": "anthropic_direct"},
+
+    {"at": "app/gateway.py:7", "chain": "ChatOpenAI", "routing": "custom_base_url", "values": {"model": "gpt-4o"}},
+    {"at": "app/gateway.py:8", "chain": "ChatOpenAI", "routing": "openai_direct"},
+    {"at": "app/gateway.py:9", "chain": "AzureChatOpenAI", "routing": "azure_openai", "values": {"model": "gpt-4o"}},
+    {"at": "app/gateway.py:17", "chain": "routed.invoke", "routing": "custom_base_url"},
+    {"at": "app/gateway.py:22", "chain": "azure.invoke", "routing": "azure_openai"},
+    {"at": "app/gateway.py:24", "chain": "fallback.invoke", "routing": "openai_direct"},
+
+    {"at": "app/legacy_bot.py:6", "chain": "ChatOpenAI", "routing": "openai_direct", "values": {"model_name": "gpt-3.5-turbo"}},
+    {"at": "app/legacy_bot.py:14", "chain": "chat.predict_messages", "routing": "openai_direct"},
+
+    {"at": "app/local_proxy.py:11", "chain": "ChatOpenAI", "routing": "unknown", "values": {"model": "gpt-4o-mini"}},
+    {"at": "app/local_proxy.py:12", "chain": "ChatAnthropic", "routing": "anthropic_direct", "values": {"model": "claude-3-5-haiku-20241022"}},
+    {"at": "app/local_proxy.py:16", "chain": "assistant.invoke", "routing": "unknown"},
+    {"at": "app/local_proxy.py:20", "chain": "critic.invoke", "routing": "anthropic_direct"}
+  ],
+  "clients_expected": [
+    {"at": "app/chains.py:8", "constructor": "langchain_openai.ChatOpenAI", "binding": "drafter", "routing": "openai_direct"},
+    {"at": "app/chains.py:9", "constructor": "langchain_openai.ChatOpenAI", "binding": "summarizer", "routing": "openai_direct"},
+    {"at": "app/chains.py:10", "constructor": "langchain_anthropic.ChatAnthropic", "binding": "reviewer", "routing": "anthropic_direct"},
+    {"at": "app/gateway.py:7", "constructor": "langchain_openai.ChatOpenAI", "binding": "routed", "routing": "custom_base_url"},
+    {"at": "app/gateway.py:8", "constructor": "langchain_openai.ChatOpenAI", "binding": "fallback", "routing": "openai_direct"},
+    {"at": "app/gateway.py:9", "constructor": "langchain_openai.AzureChatOpenAI", "binding": "azure", "routing": "azure_openai"},
+    {"at": "app/legacy_bot.py:6", "constructor": "langchain.ChatOpenAI", "binding": "chat", "routing": "openai_direct"},
+    {"at": "app/local_proxy.py:11", "constructor": "langchain_openai.ChatOpenAI", "binding": "assistant", "routing": "unknown"},
+    {"at": "app/local_proxy.py:12", "constructor": "langchain_anthropic.ChatAnthropic", "binding": "critic", "routing": "anthropic_direct"}
+  ],
+  "gaps_expected": [
+    {"at": "app/gateway.py:8", "kind": "unresolved_model", "reason": "missing_model"},
+    {"at": "app/local_proxy.py:11", "kind": "ambiguous_client", "reason": "endpoint_env"},
+    {"at": "app/local_proxy.py:16", "kind": "ambiguous_client", "reason": "endpoint_env"}
+  ],
+  "skipped_expected": {"vendored_files": 0, "vendored_calls": 0, "hidden_files": 0, "hidden_calls": 0},
+  "forbidden_in_output": [
+    "sk-test-NOT-A-REAL-KEY-langchain",
+    "text-embedding-ada-002",
+    "llm-gateway.internal.example.com",
+    "localhost:4000"
+  ],
+  "known_missing": [],
+  "known_extra": [],
+  "notes": "Synthetic. Truth is what each line does at run time, except where a policy turns it into a gap. A LangChain chat-model constructor builds the provider SDK client and fixes the model every request on it uses, so each one is both a client and a call record (chain as written, request=false) with its model; calls on the built model (invoke, predict_messages) keep its routing and carry no model of their own. gateway.py:7 is given a module-constant base_url on another host, so it and routed.invoke are custom_base_url. gateway.py:8 passes no model, so LangChain's default applies: a missing_model gap. AzureChatOpenAI serves its deployment, so gateway.py:9 needs no model; its model= is still listed, and the deployment name is not a captured value. legacy_bot.py uses the deprecated langchain.chat_models import in a file with no openai.api_* settings, so it is direct. It never mentions a lowercase `openai` or `anthropic`: it is read because `langchain` is a PREFILTER needle in usages/python.rs (the match is case-sensitive). local_proxy.py may set OPENAI_API_BASE (only when USE_LOCAL_PROXY is set) before assistant is built, so its OpenAI chat model and the call on it are unknown with an endpoint_env gap; LangChain's ChatAnthropic does not read that variable, so critic stays direct. OpenAIEmbeddings (chains.py:11) and embeddings.embed_query (chains.py:27) are not tracked: their model and the api_key passed to drafter must not be output."
+}
