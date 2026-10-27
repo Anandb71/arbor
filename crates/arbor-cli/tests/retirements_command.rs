@@ -713,7 +713,7 @@ fn human_report_reads_plainly_and_offers_a_review_once() {
     let review = "https://getarbor.dev/retirements?utm_source=arbor-cli&review=1&calls=4&retired=1&next=2027-01-14";
     assert_eq!(text.matches("getarbor.dev").count(), 1, "{text}");
     assert!(text.contains(&format!(
-        "\nWant these calls ready before 14 Jan 2027? Ask for a readiness review: Arbor writes the fix pull requests with you and lists every call it could not check.\n{review}\nArbor has sent nothing. From this run, opening the link shares only how many calls are listed, how many are already retired and the next shutdown date: no code, paths, file names or model names. Your email reaches Arbor only if you submit the form there.\n"
+        "\nWant these calls ready before 14 Jan 2027? Ask for a paid readiness review: we write the fix pull requests with you and list every call we find but can't check.\n{review}\nArbor has sent nothing. From this run, opening the link shares only how many calls are listed, how many are already retired and the next shutdown date: no code, paths, file names or model names. Your email reaches Arbor only if you submit the form there.\n"
     )), "{text}");
     assert!(text.ends_with("submit the form there.\n"), "{text}");
     // The link names no file, path, directory or model from the scan.
@@ -741,7 +741,7 @@ fn human_report_reads_plainly_and_offers_a_review_once() {
         &["retirements", ".", "--today", TODAY],
     ));
     assert!(text.contains(
-        "\nWant this call fixed? Ask for a readiness review: Arbor writes the fix pull requests with you and lists every call it could not check.\nhttps://getarbor.dev/retirements?utm_source=arbor-cli&review=1&calls=1&retired=1\n"
+        "\nWant this call fixed? Ask for a paid readiness review: we write the fix pull requests with you and list every call we find but can't check.\nhttps://getarbor.dev/retirements?utm_source=arbor-cli&review=1&calls=1&retired=1\n"
     ), "{text}");
 
     // Nothing found: no offer and no link, as before.

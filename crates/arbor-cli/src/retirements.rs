@@ -219,7 +219,7 @@ fn offer_lines(s: &Summary, routed: bool) -> Vec<String> {
         };
         return vec![
             format!(
-                "{ask} Ask for a readiness review: Arbor writes the fix pull requests with you and lists every call it could not check."
+                "{ask} Ask for a paid readiness review: we write the fix pull requests with you and list every call we find but can't check."
             ),
             url,
             format!(
@@ -1207,7 +1207,7 @@ fn annotations(report: &RetirementReport, limit: usize) -> String {
             "::notice title={}::{}\n",
             escape_property("Arbor retirements"),
             escape_data(&format!(
-                "{} more {} to retired or retiring models {} not annotated (at most {limit} warnings per step); the full report lists every call.",
+                "{} more {} to retired or retiring models {} not annotated (at most {limit} warnings per step); the full report lists them all.",
                 more,
                 verb(more, "call", "calls"),
                 verb(more, "is", "are")
@@ -1384,8 +1384,14 @@ mod tests {
         // shares, with nothing sent until the person opens it.
         let lines = offer_lines(&summary(4, 1, 3, Some("2027-01-14")), false);
         assert_eq!(lines.len(), 3, "{lines:?}");
-        assert!(lines[0]
-            .starts_with("Want these calls ready before 14 Jan 2027? Ask for a readiness review:"));
+        assert!(lines[0].starts_with(
+            "Want these calls ready before 14 Jan 2027? Ask for a paid readiness review:"
+        ));
+        // The review is a paid service people deliver: it lists the calls
+        // they find but can't check, not every call the tool missed.
+        assert!(lines[0].ends_with(
+            "we write the fix pull requests with you and list every call we find but can't check."
+        ));
         assert_eq!(
             Some(lines[1].clone()),
             review_url(&summary(4, 1, 3, Some("2027-01-14")))

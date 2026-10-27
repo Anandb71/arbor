@@ -139,7 +139,7 @@ jobs:
 ```
 
 The Action scans once. The job summary gets the Markdown report, which lists every
-call. Affected lines get warning annotations: GitHub shows at most 10 warnings per
+call the scan finds. Affected lines get warning annotations: GitHub shows at most 10 warnings per
 step, so Arbor writes 10, the calls that fail the check first and then the most
 urgent, and one notice saying how many more the summary lists. The Action fails the build only if you set `retirements-fail-on` to
 `retired` or to a number of days, with one exception: when the check cannot run
@@ -217,7 +217,7 @@ proxy; it reports only that class, never the URL.
 The human report can end with an offer of help. It is never printed with `--json`,
 `--markdown`, `--annotations`, `--quiet`, or when `CI` is set, and Arbor opens nothing
 itself. When the report lists at least one call to a retired or retiring model, the offer
-is a readiness review, and its link
+is a paid readiness review, and its link
 (`https://getarbor.dev/retirements?utm_source=arbor-cli&review=1&calls=4&retired=1&next=2027-01-14`,
 for example) carries only the number of calls in the summary, how many of them are already
 retired and the soonest shutdown date among the retiring ones, never code, paths, file

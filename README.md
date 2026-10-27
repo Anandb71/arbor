@@ -57,7 +57,7 @@ locally, with no account, API key or telemetry.
 | New | What it does |
 |-----|--------------|
 | **`arbor retirements`** | Lists the direct `openai`, `anthropic` and Google SDK calls that use a model its provider has retired or is retiring: the date, the replacement the provider lists, the arguments that change with it and the choices your repo makes first. OpenAI shuts down `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` on 14 January 2027. [More below](#find-code-that-calls-retiring-ai-models) |
-| **GitHub Action `mode: retirements`** | The same check in CI: a job summary that lists every affected call, and warnings on the most urgent lines. It warns by default and fails the build only when you set `retirements-fail-on`, or when the check cannot run. |
+| **GitHub Action `mode: retirements`** | The same check in CI: a job summary that lists every affected call it finds, and warnings on the most urgent lines. It warns by default and fails the build only when you set `retirements-fail-on`, or when the check cannot run. |
 | **`arbor usages` and `find_api_usages`** | Every OpenAI, Anthropic and Gemini SDK call with its file and line, client routing (direct, Azure, custom `base_url`, Bedrock, Vertex) and model IDs, for people and agents. A value is confirmed only inside a small supported grammar; everything else carries a typed gap. [What a report confirms](docs/SDK_USAGES.md) |
 
 Python only for now; graph extraction is unchanged (a saved graph is rebuilt
@@ -421,7 +421,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-`mode: retirements` runs `arbor retirements` instead. It writes a job summary that lists every call to a retiring model and annotates the 10 most urgent lines, GitHub's limit per step ([guide](docs/RETIREMENTS.md#in-ci-github-action)).
+`mode: retirements` runs `arbor retirements` instead. It writes a job summary that lists each call it finds to a retiring model and annotates the 10 most urgent lines, GitHub's limit per step ([guide](docs/RETIREMENTS.md#in-ci-github-action)).
 
 ---
 
