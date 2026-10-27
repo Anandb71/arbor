@@ -133,9 +133,12 @@ const PREFILTER: &[&str] = &[
     "ChatAnthropic",
     "ChatBedrock",
     // A `boto3` client is followed only when its service name is this
-    // literal; `invoke_model` is Bedrock's own request name.
+    // literal; the others are Bedrock's request names, which a client
+    // passed in from elsewhere is called by.
     "bedrock-runtime",
     "invoke_model",
+    "converse(",
+    "converse_stream(",
     "litellm",
 ];
 
@@ -192,21 +195,35 @@ const REQUEST_METHODS: &[&str] = &[
     "delete_file",
     "list_models",
     "get_model",
-    // Amazon Bedrock's runtime client.
+];
+
+/// The requests of a Bedrock runtime client; each takes a `modelId`.
+const BEDROCK_REQUESTS: &[&str] = &[
     "invoke_model",
     "invoke_model_with_response_stream",
     "invoke_model_with_bidirectional_stream",
     "converse",
     "converse_stream",
     "start_async_invoke",
-    // LiteLLM.
-    "acompletion",
+    "count_tokens",
 ];
 
 /// Whether a call's member path ends in a request method.
 fn is_request(member: &str) -> bool {
     let last = member.rsplit('.').next().unwrap_or(member);
     REQUEST_METHODS.contains(&last)
+}
+
+/// [`is_request`] for a member of `pkg`: a Bedrock client's requests are
+/// [`BEDROCK_REQUESTS`] and LiteLLM's [`LITELLM_REQUESTS`], and those names
+/// are no request of any other SDK.
+fn is_request_of(pkg: Pkg, member: &str) -> bool {
+    let last = member.rsplit('.').next().unwrap_or(member);
+    match pkg {
+        Pkg::Boto3 => BEDROCK_REQUESTS.contains(&last),
+        Pkg::Litellm => LITELLM_REQUESTS.contains(&last),
+        _ => REQUEST_METHODS.contains(&last),
+    }
 }
 
 /// Members that take a model. Like a request, an unresolved model value here
@@ -256,11 +273,6 @@ const MODEL_BEARING: &[&str] = &[
     "ChatAnthropic",
     "ChatBedrock",
     "ChatBedrockConverse",
-    // Amazon Bedrock's runtime client.
-    "invoke_model",
-    "invoke_model_with_response_stream",
-    "converse",
-    "converse_stream",
 ];
 
 /// Members that wrap a resource without changing the request
@@ -792,7 +804,11 @@ impl ValueKeys {
 fn value_keys(pkg: Pkg, receiver: Receiver) -> ValueKeys {
     match pkg {
         Pkg::Boto3 => ValueKeys::Only(&["modelId"]),
-        Pkg::LangchainAws if receiver != Receiver::Client => ValueKeys::Plus(&["model_id"]),
+        // `ChatBedrock` and `ChatBedrockConverse` have no `model_name`,
+        // `engine` or `deployment_id` field.
+        Pkg::LangchainAws if receiver != Receiver::Client => {
+            ValueKeys::Only(&["model_id", "model"])
+        }
         _ => ValueKeys::DEFAULT,
     }
 }
@@ -982,24 +998,47 @@ enum BaseUrl {
 }
 
 /// Whether `host` is the provider's own API host, for
-/// [`BaseUrl::Provider`]. For Bedrock that is any of its runtime endpoints
-/// on AWS (`bedrock-runtime.us-east-1.amazonaws.com`, a FIPS or dual-stack
-/// one, or a VPC endpoint's `vpce-....bedrock-runtime....amazonaws.com`).
+/// [`BaseUrl::Provider`]. For Bedrock that is a runtime endpoint of a
+/// region on AWS: `bedrock-runtime.<region>.amazonaws.com` (`.com.cn`,
+/// dual-stack `.api.aws`), its `bedrock-runtime-fips` form, or a VPC
+/// endpoint's `vpce-<id>.bedrock-runtime.<region>.vpce.amazonaws.com`.
 fn is_provider_host(pkg: Pkg, host: &str) -> bool {
     match pkg.sdk() {
         Sdk::Openai => host == "api.openai.com",
         Sdk::Anthropic => host == "api.anthropic.com",
         Sdk::Google => host == "generativelanguage.googleapis.com",
-        Sdk::Aws => {
-            [".amazonaws.com", ".amazonaws.com.cn", ".api.aws"]
-                .iter()
-                .any(|domain| host.ends_with(domain))
-                && host
-                    .split('.')
-                    .any(|label| label == "bedrock-runtime" || label == "bedrock-runtime-fips")
-        }
+        Sdk::Aws => is_bedrock_runtime_host(host),
         Sdk::Litellm => false,
     }
+}
+
+/// See [`is_provider_host`]. A region label has a `-` and ends in a digit
+/// (`us-east-1`, `us-gov-west-1`), so a bucket named `bedrock-runtime` on
+/// S3 (`bedrock-runtime.s3.amazonaws.com`) is another host.
+fn is_bedrock_runtime_host(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    let start = match labels.as_slice() {
+        [first, ..] if *first == "bedrock-runtime" || *first == "bedrock-runtime-fips" => 0,
+        [first, second, ..] if first.starts_with("vpce-") && *second == "bedrock-runtime" => 1,
+        _ => return false,
+    };
+    let Some(region) = labels.get(start + 1) else {
+        return false;
+    };
+    let region_like = region.contains('-') && region.ends_with(|c: char| c.is_ascii_digit());
+    let rest = &labels[start + 2..];
+    let suffix = if start == 1 {
+        matches!(
+            rest,
+            ["vpce", "amazonaws", "com"] | ["vpce", "amazonaws", "com", "cn"]
+        )
+    } else {
+        matches!(
+            rest,
+            ["amazonaws", "com"] | ["amazonaws", "com", "cn"] | ["api", "aws"]
+        )
+    };
+    region_like && suffix
 }
 
 /// The host of a URL, lowercase, without user information or port.
@@ -6487,11 +6526,20 @@ impl<'t> Ctx<'t> {
             Family::OpenaiDirect | Family::AnthropicDirect | Family::AwsBedrock
         );
         let endpoint = keyword_value(call, |n| self.text(n), |k| is_endpoint_key(class.pkg, k));
-        let base_url = match endpoint {
+        let mut base_url = match endpoint {
             Some(expr) if direct => self.base_url_kind(class.pkg, expr, scope),
             Some(_) => BaseUrl::Custom,
             None => BaseUrl::Absent,
         };
+        // `boto3.client(service, region, api_version, use_ssl, verify,
+        // endpoint_url, ...)`: an endpoint passed by position, or through
+        // `*args`, is not read.
+        if class.pkg == Pkg::Boto3
+            && base_url == BaseUrl::Absent
+            && (args.positional >= 6 || args.list_splat)
+        {
+            base_url = BaseUrl::Unknown { env: false };
+        }
         let mut routing = class.routing(&args.kwargs, args.splat, base_url);
         let mut caveat = match self.genai_endpoint_option(call, class, &args) {
             Some(option) => Some(ClientCaveat::EndpointOption { option }),
@@ -7136,7 +7184,7 @@ impl<'t> Ctx<'t> {
         // request (`client.converse = patched`) or LiteLLM's.
         let named = target.pkg().is_some_and(|pkg| {
             client_class(pkg, attr).is_some()
-                || (pkg == Pkg::Boto3 && is_request(attr))
+                || (pkg == Pkg::Boto3 && BEDROCK_REQUESTS.contains(&attr))
                 || (pkg == Pkg::Litellm && LITELLM_REQUESTS.contains(&attr))
         });
         let resource = RESOURCES.contains(&attr)
@@ -7195,27 +7243,79 @@ impl<'t> Ctx<'t> {
     /// on a boto3 session: a botocore event handler may rewrite a request's
     /// parameters or send it elsewhere. It counts as replacing an SDK member
     /// of the package (see [`Ctx::note_sdk_patch`]).
+    ///
+    /// The handler may be registered on an object this file cannot follow
+    /// (`boto3._get_default_session().events`, a session's `_session`, a
+    /// botocore session), so a `register` call whose event name is a
+    /// botocore event (`"before-parameter-build.bedrock-runtime.Converse"`)
+    /// counts wherever it is, and so does a default session set up from a
+    /// botocore session of the file's own
+    /// (`boto3.setup_default_session(botocore_session=...)`).
     fn note_botocore_events(&mut self) {
+        // The botocore events a handler can rewrite a request in, or
+        // answer it from.
+        const EVENTS: &[&str] = &[
+            "before-",
+            "after-",
+            "provide-client-params",
+            "request-created",
+            "needs-retry",
+            "response-received",
+            "choose-",
+            "creating-client-class",
+            "*",
+        ];
+        const BEDROCK: [Pkg; 2] = [Pkg::Boto3, Pkg::LangchainAws];
         for (call, scope) in self.calls.clone() {
-            let registers = call
-                .child_by_field_name("function")
-                .filter(|f| f.kind() == "attribute")
-                .and_then(|f| f.child_by_field_name("attribute"))
-                .is_some_and(|attr| self.text(attr).starts_with("register"));
-            if !registers {
-                continue;
-            }
             let Some(function) = call.child_by_field_name("function") else {
                 continue;
             };
-            let (pkg, path) = match self.eval(function, scope, 0) {
-                Val::Client { client, path } => (client.pkg, path),
-                Val::Module { pkg, path } => (pkg, path),
-                _ => continue,
+            let name = match function.kind() {
+                "attribute" => function.child_by_field_name("attribute"),
+                "identifier" => Some(function),
+                _ => None,
+            }
+            .map(|n| self.text(n));
+            let hooked: &[Pkg] = match name {
+                Some("register" | "register_first" | "register_last") => {
+                    let event = keyword_value(call, |n| self.text(n), |k| k == "event_name")
+                        .or(self.arguments(call).first_positional)
+                        .and_then(|n| self.literal(n).ok());
+                    if event.is_some_and(|e| EVENTS.iter().any(|p| e.starts_with(p))) {
+                        &BEDROCK
+                    } else {
+                        match self.eval(function, scope, 0) {
+                            Val::Client { client, path }
+                                if path.len() >= 2 && path[path.len() - 2] == "events" =>
+                            {
+                                match client.pkg {
+                                    Pkg::Boto3 => &BEDROCK[..1],
+                                    Pkg::LangchainAws => &BEDROCK[1..],
+                                    _ => &[],
+                                }
+                            }
+                            Val::Module {
+                                pkg: Pkg::Boto3,
+                                path,
+                            } if path.len() >= 2 && path[path.len() - 2] == "events" => {
+                                &BEDROCK[..1]
+                            }
+                            _ => &[],
+                        }
+                    }
+                }
+                Some("setup_default_session") => {
+                    let args = self.arguments(call);
+                    if args.splat || args.kwargs.iter().any(|k| k == "botocore_session") {
+                        &BEDROCK[..1]
+                    } else {
+                        &[]
+                    }
+                }
+                _ => &[],
             };
-            let events = path.len() >= 2 && path[path.len() - 2] == "events";
-            if events && matches!(pkg, Pkg::Boto3 | Pkg::LangchainAws) {
-                self.sdk_patched.entry(pkg).or_insert_with(|| {
+            for pkg in hooked {
+                self.sdk_patched.entry(*pkg).or_insert_with(|| {
                     Self::feature("a botocore event handler registered in this file", call)
                 });
             }
@@ -7573,7 +7673,7 @@ impl<'t> Ctx<'t> {
         let args = self.arguments_with(call, keys);
         let sdk = target.pkg.sdk();
         let member = clip_owned(strip_wrappers(&target.member));
-        let request = is_request(&member);
+        let request = is_request_of(target.pkg, &member);
         // Only LiteLLM's request functions are recorded for it.
         let model_bearing = is_model_bearing(&member) || target.pkg == Pkg::Litellm;
         // Bedrock, LangChain's Bedrock models and LiteLLM need a model: none
@@ -7640,7 +7740,12 @@ impl<'t> Ctx<'t> {
             // A Bedrock request's other fields (`inferenceConfig`,
             // `additionalModelRequestFields`, `requestMetadata`) do not
             // name the model it is sent to.
-            if (target.pkg.is_langchain() && run_option) || target.pkg == Pkg::Boto3 {
+            // LiteLLM's `model_list` names deployments, not the model the
+            // call sends (a `model_list` gap below covers it).
+            let deployments =
+                target.pkg == Pkg::Litellm && keyword.as_deref() == Some("model_list");
+            if (target.pkg.is_langchain() && run_option) || target.pkg == Pkg::Boto3 || deployments
+            {
                 continue;
             }
             let prefix = keyword
@@ -7661,6 +7766,10 @@ impl<'t> Ctx<'t> {
 
         // `**PARAMS` where `PARAMS` is a same-file dict literal.
         let mut opaque_splat = false;
+        // A LiteLLM call given a `model_list`, by keyword or in an expanded
+        // same-file dict.
+        let mut model_list =
+            target.pkg == Pkg::Litellm && args.kwargs.iter().any(|k| k == "model_list");
         let mut expanded: Vec<usize> = Vec::new();
         // The model keys the expanded same-file dicts give.
         let mut expanded_keys: HashSet<&'static str> = HashSet::new();
@@ -7714,10 +7823,25 @@ impl<'t> Ctx<'t> {
                 }
                 self.take_value(&site, key, false, result, &mut values);
             }
+            if target.pkg == Pkg::Litellm && expansion.summary.last.contains_key("model_list") {
+                model_list = true;
+            }
             if target.pkg != Pkg::Boto3 {
                 let list = self.dict_nested(&expansion);
-                nested.extend(list.found.iter().cloned());
-                nested_overridden.extend(list.overridden.iter().cloned());
+                let deployments =
+                    |path: &str| target.pkg == Pkg::Litellm && path.starts_with("model_list.");
+                nested.extend(
+                    list.found
+                        .iter()
+                        .filter(|item| !deployments(&item.path))
+                        .cloned(),
+                );
+                nested_overridden.extend(
+                    list.overridden
+                        .iter()
+                        .filter(|path| !deployments(path))
+                        .cloned(),
+                );
                 nested_cut |= list.cut;
             }
         }
@@ -7841,9 +7965,51 @@ impl<'t> Ctx<'t> {
             }
         }
 
-        // LiteLLM may map the model it is given to another one.
-        if let (Pkg::Litellm, Some(feature)) = (target.pkg, self.litellm_aliases) {
-            self.unresolved_gap(&site, "model", &Unresolved::dynamic(feature), None);
+        // LiteLLM may send the models a call names to others: through its
+        // process-wide `model_alias_map`, or through a `model_list` passed to
+        // the call (or held by a `**` expansion), which maps a model name to
+        // the deployment it calls. These gaps hold no key, so they cover
+        // every model value of the call, nested fallbacks included.
+        if target.pkg == Pkg::Litellm {
+            let mut remapped = Vec::new();
+            if let Some(feature) = self.litellm_aliases {
+                remapped.push((
+                    "dynamic_feature",
+                    format!(
+                        "{} may map the models `{chain}` names to other ones",
+                        feature.describe()
+                    ),
+                ));
+            }
+            if model_list {
+                remapped.push((
+                    "model_list",
+                    format!("`{chain}` is given a `model_list`, which maps the model names it is given to the deployments LiteLLM calls"),
+                ));
+            }
+            // With no value to cover, the `splat` gap on the model above
+            // says it.
+            if opaque_splat && !values.is_empty() {
+                remapped.push((
+                    "splat",
+                    format!("`{chain}` is given a `**` expansion that may hold a `model_list`, which maps the model names it is given to the deployments LiteLLM calls"),
+                ));
+            }
+            for (reason, detail) in remapped {
+                self.out.gaps.push(UsageGap {
+                    kind: GapKind::UnresolvedModel,
+                    sdk: Some(sdk),
+                    file: self.file.clone(),
+                    span: Some(span),
+                    symbol: symbol.clone(),
+                    chain: Some(chain.clone()),
+                    key: None,
+                    reason: reason.to_string(),
+                    detail,
+                    values: Vec::new(),
+                    values_complete: false,
+                });
+            }
         }
 
         // The argument that sets the client's endpoint, as gaps name it.
@@ -8406,7 +8572,11 @@ impl<'t> Ctx<'t> {
         let Some(last) = val.path().last() else {
             return;
         };
-        if !REQUEST_METHODS.contains(&last.as_str()) {
+        let request = match val.pkg() {
+            Some(pkg) => is_request_of(pkg, last),
+            None => is_request(last),
+        };
+        if !request {
             return;
         }
         let rendered = self.render(reference);

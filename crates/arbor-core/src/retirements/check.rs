@@ -3316,6 +3316,33 @@ routed = litellm.completion(model="anthropic/claude-3-5-sonnet-20241022", messag
         assert!(at("old = ").fails);
         assert_eq!(at("routed = ").match_kind, MatchKind::RouterPrefix);
         assert_eq!(report.exit_code, 1);
+
+        // LiteLLM may map a model, a fallback's included, to another one:
+        // through `model_alias_map` or a `model_list`. Both are confirm
+        // first, and a retired one does not fail the check.
+        for remap in [
+            "litellm.model_alias_map = {\"gpt-3.5-turbo-0613\": \"anthropic/claude-3-opus-20240229\"}\n",
+            "",
+        ] {
+            let list = if remap.is_empty() {
+                ", model_list=DEPLOYMENTS"
+            } else {
+                ""
+            };
+            let source = format!(
+                "import litellm\n{remap}litellm.completion(model=\"gpt-3.5-turbo-0613\", messages=[], fallbacks=[{{\"model\": \"gpt-3.5-turbo-0613\"}}]{list})\n"
+            );
+            let report = check_source(&source, &opts);
+            let keys: Vec<&str> = report.routed.iter().map(|f| f.key.as_str()).collect();
+            assert_eq!(keys.len(), 2, "{remap}{list}: {:#?}", report.routed);
+            assert!(keys.contains(&"fallbacks.model"), "{keys:?}");
+            for finding in &report.routed {
+                assert_eq!(finding.status, State::Retired);
+                assert_eq!(finding.confidence, Confidence::ConfirmFirst);
+                assert!(!finding.fails, "{finding:#?}");
+            }
+            assert_eq!(report.exit_code, 0, "{remap}{list}");
+        }
     }
 
     #[test]

@@ -86,6 +86,11 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     (GapKind::UnresolvedModel, "splat", "a `**` expansion may replace the model"),
     (
         GapKind::UnresolvedModel,
+        "model_list",
+        "LiteLLM is given a `model_list`, which may map the model to another deployment",
+    ),
+    (
+        GapKind::UnresolvedModel,
         "parameter_default",
         "the model is the default of a parameter other modules may pass",
     ),

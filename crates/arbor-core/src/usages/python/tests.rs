@@ -6927,6 +6927,38 @@ def build(options):
         gaps_on(&found, 17),
         vec!["ambiguous_client/base_url_unresolved".to_string()]
     );
+
+    // `endpoint_url` is boto3's sixth positional argument: by position or
+    // through `*args` it is not read. A bucket named `bedrock-runtime` on
+    // S3, or a host with no region, is not Bedrock's.
+    let found = usages(
+        r#"
+import boto3
+
+positional = boto3.client("bedrock-runtime", "us-east-1", None, True, None, "https://proxy.example.com")
+positional.converse(modelId="amazon.nova-pro-v1:0", messages=[])
+spread = boto3.client("bedrock-runtime", *REGION_AND_ENDPOINT)
+spread.converse(modelId="amazon.nova-pro-v1:0", messages=[])
+region = boto3.client("bedrock-runtime", "us-east-1")
+bucket = boto3.client("bedrock-runtime", endpoint_url="https://bedrock-runtime.s3.amazonaws.com")
+no_region = boto3.client("bedrock-runtime", endpoint_url="https://bedrock-runtime.amazonaws.com")
+dual = boto3.client("bedrock-runtime", endpoint_url="https://bedrock-runtime.us-east-1.api.aws")
+china = boto3.client("bedrock-runtime", endpoint_url="https://bedrock-runtime.cn-north-1.amazonaws.com.cn")
+"#,
+    );
+    for line in [5, 7] {
+        assert_eq!(call_on(&found, line).routing, Routing::Unknown, "{line}");
+        assert_eq!(
+            gaps_on(&found, line),
+            vec!["ambiguous_client/base_url_unresolved".to_string()],
+            "{line}"
+        );
+    }
+    assert_eq!(routing_of(&found, "region"), Routing::Bedrock);
+    assert_eq!(routing_of(&found, "bucket"), Routing::CustomBaseUrl);
+    assert_eq!(routing_of(&found, "no_region"), Routing::CustomBaseUrl);
+    assert_eq!(routing_of(&found, "dual"), Routing::Bedrock);
+    assert_eq!(routing_of(&found, "china"), Routing::Bedrock);
 }
 
 #[test]
@@ -7024,6 +7056,16 @@ llm.invoke("hi", config={"metadata": {"model_id": "x"}})
     assert!(gaps_on(&found, 12).is_empty());
     assert_eq!(call_on(&found, 13).routing, Routing::Unknown);
     assert!(gaps_on(&found, 13).contains(&"ambiguous_client/given_client".to_string()));
+    // Only its own fields are read: no `model_name` or `engine`.
+    let found_names = usages(
+        "from langchain_aws import ChatBedrock\nllm = ChatBedrock(model_id=\"amazon.nova-pro-v1:0\", model_name=\"x\", engine=\"y\")\n",
+    );
+    let keys: Vec<&str> = call_on(&found_names, 2)
+        .values
+        .iter()
+        .map(|v| v.key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["model_id"]);
     // `model_id` is required: no default applies, so no gap.
     assert!(gaps_on(&found, 14).is_empty());
     // Embeddings are not tracked; run options are not read.
@@ -7101,15 +7143,57 @@ Router(model_list=[]).completion(model="gpt-4o", messages=[])
     );
     assert_eq!(found.gaps.len(), 1, "{:?}", found.gaps);
 
-    // `model_alias_map` may map the model to another one.
+    // `model_alias_map` may map the model, and a fallback's, to another one.
     let found = usages(
-        "import litellm\nlitellm.model_alias_map = {\"fast\": \"gpt-4o-mini\"}\nlitellm.completion(model=\"gpt-4o\", messages=[])\n",
+        "import litellm\nlitellm.model_alias_map = {\"fast\": \"gpt-4o-mini\"}\nlitellm.completion(model=\"gpt-4o\", messages=[], fallbacks=[{\"model\": \"fast\"}])\n",
     );
     assert_eq!(value(call_on(&found, 3), "model"), Some("gpt-4o"));
+    assert_eq!(value(call_on(&found, 3), "fallbacks.model"), Some("fast"));
     let alias = gaps(&found, GapKind::UnresolvedModel);
     assert_eq!(alias.len(), 1, "{alias:?}");
     assert_eq!(alias[0].reason, "dynamic_feature");
+    assert_eq!(alias[0].key, None);
     assert!(alias[0].detail.contains("line 2"), "{}", alias[0].detail);
+
+    // A `model_list` (given, in a same-file dict or possibly in an opaque
+    // `**`) maps the model name to a deployment; its entries are not
+    // models the call sends.
+    let found = usages(
+        r#"
+import litellm
+CFG = {"model_list": [{"model_name": "gpt-4o", "litellm_params": {"model": "anthropic/claude-3-opus-20240229"}}]}
+litellm.completion(model="gpt-4o", messages=[], model_list=[{"model_name": "gpt-4o", "litellm_params": {"model": "anthropic/claude-3-opus-20240229"}}])
+litellm.completion(model="gpt-4o", messages=[], **CFG)
+litellm.completion(model="gpt-4o", messages=[], **options)
+litellm.completion(model="gpt-4o", messages=[])
+"#,
+    );
+    for line in [4, 5, 6, 7] {
+        let keys: Vec<&str> = call_on(&found, line)
+            .values
+            .iter()
+            .map(|v| v.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["model"], "{line}");
+    }
+    assert_eq!(
+        gaps_on(&found, 4),
+        vec!["unresolved_model/model_list".to_string()]
+    );
+    assert_eq!(
+        gaps_on(&found, 5),
+        vec!["unresolved_model/model_list".to_string()]
+    );
+    assert_eq!(
+        gaps_on(&found, 6),
+        vec!["unresolved_model/splat".to_string()]
+    );
+    assert!(gaps_on(&found, 7).is_empty());
+    assert!(
+        found.gaps.iter().all(|g| g.key.is_none()),
+        "{:?}",
+        found.gaps
+    );
 }
 
 #[test]
@@ -7139,6 +7223,42 @@ fn bedrock_and_litellm_members_replaced_or_hooked_are_dynamic() {
         gaps_on(&found, 2),
         vec!["ambiguous_client/dynamic_feature".to_string()]
     );
+
+    // A handler registered where this file cannot follow it counts by its
+    // botocore event name, and so does a default session set up from a
+    // botocore session; a `register` call that names no botocore event
+    // does not.
+    for (setup, hooked) in [
+        (
+            "boto3._get_default_session().events.register(\"before-parameter-build.bedrock-runtime.Converse\", hook)",
+            true,
+        ),
+        (
+            "boto3.Session()._session.register(\"provide-client-params.bedrock-runtime.Converse\", hook)",
+            true,
+        ),
+        (
+            "botocore.session.get_session().register(event_name=\"before-call.*\", handler=hook)",
+            true,
+        ),
+        ("boto3.setup_default_session(botocore_session=custom)", true),
+        ("boto3.setup_default_session(profile_name=\"dev\")", false),
+        ("atexit.register(cleanup)", false),
+        ("admin.site.register(Model)", false),
+        ("codecs.register(\"search\")", false),
+    ] {
+        let source = format!(
+            "import atexit\nimport boto3\nimport botocore.session\n{setup}\nclient = boto3.client(\"bedrock-runtime\")\nclient.converse(modelId=\"amazon.nova-pro-v1:0\", messages=[])\n"
+        );
+        let found = usages(&source);
+        let gaps = if hooked {
+            vec!["ambiguous_client/dynamic_feature".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(gaps_on(&found, 6), gaps, "{setup}");
+        assert_eq!(call_on(&found, 6).routing, Routing::Bedrock, "{setup}");
+    }
 }
 
 #[test]
@@ -7149,9 +7269,24 @@ fn bedrock_and_litellm_files_pass_the_prefilter() {
         "def run(client):\n    return client.invoke_model(modelId=M, body=b)\n",
         "from langchain_aws import ChatBedrock\n",
         "from litellm import completion\n",
+        "import boto3\ndef ask(client):\n    return client.converse(modelId=M, messages=[])\n",
+        "import boto3\ndef ask(client):\n    return client.converse_stream(modelId=M, messages=[])\n",
     ] {
         assert!(may_use_sdk(source), "{source}");
     }
+    // A Bedrock call on a client passed in is a gap where boto3 is imported.
+    let found = usages(
+        "import boto3\ndef ask(client):\n    return client.converse_stream(modelId=\"amazon.nova-pro-v1:0\", messages=[])\n",
+    );
+    assert_eq!(
+        gaps_on(&found, 3),
+        vec!["unknown_client_factory/parameter".to_string()]
+    );
+    // Bedrock's and LiteLLM's request names are not another SDK's.
+    let found = usages(
+        "import openai\nfrom openai import OpenAI\nclient = OpenAI()\nclient.converse(model=\"gpt-4o\")\nopenai.acompletion(model=\"gpt-4o\")\n",
+    );
+    assert!(found.calls.iter().all(|c| !c.request), "{:?}", found.calls);
     // A file using boto3 for anything else is not parsed.
     assert!(!may_use_sdk(
         "import boto3\ns3 = boto3.client(\"s3\")\ns3.put_object(Bucket=\"b\", Key=\"k\", Body=b\"\")\n"
