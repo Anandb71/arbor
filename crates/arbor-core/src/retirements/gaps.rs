@@ -156,6 +156,16 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     ),
     (
         GapKind::AmbiguousClient,
+        "langchain_module_config",
+        "this file configures the module-level OpenAI API, which a deprecated LangChain chat model uses on the pre-1.0 SDK",
+    ),
+    (
+        GapKind::AmbiguousClient,
+        "given_client",
+        "the LangChain chat model sends its requests through an SDK client it is given",
+    ),
+    (
+        GapKind::AmbiguousClient,
         "dynamic_feature",
         "this file may rebind the client or the SDK's configuration at run time",
     ),

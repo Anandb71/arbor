@@ -125,8 +125,9 @@ const PREFILTER: &[&str] = &[
     "generate_content",
     "embed_content",
     // `from langchain.chat_models import ChatOpenAI` names no SDK in lower
-    // case.
-    "langchain",
+    // case; every LangChain class tracked contains one of these.
+    "ChatOpenAI",
+    "ChatAnthropic",
 ];
 
 /// Whether `source` mentions anything the extractor tracks. A file that does
@@ -619,6 +620,30 @@ impl ClientClass {
     }
 }
 
+/// The SDK clients and resources a LangChain chat model sends its requests
+/// through. Given to its constructor or assigned after it is built, they
+/// replace the client its own options would build.
+const LANGCHAIN_CLIENT_FIELDS: &[&str] = &[
+    "client",
+    "async_client",
+    "root_client",
+    "root_async_client",
+    "_client",
+    "_async_client",
+];
+
+/// Arguments of a LangChain call that configure LangChain's run (tracing,
+/// callbacks, configurable fields) and never reach the provider's request:
+/// a `model` key inside them is not a model the request uses.
+const LANGCHAIN_RUN_OPTIONS: &[&str] = &[
+    "config",
+    "configurable",
+    "metadata",
+    "tags",
+    "callbacks",
+    "run_name",
+];
+
 /// Keyword names that set a client's endpoint: the SDKs' own, and
 /// LangChain's field names for it (`base_url` is their alias).
 fn is_base_url_key(key: &str) -> bool {
@@ -753,6 +778,9 @@ enum ClientCaveat {
     /// ([`Pkg::reads_module_config`]) in a file that configures the
     /// module-level API, which such a model's requests then go through.
     LangchainModuleConfig,
+    /// A LangChain chat model given an SDK client or resource to send its
+    /// requests through (`field`, one of [`LANGCHAIN_CLIENT_FIELDS`]).
+    GivenClient { field: &'static str },
 }
 
 /// A Python feature that can change what a name, attribute, dict or the
@@ -1795,6 +1823,10 @@ struct Ctx<'t> {
     rerouted_any: Option<Feature>,
     /// Why the module-level OpenAI API's routing may not hold.
     openai_caveat: Option<ClientCaveat>,
+    /// A LangChain model's model made configurable at run time
+    /// (`configurable_fields(model_name=...)`,
+    /// `configurable_alternatives(...)`), anywhere in the file.
+    langchain_configurable: Option<Feature>,
     /// Namespace builtins used as a value, by name (see
     /// [`Ctx::note_builtin_value`]).
     builtin_values: HashMap<&'t str, Feature>,
@@ -1947,6 +1979,7 @@ impl<'t> Ctx<'t> {
             rerouted_pkgs: HashSet::new(),
             rerouted_any: None,
             openai_caveat: None,
+            langchain_configurable: None,
             builtin_values: HashMap::new(),
             member_values: HashSet::new(),
             method_self_writes: Vec::new(),
@@ -6213,6 +6246,16 @@ impl<'t> Ctx<'t> {
             Some(option) => Some(ClientCaveat::EndpointOption { option }),
             None => self.endpoint_env(class, base_url),
         };
+        // `ChatOpenAI(client=OpenAI(base_url=...).chat.completions)`: its
+        // requests go through the client it is given.
+        if class.pkg.is_langchain() {
+            if let Some(field) = LANGCHAIN_CLIENT_FIELDS
+                .iter()
+                .find(|field| args.kwargs.iter().any(|k| k == *field))
+            {
+                caveat = Some(ClientCaveat::GivenClient { field });
+            }
+        }
         if caveat.is_some() {
             routing = Routing::Unknown;
         }
@@ -6499,6 +6542,7 @@ impl<'t> Ctx<'t> {
         }
         self.note_legacy_configure();
         self.note_rerouted_clients();
+        self.note_langchain_configurable();
         for (call, scope) in self.calls.clone() {
             if self.records() >= MAX_FILE_RECORDS {
                 return self.truncate_file(call, scope);
@@ -6826,21 +6870,11 @@ impl<'t> Ctx<'t> {
             "generate_content",
             "generate_content_async",
         ];
-        // The SDK clients and resources a LangChain chat model sends its
-        // requests through.
-        const LANGCHAIN_RESOURCES: &[&str] = &[
-            "client",
-            "async_client",
-            "root_client",
-            "root_async_client",
-            "_client",
-            "_async_client",
-        ];
         let attr = assign.attr;
         let langchain = target.pkg().is_some_and(Pkg::is_langchain);
         let resource = RESOURCES.contains(&attr)
             || attr.starts_with(|c: char| c.is_ascii_uppercase())
-            || (langchain && LANGCHAIN_RESOURCES.contains(&attr));
+            || (langchain && LANGCHAIN_CLIENT_FIELDS.contains(&attr));
         let pkg = match target {
             Val::Module { pkg, path } if !path.is_empty() || resource => *pkg,
             Val::Class(class) => class.pkg,
@@ -6851,6 +6885,41 @@ impl<'t> Ctx<'t> {
         self.sdk_patched
             .entry(pkg)
             .or_insert_with(|| Self::feature("an SDK member replaced in this file", assign.object));
+    }
+
+    /// `llm.configurable_fields(model_name=ConfigurableField(...))` or
+    /// `llm.configurable_alternatives(...)`: which model a LangChain chat
+    /// model's requests use may then be chosen at run time. The receiver is
+    /// not resolved, so any such call in the file counts.
+    fn note_langchain_configurable(&mut self) {
+        for (call, _) in self.calls.clone() {
+            let Some(attr) = call
+                .child_by_field_name("function")
+                .filter(|f| f.kind() == "attribute")
+                .and_then(|f| f.child_by_field_name("attribute"))
+            else {
+                continue;
+            };
+            let model = match self.text(attr) {
+                "configurable_alternatives" => true,
+                "configurable_fields" => {
+                    let args = self.arguments(call);
+                    args.splat
+                        || args
+                            .kwargs
+                            .iter()
+                            .any(|k| k == "model" || k == "model_name")
+                }
+                _ => false,
+            };
+            if model {
+                self.langchain_configurable = Some(Self::feature(
+                    "a LangChain model made configurable at run time",
+                    call,
+                ));
+                return;
+            }
+        }
     }
 
     /// Clients given a new `base_url` after they are built
@@ -7251,6 +7320,14 @@ impl<'t> Ctx<'t> {
         // call; what an expanded dict nests is read once per dict.
         let mut read = NestedRead::new();
         for (keyword, expr) in &args.literal_args {
+            // LangChain's run options and its positional input or config
+            // never reach the provider's request.
+            let run_option = keyword
+                .as_deref()
+                .is_none_or(|k| LANGCHAIN_RUN_OPTIONS.contains(&k));
+            if target.pkg.is_langchain() && run_option {
+                continue;
+            }
             let prefix = keyword
                 .as_ref()
                 .map(|k| format!("{k}."))
@@ -7408,11 +7485,13 @@ impl<'t> Ctx<'t> {
         // `self` or a same-file class may be one.
         let rewritten = (target.receiver != Receiver::Client)
             .then(|| {
-                self.wild_attr_any.or_else(|| {
-                    ["model", "model_name"]
-                        .iter()
-                        .find_map(|attr| self.outside_attr_writes.get(attr).copied())
-                })
+                self.wild_attr_any
+                    .or_else(|| {
+                        ["model", "model_name"]
+                            .iter()
+                            .find_map(|attr| self.outside_attr_writes.get(attr).copied())
+                    })
+                    .or(self.langchain_configurable)
             })
             .flatten()
             .map(|feature| {
@@ -7551,9 +7630,15 @@ impl<'t> Ctx<'t> {
                     ),
                 ),
                 ClientCaveat::LangchainModuleConfig => (
-                    "module_config",
+                    "langchain_module_config",
                     format!(
                         "this file configures the module-level OpenAI API, which the LangChain chat model behind `{chain}` sends its requests through when it runs on the pre-1.0 `openai` SDK, so its routing is not confirmed"
+                    ),
+                ),
+                ClientCaveat::GivenClient { field } => (
+                    "given_client",
+                    format!(
+                        "the LangChain chat model behind `{chain}` is given `{field}=`, an SDK client it sends its requests through, so where they go is decided by that client"
                     ),
                 ),
             };

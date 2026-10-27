@@ -6421,9 +6421,13 @@ followed_not = chat_models.ChatOpenAI(model="gpt-4-0613")
     assert_eq!(found.calls.len(), 4, "{:?}", found.calls);
     assert!(found.gaps.is_empty(), "{:?}", found.gaps);
 
-    // A file that names no SDK in lower case is still read.
+    // A file that names no SDK in lower case is still read; one that uses
+    // only LangChain's other packages is not.
     let source = "from langchain.chat_models import ChatOpenAI\nllm = ChatOpenAI(model_name=\"gpt-3.5-turbo\")\n";
     assert!(super::may_use_sdk(source));
+    assert!(!super::may_use_sdk(
+        "from langchain_core.prompts import ChatPromptTemplate\nfrom langchain_ollama import ChatOllama\n"
+    ));
     let found = usages(source);
     assert_eq!(
         value(call_on(&found, 2), "model_name"),
@@ -6458,7 +6462,7 @@ partner = PartnerOpenAI(model="gpt-4o")
         );
         assert_eq!(
             gaps_on(&found, line),
-            vec!["ambiguous_client/module_config".to_string()],
+            vec!["ambiguous_client/langchain_module_config".to_string()],
             "line {line}"
         );
     }
@@ -6599,6 +6603,88 @@ local.invoke("hi")
         assert_eq!(rewritten.key.as_deref(), Some("model"), "{write}");
         assert!(rewritten.detail.contains("line 3"), "{}", rewritten.detail);
     }
+    // `configurable_fields` on the model, or `configurable_alternatives`,
+    // choose it at run time; another field made configurable does not.
+    for (made, gapped) in [
+        (
+            "configurable_fields(model_name=ConfigurableField(id=\"model\"))",
+            true,
+        ),
+        (
+            "configurable_alternatives(ConfigurableField(id=\"llm\"), default_key=\"openai\")",
+            true,
+        ),
+        (
+            "configurable_fields(temperature=ConfigurableField(id=\"t\"))",
+            false,
+        ),
+    ] {
+        let source = format!(
+            "from langchain_openai import ChatOpenAI\nllm = ChatOpenAI(model=\"gpt-4o\")\nchooser = llm.{made}\n"
+        );
+        let found = usages(&source);
+        let model_gaps: Vec<&UsageGap> = found
+            .gaps
+            .iter()
+            .filter(|g| g.span.unwrap().line == 2 && g.kind == GapKind::UnresolvedModel)
+            .collect();
+        assert_eq!(
+            model_gaps.len(),
+            usize::from(gapped),
+            "{made}: {model_gaps:?}"
+        );
+        if gapped {
+            assert_eq!(model_gaps[0].reason, "dynamic_feature");
+            assert!(
+                model_gaps[0].detail.contains("line 3"),
+                "{}",
+                model_gaps[0].detail
+            );
+        }
+    }
+
+    // An SDK client given to the constructor decides where requests go.
+    let found = usages(
+        r#"
+from openai import OpenAI
+from langchain_openai import ChatOpenAI
+
+gateway = OpenAI(base_url="http://localhost:4000/v1")
+llm = ChatOpenAI(model="gpt-4o", client=gateway.chat.completions, root_client=gateway)
+"#,
+    );
+    let built = call_on(&found, 6);
+    assert_eq!(built.routing, Routing::Unknown);
+    assert_eq!(value(built, "model"), Some("gpt-4o"));
+    assert_eq!(
+        gaps_on(&found, 6),
+        vec!["ambiguous_client/given_client".to_string()]
+    );
+
+    // LangChain's run options never reach the request: a model key there
+    // is not a model value.
+    let found = usages(
+        r#"
+from langchain_anthropic import ChatAnthropic
+
+llm = ChatAnthropic(model="claude-sonnet-5-5", metadata={"model": "claude-3-opus-20240229"}, tags=["x"])
+llm.invoke("hi", config={"configurable": {"model": "gpt-3.5-turbo"}})
+llm.invoke("hi", {"metadata": {"model": "gpt-4"}})
+tuned = llm.with_config(metadata={"model_name": "gpt-4"}, configurable={"model": "gpt-4"})
+"#,
+    );
+    let keys: Vec<(u32, &str, &str)> = found
+        .calls
+        .iter()
+        .flat_map(|c| {
+            c.values
+                .iter()
+                .map(move |v| (c.span.line, v.key.as_str(), v.value.as_str()))
+        })
+        .collect();
+    assert_eq!(keys, vec![(4, "model", "claude-sonnet-5-5")]);
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+
     // A write on `self` of a same-file class is that class's attribute.
     let found = usages(
         "from langchain_openai import ChatOpenAI\nclass Bot:\n    def __init__(self):\n        self.model = \"gpt-4o\"\n        self.llm = ChatOpenAI(model=\"gpt-4o\")\n",
