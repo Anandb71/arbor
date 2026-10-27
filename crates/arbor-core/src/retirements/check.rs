@@ -3312,6 +3312,21 @@ plain = client.chat.completions.create(model="gpt-4o", messages=[], max_tokens=2
             .review
             .iter()
             .all(|r| !r.message.contains("LangChain")));
+
+        // A model the file may rewrite after the chat model is built is
+        // listed once, as confirm-first, under the name the call passes.
+        let source = "from langchain_openai import ChatOpenAI
+llm = ChatOpenAI(model_name=\"gpt-4o\")
+args.model = pick()
+";
+        let report = check_source(source, &options("2026-10-27"));
+        assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
+        assert_eq!(report.findings[0].confidence, Confidence::ConfirmFirst);
+        assert_eq!(
+            report.findings[0].gap_reason.as_deref(),
+            Some("dynamic_feature")
+        );
+        assert!(report.unreadable.is_empty(), "{:#?}", report.unreadable);
     }
 
     #[test]

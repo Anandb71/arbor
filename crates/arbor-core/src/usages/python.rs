@@ -7107,34 +7107,6 @@ impl<'t> Ctx<'t> {
                     caveat: built.caveat,
                 };
                 self.record_call(call, function, scope, target);
-                // Its requests read the model field when they are sent, so
-                // `llm.model_name = ...` after it is built changes it. Any
-                // write of that name, or one with a run-time name, on an
-                // object other than `self` or a same-file class may be one.
-                let rewrite = self.wild_attr_any.or_else(|| {
-                    ["model", "model_name"]
-                        .iter()
-                        .find_map(|attr| self.outside_attr_writes.get(attr).copied())
-                });
-                if let Some(feature) = rewrite {
-                    let chain = self.render(function);
-                    self.out.gaps.push(UsageGap {
-                        kind: GapKind::UnresolvedModel,
-                        sdk: Some(class.pkg.sdk()),
-                        file: self.file.clone(),
-                        span: Some(self.span(call)),
-                        symbol: self.symbol(scope),
-                        chain: Some(chain.clone()),
-                        key: None,
-                        reason: "dynamic_feature".to_string(),
-                        detail: format!(
-                            "the LangChain chat model `{chain}` builds may be given another model after it is built ({})",
-                            feature.describe()
-                        ),
-                        values: Vec::new(),
-                        values_complete: false,
-                    });
-                }
             }
             Val::Class(class) => {
                 self.construction(call, class);
@@ -7411,31 +7383,63 @@ impl<'t> Ctx<'t> {
         // given one, an opaque `**` expansion may hold the other, which
         // (unlike a second `model=` in an SDK call) is no `TypeError`.
         let given = |key: &str| args.kwargs.iter().any(|k| k == key) || expanded_keys.contains(key);
-        let aliased = match (given("model"), given("model_name")) {
+        let names = (given("model"), given("model_name"));
+        // The key a gap about the model as a whole holds: the name the call
+        // passes, or none (every key) when it passes both.
+        let model_key = match names {
+            (true, true) => None,
+            (false, true) => Some("model_name".to_string()),
+            _ => Some("model".to_string()),
+        };
+        let aliased = match names {
             (true, true) => Some((
                 "reassigned",
-                "is given its model twice, as `model` and as `model_name`",
+                "is given its model twice, as `model` and as `model_name`, so which one LangChain uses is not confirmed".to_string(),
             )),
             (true, false) | (false, true) if opaque_splat => Some((
                 "splat",
-                "is given its model and a `**` expansion that may hold it under its other name (`model` or `model_name`)",
+                "is given its model and a `**` expansion that may hold it under its other name (`model` or `model_name`), so which one LangChain uses is not confirmed".to_string(),
             )),
             _ => None,
         };
-        if let (true, Some((reason, what))) = (target.pkg.is_langchain(), aliased) {
-            self.out.gaps.push(UsageGap {
-                kind: GapKind::UnresolvedModel,
-                sdk: Some(sdk),
-                file: self.file.clone(),
-                span: Some(span),
-                symbol: symbol.clone(),
-                chain: Some(chain.clone()),
-                key: None,
-                reason: reason.to_string(),
-                detail: format!("`{chain}` {what}, so which one LangChain uses is not confirmed"),
-                values: Vec::new(),
-                values_complete: false,
+        // Its requests read the model field when they are sent, so
+        // `llm.model_name = ...` after it is built changes it. Any write of
+        // that name, or one with a run-time name, on an object other than
+        // `self` or a same-file class may be one.
+        let rewritten = (target.receiver != Receiver::Client)
+            .then(|| {
+                self.wild_attr_any.or_else(|| {
+                    ["model", "model_name"]
+                        .iter()
+                        .find_map(|attr| self.outside_attr_writes.get(attr).copied())
+                })
+            })
+            .flatten()
+            .map(|feature| {
+                (
+                    "dynamic_feature",
+                    format!(
+                        "may be given another model after it is built ({})",
+                        feature.describe()
+                    ),
+                )
             });
+        if target.pkg.is_langchain() {
+            for (reason, what) in aliased.into_iter().chain(rewritten) {
+                self.out.gaps.push(UsageGap {
+                    kind: GapKind::UnresolvedModel,
+                    sdk: Some(sdk),
+                    file: self.file.clone(),
+                    span: Some(span),
+                    symbol: symbol.clone(),
+                    chain: Some(chain.clone()),
+                    key: model_key.clone(),
+                    reason: reason.to_string(),
+                    detail: format!("the LangChain chat model `{chain}` {what}"),
+                    values: Vec::new(),
+                    values_complete: false,
+                });
+            }
         }
 
         if target.ambiguous {

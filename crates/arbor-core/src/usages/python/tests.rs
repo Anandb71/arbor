@@ -6357,7 +6357,10 @@ plain = ChatOpenAI(model="gpt-4o", **OPTIONS)
             .collect()
     };
     assert_eq!(value(call_on(&found, 8), "model"), Some("gpt-4o"));
-    assert_eq!(unresolved(8), vec![("splat".to_string(), None)]);
+    assert_eq!(
+        unresolved(8),
+        vec![("splat".to_string(), Some("model".to_string()))]
+    );
     assert_eq!(
         value(call_on(&found, 10), "model_name"),
         Some("gpt-4o-mini")
@@ -6593,7 +6596,7 @@ local.invoke("hi")
             .find(|g| g.span.unwrap().line == 2 && g.kind == GapKind::UnresolvedModel)
             .unwrap_or_else(|| panic!("{write}: {:?}", found.gaps));
         assert_eq!(rewritten.reason, "dynamic_feature", "{write}");
-        assert_eq!(rewritten.key, None, "{write}");
+        assert_eq!(rewritten.key.as_deref(), Some("model"), "{write}");
         assert!(rewritten.detail.contains("line 3"), "{}", rewritten.detail);
     }
     // A write on `self` of a same-file class is that class's attribute.
