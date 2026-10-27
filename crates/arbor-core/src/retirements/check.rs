@@ -817,10 +817,14 @@ fn call_routing(
         Routing::GoogleGenerativeaiLegacy => {
             (RoutingClass::Direct, Schedule::One(Table::GeminiApi))
         }
+        // Bedrock keeps its own schedule, which the data does not hold, and
+        // LiteLLM picks the provider from the model string.
         Routing::AzureOpenai
         | Routing::CustomBaseUrl
         | Routing::AnthropicBedrock
-        | Routing::AnthropicVertex => (RoutingClass::Routed, Schedule::Guess),
+        | Routing::AnthropicVertex
+        | Routing::Bedrock
+        | Routing::Litellm => (RoutingClass::Routed, Schedule::Guess),
         // The usage scan leaves a client built with `vertexai=True` or a
         // run-time value unrouted (an `endpoint_option` gap); the schedule
         // still follows what its constructor says.
@@ -859,11 +863,14 @@ fn vertexai_of(call: &SdkCall, clients: &[ClientConstruction]) -> Option<VertexA
     })
 }
 
-fn sdk_table(sdk: Sdk) -> Table {
+/// The schedule of the provider whose SDK this is, if it is a provider's
+/// own: the AWS SDK and LiteLLM call many providers' models.
+fn sdk_table(sdk: Sdk) -> Option<Table> {
     match sdk {
-        Sdk::Openai => Table::Openai,
-        Sdk::Anthropic => Table::Anthropic,
-        Sdk::Google => Table::GeminiApi,
+        Sdk::Openai => Some(Table::Openai),
+        Sdk::Anthropic => Some(Table::Anthropic),
+        Sdk::Google => Some(Table::GeminiApi),
+        Sdk::Aws | Sdk::Litellm => None,
     }
 }
 
@@ -1092,8 +1099,8 @@ fn resolve<'d>(
         }
     }
     let table = model_family(value)
-        .map(sdk_table)
-        .or(routing.sdk.map(sdk_table))?;
+        .and_then(sdk_table)
+        .or(routing.sdk.and_then(sdk_table))?;
     let hit = match lookup(data, table, value) {
         Some(hit) => hit,
         // A Google client whose endpoint is not known may be on Vertex AI,
@@ -1105,7 +1112,7 @@ fn resolve<'d>(
     };
     let table = hit.table;
     // An SDK sending another provider's model is talking to a proxy.
-    let crosses = routing.sdk.is_some_and(|sdk| sdk_table(sdk) != table)
+    let crosses = routing.sdk.is_some_and(|sdk| sdk_table(sdk) != Some(table))
         && !(routing.sdk == Some(Sdk::Google) && table == Table::Vertex);
     let class = if crosses {
         RoutingClass::Routed

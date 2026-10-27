@@ -429,7 +429,12 @@ def bedrock_direct():
     return client.converse(modelId="anthropic.claude-3-haiku")
 "#,
     );
-    assert!(found.calls.is_empty(), "{:?}", found.calls);
+    // The local Bedrock client, not the module's Anthropic one.
+    assert_eq!(found.calls.len(), 1, "{:?}", found.calls);
+    let converse = call(&found, "client.converse");
+    assert_eq!(converse.sdk, Sdk::Aws);
+    assert_eq!(converse.routing, Routing::Bedrock);
+    assert_eq!(converse.client_line, Some(8));
 }
 
 // ---------------------------------------------------------------------------
