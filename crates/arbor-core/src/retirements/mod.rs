@@ -844,6 +844,23 @@ mod data_tests {
             assert_eq!(entry.date.as_deref(), Some("2027-01-14"));
             assert_eq!(entry.replacement.as_deref(), Some("gpt-6-luna"));
         }
+        // OpenAI's deprecations page lists these bare IDs in its own 11 Dec
+        // rows (read 28 Oct 2026), so they cite the page, not the models API.
+        for (alias, replacement) in [
+            ("gpt-5", "gpt-5.6-sol"),
+            ("gpt-5-mini", "gpt-5.6-terra"),
+            ("gpt-5-nano", "gpt-5.6-luna"),
+            ("gpt-5-pro", "gpt-5.6-sol"),
+            ("o3", "gpt-5.6-sol"),
+            ("o3-pro", "gpt-5.6-sol"),
+        ] {
+            let entry = r.entry(Table::Openai, alias).expect(alias);
+            assert_eq!(entry.status, EntryStatus::Retiring, "{alias}");
+            assert_eq!(entry.date.as_deref(), Some("2026-12-11"), "{alias}");
+            assert_eq!(entry.replacement.as_deref(), Some(replacement), "{alias}");
+            assert_eq!(entry.recipe, "openai-2026-10-23", "{alias}");
+            assert!(entry.notes.is_empty(), "{alias}: {:?}", entry.notes);
+        }
         let sonnet = r
             .entry(Table::Anthropic, "claude-3-5-sonnet-20241022")
             .unwrap();

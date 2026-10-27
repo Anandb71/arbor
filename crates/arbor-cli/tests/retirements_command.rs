@@ -534,6 +534,59 @@ fn response_and_type_objects_are_not_reported() {
     assert_eq!(report["summary"]["unreadable_calls"], 0);
 }
 
+/// The launch review's probe: Arbor 3.1.0 listed only the snapshot.
+const ELEVEN_DEC: &str = r#"from openai import OpenAI
+
+client = OpenAI()
+
+
+def run(question):
+    messages = [{"role": "user", "content": question}]
+    client.chat.completions.create(model="gpt-5-2025-08-07", messages=messages)
+    client.chat.completions.create(model="gpt-5", messages=messages)
+    client.chat.completions.create(model="o3", messages=messages)
+    client.chat.completions.create(model="gpt-4o", messages=messages)
+"#;
+
+#[test]
+fn bare_gpt_5_and_o3_are_listed_for_11_december() {
+    let dir = project(ELEVEN_DEC);
+    let output = arbor(
+        dir.path(),
+        &["retirements", ".", "--json", "--today", "2026-10-28"],
+    );
+    assert_eq!(output.status.code(), Some(0), "retiring is not failing");
+    let report = json(&output);
+    assert_eq!(report["summary"]["affected_calls"], 4);
+    assert_eq!(report["summary"]["retiring"], 4);
+    assert_eq!(report["summary"]["next_shutdown"]["date"], "2026-12-11");
+    assert_eq!(report["summary"]["next_shutdown"]["days_left"], 44);
+    for model in ["gpt-5-2025-08-07", "gpt-5", "o3"] {
+        let f = finding(&report, model);
+        assert_eq!(f["status"], "retiring", "{model}");
+        assert_eq!(f["date"], "2026-12-11", "{model}");
+        assert_eq!(f["days_left"], 44, "{model}");
+        assert_eq!(f["replacement"], "gpt-5.6-sol", "{model}");
+        assert_eq!(f["fix"], "manual", "{model}");
+        assert_eq!(
+            f["source_url"], "https://developers.openai.com/api/docs/deprecations",
+            "{model}"
+        );
+    }
+    assert_eq!(finding(&report, "gpt-4o")["date"], "2027-01-14");
+
+    let text = stdout(&arbor(
+        dir.path(),
+        &["retirements", ".", "--today", "2026-10-28"],
+    ));
+    assert!(
+        text.contains("3 calls use models OpenAI shuts down on 11 Dec 2026 (44 days)"),
+        "{text}"
+    );
+    assert!(text.contains("gpt-5 → gpt-5.6-sol"), "{text}");
+    assert!(text.contains("o3 → gpt-5.6-sol"), "{text}");
+}
+
 #[test]
 fn chained_replacements_and_fine_tunes_read_plainly() {
     let dir = project(CHAINS);

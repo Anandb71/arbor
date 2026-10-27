@@ -1,8 +1,11 @@
 # Find code that calls retiring AI models
 
 AI providers retire models on fixed dates, and a request to a retired model fails.
-OpenAI shuts down `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` on
-**14 January 2027**. `arbor retirements` finds the direct `openai`, `anthropic` and
+OpenAI's deprecations page lists the dated GPT-4o, GPT-4o mini, GPT-4.1 and GPT-4.1 mini
+snapshots, such as `gpt-4o-2024-08-06`, for shutdown on **14 January 2027**. The page
+doesn't list the bare `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini`, but
+OpenAI's models API gave each of them the same date when we checked on 18 October 2026.
+`arbor retirements` finds the direct `openai`, `anthropic` and
 Google SDK calls in your code that use a model its provider has retired or is
 retiring. For each call it shows the replacement the provider lists, the other
 arguments that have to change with it, and the choices your repository has to make
@@ -155,7 +158,7 @@ it too. The check runs on the runner and sends nothing anywhere.
 
 - **Python only.** `.py` files and Python scripts. TypeScript and JavaScript are coming.
 - **Providers:** OpenAI, Anthropic, the Gemini API and Gemini on Google Cloud (Vertex AI):
-  283 entries (276 model IDs; 7 listed by both the Gemini API and Vertex; aliases
+  298 entries (291 model IDs; 7 listed by both the Gemini API and Vertex; aliases
   included) from their deprecation pages, with the aliases and changelog entries those
   pages leave out, such as the four OpenAI aliases above.
 - **Direct SDK calls only.** It reads the `openai`, `anthropic`, `google-genai` and
@@ -187,7 +190,10 @@ The model IDs, dates and replacements come from the providers' own deprecation p
 and every one was checked against a saved copy of the page. Each report prints the day
 each provider's pages were read (in the bundled data: OpenAI on 18 October 2026,
 Anthropic and Google on 16 October 2026), and the data date in `--json` is the oldest
-of them. The argument rules come from the providers' migration guides and API
+of them. Between 23 and 26 October, OpenAI's page added the bare IDs beside 15 of its
+listed snapshots, such as `gpt-5` and `o3` (11 December 2026). Those 15 IDs were checked
+against the page as read on 28 October 2026, and the date shown stays that of the last
+full check. The argument rules come from the providers' migration guides and API
 references. A rule marked `live` in the JSON was confirmed with real API calls on
 18 October 2026; the label is shown only for the models those calls used and only on
 Chat Completions, the one API they called. [Live checks, 18 October 2026](LIVE_CHECKS_2026-10-18.md)
