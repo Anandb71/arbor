@@ -489,8 +489,9 @@ does. The body is:
 - `json=body`;
 - `data=json.dumps(body)` (httpx: also `content=json.dumps(body)`), with
   `body` the only argument of `json.dumps`;
-- for requests, `body` as the third positional argument, or
-  `json.dumps(body)` as the second.
+- for requests, `json.dumps(body)` as the second positional argument
+  (`data`). A third positional argument (`json`) comes with a positional
+  `data`, so it is a second body: a `request_body` gap.
 
 Only the body's top-level `model` is read, plus the model keys nested in its
 containers (`requests[].params.model` in a Message Batch), as for any dict
@@ -505,7 +506,11 @@ with no key, which covers every model value of the call.
 **Replaced.** Writing `post` on the library's module (`requests.post =
 fake`, `setattr(requests, "post", ...)`, `del requests.post`) or any of its
 attributes with a run-time name is a `dynamic_feature` gap on every raw HTTP
-request in the file, as is any dynamic feature of the whole file.
+request in the file, as is any dynamic feature of the whole file. A replaced
+`post` may also change the dict it is given, so in such a file a dict passed
+as `json=` counts as passed elsewhere again, for SDK calls that expand it
+too. A `def` or `class` that rebinds the imported `post` (or any other
+imported name) is a definition of that name from there on.
 
 `arbor retirements` treats these as direct calls on the provider's schedule.
 Their argument names are the library's, and the scan reads only the model in

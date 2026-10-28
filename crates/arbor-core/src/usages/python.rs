@@ -881,12 +881,13 @@ fn http_endpoint(url: &str) -> Option<HttpEndpoint> {
         return None;
     }
     let rest = &url[scheme.len() + 3..];
-    let path = rest
-        .find('/')
-        .map_or("", |at| &rest[at..])
-        .split(['?', '#'])
-        .next()
-        .unwrap_or_default();
+    // The authority ends at the first `/`, `?` or `#`; only a `/` starts a
+    // path (`https://api.openai.com?x/v1/...` is a request to `/`).
+    let path = match rest.find(['/', '?', '#']) {
+        Some(at) if rest[at..].starts_with('/') => &rest[at..],
+        _ => "",
+    };
+    let path = path.split(['?', '#']).next().unwrap_or_default();
     let path = path.strip_suffix('/').unwrap_or(path);
     let (sdk, routing, endpoints) = match url_host(url).as_str() {
         "api.openai.com" => (Sdk::Openai, Routing::OpenaiDirect, OPENAI_HTTP_ENDPOINTS),
@@ -3537,9 +3538,16 @@ impl<'t> Ctx<'t> {
     /// container assigned to another name has already escaped.
     fn settle_dict_escapes(&mut self) {
         // `requests.post` and `httpx.post` serialize the dict they are
-        // given; anything else may keep or change it.
+        // given; anything else may keep or change it, and so may they once
+        // the file may replace them: `post` written on the library, or a
+        // whole-file dynamic feature (`settle_builtin_values` may add one
+        // later, so a builtin used as a value counts here already).
+        self.note_http_patch();
+        let replaceable = self.http_patched.is_some()
+            || self.file_dynamic.is_some()
+            || !self.builtin_values.is_empty();
         for (name, function, scope) in std::mem::take(&mut self.http_bodies) {
-            if self.http_library(function, scope).is_none() {
+            if replaceable || self.http_library(function, scope).is_none() {
                 self.escaped.insert(name);
             }
         }
@@ -7021,7 +7029,6 @@ impl<'t> Ctx<'t> {
         self.note_rerouted_clients();
         self.note_langchain_configurable();
         self.note_botocore_events();
-        self.note_http_patch();
         // LiteLLM maps a model name to another one through this
         // process-wide table; any mention of it in the file counts.
         if let Some(at) = self.src.find("model_alias_map") {
