@@ -117,17 +117,24 @@ fn find_workspace_root(start: &Path) -> PathBuf {
 
 /// [`find_workspace_root`] with the home folders given, so tests can choose them.
 fn find_workspace_root_below(start: &Path, homes: &[PathBuf], rules: PathRules) -> PathBuf {
-    let mut current =
-        strip_verbatim_prefix(fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf()));
+    let mut current = resolve_start(start);
     if current.is_file() {
         if let Some(parent) = current.parent() {
             current = parent.to_path_buf();
         }
     }
 
+    // The home folders as open folders, to recognise spellings no string
+    // comparison can (`\\localhost\C$\Users\ana` for `C:\Users\ana`).
+    let home_ids: Vec<same_file::Handle> = homes
+        .iter()
+        .filter_map(|home| same_file::Handle::from_path(home).ok())
+        .collect();
+
     let fallback = current.clone();
     loop {
-        let at_home = homes.iter().any(|home| same_folder(&current, home, rules));
+        let at_home = homes.iter().any(|home| same_folder(&current, home, rules))
+            || is_one_of(&current, &home_ids);
         // A home folder is the project only when the walk starts there.
         if at_home && current != fallback {
             break;
@@ -149,6 +156,45 @@ fn find_workspace_root_below(start: &Path, homes: &[PathBuf], rules: PathRules) 
     }
 
     fallback
+}
+
+/// `start` as an absolute path with its existing part resolved by
+/// `fs::canonicalize`.
+///
+/// A path that does not exist yet can't be canonicalized as a whole, so its
+/// deepest existing folder is and the missing rest is added back. Otherwise a
+/// junction, symlink or 8.3 short name of the home folder in such a path, or a
+/// relative path given in the home folder, would never be seen as home.
+fn resolve_start(start: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let absolute = std::path::absolute(start).unwrap_or_else(|_| start.to_path_buf());
+    let parts: Vec<Component> = absolute.components().collect();
+    for existing in (1..=parts.len()).rev() {
+        let Ok(canonical) = fs::canonicalize(parts[..existing].iter().collect::<PathBuf>()) else {
+            continue;
+        };
+        let mut resolved = strip_verbatim_prefix(canonical);
+        for part in &parts[existing..] {
+            match part {
+                Component::ParentDir => {
+                    resolved.pop();
+                }
+                Component::Normal(name) => resolved.push(name),
+                _ => {}
+            }
+        }
+        return resolved;
+    }
+    absolute
+}
+
+/// Whether `folder` is, on disk, one of the already opened `folders`.
+fn is_one_of(folder: &Path, folders: &[same_file::Handle]) -> bool {
+    !folders.is_empty()
+        && same_file::Handle::from_path(folder)
+            .map(|handle| folders.contains(&handle))
+            .unwrap_or(false)
 }
 
 /// How a platform spells paths, for comparing two spellings of one folder.
@@ -368,6 +414,48 @@ mod workspace_root_tests {
         assert!(!same("/home/Ana", "/home/ana"));
         assert!(!same(r"/home/a\b", "/home/a/b"));
         assert_eq!(folder_key("/", LINUX), "/");
+    }
+
+    #[test]
+    fn a_missing_start_spelled_with_dot_dot_does_not_reach_home() {
+        // `demo/../..` is home. A path that does not exist yet can't be
+        // canonicalized, and its raw ancestors never spelled home.
+        let (_root, home, demo) = home_with_arbor_dir();
+        let start = demo
+            .join("..")
+            .join("..")
+            .join("projects")
+            .join("new")
+            .join("app");
+        let expected = home.join("projects").join("new").join("app");
+        assert_eq!(root_from(&start, std::slice::from_ref(&home)), expected);
+    }
+
+    #[test]
+    fn a_relative_missing_start_resolves_from_the_current_folder() {
+        let cwd = canonical(&std::env::current_dir().unwrap());
+        let start = Path::new("no-such-folder").join("deeper");
+        assert_eq!(super::resolve_start(&start), cwd.join(&start));
+    }
+
+    #[test]
+    fn home_named_by_another_spelling_is_still_home() {
+        // `projects/..` names home without spelling it; only the folder on
+        // disk shows it is home (as `\\localhost\C$\Users\ana` is `C:\Users\ana`).
+        let (_root, home, demo) = home_with_arbor_dir();
+        let other_spelling = home.join("projects").join("..");
+        assert!(!same_folder(&other_spelling, &home, HOST_PATH_RULES));
+        assert_eq!(root_from(&demo, &[other_spelling]), demo);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_start_through_a_symlink_to_home_does_not_reach_home() {
+        let (root, home, demo) = home_with_arbor_dir();
+        let link = root.path().join("homelink");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        let start = link.join("projects").join("demo").join("missing");
+        assert_eq!(root_from(&start, &[home]), demo.join("missing"));
     }
 
     #[test]

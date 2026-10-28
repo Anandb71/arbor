@@ -86,4 +86,12 @@ fn a_folder_under_home_never_resolves_to_home_because_of_its_arbor_dir() {
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("Already initialized at"), "{stdout}");
     assert!(!stdout.contains("demo"), "{stdout}");
+
+    // A folder under home named from home is its own project, also when it
+    // does not exist yet.
+    let output = run_arbor_with_home(&home, &home, &["init", "new-app"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(!stdout.contains("Already initialized"), "{stdout}");
+    assert!(home.join("new-app").join(".arbor").is_dir(), "{stdout}");
 }

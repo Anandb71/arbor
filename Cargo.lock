@@ -320,6 +320,7 @@ dependencies = [
  "fs2",
  "indicatif",
  "petgraph",
+ "same-file",
  "serde",
  "serde_json",
  "strsim",
