@@ -11,7 +11,8 @@
 //! stdout, errors included), `--markdown` (a GitHub job summary) and
 //! `--annotations` (GitHub workflow commands, one warning per call up to
 //! GitHub's per-step limit). `--markdown-out <file>` also writes the
-//! Markdown report from the same scan, so CI scans once.
+//! Markdown report from the same scan, so CI scans once. `--diff` prints the
+//! plain model swaps ([`plan_swaps`]) as a unified diff and writes no file.
 //!
 //! Exit codes: 0 when nothing counts as failing, 1 when a confirmed call
 //! uses a model that is already retired (or, with `--fail-within N`, retires
@@ -19,14 +20,18 @@
 //! only with `--count-unconfirmed`, routed ones only with
 //! `--include-routed`.
 
+use arbor_core::languages::get_parser;
 use arbor_core::retirements::{
-    bundled, check, python_literal, routing_gap_text, value_gap_text, BaseUrl, CallKind, Change,
-    ChangeKind, CheckOptions, Confidence, Date, DateKind, Decision, Finding, MatchKind,
-    OptionStatus, RetirementReport, RoutingClass, ScanInput, State, FINE_TUNING, REPORT_VERSION,
+    apply_edits, bundled, check, plan_swaps, python_literal, routing_gap_text, value_gap_text,
+    BaseUrl, CallKind, Change, ChangeKind, CheckOptions, Confidence, Date, DateKind, Decision,
+    Finding, FixKind, MatchKind, OptionStatus, RetirementReport, RoutingClass, ScanInput,
+    SkipReason, State, SwapPlan, FINE_TUNING, REPORT_VERSION,
 };
 use arbor_core::usages::{is_unsafe_char, ValueOrigin};
+use arbor_core::{detect_language, parse_source_usages};
 use arbor_watcher::usages::{scan_usages, UsageScanOptions};
 use colored::Colorize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -48,6 +53,8 @@ pub struct Args {
     pub json: bool,
     pub markdown: bool,
     pub annotations: bool,
+    /// Print the plain swaps as a unified diff.
+    pub diff: bool,
     /// Also write the Markdown report to this file.
     pub markdown_out: Option<String>,
     /// The most warning annotations to print; a notice says how many more.
@@ -74,6 +81,8 @@ pub fn run(args: &Args) -> i32 {
                     Ok(text) => println!("{text}"),
                     Err(error) => return fail(args, &format!("cannot write JSON: {error}")),
                 }
+            } else if args.diff {
+                print_diff(&report, args.quiet);
             } else if args.markdown {
                 print!("{}", markdown(&report));
             } else if args.annotations {
@@ -1147,6 +1156,225 @@ fn annotations(report: &RetirementReport, limit: usize) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// --diff: the plain swaps as a patch
+// ---------------------------------------------------------------------------
+
+/// Lines of context around each change, as `diff -u` prints.
+const DIFF_CONTEXT: usize = 3;
+
+/// Why calls are left out of the diff, in the order the summary lists them,
+/// as a phrase for one call and for several.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum LeftOut {
+    Decide,
+    Manual,
+    NoChange,
+    Skip(SkipReason),
+    /// The file could not be read again, parsed, or named in a patch.
+    Unreadable,
+}
+
+impl LeftOut {
+    fn of(fix: FixKind, reason: SkipReason) -> LeftOut {
+        match (reason, fix) {
+            (SkipReason::NotPlainSwap, FixKind::Decide) => LeftOut::Decide,
+            (SkipReason::NotPlainSwap, FixKind::None) => LeftOut::NoChange,
+            (SkipReason::NotPlainSwap, _) => LeftOut::Manual,
+            (reason, _) => LeftOut::Skip(reason),
+        }
+    }
+
+    fn phrase(self, n: usize) -> &'static str {
+        let (one, many) = match self {
+            LeftOut::Decide => (
+                "needs a choice this repository makes first",
+                "need a choice this repository makes first",
+            ),
+            LeftOut::Manual => ("needs a manual check", "need a manual check"),
+            LeftOut::NoChange => ("needs no change", "need no change"),
+            LeftOut::Skip(reason) => match reason {
+                SkipReason::ValueNotAtCall => (
+                    "takes its model from a constant or a default (other code may read it too)",
+                    "take their model from a constant or a default (other code may read it too)",
+                ),
+                SkipReason::AddsArgument => ("needs an argument added", "need an argument added"),
+                SkipReason::ArgumentNotRenamable => (
+                    "has an argument to rename that is not written once at the call",
+                    "have an argument to rename that is not written once at the call",
+                ),
+                SkipReason::LiteralForm => (
+                    "writes the model in a form Arbor does not rewrite",
+                    "write the model in a form Arbor does not rewrite",
+                ),
+                SkipReason::UnsupportedLanguage => (
+                    "is in a language Arbor does not edit yet",
+                    "are in a language Arbor does not edit yet",
+                ),
+                SkipReason::SyntaxErrors => (
+                    "is in a file with syntax errors",
+                    "are in files with syntax errors",
+                ),
+                SkipReason::SourceMismatch => (
+                    "changed while Arbor read it",
+                    "changed while Arbor read them",
+                ),
+                SkipReason::UnsafeReplacement => (
+                    "has a replacement that is not a plain model ID",
+                    "have a replacement that is not a plain model ID",
+                ),
+                SkipReason::Overlap => ("overlaps another swap", "overlap another swap"),
+                SkipReason::NotPlainSwap => ("needs a manual check", "need a manual check"),
+            },
+            LeftOut::Unreadable => (
+                "is in a file Arbor could not read again",
+                "are in files Arbor could not read again",
+            ),
+        };
+        verb(n, one, many)
+    }
+}
+
+/// Prints the plain swaps as a unified diff on stdout, read from the files
+/// as they are now, and on stderr how many calls it swaps and why it leaves
+/// the others out. Writes no file.
+fn print_diff(report: &RetirementReport, quiet: bool) {
+    let findings: Vec<Finding> = report
+        .findings
+        .iter()
+        .chain(&report.routed)
+        .cloned()
+        .collect();
+    let files: BTreeSet<&str> = findings.iter().map(|f| f.file.as_str()).collect();
+    let mut swapped = 0;
+    let mut swapped_files = 0;
+    let mut left_out: BTreeMap<LeftOut, usize> = BTreeMap::new();
+    let mut stdout = std::io::stdout().lock();
+    for file in files {
+        let patch = file_plan(file, &findings).and_then(|(source, plan)| {
+            let fixed = apply_edits(&source, &plan.edits).ok()?;
+            Some((unified_diff(file, &source, &fixed), plan))
+        });
+        let Some((patch, plan)) = patch else {
+            let count = findings.iter().filter(|f| f.file == file).count();
+            *left_out.entry(LeftOut::Unreadable).or_default() += count;
+            continue;
+        };
+        for skipped in &plan.skipped {
+            *left_out
+                .entry(LeftOut::of(skipped.fix, skipped.reason))
+                .or_default() += 1;
+        }
+        if !plan.swaps.is_empty() {
+            swapped += plan.swaps.len();
+            swapped_files += 1;
+            let _ = stdout.write_all(patch.as_bytes());
+        }
+    }
+    let _ = stdout.flush();
+    if quiet {
+        return;
+    }
+    if swapped == 0 {
+        eprintln!("No plain model swaps to make.");
+    } else {
+        eprintln!(
+            "Diff: {} swapped in {} {}.",
+            calls(swapped),
+            swapped_files,
+            verb(swapped_files, "file", "files")
+        );
+    }
+    let total: usize = left_out.values().sum();
+    if total > 0 {
+        let parts: Vec<String> = left_out
+            .iter()
+            .map(|(why, n)| format!("{n} {}", why.phrase(*n)))
+            .collect();
+        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+        eprintln!(
+            "Left out {}: {}. Run arbor retirements without --diff to see each one.",
+            calls(total),
+            join_and(&parts)
+        );
+    }
+}
+
+/// The file as it reads now and the plain swaps in it. `None` when it
+/// cannot be read or parsed again, or its name cannot go in a patch.
+fn file_plan(file: &str, findings: &[Finding]) -> Option<(String, SwapPlan)> {
+    if file.chars().any(is_unsafe_char) {
+        return None;
+    }
+    let path = Path::new(file);
+    let source = std::fs::read_to_string(path).ok()?;
+    // As the usage scan does: an extensionless file is a Python script.
+    let parser = match path.extension() {
+        None => get_parser("py"),
+        Some(_) => detect_language(path),
+    }?;
+    let usages = parse_source_usages(&source, file, parser.as_ref()).ok()??;
+    let plan = plan_swaps(&source, &usages, findings);
+    Some((source, plan))
+}
+
+/// A unified diff of `old` to `new`, which have the same number of lines,
+/// with `a/` and `b/` before `file`. Empty when nothing differs.
+fn unified_diff(file: &str, old: &str, new: &str) -> String {
+    let a: Vec<&str> = old.split_inclusive('\n').collect();
+    let b: Vec<&str> = new.split_inclusive('\n').collect();
+    let changed: Vec<usize> = (0..a.len().min(b.len()))
+        .filter(|&i| a[i] != b[i])
+        .collect();
+    if a.len() != b.len() || changed.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("--- a/{file}\n+++ b/{file}\n");
+    let mut i = 0;
+    while i < changed.len() {
+        // Changes whose context touches are one hunk.
+        let mut j = i;
+        while j + 1 < changed.len() && changed[j + 1] - changed[j] <= 2 * DIFF_CONTEXT + 1 {
+            j += 1;
+        }
+        let start = changed[i].saturating_sub(DIFF_CONTEXT);
+        let end = (changed[j] + DIFF_CONTEXT + 1).min(a.len());
+        let count = end - start;
+        out.push_str(&format!(
+            "@@ -{},{count} +{},{count} @@\n",
+            start + 1,
+            start + 1
+        ));
+        let mut line = start;
+        while line < end {
+            if a[line] == b[line] {
+                diff_line(&mut out, ' ', a[line]);
+                line += 1;
+                continue;
+            }
+            // A run of changed lines: every old line, then every new one.
+            let run_end = (line..end).find(|&k| a[k] == b[k]).unwrap_or(end);
+            for old_line in &a[line..run_end] {
+                diff_line(&mut out, '-', old_line);
+            }
+            for new_line in &b[line..run_end] {
+                diff_line(&mut out, '+', new_line);
+            }
+            line = run_end;
+        }
+        i = j + 1;
+    }
+    out
+}
+
+fn diff_line(out: &mut String, sign: char, line: &str) {
+    out.push(sign);
+    out.push_str(line);
+    if !line.ends_with('\n') {
+        out.push_str("\n\\ No newline at end of file\n");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1207,5 +1435,82 @@ mod tests {
     #[test]
     fn no_findings_make_no_groups() {
         assert!(groups(&[]).is_empty());
+    }
+
+    fn numbered(lines: usize) -> String {
+        (1..=lines).map(|n| format!("line {n}\n")).collect()
+    }
+
+    #[test]
+    fn a_diff_has_three_lines_of_context_and_joins_close_changes() {
+        let old = numbered(30);
+        assert_eq!(unified_diff("app.py", &old, &old), "");
+        let new = old.replace("line 10\n", "line ten\n");
+        assert_eq!(
+            unified_diff("app.py", &old, &new),
+            "--- a/app.py\n+++ b/app.py\n@@ -7,7 +7,7 @@\n line 7\n line 8\n line 9\n-line 10\n+line ten\n line 11\n line 12\n line 13\n"
+        );
+        // Six unchanged lines between two changes: one hunk.
+        let close = new.replace("line 17\n", "line seventeen\n");
+        let diff = unified_diff("app.py", &old, &close);
+        assert_eq!(diff.matches("@@ -").count(), 1, "{diff}");
+        assert!(diff.contains("@@ -7,14 +7,14 @@"), "{diff}");
+        // Seven: two hunks.
+        let apart = new.replace("line 18\n", "line eighteen\n");
+        let diff = unified_diff("app.py", &old, &apart);
+        assert!(
+            diff.contains("@@ -7,7 +7,7 @@") && diff.contains("@@ -15,7 +15,7 @@"),
+            "{diff}"
+        );
+        // Changed lines next to each other: old lines first, then new ones.
+        let both = old
+            .replace("line 1\n", "line one\n")
+            .replace("line 2\n", "line two\n");
+        assert!(
+            unified_diff("app.py", &old, &both)
+                .contains("@@ -1,5 +1,5 @@\n-line 1\n-line 2\n+line one\n+line two\n line 3\n"),
+            "{}",
+            unified_diff("app.py", &old, &both)
+        );
+    }
+
+    #[test]
+    fn a_diff_keeps_line_ends_and_marks_a_missing_last_newline() {
+        let old = "a = 1\r\nb = \"o1\"";
+        let new = "a = 1\r\nb = \"gpt-5.6-sol\"";
+        assert_eq!(
+            unified_diff("x.py", old, new),
+            "--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,2 @@\n a = 1\r\n-b = \"o1\"\n\\ No newline at end of file\n+b = \"gpt-5.6-sol\"\n\\ No newline at end of file\n"
+        );
+    }
+
+    #[test]
+    fn every_skip_reason_has_a_phrase() {
+        for reason in [
+            SkipReason::NotPlainSwap,
+            SkipReason::ValueNotAtCall,
+            SkipReason::AddsArgument,
+            SkipReason::ArgumentNotRenamable,
+            SkipReason::LiteralForm,
+            SkipReason::UnsupportedLanguage,
+            SkipReason::SyntaxErrors,
+            SkipReason::SourceMismatch,
+            SkipReason::UnsafeReplacement,
+            SkipReason::Overlap,
+        ] {
+            for fix in [
+                FixKind::Swap,
+                FixKind::Decide,
+                FixKind::Manual,
+                FixKind::None,
+            ] {
+                let why = LeftOut::of(fix, reason);
+                assert!(!why.phrase(1).is_empty() && why.phrase(1) != why.phrase(2));
+            }
+        }
+        assert_eq!(
+            LeftOut::of(FixKind::Decide, SkipReason::NotPlainSwap).phrase(2),
+            "need a choice this repository makes first"
+        );
     }
 }

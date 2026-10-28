@@ -389,6 +389,10 @@ enum Commands {
         #[arg(long)]
         annotations: bool,
 
+        /// Print the plain model swaps (the calls that need no decision and no manual check) as a unified diff to review and apply with `git apply`; writes no file. What it leaves out, and why, goes to stderr
+        #[arg(long, conflicts_with_all = ["json", "markdown", "annotations"])]
+        diff: bool,
+
         /// With --annotations: the most warnings to print (GitHub shows 10 per step)
         #[arg(long, value_name = "N", requires = "annotations")]
         max_annotations: Option<usize>,
@@ -867,6 +871,7 @@ async fn run() {
             json,
             markdown,
             annotations,
+            diff,
             max_annotations,
             markdown_out,
             fail_within,
@@ -879,6 +884,7 @@ async fn run() {
             json,
             markdown,
             annotations,
+            diff,
             markdown_out,
             max_annotations,
             fail_within,
