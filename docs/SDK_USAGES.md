@@ -19,7 +19,11 @@ values. A consumer (a codemod, a reviewer) should treat the report this way:
   for a dict written inline, a conditional, or a credential-shaped name), the
   argument names it sends (`keys`) when it is a dict literal in the same file,
   and `complete` when those are all of them (no `**` or computed key inside,
-  and the dict is never changed or passed on). Names only, never values.
+  every key recorded, and the dict is never changed or passed on later in that
+  file; a change made to it from another module is not seen). Names only,
+  never values: a secret-sounding name such as `max_tokens` is listed, a key
+  that is not an identifier or is shaped like a credential is not, and the
+  dict is then not `complete`.
 
 Python is too dynamic to resolve every shape soundly. Rather than adding a
 special case for each one, the extractor resolves a small grammar exactly, and
