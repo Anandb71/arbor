@@ -397,7 +397,7 @@ enum Pkg {
     /// partner packages (`langchain_openai`, `langchain_anthropic`), and the
     /// deprecated copies in `langchain_community.chat_models` and
     /// `langchain.chat_models`. Only their chat-model classes are tracked
-    /// (see [`LANGCHAIN_REEXPORTS`]).
+    /// (see [`REEXPORTS`]).
     LangchainOpenai,
     LangchainAnthropic,
     LangchainCommunityOpenai,
@@ -451,15 +451,23 @@ impl Pkg {
     /// A LangChain package: only its chat-model classes are tracked, and
     /// what they are built with is the model the requests use.
     fn is_langchain(self) -> bool {
-        !matches!(
+        matches!(
             self,
-            Pkg::Openai
-                | Pkg::Anthropic
-                | Pkg::GoogleGenai
-                | Pkg::GoogleGenerativeai
-                | Pkg::Boto3
-                | Pkg::Litellm
+            Pkg::LangchainOpenai
+                | Pkg::LangchainAnthropic
+                | Pkg::LangchainCommunityOpenai
+                | Pkg::LangchainCommunityAnthropic
+                | Pkg::LangchainLegacyOpenai
+                | Pkg::LangchainLegacyAnthropic
+                | Pkg::LangchainAws
         )
+    }
+
+    /// A package whose tracked classes are built with the model their
+    /// requests use, and build those requests themselves: LangChain's chat
+    /// models. Each construction is recorded as a call that binds the model.
+    fn binds_model(self) -> bool {
+        self.is_langchain()
     }
 
     /// A package followed only through the names it is tracked for: its
@@ -467,7 +475,7 @@ impl Pkg {
     /// it is an ordinary import, and its other module-level calls are not
     /// recorded (`boto3.resource("s3")`, `litellm.token_counter(...)`).
     fn follows_named_only(self) -> bool {
-        self.is_langchain() || matches!(self, Pkg::Boto3 | Pkg::Litellm)
+        self.binds_model() || matches!(self, Pkg::Boto3 | Pkg::Litellm)
     }
 
     /// The names other than [`CLASSES`] a [`Pkg::follows_named_only`]
@@ -640,33 +648,39 @@ const fn class(pkg: Pkg, name: &'static str, family: Family) -> ClientClass {
     ClientClass { pkg, name, family }
 }
 
-/// The deprecated LangChain modules that re-export several providers' chat
-/// models, with the packages their OpenAI and Anthropic classes are
-/// recorded under. A name imported from one of them, or from a submodule
+/// Modules followed only through `from ... import` of one of their tracked
+/// classes, with the packages those classes are recorded under. A name
+/// imported from one of them, or from a submodule
 /// (`langchain_community.chat_models.openai`), is tracked only when it is
-/// one of those classes; the modules themselves are not followed.
-const LANGCHAIN_REEXPORTS: &[(&str, [Pkg; 2])] = &[
+/// one of those classes; the modules themselves are not followed (`import
+/// langchain_community.chat_models as cm`, a wildcard import from them).
+///
+/// The deprecated LangChain modules re-export several providers' chat
+/// models; their OpenAI and Anthropic classes are tracked.
+const REEXPORTS: &[(&str, &[Pkg])] = &[
     (
         "langchain_community.chat_models",
-        [
+        &[
             Pkg::LangchainCommunityOpenai,
             Pkg::LangchainCommunityAnthropic,
         ],
     ),
     (
         "langchain.chat_models",
-        [Pkg::LangchainLegacyOpenai, Pkg::LangchainLegacyAnthropic],
+        &[Pkg::LangchainLegacyOpenai, Pkg::LangchainLegacyAnthropic],
     ),
 ];
 
-/// The packages of the [`LANGCHAIN_REEXPORTS`] module `module` is, or is a
-/// submodule of. Only its first two segments are read.
-fn langchain_reexport(module: &str) -> Option<[Pkg; 2]> {
-    let mut parts = module.split('.').map(str::trim);
-    let head = (parts.next()?, parts.next()?);
-    LANGCHAIN_REEXPORTS
-        .iter()
-        .find_map(|(prefix, pkgs)| (prefix.split_once('.') == Some(head)).then_some(*pkgs))
+/// The packages of the [`REEXPORTS`] module `module` is, or is a submodule
+/// of. Only as many segments as the listed module has are read.
+fn reexport(module: &str) -> Option<&'static [Pkg]> {
+    REEXPORTS.iter().find_map(|(prefix, pkgs)| {
+        let mut parts = module.split('.').map(str::trim);
+        prefix
+            .split('.')
+            .all(|want| parts.next() == Some(want))
+            .then_some(*pkgs)
+    })
 }
 
 fn client_class(pkg: Pkg, name: &str) -> Option<ClientClass> {
@@ -4786,11 +4800,7 @@ impl<'t> Ctx<'t> {
         } else {
             Pkg::of_module(written)
         };
-        let reexports = if relative {
-            None
-        } else {
-            langchain_reexport(written)
-        };
+        let reexports = if relative { None } else { reexport(written) };
         if !relative {
             self.note_self_import(written, node);
         }
@@ -4897,8 +4907,8 @@ impl<'t> Ctx<'t> {
                 continue;
             }
 
-            // `from langchain_community.chat_models import ChatOpenAI`: the
-            // class's provider decides its package.
+            // `from langchain_community.chat_models import ChatOpenAI`,
+            // `from agents import Agent`: the class decides its package.
             let reexport =
                 reexports.and_then(|pkgs| pkgs.iter().find_map(|pkg| client_class(*pkg, &name)));
             if let Some(class) = reexport {
@@ -7754,7 +7764,7 @@ impl<'t> Ctx<'t> {
 
         let callee = self.eval(function, scope, 0);
         match callee {
-            Val::Class(class) if class.pkg.is_langchain() => {
+            Val::Class(class) if class.pkg.binds_model() => {
                 // A LangChain chat model is built with the model its
                 // requests use, and routes by the client it builds.
                 let built = self.construction(call, class);
@@ -8231,7 +8241,7 @@ impl<'t> Ctx<'t> {
         // builds a chat model or calls one.
         let on_sdk_object = matches!(target.receiver, Receiver::Client | Receiver::Module)
             && member.split('.').next() != Some("types");
-        let gap_worthy = request || model_bearing || on_sdk_object || target.pkg.is_langchain();
+        let gap_worthy = request || model_bearing || on_sdk_object || target.pkg.binds_model();
         let site = Site {
             sdk,
             call,
