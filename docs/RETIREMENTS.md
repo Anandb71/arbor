@@ -85,8 +85,10 @@ routed: they are counted, and `--include-routed` lists them
 on the schedule its router prefix names (`anthropic/claude-3-5-sonnet-20241022` on
 Anthropic's), else by its shape (`gpt-4o` on OpenAI's), with only the checks about the
 model, since LiteLLM takes OpenAI-style arguments and translates them for each provider.
-AWS keeps Bedrock's model schedule, which the data does not hold, so a Bedrock model ID
-(`anthropic.claude-3-5-sonnet-20240620-v1:0`) is not matched. Other LangChain models and
+A Gemini model with no prefix (`gemini-2.5-flash`) is looked up on Google Cloud's (Vertex
+AI) schedule, where LiteLLM sends it; `gemini/gemini-2.5-flash` reaches the Gemini API.
+AWS keeps Bedrock's model schedule, which the data does not hold, so nothing is looked up
+for a Bedrock call, whatever its model ID (`anthropic.claude-3-5-sonnet-20240620-v1:0`). Other LangChain models and
 integrations, LlamaIndex and other wrappers are not checked yet, so a clean result says
 "No direct openai/anthropic/google SDK calls" and nothing more.
 

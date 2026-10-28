@@ -313,6 +313,12 @@ completion models (`langchain_openai.OpenAI`, `BedrockLLM`),
   LangChain's run options (`config`, `configurable`, `metadata`, `tags`,
   `callbacks`, `run_name`) and a call's positional input never reach the
   provider's request, so a `model` key inside them is not read.
+  On a Bedrock model, the Converse API sends a `model_id=` (or `modelId=`)
+  given to the call instead of the model's own
+  (`llm.invoke(q, model_id=...)`), so it is read there, and a `**` expansion
+  the file cannot read is a `splat` gap on `model_id`. `ChatBedrock` sends it
+  only when it runs on the Converse API (`beta_use_converse_api`), so there
+  the value keeps a `conditional` gap; `ChatBedrockConverse` always does.
 
 `arbor retirements` checks only the model of these calls: LangChain takes its
 own arguments and builds the request, so the SDK's argument rules do not
@@ -411,10 +417,13 @@ not a gap.
     `splat` gap.
 
 `arbor retirements` lists both only with `--include-routed`. AWS keeps
-Bedrock's model schedule, which the bundled data does not hold, so a Bedrock
-model ID matches nothing. A LiteLLM model is looked up on the schedule its
-router prefix names (`openai/`, `anthropic/`, `gemini/`, `vertex_ai/`), else
-by its shape; as for LangChain, only the checks about the model apply (see
+Bedrock's model schedule, which the bundled data does not hold, so nothing is
+looked up for a call routed `bedrock`, whatever its model ID. A LiteLLM model
+is looked up on the schedule its router prefix names (`openai/`,
+`anthropic/`, `gemini/`, `vertex_ai/`), else by its shape, except that a
+Gemini model with no prefix (`gemini-2.5-flash`) is looked up on Vertex AI's
+schedule, where LiteLLM sends it; only `gemini/<model>` reaches the Gemini
+API. As for LangChain, only the checks about the model apply (see
 [RETIREMENTS.md](RETIREMENTS.md)).
 
 ## Dynamic features
