@@ -1693,6 +1693,17 @@ fn effective_state(status: EntryStatus, date: Option<Date>, kind: DateKind, toda
 /// pre-1.0 `FineTuningJob.create` and `FineTune.create`).
 pub const FINE_TUNING: &str = "fine_tuning";
 
+/// An endpoint as the docs name it, for a sentence.
+fn endpoint_name(endpoint: &str) -> &str {
+    match endpoint {
+        "chat.completions" => "Chat Completions",
+        "responses" => "the Responses API",
+        "completions_legacy" => "the legacy Completions API",
+        "assistants" => "the Assistants API",
+        other => other,
+    }
+}
+
 /// Which API a call uses, from its callee.
 fn endpoint_of(chain: &str, member: &str) -> Option<&'static str> {
     let text = if member.contains('.') { member } else { chain };
@@ -1876,6 +1887,34 @@ impl RuleContext<'_> {
         endpoint == "*" || Some(endpoint) == self.endpoint
     }
 
+    /// For a rule a live check saw on this model but on another API, the
+    /// sentence that says so: "stop and logit_bias are not supported on
+    /// gpt-6-luna (400)" was seen on Chat Completions, and no live check
+    /// called the Responses API. `None` when the check covers this call.
+    fn unchecked_endpoint(&self, rule: &ParamRule) -> Option<String> {
+        let model =
+            rule.live_models.is_empty() || rule.live_models.iter().any(|m| m == self.target);
+        let endpoint = self
+            .endpoint
+            .is_some_and(|e| rule.live_endpoints.iter().any(|x| x == e));
+        if rule.verified != Verified::Live || rule.live_endpoints.is_empty() || !model || endpoint {
+            return None;
+        }
+        let seen: Vec<&str> = rule
+            .live_endpoints
+            .iter()
+            .map(|e| endpoint_name(e))
+            .collect();
+        Some(match self.endpoint {
+            Some(here) => format!(
+                "Seen on {} only; {} was not checked.",
+                seen.join(" and "),
+                endpoint_name(here)
+            ),
+            None => format!("Seen on {} only.", seen.join(" and ")),
+        })
+    }
+
     /// The label for this call: a live check vouches only for the models
     /// and the API it called.
     fn verified(&self, rule: &ParamRule) -> Verified {
@@ -1971,7 +2010,10 @@ fn apply_rules<'r>(
         match rule.effect {
             RuleEffect::Review => out.review.push(ReviewItem {
                 rule: Some(rule.id.clone()),
-                message: context.message(&rule.message),
+                message: match context.unchecked_endpoint(rule) {
+                    Some(scope) => format!("{} {scope}", context.message(&rule.message)),
+                    None => context.message(&rule.message),
+                },
                 because,
                 verified: Some(context.verified(rule)),
             }),
@@ -2006,6 +2048,28 @@ fn apply_rules<'r>(
                         .map(|o| o.label.as_str())
                         .unwrap_or("reasoning off")
                 ));
+                // Only an option that turns reasoning off runs the call the
+                // way it was checked. On any other, no check says whether
+                // the argument works, so that option is never "no change"
+                // (`seed=` on gpt-6-luna with the model reasoning). Off the
+                // checked endpoint, no option runs it that way.
+                let checked_here = context.verified(rule) != Verified::Unverified;
+                for option in decision.options.iter_mut().filter(|o| {
+                    !checked_here
+                        || !o
+                            .add
+                            .iter()
+                            .any(|a| is_effort_none(&a.name, Some(&a.value)))
+                }) {
+                    for name in &because {
+                        let settled = option.remove.contains(name)
+                            || option.keep.contains(name)
+                            || option.add.iter().any(|a| &a.name == name);
+                        if !settled {
+                            push_unique(&mut option.unverified, name.clone());
+                        }
+                    }
+                }
             } else {
                 out.review.push(ReviewItem {
                     rule: Some(rule.id.clone()),
@@ -2272,16 +2336,21 @@ fn merge_change(changes: &mut Vec<Change>, change: Change) {
 
 /// Whether the changes set reasoning effort to `none`.
 fn effort_none(changes: &[Change]) -> bool {
-    changes.iter().any(|c| {
-        c.kind == ChangeKind::Add
-            && match (c.param.as_str(), &c.value) {
-                ("reasoning_effort", Some(serde_json::Value::String(v))) => v == "none",
-                ("reasoning", Some(serde_json::Value::Object(map))) => {
-                    map.get("effort").and_then(|v| v.as_str()) == Some("none")
-                }
-                _ => false,
-            }
-    })
+    changes
+        .iter()
+        .any(|c| c.kind == ChangeKind::Add && is_effort_none(&c.param, c.value.as_ref()))
+}
+
+/// Whether setting `param` to `value` turns reasoning off:
+/// `reasoning_effort="none"` or `reasoning={"effort": "none"}`.
+fn is_effort_none(param: &str, value: Option<&serde_json::Value>) -> bool {
+    match (param, value) {
+        ("reasoning_effort", Some(serde_json::Value::String(v))) => v == "none",
+        ("reasoning", Some(serde_json::Value::Object(map))) => {
+            map.get("effort").and_then(|v| v.as_str()) == Some("none")
+        }
+        _ => false,
+    }
 }
 
 /// A JSON value as a Python literal (`"none"`, `{"effort": "none"}`).
@@ -4285,6 +4354,85 @@ def run():
         assert!(flags(&plain)
             .iter()
             .all(|(_, check, unverified)| check.is_empty() && unverified.is_empty()));
+    }
+
+    #[test]
+    fn an_argument_checked_only_with_reasoning_off_cannot_be_vouched_for_otherwise() {
+        // #291 round 3 review: `seed=1` on gpt-4o read "let the model reason
+        // (no change)" next to Arbor's own note that seed is untested with
+        // the model reasoning (LIVE_CHECKS_2026-10-18.md:77, :284).
+        let unverified = |finding: &Finding| -> Vec<(String, Vec<String>)> {
+            finding.decisions[0]
+                .options
+                .iter()
+                .map(|o| (o.id.clone(), o.unverified.clone()))
+                .collect()
+        };
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for arg in ["seed", "n"] {
+            let finding = one(&[openai("gpt-4o", &[arg, "messages"])]);
+            assert_eq!(
+                unverified(&finding),
+                [
+                    ("reasoning_none".to_string(), Vec::new()),
+                    ("model_default".to_string(), names(&[arg])),
+                ],
+                "{arg}"
+            );
+            assert!(
+                finding.decisions[0]
+                    .notes
+                    .iter()
+                    .any(|n| n.starts_with(&format!("{arg} was accepted on gpt-6-luna"))),
+                "{:?}",
+                finding.decisions[0].notes
+            );
+        }
+        // With temperature too: the reasoning option removes temperature and
+        // still cannot vouch for seed.
+        let finding = one(&[openai("gpt-4o", &["seed", "temperature", "messages"])]);
+        let model_default = &finding.decisions[0].options[1];
+        assert_eq!(model_default.remove, names(&["temperature"]));
+        assert_eq!(model_default.unverified, names(&["seed"]));
+        assert!(finding.decisions[0].options[0].unverified.is_empty());
+    }
+
+    #[test]
+    fn a_check_line_seen_on_another_api_says_where_it_was_seen() {
+        // #291 round 3 review: on the Responses API "stop and logit_bias are
+        // not supported on gpt-6-luna (400)" sat next to "could not check
+        // logit_bias"; the live check called Chat Completions only.
+        let message = |finding: &Finding, rule: &str| -> String {
+            finding
+                .review
+                .iter()
+                .find(|r| r.rule.as_deref() == Some(rule))
+                .unwrap_or_else(|| panic!("no {rule}: {:#?}", finding.review))
+                .message
+                .clone()
+        };
+        let responses = one(&[call(
+            Sdk::Openai,
+            Routing::OpenaiDirect,
+            "client.responses.create",
+            "gpt-4o-mini",
+            &["logit_bias", "input"],
+            10,
+        )]);
+        assert_eq!(
+            message(&responses, "G6-STOP-LOGIT-BIAS"),
+            "stop and logit_bias are not supported on gpt-6-luna (400). Seen on Chat Completions only; the Responses API was not checked."
+        );
+        assert!(responses.decisions[0]
+            .options
+            .iter()
+            .all(|o| o.unverified == ["logit_bias"]));
+        // On the API the live check called, the line is as before.
+        let chat = one(&[openai("gpt-4o-mini", &["logit_bias", "messages"])]);
+        assert_eq!(
+            message(&chat, "G6-STOP-LOGIT-BIAS"),
+            "stop and logit_bias are not supported on gpt-6-luna (400)."
+        );
     }
 
     #[test]
