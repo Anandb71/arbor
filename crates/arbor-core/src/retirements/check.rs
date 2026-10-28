@@ -756,6 +756,7 @@ fn call_kind(call: &SdkCall) -> Option<CallKind> {
 // Routing
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct CallRouting {
     class: RoutingClass,
     routing: String,
@@ -1310,7 +1311,17 @@ fn finding_for(
     value: &CapturedValue,
     confidence: Confidence,
 ) -> Option<Finding> {
-    let (hit, class) = resolve(data, routing, &value.value)?;
+    let (hit, class) = match site {
+        Site::Call(call, _) if call.package == "agents" => {
+            let (sent, through_litellm) = agents_model_sent(&value.value);
+            let litellm = CallRouting {
+                sdk: Some(Sdk::Litellm),
+                ..routing.clone()
+            };
+            resolve(data, if through_litellm { &litellm } else { routing }, sent)?
+        }
+        _ => resolve(data, routing, &value.value)?,
+    };
 
     let (file, span, symbol, chain, kwargs, splat, endpoint, call_kind) = match site {
         Site::Call(call, kind) => (
@@ -1602,6 +1613,19 @@ fn wrapper_of(call: &SdkCall) -> Option<String> {
         "claude_code_sdk" => Some("the Claude Code SDK (claude_code_sdk)".to_string()),
         "agentscope" => Some("AgentScope".to_string()),
         _ => None,
+    }
+}
+
+/// The model an OpenAI Agents SDK model name sends, and whether it goes
+/// through LiteLLM: the SDK's model provider routes by the name's prefix and
+/// strips `openai/` and `litellm/` before the request
+/// (`"litellm/anthropic/claude-3-5-sonnet-20240620"` sends
+/// `anthropic/claude-3-5-sonnet-20240620` to LiteLLM).
+fn agents_model_sent(value: &str) -> (&str, bool) {
+    if let Some(model) = value.strip_prefix("litellm/") {
+        (model, true)
+    } else {
+        (value.strip_prefix("openai/").unwrap_or(value), false)
     }
 }
 
@@ -3531,6 +3555,34 @@ old = Agent(name="old", model="o3-mini")
         assert_eq!(old.status, State::Retired);
         assert!(old.fails);
         assert_eq!(report.exit_code, 1);
+    }
+
+    #[test]
+    fn an_agents_sdk_model_is_looked_up_as_the_sdk_sends_it() {
+        // The SDK strips `openai/` and `litellm/` before the request.
+        let source = r#"from agents import Agent
+
+stripped = Agent(name="a", model="openai/o3-mini")
+routed = Agent(name="b", model="litellm/anthropic/claude-3-5-sonnet-20240620")
+"#;
+        let mut opts = options("2026-10-27");
+        opts.include_routed = true;
+        let report = check_source(source, &opts);
+        let stripped = report
+            .findings
+            .iter()
+            .find(|f| f.line == line_of(source, "stripped = "))
+            .expect("openai/o3-mini is looked up as o3-mini");
+        assert_eq!(stripped.status, State::Retired);
+        assert_eq!(stripped.routing_class, RoutingClass::Direct);
+        assert!(stripped.fails);
+        let routed = report
+            .routed
+            .iter()
+            .find(|f| f.line == line_of(source, "routed = "))
+            .expect("a litellm/ name is looked up by the provider prefix after it");
+        assert_eq!(routed.routing, "litellm");
+        assert_eq!(routed.routing_class, RoutingClass::Routed);
     }
 
     #[test]
