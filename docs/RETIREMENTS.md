@@ -159,7 +159,7 @@ it too. The check runs on the runner and sends nothing anywhere.
 
 - **Python only.** `.py` files and Python scripts. TypeScript and JavaScript are coming.
 - **Providers:** OpenAI, Anthropic, the Gemini API and Gemini on Google Cloud (Vertex AI):
-  298 entries (291 model IDs; 7 listed by both the Gemini API and Vertex; aliases
+  308 entries (297 model IDs; 11 listed by both the Gemini API and Vertex; aliases
   included) from their deprecation pages, with the aliases and changelog entries those
   pages leave out, such as the four OpenAI aliases above.
 - **Direct SDK calls only.** It reads the `openai`, `anthropic`, `google-genai` and
@@ -189,13 +189,12 @@ it too. The check runs on the runner and sends nothing anywhere.
 
 The model IDs, dates and replacements come from the providers' own deprecation pages,
 and every one was checked against a saved copy of the page. Each report prints the day
-each provider's pages were read (in the bundled data: OpenAI on 18 October 2026,
-Anthropic and Google on 16 October 2026), and the data date in `--json` is the oldest
-of them. Between 23 and 26 October, OpenAI's page started listing bare IDs and dated
-snapshots together in its rows, which added 15 IDs: seven bare IDs, among them `gpt-5`
-and `o3` (11 December 2026), and eight dated snapshots, such as `gpt-5.1-2025-11-13`
-(1 April 2027). Those 15 IDs were checked against the page as read on 28 October 2026,
-and the date shown stays that of the last full check. The argument rules come from the
+each provider's pages were read (in the bundled data: 28 October 2026 for every
+provider, when every page was read and checked again), and the data date in `--json`
+is the oldest of them. Between 23 and 26 October, OpenAI's page started listing bare
+IDs and dated snapshots together in its rows, which added 15 IDs: seven bare IDs, among
+them `gpt-5` and `o3` (11 December 2026), and eight dated snapshots, such as
+`gpt-5.1-2025-11-13` (1 April 2027). The argument rules come from the
 providers' migration guides and API references. A rule marked `live` in the JSON was confirmed with real API calls on
 18 October 2026; the label is shown only for the models those calls used and only on
 Chat Completions, the one API they called. [Live checks, 18 October 2026](LIVE_CHECKS_2026-10-18.md)

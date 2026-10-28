@@ -989,6 +989,96 @@ mod data_tests {
     }
 
     #[test]
+    fn the_28_october_page_reading_reaches_what_people_are_told() {
+        // Each assertion fails on the data generated from the 20 Oct recipes.
+        let r = data();
+        let rule = |set: &str, id: &str| {
+            r.rules(set)
+                .find(|rule| rule.id == id)
+                .unwrap_or_else(|| panic!("{set} {id}"))
+        };
+        // The deprecations page gives the bare aliases no row; OpenAI's API
+        // reference lists each "Deprecated. Announced shutdown date:
+        // 2027-01-14", and its models API gave that date on 18 Oct.
+        for alias in ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"] {
+            let entry = r.entry(Table::Openai, alias).expect(alias);
+            assert_eq!(entry.notes.len(), 1, "{alias}: {:?}", entry.notes);
+            let note = &entry.notes[0];
+            assert!(
+                note.contains("deprecations page gives it no shutdown date"),
+                "{note}"
+            );
+            assert!(
+                note.contains(
+                    "API reference lists it as deprecated with shutdown date 14 Jan 2027"
+                ),
+                "{note}"
+            );
+            assert!(
+                note.contains("models API gave that date on 18 Oct 2026"),
+                "{note}"
+            );
+            assert!(!note.contains("does not list"), "{note}");
+        }
+        // Haiku 4.5 is no longer said to accept the sampling parameters: API
+        // version 2026-10-21 rejects them on every model.
+        let haiku = rule("anthropic-retirements", "ANT-SAMPLING-HAIKU45");
+        assert_eq!(haiku.effect, RuleEffect::Review);
+        assert_eq!(haiku.verified, Verified::Unverified);
+        assert!(!haiku.message.contains("accepts"), "{}", haiku.message);
+        assert!(haiku.message.contains("2026-10-21"), "{}", haiku.message);
+        let claude = rule("anthropic-retirements", "ANT-SAMPLING");
+        assert!(claude
+            .message
+            .contains("at any value under API version 2026-10-21"));
+        // The "Using GPT-6" guide states the Responses rule; no Responses
+        // call was made, and the message says so.
+        let responses = rule("openai-2027-01-14", "G6-SAMPLING-RESPONSES");
+        assert_eq!(responses.verified, Verified::Docs);
+        assert!(responses.message.contains("\"Using GPT-6\" guide"));
+        assert!(responses
+            .message
+            .contains("has not tested this on the Responses API"));
+        let tier = rule("openai-2027-01-14", "G6-TIER-CHANGE");
+        assert!(!tier.message.contains("flagship"), "{}", tier.message);
+        assert!(tier.source_url.is_some());
+        // stop and logit_bias were called on gpt-5.6-terra only, and no page
+        // backs them on the other GPT-5.6 tiers.
+        for id in ["OAI-STOP", "OAI-LOGIT-BIAS"] {
+            let check = rule("openai-2026-10-23", id);
+            assert_eq!(check.verified, Verified::Live, "{id}");
+            assert_eq!(check.live_models, ["gpt-5.6-terra"], "{id}");
+            assert_eq!(check.otherwise_verified, Some(Verified::Unverified), "{id}");
+            assert!(
+                check
+                    .message
+                    .contains("not tested on gpt-5.6-sol, gpt-5.6-luna"),
+                "{id}: {}",
+                check.message
+            );
+        }
+        let max_tokens = rule("openai-2026-10-23", "OAI-MAX-TOKENS");
+        assert!(max_tokens
+            .message
+            .contains("deprecated in favour of max_completion_tokens"));
+        // top_p and logprobs were sent only at "none" on GPT-5.6.
+        let reasoning = rule("openai-2026-10-23", "OAI-SAMPLING-REASONING-SOURCE");
+        assert_eq!(reasoning.verified, Verified::Live);
+        assert!(reasoning
+            .message
+            .contains("top_p and logprobs were tested only at"));
+        // The 23 Oct section's only fine-tune row is ft-o4-mini-2025-04-16.
+        let oct23: Vec<&str> = r
+            .data
+            .fine_tunes
+            .iter()
+            .filter(|fine| fine.recipe == "openai-2026-10-23")
+            .map(|fine| fine.base.as_str())
+            .collect();
+        assert_eq!(oct23, ["o4-mini-2025-04-16"]);
+    }
+
+    #[test]
     fn rejects_unknown_fields_and_schemas() {
         let mut value: serde_json::Value = serde_json::from_str(DATA_JSON).unwrap();
         value["entries"][0]["surprise"] = serde_json::json!(true);

@@ -2471,7 +2471,10 @@ mod tests {
         assert_eq!(finding.call_kind, CallKind::Request);
         assert_eq!(finding.endpoint, Some("chat.completions"));
         assert!(!finding.in_window, "retiring is not failing by default");
-        assert!(finding.notes.iter().any(|n| n.contains("efficient tier")));
+        assert!(finding
+            .notes
+            .iter()
+            .any(|n| n.contains("most efficient model for focused, high-volume tasks")));
 
         // The day after the date the call is retired.
         let report = run(&[openai("gpt-4o", &[])], &[], &options("2027-01-15"));
@@ -3039,15 +3042,32 @@ mod tests {
         assert!(advice.contains("does not support fine-tuning"), "{advice}");
         assert!(!advice.contains("retrain on gpt-6-luna"), "{advice}");
 
-        // A listed base that cannot be fine-tuned is named, not recommended.
-        let finding = one(&[openai("ft:gpt-3.5-turbo:acme::abc123", &[])]);
+        // A listed base that cannot be fine-tuned is named, not recommended:
+        // ft-o4-mini-2025-04-16 is the 23 Oct table's only fine-tune row.
+        let finding = one(&[openai("ft:o4-mini-2025-04-16:acme::abc123", &[])]);
         assert_eq!(
             finding.replacement_text.as_deref(),
             Some("no fine-tunable replacement is listed")
         );
         assert!(finding.review[0]
             .message
-            .contains("OpenAI lists gpt-5.6-terra for fine-tunes of gpt-3.5-turbo"));
+            .contains("OpenAI lists gpt-5.6-terra for fine-tunes of o4-mini-2025-04-16"));
+
+        // Since OpenAI removed its separate fine-tune table (26-27 Oct), the
+        // page names no replacement for fine-tunes of gpt-3.5-turbo: they
+        // follow their base model, and no base is named.
+        let finding = one(&[openai("ft:gpt-3.5-turbo:acme::abc123", &[])]);
+        assert_eq!(finding.date.unwrap().iso(), "2026-10-23");
+        assert_eq!(
+            finding.replacement_text.as_deref(),
+            Some("no fine-tunable replacement is listed")
+        );
+        let advice = &finding.review[0].message;
+        assert!(
+            advice.contains("OpenAI lists no replacement for fine-tunes of gpt-3.5-turbo"),
+            "{advice}"
+        );
+        assert!(!advice.contains("gpt-5.6-terra"), "{advice}");
     }
 
     #[test]
@@ -3108,10 +3128,20 @@ mod tests {
         );
         // A listed fine-tune base that cannot be fine-tuned is named, not
         // recommended.
-        let finding = one(&[job("gpt-3.5-turbo")]);
+        let finding = one(&[job("o4-mini-2025-04-16")]);
         assert!(finding.review[0]
             .message
-            .contains("OpenAI lists gpt-5.6-terra for fine-tunes of gpt-3.5-turbo"));
+            .contains("OpenAI lists gpt-5.6-terra for fine-tunes of o4-mini-2025-04-16"));
+        // gpt-3.5-turbo has no fine-tune row since OpenAI removed that table:
+        // its listed replacement is named as a replacement, not as a base.
+        let finding = one(&[job("gpt-3.5-turbo")]);
+        assert!(
+            finding.review[0].message.contains(
+                "OpenAI lists gpt-5.6-terra as the replacement for gpt-3.5-turbo, not as a base for fine-tuning"
+            ),
+            "{:#?}",
+            finding.review
+        );
         // An `ft:` model continued in a job keeps the fine-tune advice.
         let finding = one(&[job("ft:gpt-4o-mini-2024-07-18:acme::abc123")]);
         assert_eq!(finding.match_kind, MatchKind::FineTuned);
@@ -3909,15 +3939,18 @@ def run():
         assert_eq!(report.findings[0].fix, FixKind::Manual);
 
         // Each provider's pages carry their own date; as_of is the oldest.
+        // The 28 Oct 2026 refresh read every provider's pages that day.
         let dates: Vec<(&str, String)> = report
             .data
             .providers
             .iter()
             .map(|p| (p.provider.as_str(), p.as_of.iso()))
             .collect();
-        assert_eq!(dates[0], ("OpenAI", "2026-10-18".to_string()));
-        assert_eq!(dates[1], ("Anthropic", "2026-10-16".to_string()));
-        assert_eq!(report.data.as_of.iso(), "2026-10-16");
+        assert_eq!(dates[0], ("OpenAI", "2026-10-28".to_string()));
+        assert_eq!(dates[1], ("Anthropic", "2026-10-28".to_string()));
+        let oldest = report.data.providers.iter().map(|p| p.as_of).min().unwrap();
+        assert_eq!(report.data.as_of, oldest);
+        assert_eq!(report.data.as_of.iso(), "2026-10-28");
 
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["version"], 1);

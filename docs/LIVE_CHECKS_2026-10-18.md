@@ -101,8 +101,10 @@ Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_c
 ```
 
 The same request with `"max_completion_tokens": 50` in place of `max_tokens` returned 200
-on both models. Supports `OAI-MAX-TOKENS` and `G6-MAX-TOKENS`, whose message is
-`max_tokens is rejected on {target}: use max_completion_tokens (same value).`
+on both models. Supports `G6-MAX-TOKENS` (`max_tokens is rejected on {target}: use
+max_completion_tokens (same value).`) and `OAI-MAX-TOKENS`, whose message since the
+28 October 2026 data refresh says that OpenAI's API reference deprecates `max_tokens`
+in favour of `max_completion_tokens` and that only gpt-5.6-terra was called.
 
 ### E2: a non-default temperature is rejected
 
@@ -162,7 +164,8 @@ of 2 calls (`gpt-5.6-terra`, `gpt-6-luna`), at `reasoning_effort` `"none"`.
 Unsupported parameter: 'stop' is not supported with this model.
 ```
 
-Supports `OAI-STOP` (`stop is not supported on {target} (400).`) and
+Supports `OAI-STOP` on gpt-5.6-terra only (since the 28 October 2026 data refresh its
+message says gpt-5.6-sol, gpt-5.6-luna and the default effort were not tested) and
 `G6-STOP-LOGIT-BIAS` (`stop and logit_bias are not supported on {target} (400).`).
 
 ### E5: logit_bias is rejected
@@ -178,7 +181,8 @@ on 2 of 2 calls (`gpt-5.6-terra`, `gpt-6-luna`), at `reasoning_effort` `"none"`.
 Unsupported parameter: 'logit_bias' is not supported with this model.
 ```
 
-Supports `OAI-LOGIT-BIAS` (`logit_bias is not supported on {target} (400).`) and
+Supports `OAI-LOGIT-BIAS` on gpt-5.6-terra only (since the 28 October 2026 data refresh
+its message says gpt-5.6-sol, gpt-5.6-luna and the default effort were not tested) and
 `G6-STOP-LOGIT-BIAS`.
 
 ### E6: prediction is rejected
