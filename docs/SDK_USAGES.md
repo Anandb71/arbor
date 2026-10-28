@@ -5,8 +5,10 @@ calls the OpenAI, Anthropic and Gemini SDKs, directly or through LangChain's
 OpenAI and Anthropic chat models ([LangChain chat
 models](#langchain-chat-models)), and where it calls models on Amazon Bedrock
 or through LiteLLM ([Amazon Bedrock and LiteLLM](#amazon-bedrock-and-litellm)),
-and where it posts JSON to OpenAI's or Anthropic's REST API with `requests` or
-`httpx` ([Raw HTTP requests](#raw-http-requests)), with each call's routing
+where it posts JSON to OpenAI's or Anthropic's REST API with `requests` or
+`httpx` ([Raw HTTP requests](#raw-http-requests)), and where an agent
+framework is given a model: the OpenAI Agents SDK, the Claude Agent SDK and
+AgentScope ([Agent frameworks](#agent-frameworks)), with each call's routing
 and model values. A consumer (a codemod, a reviewer)
 should treat the report this way:
 
@@ -517,6 +519,117 @@ Their argument names are the library's, and the scan reads only the model in
 the body, so only the checks about the model apply, with a check to review
 the body's other fields by hand.
 
+## Agent frameworks
+
+An agent framework builds the provider's request itself from a model it is
+given. The report follows the classes below that take a model; each one is
+recorded like a LangChain chat model, as a construction and a call
+(`request: false`) that binds the model, read under the value rules above.
+Nothing called on what they build is recorded (`agent.clone(...)`,
+`agent.as_tool(...)`): those objects configure a run, they are not clients.
+
+| Framework | Classes | Imported from | Model |
+|---|---|---|---|
+| OpenAI Agents SDK (`openai-agents`) | `Agent`, `RunConfig` | `agents` and its submodules | `model`; a run's first positional argument |
+| | `OpenAIResponsesModel`, `OpenAIChatCompletionsModel` | the same | `model` or the first positional argument |
+| | `LitellmModel` | `agents.extensions.models.litellm_model` | the same |
+| Claude Agent SDK, Claude Code SDK | `ClaudeAgentOptions`, `AgentDefinition`; `ClaudeCodeOptions` | `claude_agent_sdk`; `claude_code_sdk` | `model`, `fallback_model` |
+| AgentScope | `OpenAIChatModel`, `OpenAIResponseModel`, `AnthropicChatModel`, `GeminiChatModel` | `agentscope.model` | `model_name` (AgentScope 1, also its first positional argument) or `model` (AgentScope 2, also after a credential passed by position) |
+
+`agents` is also a common name for a repository's own package, so the OpenAI
+Agents SDK is followed only through `from agents... import` of one of these
+classes: `import agents`, a wildcard import, any other name (`from agents
+import get_sql_agent`) and a relative import are not followed. AgentScope is
+followed only through `from agentscope.model... import`; its models for
+other providers (`DashScopeChatModel`, `OllamaChatModel`...) and its 0.x
+model configurations are not. The Claude Agent SDK's modules are followed
+like an SDK's (`import claude_agent_sdk as sdk` too). A name that is not on
+this list reports nothing. A repository's own `agents` package is therefore
+read as the SDK only where a file imports one of these class names from it
+(`from agents import Agent`).
+
+**OpenAI Agents SDK.** The SDK sends a model name through its model
+provider, which picks the provider from the name's prefix. So the route
+follows the model:
+
+- a name with no prefix, or `openai/`, goes through the SDK's default
+  `AsyncOpenAI()` client: `openai_direct`, with an `endpoint_env` gap in a
+  file that sets `OPENAI_BASE_URL`, as for an SDK client;
+- `litellm/` is LiteLLM: `litellm`, and a file that mentions
+  `litellm.model_alias_map` gives its values a `dynamic_feature` gap, as for
+  a LiteLLM call ([Amazon Bedrock and LiteLLM](#amazon-bedrock-and-litellm));
+- any other prefix (`any-llm/`, a provider map's), a model the scan does not
+  confirm, and a `**` expansion that may hold one route `unknown` with a
+  `model_route` gap;
+- a model object routes like itself: `OpenAIResponsesModel` and
+  `OpenAIChatCompletionsModel` like the `openai_client` they are given (a
+  client the file does not resolve to one tracked client is `unknown` with a
+  `given_client` gap), `LitellmModel` `litellm`. An agent or run given one
+  records no call of its own (the object carries the model), and its
+  construction routes like the object. Both route at each use through what
+  they were built on, so a client given a `base_url` after it is handed to a
+  model object re-routes the object too.
+
+A file that sets the SDK's default client (`set_default_openai_client(...)`,
+also imported under another name) or passes a `model_provider` anywhere
+(`RunConfig(model_provider=...)`, a run's second positional argument, or a
+`**` expansion given to a run) routes every model name `unknown` with a
+`given_client` gap. An agent given no model runs the SDK's default model,
+which depends on the SDK version (`gpt-4.1` from 0.3 to 0.6) and on
+`OPENAI_DEFAULT_MODEL`: a `missing_model` gap. A run given none keeps its
+agents' models, and a model object needs one, so neither is a gap. A
+`RunConfig` given a model (by keyword, by position or through an expansion)
+replaces the model of every agent it runs, so in a file that builds one,
+every agent's values keep a `dynamic_feature` gap; so they do in a file that
+writes `model` on another object (`agent.model = ...`). `Agent.clone(model=
+...)` and `Runner.run(...)` are not read.
+
+**Claude Agent SDK.** The SDK runs the Claude Code CLI with the options'
+`model` and `fallback_model`. An alias (`"sonnet"`, `"opus"`, an agent
+definition's `"inherit"`) is reported as written: what it resolves to is the
+CLI's. Options given no model run the CLI's default model: a `missing_model`
+gap; an agent definition given none runs its parent's, so it is not one. The
+CLI uses Anthropic's API (`anthropic_direct`) unless its environment picks
+another provider or endpoint, so:
+
+- a file that sets one of the CLI's provider switches or endpoints
+  (`ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`,
+  `CLAUDE_CODE_USE_FOUNDRY`, `CLAUDE_CODE_USE_MANTLE`,
+  `CLAUDE_CODE_USE_ANTHROPIC_AWS`, `ANTHROPIC_BEDROCK_BASE_URL`,
+  `ANTHROPIC_BEDROCK_MANTLE_BASE_URL`, `ANTHROPIC_VERTEX_BASE_URL`,
+  `ANTHROPIC_FOUNDRY_BASE_URL`, `ANTHROPIC_AWS_BASE_URL`) is an `endpoint_env`
+  gap;
+- options given `env=` (unless `None` or a dict literal whose keys are all
+  strings, none of them one of these, with no `**`), `settings=` (a settings
+  file or JSON, whose `env` the CLI applies) or a `**` expansion route
+  `unknown` with an `endpoint_option` gap. An agent definition takes none of
+  these: it runs where its options do.
+
+The options' `extra_args` become CLI flags and may pass another model: unless
+they are `None` or a dict literal that names no model flag, they, or a `**`
+expansion that may hold them, are a `reassigned` gap with no key, which
+covers every value of the call. `query(...)`, `ClaudeSDKClient` and its
+`set_model(...)` are not read.
+
+**AgentScope.** Each model builds its provider's SDK client: OpenAI's for
+`OpenAIChatModel` and `OpenAIResponseModel`, Anthropic's for
+`AnthropicChatModel`, Gemini's for `GeminiChatModel` (`google_genai`). The
+model is required, so none given is not a gap. The route is the provider's
+own API, and its endpoint is a `base_url` in the AgentScope 2 credential
+(`credential=OpenAICredential(base_url=...)`) or in AgentScope 1's
+`client_kwargs` (earlier `client_args`), routed by host like a direct
+client's ([Routes](#routes)); with neither, a file that sets the SDK's
+endpoint variable is an `endpoint_env` gap. `client_type="azure"` routes
+`azure_openai`. A credential or client arguments the file cannot read whole
+(a name, a `**` expansion, a key other than the API key and the client's
+`organization`, `project`, `timeout`, `max_retries` and `default_headers`;
+for Gemini, anything but the API key), any other `client_type`, and a `**`
+expansion given to the model route `unknown` with an `endpoint_option` gap.
+
+`arbor retirements` checks only the model of these calls: each framework
+takes its own arguments and builds the request, so the SDK's argument rules
+do not describe them (see [RETIREMENTS.md](RETIREMENTS.md)).
+
 ## Dynamic features
 
 The collection pass looks for the following features in the same linear walk
@@ -645,8 +758,18 @@ The report assumes the rest. In particular:
 - The process environment at run time is not known: a direct client built
   without a `base_url` is reported direct, although the deployment (or a
   `.env` file loaded with `load_dotenv`) may set `OPENAI_BASE_URL`,
-  `ANTHROPIC_BASE_URL` or `GOOGLE_GENAI_USE_VERTEXAI`, and for a LangChain
-  chat model `OPENAI_API_BASE`, `ANTHROPIC_API_URL` or `LANGSMITH_GATEWAY`.
+  `ANTHROPIC_BASE_URL` or `GOOGLE_GENAI_USE_VERTEXAI`, for a LangChain
+  chat model `OPENAI_API_BASE`, `ANTHROPIC_API_URL` or `LANGSMITH_GATEWAY`,
+  and for the Claude Code CLI one of its provider switches. The model an
+  agent given none runs may come from `OPENAI_DEFAULT_MODEL`, and Claude
+  Code options given none from `ANTHROPIC_MODEL`.
+- Claude Code's settings files (`.claude/settings.json` and the user's),
+  which the Claude Agent SDK loads unless `setting_sources` says otherwise,
+  may set the CLI's `env`, and so its provider. They are not read.
+- The OpenAI Agents SDK's default client or model provider set in another
+  module (`set_default_openai_client(...)` at start-up), and a `RunConfig`
+  with a model built in another module, are not seen: an agent's model name
+  is reported routed as the SDK's default would send it.
 - Where a Bedrock client sends its requests may also come from the AWS
   configuration: an `endpoint_url` in `~/.aws/config`, under whichever
   profile the environment or the file selects (`AWS_PROFILE`,
@@ -655,7 +778,9 @@ The report assumes the rest. In particular:
   `litellm.model_alias_map`). Neither is seen.
 - A LangChain chat model's field names and aliases are those of the current
   `langchain-openai`, `langchain-anthropic` and `langchain-aws`; which LangChain version the
-  project runs is not known. The deprecated classes are read the same way.
+  project runs is not known. The agent frameworks' classes and fields are
+  those of `openai-agents` 0.24, `claude-agent-sdk` 0.2 (and the last
+  `claude-code-sdk`, 0.0.25), and AgentScope 1.0 and 2.0. The deprecated classes are read the same way.
   Where they differ, that can only add a gap: the deprecated `ChatAnthropic`
   has no `base_url` alias and does not read `ANTHROPIC_BASE_URL`, so for it a
   `base_url=` or that variable is a gap or a custom route it does not need.

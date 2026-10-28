@@ -95,9 +95,24 @@ A raw HTTP request that posts JSON to the provider's REST API (`requests.post(..
 direct call on that provider's schedule, with the model read from its JSON body
 ([SDK_USAGES.md](SDK_USAGES.md#raw-http-requests)). Its argument names are the HTTP
 library's, and the scan reads only the model in the body, so only the checks about the
-model apply, with a check to review the body's other fields by hand. Other LangChain models and
-integrations, LlamaIndex and other wrappers are not checked yet, so a clean result says
-"No direct openai/anthropic/google SDK calls" and nothing more.
+model apply, with a check to review the body's other fields by hand.
+
+An agent framework's classes that take a model are checked where they are built, like
+a LangChain chat model ([SDK_USAGES.md](SDK_USAGES.md#agent-frameworks)): the OpenAI
+Agents SDK's `Agent`, `RunConfig` and model objects, the Claude Agent SDK's options and
+agent definitions (and the Claude Code SDK's options), and AgentScope's OpenAI,
+Anthropic and Gemini models. `Agent(name="triage", model="gpt-4o")` is a direct call on
+OpenAI's schedule, `ClaudeAgentOptions(model=...)` on Anthropic's, unless the scan
+leaves the route unconfirmed (a model the Agents SDK routes by a prefix or a model
+object, Claude Code options whose `env=` may pick another provider). The framework
+takes its own arguments and builds the request, so only the checks about the model
+apply, with a check to review the parameters it sends by hand. A Claude Code alias
+(`"sonnet"`) names no dated model, so it is not listed. An agent or Claude Code options
+given no model run a default model, which is counted under "Not checked".
+
+Other LangChain models and integrations, LlamaIndex and other wrappers are not checked
+yet, so a clean result says "No direct openai/anthropic/google SDK calls" and nothing
+more.
 
 Fine-tuned models (`ft:<base>:...`) follow their base model's schedule. Arbor names a
 base model to retrain on only when the provider lists one that supports fine-tuning;
@@ -187,8 +202,9 @@ it too. The check runs on the runner and sends nothing anywhere.
   pages leave out, such as the four OpenAI aliases above.
 - **Direct SDK calls and LangChain chat models.** It reads the `openai`, `anthropic`,
   `google-genai` and `google-generativeai` SDKs, and LangChain's `ChatOpenAI`,
-  `AzureChatOpenAI` and `ChatAnthropic`, and raw HTTP posts to OpenAI's and Anthropic's
-  REST APIs with `requests` or `httpx`. Calls through LiteLLM and on Amazon Bedrock are
+  `AzureChatOpenAI` and `ChatAnthropic`, raw HTTP posts to OpenAI's and Anthropic's
+  REST APIs with `requests` or `httpx`, and the models given to the OpenAI Agents SDK,
+  the Claude Agent SDK and AgentScope. Calls through LiteLLM and on Amazon Bedrock are
   routed (`--include-routed`), and Bedrock's own schedule is not in the data. Other
   framework wrappers (LangChain's other integrations, LlamaIndex) are not checked yet. Model IDs in `.env`, YAML, JSON or notebooks are not read.
 - **Values it can see.** A model passed in from an environment variable, a function
