@@ -143,7 +143,8 @@ makes a decision for you.
 Everything else is left out, and stderr counts each reason:
 
 - a call that needs a choice your repository makes first (the reasoning effort on
-  gpt-6-luna and GPT-5.6, Claude's thinking) or a manual check;
+  gpt-6-luna and GPT-5.6, Claude's thinking) or a manual check, and a call where any
+  other model value does, such as a model nested in `extra_body`;
 - a model that comes from a constant or a default: other code, or another module, may
   read the same value, so edit it by hand;
 - a swap that needs an argument added, such as `reasoning={"mode": "pro"}` for `o1-pro`;
@@ -152,9 +153,10 @@ Everything else is left out, and stderr counts each reason:
 - a model written in another form, such as implicit concatenation (`"gpt-" "4"`);
 - a file with syntax errors, or one that changed while Arbor read it.
 
-`arbor retirements` without `--diff` lists every one of them. The patch names files as
-the report does, so apply it from the directory you ran Arbor in. The exit codes are the
-check's, and `--quiet` keeps only the patch. Read the patch before you apply it: a
+`arbor retirements` without `--diff` lists every one of them. The patch names each file
+relative to the directory you run Arbor in, however you write the path to scan, so
+apply it from there; swaps in files outside that directory are left out. The exit codes
+are the check's, and `--quiet` keeps only the patch. Read the patch before you apply it: a
 replacement can cost more or answer differently, and no static check sees that.
 
 ## In CI: GitHub Action
