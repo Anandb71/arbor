@@ -1401,7 +1401,14 @@ fn finding_for(
         Site::Call(call, _) => wrapper_of(call),
         Site::Gap(_) => None,
     };
-    let model_only = nested.is_some() || wrapper.is_some();
+    // A raw HTTP request's argument names are the HTTP library's (`url`,
+    // `headers`, `json`); the scan reads only the model in its body, so the
+    // rules about the other fields cannot be checked either.
+    let raw_http = match site {
+        Site::Call(call, _) => raw_http_of(call),
+        Site::Gap(_) => None,
+    };
+    let model_only = nested.is_some() || wrapper.is_some() || raw_http.is_some();
     let mut outcome = Outcome::default();
     if call_kind != CallKind::RequestParam {
         if let Some((rule_set, target, source_model, source_family)) = source {
@@ -1461,11 +1468,21 @@ fn finding_for(
             verified: None,
         });
     }
+    let against = live
+        .as_deref()
+        .map(|m| format!(" against {m}"))
+        .unwrap_or_default();
+    if let Some(library) = raw_http {
+        reasons.push(ReviewItem {
+            rule: None,
+            message: format!(
+                "The call is a raw HTTP request ({library}): Arbor read only the model in its JSON body, not the other fields it sends, so check those{against} by hand."
+            ),
+            because: Vec::new(),
+            verified: None,
+        });
+    }
     if let Some(through) = wrapper {
-        let against = live
-            .as_deref()
-            .map(|m| format!(" against {m}"))
-            .unwrap_or_default();
         reasons.push(ReviewItem {
             rule: None,
             message: format!(
@@ -1581,6 +1598,13 @@ fn wrapper_of(call: &SdkCall) -> Option<String> {
         "boto3" => Some("Amazon Bedrock (boto3)".to_string()),
         _ => None,
     }
+}
+
+/// The HTTP library a raw HTTP request to a provider's API is sent with
+/// (`requests.post(...)`), which the usage scan records with the package
+/// it comes from.
+fn raw_http_of(call: &SdkCall) -> Option<&str> {
+    matches!(call.package.as_str(), "requests" | "httpx").then_some(call.package.as_str())
 }
 
 /// A rule about the model itself rather than the request that sends it: a
@@ -3390,6 +3414,62 @@ first_party = brt.converse(modelId="claude-3-5-sonnet-20240620", messages=[])
             }
             assert_eq!(report.exit_code, 0, "{remap}{list}");
         }
+    }
+
+    #[test]
+    fn raw_http_requests_are_direct_and_checked_only_for_the_model() {
+        let source = r#"import requests
+
+URL = "https://api.openai.com/v1/chat/completions"
+
+def old():
+    return requests.post(URL, json={"model": "gpt-3.5-turbo", "messages": [], "max_tokens": 256})
+
+def current(model):
+    return requests.post(URL, json={"model": "gpt-4o", "messages": [], "max_tokens": 256})
+
+def claude():
+    data = {"model": "claude-3-opus-20240229", "max_tokens": 200, "messages": []}
+    return requests.post("https://api.anthropic.com/v1/messages", json=data)
+"#;
+        let report = check_source(source, &options("2026-10-27"));
+        let at = |needle: &str| -> Finding {
+            let line = line_of(source, needle);
+            let found: Vec<&Finding> = report.findings.iter().filter(|f| f.line == line).collect();
+            assert_eq!(found.len(), 1, "{needle}: {:#?}", report.findings);
+            found[0].clone()
+        };
+        for needle in [
+            "\"gpt-3.5-turbo\"",
+            "\"gpt-4o\"",
+            "requests.post(\"https://api.anthropic",
+        ] {
+            let finding = at(needle);
+            assert_eq!(finding.call_kind, CallKind::Request, "{needle}");
+            assert_eq!(finding.routing_class, RoutingClass::Direct, "{needle}");
+            assert_eq!(finding.confidence, Confidence::Confirmed, "{needle}");
+            // `max_tokens` is in the body, not an argument the scan reads:
+            // no argument change or reasoning choice is offered.
+            assert!(finding.changes.is_empty(), "{:#?}", finding.changes);
+            assert!(finding.decisions.is_empty(), "{:#?}", finding.decisions);
+            assert_eq!(finding.fix, FixKind::Manual, "{needle}");
+            assert!(
+                finding
+                    .review
+                    .iter()
+                    .any(|r| r.message.contains("raw HTTP request (requests)")),
+                "{:#?}",
+                finding.review
+            );
+        }
+        let old = at("\"gpt-3.5-turbo\"");
+        assert_eq!(old.status, State::Retired);
+        assert!(old.fails);
+        assert_eq!(
+            at("requests.post(\"https://api.anthropic").status,
+            State::Retired
+        );
+        assert_eq!(report.exit_code, 1);
     }
 
     #[test]
