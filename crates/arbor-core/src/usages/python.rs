@@ -841,6 +841,23 @@ fn langchain_model_names(pkg: Pkg) -> [&'static str; 2] {
     }
 }
 
+/// Every package, for reading one back from its name.
+const ALL_PKGS: [Pkg; 13] = [
+    Pkg::Openai,
+    Pkg::Anthropic,
+    Pkg::GoogleGenai,
+    Pkg::GoogleGenerativeai,
+    Pkg::LangchainOpenai,
+    Pkg::LangchainAnthropic,
+    Pkg::LangchainCommunityOpenai,
+    Pkg::LangchainCommunityAnthropic,
+    Pkg::LangchainLegacyOpenai,
+    Pkg::LangchainLegacyAnthropic,
+    Pkg::LangchainAws,
+    Pkg::Boto3,
+    Pkg::Litellm,
+];
+
 /// HTTP libraries whose `post` function is followed to a provider's REST
 /// API: `requests.post(url, json=...)` and `httpx.post(url, json=...)`.
 /// Nothing else of theirs is followed (sessions, clients, `request`).
@@ -8240,9 +8257,9 @@ impl<'t> Ctx<'t> {
     /// The parameter `expr` is, unchanged: a plain name whose only
     /// definition reaching it is a parameter of the function that binds
     /// it, or `self.attr` read in a method of a class whose one assignment
-    /// of `attr` (in it, its base and its subclasses) is `self.attr =
-    /// <parameter>` in its own `__init__`, which calls no base class's
-    /// `__init__` after it. `None` for anything else, and for an attribute
+    /// of `attr` (in it, its same-file base and its subclasses) is
+    /// `self.attr = <parameter>` in its own `__init__`, which calls no base
+    /// class's `__init__` after it. `None` for anything else, and for an attribute
     /// a dynamic feature of the class may change.
     fn param_source(&mut self, expr: Node<'t>, scope: usize) -> Option<ParamSource> {
         match expr.kind() {
@@ -8275,6 +8292,14 @@ impl<'t> Ctx<'t> {
                     return None;
                 };
                 let assign = *assign;
+                // Once the class assigns the attribute, the lookup no longer
+                // lists its same-file base's assignments, but a method of the
+                // base the instance runs may still set it.
+                if let Some(base) = self.class_shape(class).base {
+                    if !self.own_attrs(base, attr).is_empty() {
+                        return None;
+                    }
+                }
                 let init = &self.scopes[assign.scope];
                 let own_init = init.kind == ScopeKind::Function
                     && !init.lambda
@@ -8438,6 +8463,7 @@ impl<'t> Ctx<'t> {
                 chain: request.chain.to_string(),
                 member: request.member.to_string(),
                 line: request.line,
+                receiver: request.receiver,
                 routing: request.routing,
                 route_confirmed,
             };
@@ -8554,23 +8580,58 @@ impl<'t> Ctx<'t> {
             return;
         }
 
-        // A class keeps the model in an instance attribute, which this file
-        // may write after it is built.
-        let attrs: Vec<&str> = wrapper
+        // The packages of the requests (`langchain_community` names two).
+        let pkgs: Vec<Pkg> = ALL_PKGS
+            .iter()
+            .copied()
+            .filter(|pkg| wrapper.params.iter().any(|p| p.package == pkg.package()))
+            .collect();
+
+        // The model may change once the call returns: a class keeps it in
+        // an instance attribute, and a LangChain chat model (built by the
+        // wrapper and handed back) in its model field, either of which this
+        // file may write; LiteLLM may map it to another model.
+        let mut fields: Vec<&str> = wrapper
             .params
             .iter()
             .filter_map(|p| p.attribute.as_deref())
             .collect();
-        let written = if attrs.is_empty() {
+        let langchain: Vec<Pkg> = pkgs.iter().copied().filter(|p| p.is_langchain()).collect();
+        for pkg in &langchain {
+            fields.extend(langchain_model_names(*pkg));
+        }
+        let written = if fields.is_empty() {
             None
         } else {
             self.wild_attr_any.or_else(|| {
-                attrs
+                fields
                     .iter()
-                    .find_map(|attr| self.outside_attr_writes.get(attr).copied())
+                    .find_map(|field| self.outside_attr_writes.get(field).copied())
             })
         };
-        if let Some(feature) = written {
+        let written = written.or(if langchain.is_empty() {
+            None
+        } else {
+            self.langchain_configurable
+        });
+        let remapped = self
+            .litellm_aliases
+            .filter(|_| pkgs.contains(&Pkg::Litellm));
+        let changed = [
+            written.map(|feature| {
+                format!(
+                    "`{chain}` passes its model to something this file may give another model after it is built ({})",
+                    feature.describe()
+                )
+            }),
+            remapped.map(|feature| {
+                format!(
+                    "{} may map the models `{chain}` passes on to other ones",
+                    feature.describe()
+                )
+            }),
+        ];
+        for detail in changed.into_iter().flatten() {
             self.out.gaps.push(UsageGap {
                 kind: GapKind::UnresolvedModel,
                 sdk: Some(first.sdk),
@@ -8580,10 +8641,7 @@ impl<'t> Ctx<'t> {
                 chain: Some(chain.clone()),
                 key: None,
                 reason: "dynamic_feature".to_string(),
-                detail: format!(
-                    "`{chain}` keeps its model in an attribute this file may write after it is built ({})",
-                    feature.describe()
-                ),
+                detail,
                 values: Vec::new(),
                 values_complete: false,
             });
@@ -8596,11 +8654,6 @@ impl<'t> Ctx<'t> {
             .params
             .iter()
             .all(|p| p.route_confirmed && (p.sdk, p.routing) == route);
-        let routing = if agreed {
-            first.routing
-        } else {
-            Routing::Unknown
-        };
         let unconfirmed = if !agreed {
             Some((
                 "wrapper_route",
@@ -8610,15 +8663,26 @@ impl<'t> Ctx<'t> {
                 ),
             ))
         } else {
-            self.file_dynamic.map(|feature| {
-                (
-                    "dynamic_feature",
-                    format!(
-                        "this file may rebind any name or attribute at run time ({}), so the routing of `{chain}` is not confirmed",
-                        feature.describe()
-                    ),
-                )
+            let module_level = wrapper
+                .params
+                .iter()
+                .any(|p| p.receiver != Receiver::Client);
+            self.configured_route(&pkgs, module_level, &chain).or_else(|| {
+                self.file_dynamic.map(|feature| {
+                    (
+                        "dynamic_feature",
+                        format!(
+                            "this file may rebind any name or attribute at run time ({}), so the routing of `{chain}` is not confirmed",
+                            feature.describe()
+                        ),
+                    )
+                })
             })
+        };
+        let routing = if unconfirmed.is_none() {
+            first.routing
+        } else {
+            Routing::Unknown
         };
         if let Some((reason, detail)) = unconfirmed {
             self.out.gaps.push(UsageGap {
@@ -8682,6 +8746,78 @@ impl<'t> Ctx<'t> {
                 requests,
             }),
         });
+    }
+
+    /// Why requests of `pkgs` that a wrapper call in this file reaches may
+    /// not go where the wrapper's file says, because of something this
+    /// file does to the whole process: it sets an endpoint variable those
+    /// SDKs read, writes the environment with a run-time name, configures
+    /// the module-level API (which matters only to `module_level`
+    /// requests, those not sent through a client), replaces part of the
+    /// SDK, or writes a `base_url` on an object it cannot identify.
+    fn configured_route(
+        &self,
+        pkgs: &[Pkg],
+        module_level: bool,
+        chain: &str,
+    ) -> Option<(&'static str, String)> {
+        let dynamic = |feature: Feature, what: &str| {
+            Some((
+                "dynamic_feature",
+                format!(
+                    "this file {what} ({}), so where the requests `{chain}` passes its model to go is not confirmed",
+                    feature.describe()
+                ),
+            ))
+        };
+        for pkg in pkgs {
+            let module_env = if module_level && pkg.sdk() == Sdk::Openai {
+                OPENAI_MODULE_ENV
+            } else {
+                &[]
+            };
+            let var = endpoint_env_vars(*pkg)
+                .iter()
+                .chain(module_env)
+                .find(|var| self.env_writes.contains(**var));
+            if let Some(var) = var {
+                return Some((
+                    "endpoint_env",
+                    format!(
+                        "this file sets `{var}`, which the SDK reads its endpoint from, so the requests `{chain}` passes its model to may go elsewhere"
+                    ),
+                ));
+            }
+        }
+        if let Some(feature) = self.env_wild {
+            return dynamic(feature, "may write the SDK's endpoint variables");
+        }
+        for pkg in pkgs.iter().filter(|_| module_level) {
+            let module_configured = match pkg.sdk() {
+                Sdk::Openai => {
+                    self.openai_routing != Routing::OpenaiDirect || self.openai_caveat.is_some()
+                }
+                Sdk::Google => *pkg == Pkg::GoogleGenerativeai && self.legacy_caveat.is_some(),
+                _ => false,
+            };
+            if module_configured {
+                return Some((
+                    "module_config",
+                    format!(
+                        "this file configures the SDK's module-level API, which the requests `{chain}` passes its model to go through"
+                    ),
+                ));
+            }
+        }
+        if let Some(feature) = pkgs.iter().find_map(|pkg| self.sdk_patched.get(pkg)) {
+            return dynamic(*feature, "replaces part of the SDK");
+        }
+        self.rerouted_any.and_then(|feature| {
+            dynamic(
+                feature,
+                "writes a `base_url` on an object it cannot identify",
+            )
+        })
     }
 
     fn record_call(
@@ -9253,6 +9389,7 @@ impl<'t> Ctx<'t> {
                 chain: &chain,
                 member: &member,
                 line: span.line,
+                receiver: target.receiver,
                 routing: target.routing,
             };
             self.note_model_params(from_params, gaps_before, &request);
@@ -11151,6 +11288,7 @@ struct ParamRequest<'a> {
     chain: &'a str,
     member: &'a str,
     line: u32,
+    receiver: Receiver,
     routing: Routing,
 }
 

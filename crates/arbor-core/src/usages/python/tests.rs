@@ -8038,6 +8038,89 @@ fn a_function_wrapper_keeps_no_attribute_to_write() {
     let caller = "from .sampler import Sampler, ask\nsetattr(obj, name, value)\nask(\"hi\", model=\"o1\")\nSampler(model=\"o1\")\n";
     let found = through(SAMPLER, ".sampler", caller);
     assert_eq!(value(call_on(&found, 3), "model"), Some("o1"));
-    assert!(gaps_on(&found, 3).is_empty(), "{:?}", gaps_on(&found, 3));
+    let model_gaps = |line: u32| -> Vec<String> {
+        gaps_on(&found, line)
+            .into_iter()
+            .filter(|g| g.starts_with("unresolved_model/"))
+            .collect()
+    };
+    assert!(model_gaps(3).is_empty(), "{:?}", gaps_on(&found, 3));
+    assert_eq!(model_gaps(4), ["unresolved_model/dynamic_feature"]);
+}
+
+#[test]
+fn a_base_class_that_sets_the_attribute_too_keeps_it_unlisted() {
+    let source = "from openai import OpenAI\nclient = OpenAI()\nclass Base:\n    def with_model(self, model):\n        self.model = model\n        return self\nclass S(Base):\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n";
+    assert_eq!(model_params(source, "llm.py"), []);
+}
+
+#[test]
+fn a_wrapper_call_keeps_what_the_calling_file_changes() {
+    // A LangChain chat model the wrapper builds and hands back, given
+    // another model or made configurable where it is called.
+    let make_llm = "from langchain_openai import ChatOpenAI\n\ndef make_llm(model=\"gpt-4o\"):\n    return ChatOpenAI(model=model, temperature=0)\n";
+    assert_eq!(model_params(make_llm, "llm.py").len(), 1);
+    for later in [
+        "llm.model_name = \"gpt-3.5-turbo\"",
+        "llm = llm.configurable_fields(model_name=ConfigurableField(id=\"m\"))",
+    ] {
+        let caller =
+            format!("from .llm import make_llm\nllm = make_llm(model=\"gpt-4o\")\n{later}\n");
+        let found = through(make_llm, ".llm", &caller);
+        assert_eq!(
+            value(call_on(&found, 2), "model"),
+            Some("gpt-4o"),
+            "{later}"
+        );
+        assert_eq!(
+            gaps_on(&found, 2),
+            ["unresolved_model/dynamic_feature"],
+            "{later}"
+        );
+    }
+
+    // The module-level API configured, or an endpoint variable set, in the
+    // calling file.
+    let ask = "import openai\n\ndef ask(model):\n    return openai.chat.completions.create(model=model, messages=[])\n";
+    assert!(model_params(ask, "llm.py")[0].route_confirmed);
+    let cases = [
+        (
+            "import openai\nfrom .llm import ask\nopenai.base_url = \"http://localhost:4000/v1/\"\nask(model=\"gpt-3.5-turbo\")\n",
+            "ambiguous_client/module_config",
+        ),
+        (
+            "import os\nfrom .llm import ask\nos.environ[\"OPENAI_BASE_URL\"] = \"http://proxy\"\nask(model=\"gpt-3.5-turbo\")\n",
+            "ambiguous_client/endpoint_env",
+        ),
+        (
+            "import os\nfrom .llm import ask\nos.environ[name] = value\nask(model=\"gpt-3.5-turbo\")\n",
+            "ambiguous_client/dynamic_feature",
+        ),
+    ];
+    for (caller, gap) in cases {
+        let found = through(ask, ".llm", caller);
+        let call = call_on(&found, 4);
+        assert_eq!(call.routing, Routing::Unknown, "{caller}");
+        assert_eq!(value(call, "model"), Some("gpt-3.5-turbo"), "{caller}");
+        assert_eq!(gaps_on(&found, 4), [gap], "{caller}");
+    }
+    // Configuring something else leaves the route alone.
+    let found = through(
+        ask,
+        ".llm",
+        "import openai\nfrom .llm import ask\nopenai.api_key = key\nask(model=\"gpt-3.5-turbo\")\n",
+    );
+    assert_eq!(call_on(&found, 4).routing, Routing::OpenaiDirect);
+    assert!(gaps_on(&found, 4).is_empty());
+
+    // LiteLLM's alias table mentioned in the calling file.
+    let litellm = "import litellm\n\ndef ask(model):\n    return litellm.completion(model=model, messages=[])\n";
+    let found = through(
+        litellm,
+        ".llm",
+        "import litellm\nfrom .llm import ask\nlitellm.model_alias_map = {\"gpt-3.5-turbo\": \"gpt-4o-mini\"}\nask(model=\"gpt-3.5-turbo\")\n",
+    );
+    let call = call_on(&found, 4);
+    assert_eq!(call.routing, Routing::Litellm);
     assert_eq!(gaps_on(&found, 4), ["unresolved_model/dynamic_feature"]);
 }

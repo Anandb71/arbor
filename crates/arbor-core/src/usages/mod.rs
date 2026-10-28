@@ -517,6 +517,10 @@ pub struct ModelParam {
     pub chain: String,
     pub member: String,
     pub line: u32,
+    /// How the request reaches the SDK: through a client, or through the
+    /// module-level API (or a class or function imported from the SDK),
+    /// whose process-wide configuration a calling file may change.
+    pub receiver: Receiver,
     pub routing: Routing,
     /// The request's routing has no client gap.
     pub route_confirmed: bool,
