@@ -1588,7 +1588,8 @@ fn finding_for(
 
 /// What a call that is not the provider's own SDK goes through, as people
 /// say it: a LangChain chat model built or called (`LangChain
-/// (langchain_openai)`), LiteLLM, or Amazon Bedrock through boto3.
+/// (langchain_openai)`), LiteLLM, Amazon Bedrock through boto3, or an agent
+/// framework's agent, options or model.
 fn wrapper_of(call: &SdkCall) -> Option<String> {
     let package = call.package.as_str();
     match package {
@@ -1596,6 +1597,10 @@ fn wrapper_of(call: &SdkCall) -> Option<String> {
         _ if package.starts_with("langchain_") => Some(format!("LangChain ({package})")),
         "litellm" => Some("LiteLLM".to_string()),
         "boto3" => Some("Amazon Bedrock (boto3)".to_string()),
+        "agents" => Some("the OpenAI Agents SDK (agents)".to_string()),
+        "claude_agent_sdk" => Some("the Claude Agent SDK (claude_agent_sdk)".to_string()),
+        "claude_code_sdk" => Some("the Claude Code SDK (claude_code_sdk)".to_string()),
+        "agentscope" => Some("AgentScope".to_string()),
         _ => None,
     }
 }
@@ -3469,6 +3474,62 @@ def claude():
             at("requests.post(\"https://api.anthropic").status,
             State::Retired
         );
+        assert_eq!(report.exit_code, 1);
+    }
+
+    #[test]
+    fn agent_frameworks_get_only_the_rules_about_the_model() {
+        // An agent's, options' or AgentScope model's arguments are the
+        // framework's own, which builds the request: only the checks about
+        // the model apply.
+        let source = r#"from agents import Agent
+from claude_agent_sdk import ClaudeAgentOptions
+from agentscope.model import OpenAIChatModel
+
+agent = Agent(name="triage", model="gpt-4o", instructions="x")
+options = ClaudeAgentOptions(model="claude-sonnet-4-5-20250929", max_turns=3)
+scope = OpenAIChatModel(model_name="gpt-4.1", stream=True)
+old = Agent(name="old", model="o3-mini")
+"#;
+        let report = check_source(source, &options("2026-10-27"));
+        let at = |needle: &str| -> Finding {
+            let line = line_of(source, needle);
+            let found: Vec<&Finding> = report.findings.iter().filter(|f| f.line == line).collect();
+            assert_eq!(found.len(), 1, "{needle}: {:#?}", report.findings);
+            found[0].clone()
+        };
+        let data = bundled().unwrap();
+        for (needle, through) in [
+            ("agent = ", "the OpenAI Agents SDK (agents)"),
+            ("options = ", "the Claude Agent SDK (claude_agent_sdk)"),
+            ("scope = ", "AgentScope"),
+        ] {
+            let finding = at(needle);
+            assert_eq!(finding.call_kind, CallKind::ModelBinding, "{needle}");
+            assert_eq!(finding.confidence, Confidence::Confirmed, "{needle}");
+            assert_eq!(finding.routing_class, RoutingClass::Direct, "{needle}");
+            assert!(finding.changes.is_empty(), "{:#?}", finding.changes);
+            assert!(finding.decisions.is_empty(), "{:#?}", finding.decisions);
+            assert_eq!(finding.fix, FixKind::Manual, "{needle}");
+            assert!(
+                finding
+                    .review
+                    .iter()
+                    .any(|r| r.message.contains(&format!("goes through {through}"))),
+                "{needle}: {:#?}",
+                finding.review
+            );
+            for item in &finding.review {
+                if let Some(id) = &item.rule {
+                    let rule = data.data.rules.iter().find(|r| &r.id == id).unwrap();
+                    assert!(about_the_model(rule), "{id} is about the request");
+                }
+            }
+        }
+        // A retired model still fails the check through an agent.
+        let old = at("old = ");
+        assert_eq!(old.status, State::Retired);
+        assert!(old.fails);
         assert_eq!(report.exit_code, 1);
     }
 
