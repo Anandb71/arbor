@@ -8373,6 +8373,7 @@ impl<'t> Ctx<'t> {
                 let key = method(m);
                 self.functions.get(&key).map_or(0, Vec::len)
                     + self.assigns.get(&key).map_or(0, Vec::len)
+                    + self.attr_assigns.get(&key).map_or(0, Vec::len)
                     + usize::from(self.imports.contains_key(&key))
                     + usize::from(self.other_imports.contains_key(&key))
             };

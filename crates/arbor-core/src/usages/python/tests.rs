@@ -7880,3 +7880,153 @@ def main(fast="o3-mini"):
         .iter()
         .all(|g| g.kind != GapKind::AmbiguousClient));
 }
+
+#[test]
+fn a_parameter_is_not_listed_where_the_extractor_cannot_confirm_it() {
+    let head = "from openai import OpenAI\nimport litellm\nclient = OpenAI()\n";
+    let cases = [
+        // Decorated, defined twice, rebound, nested, a method, a lambda.
+        "@retry\ndef ask(model):\n    return client.chat.completions.create(model=model)\n",
+        "def ask(model):\n    return client.chat.completions.create(model=model)\ndef ask(model):\n    return 1\n",
+        "def ask(model):\n    return client.chat.completions.create(model=model)\nask = wrap(ask)\n",
+        "def outer():\n    def ask(model):\n        return client.chat.completions.create(model=model)\n    return ask\n",
+        "class Bot:\n    def ask(self, model):\n        return client.chat.completions.create(model=model)\n",
+        "ask = lambda model: client.chat.completions.create(model=model)\n",
+        // The parameter is changed before the request.
+        "def ask(model):\n    model = model or \"gpt-4o\"\n    return client.chat.completions.create(model=model)\n",
+        "def ask(model):\n    return client.chat.completions.create(model=model.lower())\n",
+        // The attribute is set twice, from something else, or again by a
+        // base class's constructor.
+        "class S:\n    def __init__(self, model):\n        self.model = model\n    def reset(self):\n        self.model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S:\n    def __init__(self, model):\n        self.model = model.strip()\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S(Base):\n    def __init__(self, model):\n        self.model = model\n        super().__init__()\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S(Base):\n    def __init__(self, model):\n        self.model = model\n        Base.__init__(self)\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        // The class may be built some other way.
+        "@dataclass\nclass S:\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S(metaclass=Meta):\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S(A, B):\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S:\n    def __new__(cls, model):\n        return object.__new__(cls)\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S:\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\nS.__init__ = other\n",
+        // The file may rewrite anything, or the request remaps its model.
+        "def ask(model):\n    return client.chat.completions.create(model=model)\nexec(code)\n",
+        "from settings import *\ndef ask(model):\n    return client.chat.completions.create(model=model)\n",
+        "litellm.model_alias_map = {}\ndef ask(model):\n    return litellm.completion(model=model, messages=[])\n",
+        // Passed through `**`: not a parameter this scan follows.
+        "def ask(**kw):\n    return client.chat.completions.create(**kw)\n",
+    ];
+    for case in cases {
+        let source = format!("{head}{case}");
+        assert_eq!(model_params(&source, "llm.py"), [], "{case}");
+    }
+    // A script is not imported.
+    let script =
+        format!("{head}def ask(model):\n    return client.chat.completions.create(model=model)\n");
+    assert_eq!(model_params(&script, "pkg/__main__.py"), []);
+    assert_eq!(model_params(&script, "llm.py").len(), 1);
+}
+
+#[test]
+fn a_wrapper_whose_requests_route_is_not_confirmed_is_routed_unknown() {
+    let wrapper = r#"import os
+from openai import OpenAI
+
+class Model:
+    def __init__(self, model):
+        self.model = model
+        if model == "deepseek-reasoner":
+            self.client = OpenAI(base_url="https://api.deepseek.com")
+        else:
+            self.client = OpenAI()
+
+    def generate(self, prompt):
+        return self.client.chat.completions.create(model=self.model, messages=[prompt])
+"#;
+    let params = model_params(wrapper, "sampler.py");
+    assert_eq!(params.len(), 1);
+    assert!(!params[0].route_confirmed);
+    let found = through(
+        wrapper,
+        "reasoners.lm.openai_model",
+        r#"from reasoners.lm.openai_model import Model
+
+def main(openai_model="o1"):
+    return Model(openai_model)
+"#,
+    );
+    let built = call_on(&found, 4);
+    assert_eq!(built.routing, Routing::Unknown);
+    assert_eq!(value(built, "model"), Some("o1"));
+    assert!(built.values[0].positional);
+    assert_eq!(
+        gaps_on(&found, 4),
+        [
+            "unresolved_model/parameter_default",
+            "ambiguous_client/wrapper_route"
+        ]
+    );
+}
+
+#[test]
+fn a_wrapper_call_keeps_the_gaps_of_what_it_passes() {
+    let found = through(
+        SAMPLER,
+        ".sampler",
+        r#"import os
+from .sampler import Sampler, ask
+
+def run(kw):
+    a = Sampler(model=os.environ["MODEL"])
+    b = Sampler(**kw)
+    c = ask("hi", *kw)
+    return a, b, c
+"#,
+    );
+    assert!(call_on(&found, 5).values.is_empty());
+    assert_eq!(gaps_on(&found, 5), ["unresolved_model/env_var"]);
+    assert_eq!(gaps_on(&found, 6), ["unresolved_model/splat"]);
+    assert_eq!(gaps_on(&found, 7), ["unresolved_model/splat"]);
+
+    // The instance's attribute written after it is built.
+    let found = through(
+        SAMPLER,
+        ".sampler",
+        "from .sampler import Sampler\ns = Sampler(model=\"o1\")\ns.model = \"gpt-4o\"\n",
+    );
+    assert_eq!(value(call_on(&found, 2), "model"), Some("o1"));
+    assert_eq!(gaps_on(&found, 2), ["unresolved_model/dynamic_feature"]);
+
+    // A file that may rebind anything: the callee too.
+    let found = through(
+        SAMPLER,
+        ".sampler",
+        "from .sampler import Sampler\nexec(code)\ns = Sampler(model=\"o1\")\n",
+    );
+    assert_eq!(value(call_on(&found, 3), "model"), Some("o1"));
+    assert_eq!(gaps_on(&found, 3), ["ambiguous_client/dynamic_feature"]);
+}
+
+#[test]
+fn a_wrapper_call_is_recorded_only_through_its_import_alone() {
+    let cases = [
+        "from .sampler import Sampler\nif flag:\n    Sampler = Other\nSampler(model=\"o1\")\n",
+        "from .sampler import Sampler\nfrom other import *\nSampler(model=\"o1\")\n",
+        "from .sampler import Sampler\ndef run(Sampler):\n    return Sampler(model=\"o1\")\n",
+        "from . import sampler\nsampler.Sampler(model=\"o1\")\n",
+        "import sampler\nsampler.Sampler(model=\"o1\")\n",
+        "from .other import Sampler\nSampler(model=\"o1\")\n",
+        "from .sampler import Other as Sampler\nSampler(model=\"o1\")\n",
+    ];
+    for case in cases {
+        let found = through(SAMPLER, ".sampler", case);
+        assert!(found.calls.is_empty(), "{case}: {:?}", found.calls);
+        assert!(found.gaps.is_empty(), "{case}: {:?}", found.gaps);
+    }
+    // An import inside the function that calls it.
+    let found = through(
+        SAMPLER,
+        ".sampler",
+        "def build():\n    from .sampler import Sampler\n    return Sampler(model=\"o1\")\n",
+    );
+    assert_eq!(value(call_on(&found, 3), "model"), Some("o1"));
+    assert_eq!(call_on(&found, 3).symbol.as_deref(), Some("build"));
+}
