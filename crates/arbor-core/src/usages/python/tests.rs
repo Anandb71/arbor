@@ -8099,3 +8099,28 @@ claude.model_name = "claude-3-5-haiku-20241022"
     assert!(gaps.contains(&"ambiguous_client/endpoint_env".to_string()));
     assert!(gaps.contains(&"unresolved_model/dynamic_feature".to_string()));
 }
+
+#[test]
+fn a_file_that_only_mentions_agents_is_not_read_for_them() {
+    // The frameworks' classes are followed only through the imports that
+    // name them, so a word in a comment does not make the file readable
+    // (which would report its other imports, such as boto3's).
+    for source in [
+        "# agents share one queue\nimport boto3\n",
+        "AGENTS = []\nimport boto3\n",
+        "import agentscope\nimport boto3\n",
+    ] {
+        assert!(!super::may_use_sdk(source), "{source}");
+        let found = usages(source);
+        assert!(found.imports.is_empty(), "{source}: {:?}", found.imports);
+    }
+    for source in [
+        "from agents import Agent\n",
+        "from agents.models.openai_responses import OpenAIResponsesModel\n",
+        "from agentscope.model import OpenAIChatModel\n",
+        "import claude_agent_sdk\n",
+        "from claude_code_sdk import ClaudeCodeOptions\n",
+    ] {
+        assert!(super::may_use_sdk(source), "{source}");
+    }
+}

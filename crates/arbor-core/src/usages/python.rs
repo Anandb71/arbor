@@ -140,13 +140,14 @@ const PREFILTER: &[&str] = &[
     "converse(",
     "converse_stream(",
     "litellm",
-    // The OpenAI Agents SDK's classes are imported from `agents`, the
-    // Claude Agent SDK's from `claude_agent_sdk` or `claude_code_sdk`.
-    "agents",
+    // The agent frameworks' classes are followed only through the import
+    // statements that name them: `from agents... import` (the OpenAI
+    // Agents SDK) and `from agentscope.model... import`. The Claude Agent
+    // SDK's modules are named in any form.
+    "from agents",
+    "agentscope.model",
     "claude_agent_sdk",
     "claude_code_sdk",
-    // AgentScope's model classes are imported from `agentscope.model`.
-    "agentscope",
 ];
 
 /// Whether `source` mentions anything the extractor tracks. A file that does
