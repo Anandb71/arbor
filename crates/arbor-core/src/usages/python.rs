@@ -824,6 +824,90 @@ fn langchain_model_names(pkg: Pkg) -> [&'static str; 2] {
     }
 }
 
+/// HTTP libraries whose `post` function is followed to a provider's REST
+/// API: `requests.post(url, json=...)` and `httpx.post(url, json=...)`.
+/// Nothing else of theirs is followed (sessions, clients, `request`).
+const HTTP_LIBRARIES: &[&str] = &["requests", "httpx"];
+
+/// A provider API a raw HTTP request is sent to (see [`http_endpoint`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HttpEndpoint {
+    sdk: Sdk,
+    routing: Routing,
+    /// The SDK method the endpoint is (`chat.completions.create` for
+    /// `/v1/chat/completions`), recorded as the call's member.
+    member: &'static str,
+    /// The request body names the model at its top level, so a body with
+    /// no `model` is a `missing_model` gap. A Message Batch nests its
+    /// models in its requests.
+    takes_model: bool,
+}
+
+/// The REST endpoints a raw HTTP request is recorded for, by path, with
+/// the SDK method each one is. Only endpoints whose JSON body names a
+/// model are listed.
+const OPENAI_HTTP_ENDPOINTS: &[(&str, &str)] = &[
+    ("/v1/chat/completions", "chat.completions.create"),
+    ("/v1/completions", "completions.create"),
+    ("/v1/responses", "responses.create"),
+    ("/v1/embeddings", "embeddings.create"),
+    ("/v1/images/generations", "images.generate"),
+    ("/v1/images/edits", "images.edit"),
+    ("/v1/images/variations", "images.create_variation"),
+    ("/v1/audio/speech", "audio.speech.create"),
+    ("/v1/audio/transcriptions", "audio.transcriptions.create"),
+    ("/v1/audio/translations", "audio.translations.create"),
+    ("/v1/moderations", "moderations.create"),
+    ("/v1/fine_tuning/jobs", "fine_tuning.jobs.create"),
+    ("/v1/assistants", "assistants.create"),
+];
+const ANTHROPIC_HTTP_ENDPOINTS: &[(&str, &str)] = &[
+    ("/v1/messages", "messages.create"),
+    ("/v1/messages/count_tokens", "messages.count_tokens"),
+    ("/v1/messages/batches", "messages.batches.create"),
+    ("/v1/complete", "completions.create"),
+];
+
+/// The provider endpoint `url` names: an `https://` (or `http://`) URL on
+/// `api.openai.com` or `api.anthropic.com` whose path, without its query,
+/// fragment or a trailing `/`, is one of [`OPENAI_HTTP_ENDPOINTS`] or
+/// [`ANTHROPIC_HTTP_ENDPOINTS`]. Any other URL names none: a gateway's
+/// host, Azure's or Google's REST paths, and a path this list does not
+/// hold are not recorded.
+fn http_endpoint(url: &str) -> Option<HttpEndpoint> {
+    let url = url.trim();
+    let scheme = url.split_once("://")?.0;
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let rest = &url[scheme.len() + 3..];
+    let path = rest
+        .find('/')
+        .map_or("", |at| &rest[at..])
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let (sdk, routing, endpoints) = match url_host(url).as_str() {
+        "api.openai.com" => (Sdk::Openai, Routing::OpenaiDirect, OPENAI_HTTP_ENDPOINTS),
+        "api.anthropic.com" => (
+            Sdk::Anthropic,
+            Routing::AnthropicDirect,
+            ANTHROPIC_HTTP_ENDPOINTS,
+        ),
+        _ => return None,
+    };
+    let member = endpoints
+        .iter()
+        .find_map(|(p, member)| (*p == path).then_some(*member))?;
+    Some(HttpEndpoint {
+        sdk,
+        routing,
+        member,
+        takes_model: member != "messages.batches.create",
+    })
+}
+
 /// The provider an SDK-shaped chain on an unknown receiver most likely
 /// belongs to, and whether the shape alone is distinctive enough to report.
 fn sdk_shape(chain: &str) -> Option<(Sdk, bool)> {
@@ -1594,6 +1678,11 @@ struct OtherImport {
     /// The module as written, clipped, shared by every name one statement
     /// imports.
     module: Rc<str>,
+    /// The dotted path the local name is bound to, clipped: `requests` for
+    /// `import requests` and `import requests.adapters`, `requests.adapters`
+    /// for `import requests.adapters as ra`, `requests.post` for `from
+    /// requests import post`. A relative import's path starts with `.`.
+    target: Rc<str>,
     place: Place,
 }
 
@@ -1972,6 +2061,15 @@ struct Ctx<'t> {
     /// function, stored, returned, or aliased by a name that is. Their
     /// literal is never read.
     escaped: HashSet<&'t str>,
+    /// The `json=` argument of each call shaped like `requests.post(...)`
+    /// or a bare `post(...)`, by its value's node id, with the callee. A
+    /// name passed there is not escaped yet (see [`Ctx::http_bodies`]).
+    http_body_args: HashMap<usize, Node<'t>>,
+    /// Names passed as such a `json=` argument, with the callee and the
+    /// scope of the call. Once imports are bound, a name whose callee is
+    /// not `requests.post` or `httpx.post` (which only serialize the dict)
+    /// is escaped like any dict passed to a function.
+    http_bodies: Vec<(&'t str, Node<'t>, usize)>,
     /// Dict parts that leave their dict, and plain-name aliases.
     exposed: Vec<Exposed<'t>>,
     def_index: HashMap<Key, DefIndex>,
@@ -2084,6 +2182,10 @@ struct Ctx<'t> {
     /// = patched`, `openai.OpenAI = Sub`), by package: every route of that
     /// package is then a `dynamic_feature` gap.
     sdk_patched: HashMap<Pkg, Feature>,
+    /// `requests.post` or `httpx.post` replaced in this file (`requests.post
+    /// = fake`, or an attribute of either written with a run-time name):
+    /// every raw HTTP request is then a `dynamic_feature` gap.
+    http_patched: Option<Feature>,
     /// Names bound by `def` and `class` statements and class-body imports,
     /// where they bind: a name also assigned there gets an assignment of no
     /// known value for each (see [`Ctx::bind_definitions`]).
@@ -2170,6 +2272,8 @@ impl<'t> Ctx<'t> {
             name_uses: HashMap::new(),
             attr_uses: HashMap::new(),
             escaped: HashSet::new(),
+            http_body_args: HashMap::new(),
+            http_bodies: Vec::new(),
             exposed: Vec::new(),
             def_index: HashMap::new(),
             loops: HashMap::new(),
@@ -2219,6 +2323,7 @@ impl<'t> Ctx<'t> {
             exported: HashSet::new(),
             exports_dynamic: false,
             sdk_patched: HashMap::new(),
+            http_patched: None,
             def_bindings: Vec::new(),
             openai_last_config: None,
             config_top: false,
@@ -2515,6 +2620,7 @@ impl<'t> Ctx<'t> {
                             self.parents.insert(node.id(), parent);
                         }
                         self.note_dict_mutation(node);
+                        self.note_http_body(node);
                         self.note_env_read(node);
                         self.note_env_write(node);
                         if is_get_call(node, |n| self.text(n)) {
@@ -3284,6 +3390,10 @@ impl<'t> Ctx<'t> {
     /// A bare name: whether a dict bound to it may change or escape here.
     fn note_dict_name(&mut self, node: Node<'t>, frame: &Frame<'t>, scope: usize) {
         let name = self.text(node);
+        if let Some(function) = self.http_body_args.get(&node.id()).copied() {
+            self.http_bodies.push((name, function, scope));
+            return;
+        }
         match self.dict_use(frame, false) {
             DictUse::Safe => {}
             DictUse::Escape => {
@@ -3298,6 +3408,35 @@ impl<'t> Ctx<'t> {
                     _ => None,
                 },
             }),
+        }
+    }
+
+    /// `post(url, json=body)` or `x.post(url, json=body)`: the name passed as
+    /// `json=` is held back from escaping until imports are bound (see
+    /// [`Ctx::http_bodies`]). The callee's shape is all that is known here.
+    fn note_http_body(&mut self, call: Node<'t>) {
+        let Some(function) = call.child_by_field_name("function") else {
+            return;
+        };
+        let shaped = match function.kind() {
+            "identifier" => true,
+            "attribute" => {
+                function
+                    .child_by_field_name("attribute")
+                    .is_some_and(|a| self.text(a) == "post")
+                    && function
+                        .child_by_field_name("object")
+                        .is_some_and(|o| o.kind() == "identifier")
+            }
+            _ => false,
+        };
+        if !shaped {
+            return;
+        }
+        if let Some(value) = keyword_value(call, |n| self.text(n), |name| name == "json") {
+            if value.kind() == "identifier" {
+                self.http_body_args.insert(value.id(), function);
+            }
         }
     }
 
@@ -3397,6 +3536,13 @@ impl<'t> Ctx<'t> {
     /// and escapes too. There is no alias tracking to get wrong: a whole
     /// container assigned to another name has already escaped.
     fn settle_dict_escapes(&mut self) {
+        // `requests.post` and `httpx.post` serialize the dict they are
+        // given; anything else may keep or change it.
+        for (name, function, scope) in std::mem::take(&mut self.http_bodies) {
+            if self.http_library(function, scope).is_none() {
+                self.escaped.insert(name);
+            }
+        }
         for exposed in std::mem::take(&mut self.exposed) {
             let (alters, names) = self.exposed_contents(&exposed);
             if alters {
@@ -4502,7 +4648,14 @@ impl<'t> Ctx<'t> {
         scope
     }
 
-    fn other_import(&mut self, scope: usize, local: String, module: &Rc<str>, place: Place) {
+    fn other_import(
+        &mut self,
+        scope: usize,
+        local: String,
+        module: &Rc<str>,
+        target: Rc<str>,
+        place: Place,
+    ) {
         self.class_body_import(scope, &local, place);
         let home = self.import_home(scope, &local);
         self.other_imports
@@ -4510,6 +4663,7 @@ impl<'t> Ctx<'t> {
             .or_default()
             .push(OtherImport {
                 module: Rc::clone(module),
+                target,
                 place,
             });
     }
@@ -4559,11 +4713,14 @@ impl<'t> Ctx<'t> {
             self.note_self_import(written, node);
             let module = clip(written);
             let Some((pkg, rest)) = Pkg::of_module(written) else {
-                let local = match alias {
-                    Some(alias) => self.text(alias).to_string(),
-                    None => written.split('.').next().unwrap_or("").to_string(),
+                let (local, target) = match alias {
+                    Some(alias) => (self.text(alias).to_string(), Rc::from(module.as_str())),
+                    None => {
+                        let first = written.split('.').next().unwrap_or("");
+                        (first.to_string(), Rc::from(clip(first.trim())))
+                    }
                 };
-                self.other_import(scope, local, &Rc::from(module), place);
+                self.other_import(scope, local, &Rc::from(module), target, place);
                 continue;
             };
             let (local, val) = match alias {
@@ -4702,6 +4859,10 @@ impl<'t> Ctx<'t> {
             if !relative {
                 self.note_dynamic_import(written, &name, &local, node);
             }
+            // What `local` is bound to, for an import this file does not
+            // track (`requests.post`).
+            let bound =
+                || -> Rc<str> { Rc::from(clip(&format!("{}.{}", written.trim(), name.trim()))) };
 
             // `from google import genai` / `from google import generativeai`.
             if !relative && written == "google" {
@@ -4709,7 +4870,7 @@ impl<'t> Ctx<'t> {
                     "genai" => Pkg::GoogleGenai,
                     "generativeai" => Pkg::GoogleGenerativeai,
                     _ => {
-                        self.other_import(scope, local, &shared, place);
+                        self.other_import(scope, local, &shared, bound(), place);
                         continue;
                     }
                 };
@@ -4745,7 +4906,7 @@ impl<'t> Ctx<'t> {
             }
 
             let Some((pkg, rest)) = target.clone() else {
-                self.other_import(scope, local, &shared, place);
+                self.other_import(scope, local, &shared, bound(), place);
                 continue;
             };
             let mut path = rest;
@@ -4756,7 +4917,7 @@ impl<'t> Ctx<'t> {
                 // `ChatOllama`), boto3 (`resource`) or LiteLLM (`Router`) is
                 // not followed.
                 None if pkg.follows_named_only() && !pkg.is_named_symbol(&path) => {
-                    self.other_import(scope, local, &shared, place);
+                    self.other_import(scope, local, &shared, bound(), place);
                     continue;
                 }
                 None => (Val::Symbol { pkg, path }, BindingKind::Symbol),
@@ -6860,6 +7021,7 @@ impl<'t> Ctx<'t> {
         self.note_rerouted_clients();
         self.note_langchain_configurable();
         self.note_botocore_events();
+        self.note_http_patch();
         // LiteLLM maps a model name to another one through this
         // process-wide table; any mention of it in the file counts.
         if let Some(at) = self.src.find("model_alias_map") {
@@ -7574,6 +7736,10 @@ impl<'t> Ctx<'t> {
             self.check_getattr(call, scope);
             return;
         }
+        if let Some(library) = self.http_library(function, scope) {
+            self.analyze_http(call, function, scope, library);
+            return;
+        }
 
         let callee = self.eval(function, scope, 0);
         match callee {
@@ -7674,6 +7840,356 @@ impl<'t> Ctx<'t> {
             }
             _ => {}
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Raw HTTP requests
+    // ------------------------------------------------------------------
+
+    /// The dotted path a name is bound to when every definition of it that
+    /// reaches `node` is an untracked import binding that same path
+    /// (`requests` after `import requests`). A name also assigned, a
+    /// parameter, a wildcard import or a write to the module namespace has
+    /// none.
+    fn import_target(&self, node: Node<'t>, scope: usize) -> Option<Rc<str>> {
+        let (key, at) = self.locate(self.text(node), scope, node.start_byte());
+        let imports = self.other_imports.get(&key)?;
+        let defs = match self.reaching(&key, at) {
+            Reach::All => self.all_defs(&key),
+            Reach::Subset(defs) => defs,
+        };
+        let mut target: Option<Rc<str>> = None;
+        for def in defs {
+            let DefRef::Other(i) = def else {
+                return None;
+            };
+            let bound = &imports.get(i)?.target;
+            match &target {
+                Some(seen) if seen != bound => return None,
+                Some(_) => {}
+                None => target = Some(Rc::clone(bound)),
+            }
+        }
+        target
+    }
+
+    /// The HTTP library ([`HTTP_LIBRARIES`]) whose `post` function
+    /// `function` is: `requests.post` after `import requests` (or `r.post`
+    /// after `import requests as r`), or `post` after `from requests import
+    /// post`, each name bound by its import alone (see
+    /// [`Ctx::import_target`]).
+    fn http_library(&self, function: Node<'t>, scope: usize) -> Option<&'static str> {
+        match function.kind() {
+            "identifier" => {
+                let target = self.import_target(function, scope)?;
+                HTTP_LIBRARIES
+                    .iter()
+                    .copied()
+                    .find(|lib| target.strip_prefix(lib) == Some(".post"))
+            }
+            "attribute" => {
+                let attr = function.child_by_field_name("attribute")?;
+                if self.text(attr) != "post" {
+                    return None;
+                }
+                self.http_module(function.child_by_field_name("object")?, scope)
+            }
+            _ => None,
+        }
+    }
+
+    /// The HTTP library `object` is the module of, bound by its import
+    /// alone.
+    fn http_module(&self, object: Node<'t>, scope: usize) -> Option<&'static str> {
+        if object.kind() != "identifier" {
+            return None;
+        }
+        let target = self.import_target(object, scope)?;
+        HTTP_LIBRARIES.iter().copied().find(|lib| *lib == &*target)
+    }
+
+    /// `requests.post = fake` (or `del`, `setattr`), or an attribute of the
+    /// module written with a run-time name: a raw HTTP request may then not
+    /// be sent the way it is written.
+    fn note_http_patch(&mut self) {
+        let written: Vec<(Node<'t>, usize)> = self
+            .config_assigns
+            .iter()
+            .filter(|assign| assign.attr == "post")
+            .map(|assign| (assign.object, assign.scope))
+            .chain(self.wild_attr_objects.iter().copied())
+            .collect();
+        for (object, scope) in written {
+            if self.http_patched.is_none() && self.http_module(object, scope).is_some() {
+                self.http_patched = Some(Self::feature(
+                    "an HTTP library's `post` replaced in this file",
+                    object,
+                ));
+            }
+        }
+    }
+
+    /// The dict a `data=` or `content=` argument sends as JSON:
+    /// `json.dumps(body)`, with `body` its only argument.
+    fn json_dumps_argument(&self, expr: Node<'t>) -> Option<Node<'t>> {
+        if expr.kind() != "call" {
+            return None;
+        }
+        let function = expr.child_by_field_name("function")?;
+        if self.render(function) != "json.dumps" {
+            return None;
+        }
+        let args = self.arguments(expr);
+        if args.splat || args.list_splat || args.positional != 1 || !args.kwargs.is_empty() {
+            return None;
+        }
+        args.first_positional
+    }
+
+    /// `requests.post(url, json=body)` or `httpx.post(...)`: a request to a
+    /// provider's REST API when `url` resolves, with no gap, to an endpoint
+    /// [`http_endpoint`] lists. It is recorded as a request whose member is
+    /// the SDK method that endpoint is, routed direct, and its model is
+    /// read from the JSON body the way a dict expanded with `**` is read at
+    /// an SDK call. A URL that does not resolve, or names another host or
+    /// path, records nothing.
+    fn analyze_http(
+        &mut self,
+        call: Node<'t>,
+        function: Node<'t>,
+        scope: usize,
+        library: &'static str,
+    ) {
+        // The call's own arguments: none of them is a model value.
+        let args = self.arguments_with(call, ValueKeys::Only(&[]));
+        let (positional, keywords) = call_arguments(call, |n| self.text(n));
+        let by_keyword = |name: &str| {
+            keywords
+                .iter()
+                .find_map(|(k, value)| (k == name).then_some(*value))
+        };
+        let url_keyword = by_keyword("url");
+        let Some(url) = url_keyword.or_else(|| positional.first().copied()) else {
+            return;
+        };
+        let endpoint = match self.resolve_value(url, scope, 0) {
+            Ok(resolved) if resolved.is_certain() => http_endpoint(&resolved.value),
+            _ => None,
+        };
+        let Some(endpoint) = endpoint else {
+            return;
+        };
+
+        // Where the JSON body is: `json=`, or a `data=` (httpx also
+        // `content=`) that is `json.dumps(...)` of it; requests also takes
+        // `data` and `json` as its second and third positional arguments.
+        // `None` is a body this file cannot read as JSON.
+        let mut bodies: Vec<Option<Node<'t>>> = Vec::new();
+        for (name, value) in &keywords {
+            match name.as_str() {
+                "json" => bodies.push(Some(*value)),
+                "data" => bodies.push(self.json_dumps_argument(*value)),
+                "content" if library == "httpx" => {
+                    bodies.push(self.json_dumps_argument(*value));
+                }
+                "files" => bodies.push(None),
+                _ => {}
+            }
+        }
+        let skip = usize::from(url_keyword.is_none());
+        for (index, value) in positional.iter().enumerate().skip(skip) {
+            match (library, index - skip) {
+                ("requests", 0) => bodies.push(self.json_dumps_argument(*value)),
+                ("requests", 1) => bodies.push(Some(*value)),
+                _ => bodies.push(None),
+            }
+        }
+
+        let chain = self.render(function);
+        let span = self.span(call);
+        let symbol = self.symbol(scope);
+        let site = Site {
+            sdk: endpoint.sdk,
+            call,
+            chain: &chain,
+            scope,
+            gap_worthy: true,
+        };
+        let gaps_before = self.out.gaps.len();
+        let mut values = Vec::new();
+        // Why the body's model is not known, when it is not.
+        let mut unread: Option<String> = None;
+        match bodies.as_slice() {
+            [Some(body)] => match self.expand_splat(*body, scope) {
+                Some(expansion) => {
+                    let mut named = false;
+                    for (key, index, value) in expansion.summary.expansion.iter() {
+                        if key != "model" {
+                            continue;
+                        }
+                        named = true;
+                        let label = expansion.name.as_ref().map(|n| format!("{n}[\"{key}\"]"));
+                        let mut result = self
+                            .resolve_value(*value, expansion.scope, 0)
+                            .map(|mut r| {
+                                if r.origin == ValueOrigin::Literal {
+                                    r.origin = expansion.origin;
+                                    r.name = label.clone();
+                                }
+                                r
+                            })
+                            .map_err(|u| match &label {
+                                Some(label) => u.via(label),
+                                None => u,
+                            });
+                        // `{"model": "gpt-4o", **extra}`: the entry is a
+                        // candidate, not the value.
+                        if expansion.summary.overridable(*index) {
+                            let shape = expansion
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| "{...}".to_string());
+                            let candidates: Vec<Resolved> = result.ok().into_iter().collect();
+                            result =
+                                Err(Unresolved::new("splat", shape).with_candidates(candidates, false));
+                        }
+                        self.take_value(&site, key, false, result, &mut values);
+                    }
+                    let nested = self.dict_nested(&expansion);
+                    self.take_nested(&site, nested.found.clone(), nested.cut, &mut values);
+                    let mut seen: HashSet<&str> = HashSet::new();
+                    for path in nested.overridden.iter().take(MAX_NESTED_VALUES) {
+                        if seen.insert(path.as_str()) {
+                            let unresolved = Unresolved::new("splat", "{...}".to_string());
+                            self.unresolved_gap(&site, path, &unresolved, None);
+                        }
+                    }
+                    if !named && expansion.opaque() {
+                        let shape = expansion
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| "{...}".to_string());
+                        let unresolved = Unresolved::new("splat", shape);
+                        self.unresolved_gap(&site, "model", &unresolved, None);
+                    } else if !named && endpoint.takes_model {
+                        let unresolved = Unresolved::new("missing_model", String::new());
+                        self.unresolved_gap(&site, "model", &unresolved, None);
+                    }
+                }
+                None => {
+                    let shape = self.render(*body);
+                    unread = Some(format!(
+                            "the JSON body of `{chain}` is `{shape}`, which is not a dict literal this file can read, so the model it sends is not known"
+                        ));
+                }
+            },
+            [] if !endpoint.takes_model => {}
+            [] => unread = Some(format!(
+                    "`{chain}` passes no JSON body this scan reads (`json=` or `data=json.dumps(...)`), so the model it sends is not known"
+                )),
+            _ => unread = Some(format!(
+                    "the body of `{chain}` is not one JSON value this scan reads (it is form data, a string, passed by position or passed more than once), so the model it sends is not known"
+                )),
+        }
+        if let Some(detail) = unread {
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::UnresolvedModel,
+                sdk: Some(endpoint.sdk),
+                file: self.file.clone(),
+                span: Some(span),
+                symbol: symbol.clone(),
+                chain: Some(chain.clone()),
+                key: Some("model".to_string()),
+                reason: "request_body".to_string(),
+                detail,
+                values: Vec::new(),
+                values_complete: false,
+            });
+        }
+        if args.splat || args.list_splat {
+            // `**kw` may hold `data=`, which replaces a `json=` body: no
+            // value of the body is confirmed, nested ones included.
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::UnresolvedModel,
+                sdk: Some(endpoint.sdk),
+                file: self.file.clone(),
+                span: Some(span),
+                symbol: symbol.clone(),
+                chain: Some(chain.clone()),
+                key: None,
+                reason: "splat".to_string(),
+                detail: format!(
+                    "`{chain}` is given arguments through `*` or `**`, which may replace its body, so the model it sends is not confirmed"
+                ),
+                values: Vec::new(),
+                values_complete: false,
+            });
+        }
+        // The request goes where its URL says unless `post` itself, or
+        // anything in the file, may be replaced at run time.
+        let replaced = match (self.http_patched, self.file_dynamic) {
+            (Some(feature), _) => Some(format!(
+                "`{chain}` may be replaced at run time ({}), so where the request goes is not confirmed",
+                feature.describe()
+            )),
+            (None, Some(feature)) => Some(format!(
+                "this file may rebind any name or attribute at run time ({}), so the routing of `{chain}` is not confirmed",
+                feature.describe()
+            )),
+            (None, None) => None,
+        };
+        if let Some(detail) = replaced {
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::AmbiguousClient,
+                sdk: Some(endpoint.sdk),
+                file: self.file.clone(),
+                span: Some(span),
+                symbol: symbol.clone(),
+                chain: Some(chain.clone()),
+                key: None,
+                reason: "dynamic_feature".to_string(),
+                detail,
+                values: Vec::new(),
+                values_complete: false,
+            });
+        }
+
+        // The same value or gap reached twice is listed once.
+        let mut seen_values = HashSet::new();
+        values.retain(|v| seen_values.insert((v.key.clone(), v.span.start_byte, v.value.clone())));
+        let mut seen_gaps = HashSet::new();
+        for gap in self.out.gaps.split_off(gaps_before) {
+            if seen_gaps.insert((
+                gap.kind,
+                gap.key.clone(),
+                gap.reason.clone(),
+                gap.detail.clone(),
+            )) {
+                self.out.gaps.push(gap);
+            }
+        }
+
+        self.out.calls.push(SdkCall {
+            sdk: endpoint.sdk,
+            package: library.to_string(),
+            chain,
+            member: endpoint.member.to_string(),
+            request: true,
+            receiver: if function.kind() == "attribute" {
+                Receiver::Module
+            } else {
+                Receiver::Symbol
+            },
+            routing: endpoint.routing,
+            client_line: None,
+            file: self.file.clone(),
+            span,
+            symbol,
+            kwargs: args.kwargs,
+            positional: args.positional,
+            splat: args.splat,
+            values,
+        });
     }
 
     fn record_call(

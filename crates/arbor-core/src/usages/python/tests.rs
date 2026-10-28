@@ -7337,3 +7337,269 @@ fn bedrock_and_litellm_files_pass_the_prefilter() {
         "import boto3\ns3 = boto3.client(\"s3\")\ns3.put_object(Bucket=\"b\", Key=\"k\", Body=b\"\")\n"
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Raw HTTP requests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn raw_http_posts_to_provider_apis_read_the_json_body() {
+    let found = usages(
+        r#"import json
+import requests
+import httpx as hx
+from requests import post
+
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+
+def ask(prompt):
+    data = {"model": "claude-3-haiku-20240307", "max_tokens": 200, "messages": []}
+    return requests.post("https://api.anthropic.com/v1/messages", headers=H, json=data)
+
+def ask_inline(prompt, key):
+    return requests.post(url="https://api.openai.com/v1/chat/completions", headers={"authorization": key}, json={"model": "gpt-3.5-turbo", "messages": []})
+
+def ask_httpx(prompt):
+    body = {"model": "gpt-4o", "input": prompt}
+    return hx.post("https://api.openai.com/v1/responses/", content=json.dumps(body))
+
+def ask_bare():
+    return post(OPENAI_URL, data=json.dumps({"model": "gpt-4-turbo", "messages": []}), timeout=5)
+"#,
+    );
+    assert!(found.imports.is_empty(), "{:?}", found.imports);
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+
+    let anthropic = call_on(&found, 10);
+    assert_eq!(anthropic.chain, "requests.post");
+    assert_eq!(anthropic.package, "requests");
+    assert_eq!(anthropic.sdk, Sdk::Anthropic);
+    assert_eq!(anthropic.routing, Routing::AnthropicDirect);
+    assert_eq!(anthropic.member, "messages.create");
+    assert!(anthropic.request);
+    assert_eq!(anthropic.receiver, Receiver::Module);
+    assert_eq!(anthropic.kwargs, ["headers", "json"]);
+    assert_eq!(value(anthropic, "model"), Some("claude-3-haiku-20240307"));
+    let captured = &anthropic.values[0];
+    assert_eq!(captured.origin, ValueOrigin::LocalConstant);
+    assert_eq!(captured.name.as_deref(), Some("data[\"model\"]"));
+    assert_eq!(captured.model_family, Some(Sdk::Anthropic));
+
+    let inline = call_on(&found, 13);
+    assert_eq!(inline.routing, Routing::OpenaiDirect);
+    assert_eq!(inline.member, "chat.completions.create");
+    assert_eq!(value(inline, "model"), Some("gpt-3.5-turbo"));
+    assert_eq!(inline.values[0].origin, ValueOrigin::Literal);
+    assert_eq!(inline.values.len(), 1, "{:?}", inline.values);
+
+    let responses = call_on(&found, 17);
+    assert_eq!(responses.package, "httpx");
+    assert_eq!(responses.chain, "hx.post");
+    assert_eq!(responses.member, "responses.create");
+    assert_eq!(value(responses, "model"), Some("gpt-4o"));
+
+    let bare = call_on(&found, 20);
+    assert_eq!(bare.receiver, Receiver::Symbol);
+    assert_eq!(bare.member, "chat.completions.create");
+    assert_eq!(value(bare, "model"), Some("gpt-4-turbo"));
+}
+
+#[test]
+fn raw_http_to_other_urls_is_not_recorded() {
+    for url in [
+        "\"https://api.openai.com/v1/models\"",
+        "\"https://openrouter.ai/api/v1/chat/completions\"",
+        "\"https://myco.openai.azure.com/openai/deployments/d/chat/completions\"",
+        "\"https://api.openai.com.evil.example/v1/chat/completions\"",
+        "\"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent\"",
+        "f\"{BASE}/v1/chat/completions\"",
+        "os.getenv(\"URL\", \"https://api.openai.com/v1/chat/completions\")",
+        "url",
+        "\"ftp://api.openai.com/v1/chat/completions\"",
+    ] {
+        let source = format!(
+            "import os\nimport requests\ndef ask(url):\n    return requests.post({url}, json={{\"model\": \"gpt-4o\"}})\n"
+        );
+        let found = usages(&source);
+        assert!(found.calls.is_empty(), "{url}: {:?}", found.calls);
+        assert!(found.gaps.is_empty(), "{url}: {:?}", found.gaps);
+    }
+    // A query string, a fragment, a port and a trailing `/` keep the path.
+    for url in [
+        "https://api.openai.com/v1/chat/completions?x=1",
+        "https://API.openai.com:443/v1/chat/completions/",
+        "http://api.openai.com/v1/chat/completions#top",
+    ] {
+        let source =
+            format!("import requests\nrequests.post(\"{url}\", json={{\"model\": \"gpt-4o\"}})\n");
+        let found = usages(&source);
+        assert_eq!(
+            call_on(&found, 2).member,
+            "chat.completions.create",
+            "{url}"
+        );
+    }
+}
+
+#[test]
+fn only_post_imported_from_an_http_library_is_followed() {
+    for source in [
+        // Not the library: a name assigned, a parameter, another module's
+        // `post`, another method.
+        "import requests\nrequests = Session()\nrequests.post(URL, json={\"model\": \"gpt-4o\"})\n",
+        "def ask(requests):\n    return requests.post(URL, json={\"model\": \"gpt-4o\"})\n",
+        "from mylib import post\npost(URL, json={\"model\": \"gpt-4o\"})\n",
+        "from requests import get as post\npost(URL, json={\"model\": \"gpt-4o\"})\n",
+        "import requests.adapters as requests\nrequests.post(URL, json={\"model\": \"gpt-4o\"})\n",
+        "import requests\nrequests.put(URL, json={\"model\": \"gpt-4o\"})\n",
+        "import requests\nrequests.Session().post(URL, json={\"model\": \"gpt-4o\"})\n",
+        "from requests import *\npost(URL, json={\"model\": \"gpt-4o\"})\n",
+    ] {
+        let source = format!("URL = \"https://api.openai.com/v1/chat/completions\"\n{source}");
+        let found = usages(&source);
+        assert!(found.calls.is_empty(), "{source}: {:?}", found.calls);
+    }
+    for source in [
+        "import requests.adapters\nrequests.post(URL, json={\"model\": \"gpt-4o\"})\n",
+        "from requests import post as send\nsend(URL, json={\"model\": \"gpt-4o\"})\n",
+        "def f():\n    import httpx\n    return httpx.post(URL, json={\"model\": \"gpt-4o\"})\n",
+    ] {
+        let source = format!("URL = \"https://api.openai.com/v1/chat/completions\"\n{source}");
+        let found = usages(&source);
+        assert_eq!(found.calls.len(), 1, "{source}");
+        assert_eq!(value(&found.calls[0], "model"), Some("gpt-4o"), "{source}");
+    }
+}
+
+#[test]
+fn raw_http_bodies_that_do_not_read_are_gaps() {
+    let found = usages(
+        r#"import json
+import requests
+URL = "https://api.openai.com/v1/chat/completions"
+MODELS = {"fast": "gpt-4o-mini", "slow": "gpt-4.1"}
+
+def from_param(body):
+    return requests.post(URL, json=body)
+
+def mutated():
+    data = {"model": "gpt-4o"}
+    data["model"] = pick()
+    return requests.post(URL, json=data)
+
+def overridable(extra):
+    return requests.post(URL, json={"model": "gpt-4o", **extra})
+
+def no_model():
+    return requests.post(URL, json={"messages": []})
+
+def string_body(payload):
+    return requests.post(URL, data=payload)
+
+def splat(**kw):
+    return requests.post(URL, json={"model": "gpt-4o"}, **kw)
+
+def looked_up(kind):
+    return requests.post(URL, json={"model": MODELS[kind]})
+
+def batch():
+    return requests.post("https://api.anthropic.com/v1/messages/batches", json={"requests": [{"custom_id": "a", "params": {"model": "claude-3-opus-20240229"}}]})
+
+def form():
+    return requests.post("https://api.openai.com/v1/audio/transcriptions", files=F, data={"model": "whisper-1"})
+"#,
+    );
+    assert_eq!(gaps_on(&found, 7), ["unresolved_model/request_body"]);
+    assert!(call_on(&found, 7).values.is_empty());
+    // A mutated dict is not read.
+    assert_eq!(gaps_on(&found, 12), ["unresolved_model/request_body"]);
+    assert!(call_on(&found, 12).values.is_empty());
+    assert_eq!(gaps_on(&found, 15), ["unresolved_model/splat"]);
+    let overridable = &gaps(&found, GapKind::UnresolvedModel)
+        .into_iter()
+        .find(|g| g.span.is_some_and(|s| s.line == 15))
+        .unwrap()
+        .values;
+    assert_eq!(overridable[0].value, "gpt-4o");
+    assert_eq!(gaps_on(&found, 18), ["unresolved_model/missing_model"]);
+    assert_eq!(gaps_on(&found, 21), ["unresolved_model/request_body"]);
+    // `**kw` may hold `data=`, which replaces a `json=` body.
+    assert_eq!(gaps_on(&found, 24), ["unresolved_model/splat"]);
+    assert_eq!(value(call_on(&found, 24), "model"), Some("gpt-4o"));
+    let splat = found
+        .gaps
+        .iter()
+        .find(|g| g.span.is_some_and(|s| s.line == 24))
+        .unwrap();
+    assert_eq!(splat.key, None);
+    // A model looked up with a run-time key lists the dict's values.
+    assert_eq!(gaps_on(&found, 27), ["unresolved_model/subscript"]);
+    let looked_up = found
+        .gaps
+        .iter()
+        .find(|g| g.span.is_some_and(|s| s.line == 27))
+        .unwrap();
+    let listed: Vec<&str> = looked_up.values.iter().map(|v| v.value.as_str()).collect();
+    assert_eq!(listed, ["gpt-4o-mini", "gpt-4.1"]);
+    // A Message Batch nests its models in its requests.
+    let batch = call_on(&found, 30);
+    assert_eq!(batch.member, "messages.batches.create");
+    assert!(gaps_on(&found, 30).is_empty());
+    assert_eq!(
+        value(batch, "requests.params.model"),
+        Some("claude-3-opus-20240229")
+    );
+    // Form data is not a JSON body.
+    assert_eq!(gaps_on(&found, 33), ["unresolved_model/request_body"]);
+    assert!(call_on(&found, 33).values.is_empty());
+}
+
+#[test]
+fn a_dict_passed_to_requests_post_stays_readable() {
+    // `requests.post(json=...)` only serializes the dict, so an SDK call
+    // that expands it later still reads it.
+    let found = usages(
+        r#"import requests
+from openai import OpenAI
+client = OpenAI()
+PARAMS = {"model": "gpt-4o", "messages": []}
+requests.post("https://api.openai.com/v1/chat/completions", json=PARAMS)
+client.chat.completions.create(**PARAMS)
+"#,
+    );
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+    assert_eq!(value(call_on(&found, 6), "model"), Some("gpt-4o"));
+    // Any other `post` may keep or change it.
+    let found = usages(
+        r#"import requests
+from openai import OpenAI
+client = OpenAI()
+session = make_session()
+PARAMS = {"model": "gpt-4o", "messages": []}
+session.post("https://api.openai.com/v1/chat/completions", json=PARAMS)
+client.chat.completions.create(**PARAMS)
+"#,
+    );
+    assert!(call_on(&found, 7).values.is_empty());
+    assert_eq!(gaps_on(&found, 7), ["unresolved_model/splat"]);
+}
+
+#[test]
+fn a_replaced_post_or_a_dynamic_file_leaves_the_route_unconfirmed() {
+    for (setup, reason) in [
+        ("requests.post = fake_post", "dynamic_feature"),
+        ("setattr(requests, name, fake)", "dynamic_feature"),
+        ("exec(code)", "dynamic_feature"),
+    ] {
+        let source = format!(
+            "import requests\n{setup}\nrequests.post(\"https://api.openai.com/v1/chat/completions\", json={{\"model\": \"gpt-4o\"}})\n"
+        );
+        let found = usages(&source);
+        assert_eq!(
+            gaps_on(&found, 3),
+            [format!("ambiguous_client/{reason}")],
+            "{setup}"
+        );
+        assert_eq!(call_on(&found, 3).routing, Routing::OpenaiDirect, "{setup}");
+    }
+}
