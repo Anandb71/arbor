@@ -105,6 +105,12 @@
       "language": "python",
       "suite": "usages",
       "covers": "Raw HTTP requests: requests.post and httpx.post (and a bare post imported from httpx) to api.openai.com and api.anthropic.com endpoints, the model read from a json= dict or data=json.dumps(...), a parameter in the body, a body with no model, requests.get, a gateway host and /v1/models not recorded"
+    },
+    {
+      "name": "py-sdk-agent-frameworks",
+      "language": "python",
+      "suite": "usages",
+      "covers": "Agent frameworks: OpenAI Agents SDK agents, model objects (on a local client) and LitellmModel, a litellm/ model name and an agent with no model; Claude Agent SDK options, an agent definition and options whose env= turns on Bedrock; AgentScope 1 and 2 models and one on a gateway base_url; a repository's own agents package and DashScope not tracked"
     }
   ]
 }
