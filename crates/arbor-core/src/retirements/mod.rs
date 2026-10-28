@@ -1061,9 +1061,12 @@ mod data_tests {
         assert!(max_tokens
             .message
             .contains("deprecated in favour of max_completion_tokens"));
-        // top_p and logprobs were sent only at "none" on GPT-5.6.
+        // top_p and logprobs were sent only at "none" on GPT-5.6, and only on Chat
+        // Completions; no GPT-5.6 page states the rule, so it is not `docs` elsewhere.
         let reasoning = rule("openai-2026-10-23", "OAI-SAMPLING-REASONING-SOURCE");
         assert_eq!(reasoning.verified, Verified::Live);
+        assert_eq!(reasoning.live_endpoints, ["chat.completions"]);
+        assert_eq!(reasoning.otherwise_verified, Some(Verified::Unverified));
         assert!(reasoning
             .message
             .contains("top_p and logprobs were tested only at"));

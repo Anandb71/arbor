@@ -118,8 +118,13 @@ RULES = {
     "OAI-REASONING-DEFAULT": {"message": "{target} runs at medium reasoning effort by default, so it can reason; the model it replaces answered without a reasoning step."},
     "OAI-SAMPLING": {"message": "temperature, top_p and logprobs are accepted on {target} at reasoning_effort \"none\"; at its default effort a non-default temperature returns 400."},
     "OAI-SAMPLING-RESPONSES": {"message": "Whether {target} accepts temperature, top_p or logprobs on the Responses API is not verified."},
-    # 28 Oct audit (RECIPE-DRIFT §7): the live check sent top_p and logprobs only at "none".
-    "OAI-SAMPLING-REASONING-SOURCE": {"message": "On {target}, a non-default temperature returned 400 at the default reasoning effort and worked at reasoning_effort \"none\", which would turn off this reasoning model's reasoning (live check, 18 Oct 2026); top_p and logprobs were tested only at \"none\"."},
+    # 28 Oct audit (RECIPE-DRIFT §7): the live check sent top_p and logprobs only at "none",
+    # and only on Chat Completions; the recipe's evidence says no GPT-5.6 page states the rule.
+    "OAI-SAMPLING-REASONING-SOURCE": {
+        "message": "On {target}, a non-default temperature returned 400 at the default reasoning effort and worked at reasoning_effort \"none\", which would turn off this reasoning model's reasoning (live check, 18 Oct 2026); top_p and logprobs were tested only at \"none\".",
+        "otherwise_verified": "unverified",
+        "why": "the recipe cites no page for it (its evidence: no GPT-5.6 page states the rule; the GPT-5.4 guide states it for older models), so nothing backs it where the live calls did not reach, such as the Responses API",
+    },
     "OAI-MAX-TOKENS": {
         # 28 Oct audit (RECIPE-DRIFT item 15): the API reference says "deprecated"; only
         # gpt-5.6-terra was called live.
