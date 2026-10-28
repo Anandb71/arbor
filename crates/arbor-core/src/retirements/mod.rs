@@ -12,12 +12,14 @@
 //! have moved on.
 //!
 //! [`check`] matches the model values that [`crate::usages`] found at SDK
-//! calls against this data. Nothing here reads files, runs code or reaches
+//! calls against this data, and [`plan_swaps`] turns the plain swaps among
+//! its findings into edits. Nothing here reads files, runs code or reaches
 //! the network.
 
 mod base_url;
 mod check;
 mod date;
+mod fix;
 mod gaps;
 
 pub use base_url::BaseUrl;
@@ -28,6 +30,9 @@ pub use check::{
     ScanInput, State, Summary, Unreadable, FINE_TUNING, REPORT_VERSION,
 };
 pub use date::Date;
+pub use fix::{
+    apply_edits, plan_swaps, ArgumentRename, Edit, PlannedSwap, SkipReason, SkippedSwap, SwapPlan,
+};
 pub use gaps::{gap_text, routing_gap_text, value_gap_text, GAP_REASONS};
 
 use serde::{Deserialize, Serialize};
