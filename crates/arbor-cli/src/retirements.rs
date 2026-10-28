@@ -33,7 +33,7 @@ use arbor_watcher::usages::{scan_usages, UsageScanOptions};
 use colored::Colorize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Component, Path};
 
 /// Where the closing line of the human report points people who want the
 /// fix PRs opened for them. The only place this URL is written. The
@@ -1173,6 +1173,9 @@ enum LeftOut {
     Skip(SkipReason),
     /// The file could not be read again, parsed, or named in a patch.
     Unreadable,
+    /// The file is outside the directory Arbor runs in, so a patch applied
+    /// there cannot name it.
+    OutsideDirectory,
 }
 
 impl LeftOut {
@@ -1194,14 +1197,18 @@ impl LeftOut {
             LeftOut::Manual => ("needs a manual check", "need a manual check"),
             LeftOut::NoChange => ("needs no change", "need no change"),
             LeftOut::Skip(reason) => match reason {
+                SkipReason::CallNeedsReview => (
+                    "is at a call where another model value needs a choice or a manual check",
+                    "are at calls where another model value needs a choice or a manual check",
+                ),
                 SkipReason::ValueNotAtCall => (
                     "takes its model from a constant or a default (other code may read it too)",
                     "take their model from a constant or a default (other code may read it too)",
                 ),
                 SkipReason::AddsArgument => ("needs an argument added", "need an argument added"),
                 SkipReason::ArgumentNotRenamable => (
-                    "has an argument Arbor cannot rename at the call (it already passes the new name)",
-                    "have an argument Arbor cannot rename at the call (they already pass the new name)",
+                    "has an argument Arbor cannot rename at the call (its new name is already there, or it is written twice)",
+                    "have an argument Arbor cannot rename at the call (its new name is already there, or it is written twice)",
                 ),
                 SkipReason::LiteralForm => (
                     "writes the model in a form Arbor does not rewrite",
@@ -1230,14 +1237,19 @@ impl LeftOut {
                 "is in a file Arbor could not read again",
                 "are in files Arbor could not read again",
             ),
+            LeftOut::OutsideDirectory => (
+                "is in a file outside the current directory (run Arbor from the repository root)",
+                "are in files outside the current directory (run Arbor from the repository root)",
+            ),
         };
         verb(n, one, many)
     }
 }
 
 /// Prints the plain swaps as a unified diff on stdout, read from the files
-/// as they are now, and on stderr how many calls it swaps and why it leaves
-/// the others out. Writes no file.
+/// as they are now and named relative to the current directory, and on
+/// stderr how many calls it swaps and why it leaves the others out. Writes
+/// no file.
 fn print_diff(report: &RetirementReport, quiet: bool) {
     let findings: Vec<Finding> = report
         .findings
@@ -1246,16 +1258,17 @@ fn print_diff(report: &RetirementReport, quiet: bool) {
         .cloned()
         .collect();
     let files: BTreeSet<&str> = findings.iter().map(|f| f.file.as_str()).collect();
+    let cwd = std::env::current_dir().and_then(|d| d.canonicalize()).ok();
     let mut swapped = 0;
     let mut swapped_files = 0;
     let mut left_out: BTreeMap<LeftOut, usize> = BTreeMap::new();
     let mut stdout = std::io::stdout().lock();
     for file in files {
-        let patch = file_plan(file, &findings).and_then(|(source, plan)| {
+        let planned = file_plan(file, &findings).and_then(|(source, plan)| {
             let fixed = apply_edits(&source, &plan.edits).ok()?;
-            Some((unified_diff(file, &source, &fixed), plan))
+            Some((source, fixed, plan))
         });
-        let Some((patch, plan)) = patch else {
+        let Some((source, fixed, plan)) = planned else {
             let count = findings.iter().filter(|f| f.file == file).count();
             *left_out.entry(LeftOut::Unreadable).or_default() += count;
             continue;
@@ -1265,10 +1278,18 @@ fn print_diff(report: &RetirementReport, quiet: bool) {
                 .entry(LeftOut::of(skipped.fix, skipped.reason))
                 .or_default() += 1;
         }
-        if !plan.swaps.is_empty() {
-            swapped += plan.swaps.len();
-            swapped_files += 1;
-            let _ = stdout.write_all(patch.as_bytes());
+        if plan.swaps.is_empty() {
+            continue;
+        }
+        match cwd.as_deref().and_then(|cwd| patch_path(cwd, file)) {
+            Some(name) => {
+                swapped += plan.swaps.len();
+                swapped_files += 1;
+                let _ = stdout.write_all(unified_diff(&name, &source, &fixed).as_bytes());
+            }
+            None => {
+                *left_out.entry(LeftOut::OutsideDirectory).or_default() += plan.swaps.len();
+            }
         }
     }
     let _ = stdout.flush();
@@ -1316,6 +1337,24 @@ fn file_plan(file: &str, findings: &[Finding]) -> Option<(String, SwapPlan)> {
     let usages = parse_source_usages(&source, file, parser.as_ref()).ok()??;
     let plan = plan_swaps(&source, &usages, findings);
     Some((source, plan))
+}
+
+/// `file` as a patch applied in `cwd` (canonical) names it: relative to
+/// `cwd`, with forward slashes and no `.` or `..` parts, however the scan
+/// path was written (`/abs/repo`, `./src/.`, `../repo`). `None` when the
+/// file is not under `cwd`.
+fn patch_path(cwd: &Path, file: &str) -> Option<String> {
+    let full = Path::new(file).canonicalize().ok()?;
+    let parts = full
+        .strip_prefix(cwd)
+        .ok()?
+        .components()
+        .map(|part| match part {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<&str>>>()?;
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 /// A unified diff of `old` to `new`, which have the same number of lines,
@@ -1488,6 +1527,7 @@ mod tests {
     fn every_skip_reason_has_a_phrase() {
         for reason in [
             SkipReason::NotPlainSwap,
+            SkipReason::CallNeedsReview,
             SkipReason::ValueNotAtCall,
             SkipReason::AddsArgument,
             SkipReason::ArgumentNotRenamable,
@@ -1511,6 +1551,10 @@ mod tests {
         assert_eq!(
             LeftOut::of(FixKind::Decide, SkipReason::NotPlainSwap).phrase(2),
             "need a choice this repository makes first"
+        );
+        assert_ne!(
+            LeftOut::OutsideDirectory.phrase(1),
+            LeftOut::OutsideDirectory.phrase(2)
         );
     }
 }

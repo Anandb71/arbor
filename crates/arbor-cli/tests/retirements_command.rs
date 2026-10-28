@@ -734,6 +734,45 @@ fn diff_prints_only_the_plain_swaps_and_writes_nothing() {
 }
 
 #[test]
+fn diff_names_files_relative_to_where_arbor_runs() {
+    let dir = project(SWAPS);
+    fs::create_dir(dir.path().join("sub")).unwrap();
+    fs::write(dir.path().join("sub/more.py"), SWAPS).unwrap();
+    let absolute = dir.path().to_str().unwrap().to_string();
+    // However the scan path is written, the patch names files from here.
+    for path in [absolute.as_str(), "./.", "sub/.."] {
+        let output = arbor(
+            dir.path(),
+            &["retirements", "--diff", path, "--today", TODAY],
+        );
+        let patch = stdout(&output);
+        assert!(
+            patch.starts_with("--- a/app.py\n+++ b/app.py\n@@ ")
+                && patch.contains("\n--- a/sub/more.py\n+++ b/sub/more.py\n@@ "),
+            "{path}: {patch}"
+        );
+    }
+    // From a subdirectory, a file above it cannot be named in a patch.
+    let output = arbor(
+        &dir.path().join("sub"),
+        &["retirements", "--diff", "..", "--today", TODAY],
+    );
+    let patch = stdout(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        patch.starts_with("--- a/more.py\n+++ b/more.py\n@@ ") && !patch.contains("app.py"),
+        "{patch}"
+    );
+    assert!(
+        stderr.contains("Diff: 2 calls swapped in 1 file.")
+            && stderr.contains(
+                "2 are in files outside the current directory (run Arbor from the repository root)"
+            ),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn exit_codes_follow_the_window() {
     let dir = project(RETIRING_ONLY);
     let run = |extra: &[&str]| {
