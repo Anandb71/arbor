@@ -145,6 +145,8 @@ const PREFILTER: &[&str] = &[
     "agents",
     "claude_agent_sdk",
     "claude_code_sdk",
+    // AgentScope's model classes are imported from `agentscope.model`.
+    "agentscope",
 ];
 
 /// Whether `source` mentions anything the extractor tracks. A file that does
@@ -428,6 +430,12 @@ enum Pkg {
     /// uses.
     ClaudeAgentSdk,
     ClaudeCodeSdk,
+    /// AgentScope's model classes (`from agentscope.model import ...`), by
+    /// the provider's SDK each one builds: only its OpenAI, Anthropic and
+    /// Gemini ones (see [`REEXPORTS`]).
+    AgentscopeOpenai,
+    AgentscopeAnthropic,
+    AgentscopeGemini,
 }
 
 impl Pkg {
@@ -446,6 +454,9 @@ impl Pkg {
             Pkg::Litellm | Pkg::OpenaiAgentsLitellm => Sdk::Litellm,
             Pkg::OpenaiAgents => Sdk::Openai,
             Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk => Sdk::Anthropic,
+            Pkg::AgentscopeOpenai => Sdk::Openai,
+            Pkg::AgentscopeAnthropic => Sdk::Anthropic,
+            Pkg::AgentscopeGemini => Sdk::Google,
         }
     }
 
@@ -467,6 +478,7 @@ impl Pkg {
             Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm => "agents",
             Pkg::ClaudeAgentSdk => "claude_agent_sdk",
             Pkg::ClaudeCodeSdk => "claude_code_sdk",
+            Pkg::AgentscopeOpenai | Pkg::AgentscopeAnthropic | Pkg::AgentscopeGemini => "agentscope",
         }
     }
 
@@ -496,6 +508,17 @@ impl Pkg {
                 | Pkg::OpenaiAgentsLitellm
                 | Pkg::ClaudeAgentSdk
                 | Pkg::ClaudeCodeSdk
+                | Pkg::AgentscopeOpenai
+                | Pkg::AgentscopeAnthropic
+                | Pkg::AgentscopeGemini
+        )
+    }
+
+    /// One of AgentScope's model classes.
+    fn is_agentscope(self) -> bool {
+        matches!(
+            self,
+            Pkg::AgentscopeOpenai | Pkg::AgentscopeAnthropic | Pkg::AgentscopeGemini
         )
     }
 
@@ -610,6 +633,9 @@ enum Family {
     /// its requests to Anthropic's API unless its environment picks another
     /// provider or endpoint (see [`CLAUDE_CODE_ENDPOINT_ENV`]).
     ClaudeCode,
+    /// An AgentScope model, which builds its provider's SDK client from
+    /// its credential or client arguments (see [`Ctx::agentscope_route`]).
+    Agentscope,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -716,6 +742,19 @@ const CLASSES: &[ClientClass] = &[
     ),
     class(Pkg::ClaudeAgentSdk, "AgentDefinition", Family::ClaudeCode),
     class(Pkg::ClaudeCodeSdk, "ClaudeCodeOptions", Family::ClaudeCode),
+    // AgentScope's models for the tracked providers.
+    class(Pkg::AgentscopeOpenai, "OpenAIChatModel", Family::Agentscope),
+    class(
+        Pkg::AgentscopeOpenai,
+        "OpenAIResponseModel",
+        Family::Agentscope,
+    ),
+    class(
+        Pkg::AgentscopeAnthropic,
+        "AnthropicChatModel",
+        Family::Agentscope,
+    ),
+    class(Pkg::AgentscopeGemini, "GeminiChatModel", Family::Agentscope),
 ];
 
 /// LiteLLM's functions that send a request; the first argument is the
@@ -764,6 +803,8 @@ const fn class(pkg: Pkg, name: &'static str, family: Family) -> ClientClass {
 ///   name for a repository's own package, so `import agents` and its other
 ///   names are not followed; its classes live in submodules too
 ///   (`agents.models.openai_responses`, `agents.extensions.models.litellm_model`).
+/// - AgentScope's `agentscope.model` holds model classes for many
+///   providers; its OpenAI, Anthropic and Gemini ones are tracked.
 const REEXPORTS: &[(&str, &[Pkg])] = &[
     (
         "langchain_community.chat_models",
@@ -777,6 +818,14 @@ const REEXPORTS: &[(&str, &[Pkg])] = &[
         &[Pkg::LangchainLegacyOpenai, Pkg::LangchainLegacyAnthropic],
     ),
     ("agents", &[Pkg::OpenaiAgents, Pkg::OpenaiAgentsLitellm]),
+    (
+        "agentscope.model",
+        &[
+            Pkg::AgentscopeOpenai,
+            Pkg::AgentscopeAnthropic,
+            Pkg::AgentscopeGemini,
+        ],
+    ),
 ];
 
 /// The packages of the [`REEXPORTS`] module `module` is, or is a submodule
@@ -838,6 +887,13 @@ impl ClientClass {
             // Options that may pick another provider are routed by
             // `Ctx::claude_endpoint_option`.
             Family::ClaudeCode => Routing::AnthropicDirect,
+            // Refined from its arguments (see `Ctx::agentscope_route`).
+            Family::Agentscope => match self.pkg.sdk() {
+                Sdk::Openai => Routing::OpenaiDirect,
+                Sdk::Anthropic => Routing::AnthropicDirect,
+                Sdk::Google => Routing::GoogleGenai,
+                Sdk::Aws | Sdk::Litellm => Routing::Unknown,
+            },
             Family::OpenaiDirect => Routing::OpenaiDirect,
             Family::AnthropicDirect => Routing::AnthropicDirect,
             Family::Azure => Routing::AzureOpenai,
@@ -860,7 +916,8 @@ impl ClientClass {
             | Family::AwsBedrock
             | Family::AgentsDefault
             | Family::AgentsModel
-            | Family::ClaudeCode => Routing::Unknown,
+            | Family::ClaudeCode
+            | Family::Agentscope => Routing::Unknown,
             _ => self.routing(&[], false, BaseUrl::Absent),
         }
     }
@@ -910,6 +967,9 @@ fn is_endpoint_key(pkg: Pkg, key: &str) -> bool {
         // endpoint of its own, and the Claude Code CLI reads its endpoint
         // from its environment.
         Pkg::OpenaiAgents | Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk => false,
+        // An AgentScope model's endpoint is in its credential or client
+        // arguments (see `Ctx::agentscope_route`).
+        pkg if pkg.is_agentscope() => false,
         _ => is_base_url_key(key),
     }
 }
@@ -960,6 +1020,7 @@ fn framework_model_fields(pkg: Pkg) -> &'static [&'static str] {
     match pkg {
         Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm => &["model"],
         Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk => &["model", "fallback_model"],
+        pkg if pkg.is_agentscope() => &["model", "model_name"],
         _ => &[],
     }
 }
@@ -1350,6 +1411,10 @@ fn endpoint_env_vars(pkg: Pkg) -> &'static [&'static str] {
         // model object routes like the client it is given.
         Pkg::OpenaiAgents => &["OPENAI_BASE_URL"],
         Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk => CLAUDE_CODE_ENDPOINT_ENV,
+        // AgentScope builds the provider's SDK client, which reads its own.
+        Pkg::AgentscopeOpenai => endpoint_env_vars(Pkg::Openai),
+        Pkg::AgentscopeAnthropic => endpoint_env_vars(Pkg::Anthropic),
+        Pkg::AgentscopeGemini => endpoint_env_vars(Pkg::GoogleGenai),
         Pkg::Litellm | Pkg::OpenaiAgentsLitellm => &[],
     }
 }
@@ -7142,6 +7207,7 @@ impl<'t> Ctx<'t> {
                 | Family::AwsBedrock
                 | Family::AgentsDefault
                 | Family::ClaudeCode
+                | Family::Agentscope
         ) || base_url != BaseUrl::Absent
         {
             return None;
@@ -7278,8 +7344,201 @@ impl<'t> Ctx<'t> {
                     ),
                 })
             }
+            Family::Agentscope => {
+                let (routing, caveat) = self.agentscope_route(call, class, scope, args);
+                Some((routing, caveat, None))
+            }
             _ => None,
         }
+    }
+
+    /// The model a call passes by position, and the key it is reported
+    /// under (see [`positional_model_key`]). An AgentScope model takes
+    /// `model_name` first (AgentScope 1), or a credential and then `model`
+    /// (AgentScope 2), told apart by whether the first argument builds a
+    /// credential.
+    fn positional_model(
+        &self,
+        call: Node<'t>,
+        target: &CallTarget,
+        member: &str,
+        args: &Args<'t>,
+    ) -> Option<(&'static str, Node<'t>)> {
+        let first = args.first_positional?;
+        if target.pkg.is_agentscope() && target.receiver != Receiver::Client {
+            if !self.builds_credential(first) {
+                return Some(("model_name", first));
+            }
+            let (positional, _) = call_arguments(call, |n| self.text(n));
+            return positional.get(1).map(|second| ("model", *second));
+        }
+        Some((
+            positional_model_key(target.pkg, target.receiver, member)?,
+            first,
+        ))
+    }
+
+    /// The credential an AgentScope 2 model is given: `credential=`, or a
+    /// first positional argument that builds one (`OpenAICredential(...)`).
+    fn agentscope_credential(&self, call: Node<'t>) -> Option<Node<'t>> {
+        let text = |n: Node<'t>| self.text(n);
+        keyword_value(call, text, |k| k == "credential").or_else(|| {
+            let (positional, _) = call_arguments(call, text);
+            positional
+                .first()
+                .copied()
+                .filter(|first| self.builds_credential(*first))
+        })
+    }
+
+    /// Whether `expr` calls a class named like AgentScope's credentials
+    /// (`OpenAICredential(...)`, `agentscope.credential.AnthropicCredential(...)`).
+    fn builds_credential(&self, expr: Node<'t>) -> bool {
+        expr.kind() == "call"
+            && expr
+                .child_by_field_name("function")
+                .and_then(|f| match f.kind() {
+                    "identifier" => Some(f),
+                    "attribute" => f.child_by_field_name("attribute"),
+                    _ => None,
+                })
+                .is_some_and(|name| self.text(name).ends_with("Credential"))
+    }
+
+    /// Where an AgentScope model sends its requests: the provider's own API
+    /// by default, through the SDK client it builds. Its endpoint is the
+    /// `base_url` of its credential (AgentScope 2: `credential=
+    /// OpenAICredential(base_url=...)`) or of its client arguments
+    /// (AgentScope 1: `client_kwargs={"base_url": ...}`, earlier
+    /// `client_args`), routed by host like a direct client's; with neither,
+    /// the SDK reads its endpoint variable. `client_type="azure"` builds an
+    /// Azure client. A credential or client arguments this file cannot read
+    /// whole (a name, a `**` expansion, a key other than the API key and
+    /// the client's timeouts and headers), a `**` expansion given to the
+    /// model and any other `client_type` route unknown with an
+    /// `endpoint_option` gap.
+    fn agentscope_route(
+        &mut self,
+        call: Node<'t>,
+        class: ClientClass,
+        scope: usize,
+        args: &Args<'t>,
+    ) -> (Routing, Option<ClientCaveat>) {
+        let option = |option: &'static str| {
+            (
+                Routing::Unknown,
+                Some(ClientCaveat::EndpointOption { option }),
+            )
+        };
+        if args.splat {
+            return option("a `**` expansion");
+        }
+        let text = |n: Node<'t>| self.text(n);
+        let gemini = class.pkg == Pkg::AgentscopeGemini;
+        // Client arguments that do not change where requests go.
+        let harmless: &[&str] = if gemini {
+            &["api_key"]
+        } else {
+            &[
+                "api_key",
+                "organization",
+                "project",
+                "timeout",
+                "max_retries",
+                "default_headers",
+            ]
+        };
+        let mut routing = class.routing(&[], false, BaseUrl::Absent);
+        if let Some(kind) = keyword_value(call, text, |k| k == "client_type") {
+            match self.literal(kind).ok().as_deref() {
+                Some("openai") => {}
+                Some("azure") if class.pkg == Pkg::AgentscopeOpenai => {
+                    // An Azure client's endpoint and deployment are Azure's.
+                    return (Routing::AzureOpenai, None);
+                }
+                _ => return option("`client_type=`"),
+            }
+        }
+        // The `base_url` given: in the credential (AgentScope 2) or in the
+        // client arguments (AgentScope 1).
+        let mut endpoint: Option<Node<'t>> = None;
+        if let Some(credential) = self.agentscope_credential(call) {
+            if !self.builds_credential(credential) {
+                return option("`credential=`");
+            }
+            let given = self.arguments(credential);
+            if given.splat || given.list_splat || given.positional > 1 {
+                return option("`credential=`");
+            }
+            let (_, keywords) = call_arguments(credential, text);
+            for (key, value) in keywords {
+                match key.as_str() {
+                    "base_url" if !gemini => endpoint = Some(value),
+                    key if harmless.contains(&key) => {}
+                    _ => return option("`credential=`"),
+                }
+            }
+        }
+        for (field, option_name) in [
+            ("client_kwargs", "`client_kwargs=`"),
+            ("client_args", "`client_args=`"),
+        ] {
+            let Some(given) = keyword_value(call, text, |k| k == field) else {
+                continue;
+            };
+            match given.kind() {
+                "none" => {}
+                "dictionary" => {
+                    for entry in dict_entries(given, |n| self.literal(n).ok(), text) {
+                        match entry {
+                            Some((key, value)) if key == "base_url" && !gemini => {
+                                endpoint = Some(value);
+                            }
+                            Some((key, _)) if harmless.contains(&key.as_str()) => {}
+                            _ => return option(option_name),
+                        }
+                    }
+                }
+                _ => return option(option_name),
+            }
+        }
+        let base_url = match endpoint {
+            Some(expr) => self.base_url_kind(class.pkg, expr, scope),
+            None => BaseUrl::Absent,
+        };
+        let caveat = match base_url {
+            BaseUrl::Absent => {
+                let caveat = self.endpoint_env(class, BaseUrl::Absent);
+                if caveat.is_some() {
+                    routing = Routing::Unknown;
+                }
+                caveat
+            }
+            BaseUrl::Provider => None,
+            BaseUrl::Custom => {
+                routing = Routing::CustomBaseUrl;
+                None
+            }
+            BaseUrl::ProviderFallback => Some(ClientCaveat::BaseUrl {
+                env: false,
+                fallback: true,
+            }),
+            BaseUrl::CustomFallback => {
+                routing = Routing::CustomBaseUrl;
+                Some(ClientCaveat::BaseUrl {
+                    env: true,
+                    fallback: true,
+                })
+            }
+            BaseUrl::Unknown { env } => {
+                routing = Routing::Unknown;
+                Some(ClientCaveat::BaseUrl {
+                    env,
+                    fallback: false,
+                })
+            }
+        };
+        (routing, caveat)
     }
 
     /// The name a constructed client is assigned to, and how it is held.
@@ -8119,7 +8378,10 @@ impl<'t> Ctx<'t> {
             | Pkg::OpenaiAgents
             | Pkg::OpenaiAgentsLitellm
             | Pkg::ClaudeAgentSdk
-            | Pkg::ClaudeCodeSdk => Routing::Unknown,
+            | Pkg::ClaudeCodeSdk
+            | Pkg::AgentscopeOpenai
+            | Pkg::AgentscopeAnthropic
+            | Pkg::AgentscopeGemini => Routing::Unknown,
             // `litellm.completion(...)`: LiteLLM picks the provider.
             Pkg::Litellm => Routing::Litellm,
         }
@@ -8759,10 +9021,7 @@ impl<'t> Ctx<'t> {
         // `GenerativeModel("gemini-pro")`, `genai.embed_content("models/...", text)`:
         // the model is positional.
         if !keyed {
-            if let (Some(key), Some(first)) = (
-                positional_model_key(target.pkg, target.receiver, &member),
-                args.first_positional,
-            ) {
+            if let Some((key, first)) = self.positional_model(call, &target, &member, &args) {
                 keyed = true;
                 let result = self.resolve_value(first, scope, 0);
                 let site = Site {

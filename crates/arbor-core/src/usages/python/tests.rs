@@ -7996,3 +7996,106 @@ options.model = "claude-sonnet-4-5"
     // A model written after the options are built.
     assert!(gaps.contains(&"unresolved_model/dynamic_feature".to_string()));
 }
+
+// ---------------------------------------------------------------------------
+// Agent frameworks: AgentScope
+// ---------------------------------------------------------------------------
+
+#[test]
+fn agentscope_models_carry_their_model_in_both_api_versions() {
+    let found = usages(
+        r#"import os
+from agentscope.model import OpenAIChatModel, OpenAIResponseModel, AnthropicChatModel, GeminiChatModel, DashScopeChatModel
+from agentscope.credential import OpenAICredential
+
+v1 = OpenAIChatModel(model_name="gpt-4o", api_key=os.environ["OPENAI_API_KEY"])
+v1_positional = OpenAIChatModel("gpt-4o-mini", stream=True)
+v2 = OpenAIResponseModel(credential=OpenAICredential(api_key=os.environ["OPENAI_API_KEY"]), model="o1", stream=True)
+v2_positional = OpenAIChatModel(OpenAICredential(api_key=key), "gpt-4.1")
+claude = AnthropicChatModel(model_name="claude-3-5-sonnet-20241022")
+gemini = GeminiChatModel(model_name="gemini-1.5-pro", api_key=key)
+dash = DashScopeChatModel(model_name="qwen-max")
+missing = OpenAIChatModel(stream=True)
+"#,
+    );
+    let import = |name: &str| found.imports.iter().find(|i| i.local == name).unwrap();
+    assert_eq!(import("OpenAIChatModel").sdk, Sdk::Openai);
+    assert_eq!(import("AnthropicChatModel").sdk, Sdk::Anthropic);
+    assert_eq!(import("GeminiChatModel").sdk, Sdk::Google);
+    assert_eq!(import("OpenAIChatModel").package, "agentscope");
+    // Other providers' models and the credentials are not tracked.
+    assert!(found
+        .imports
+        .iter()
+        .all(|i| i.local != "DashScopeChatModel" && i.local != "OpenAICredential"));
+
+    let lines: Vec<u32> = found.calls.iter().map(|c| c.span.line).collect();
+    assert_eq!(lines, vec![5, 6, 7, 8, 9, 10, 12]);
+    assert_eq!(value(call_on(&found, 5), "model_name"), Some("gpt-4o"));
+    assert_eq!(call_on(&found, 5).routing, Routing::OpenaiDirect);
+    // AgentScope 1 takes `model_name` first.
+    let v1_positional = call_on(&found, 6);
+    assert_eq!(value(v1_positional, "model_name"), Some("gpt-4o-mini"));
+    assert!(v1_positional.values[0].positional);
+    assert_eq!(value(call_on(&found, 7), "model"), Some("o1"));
+    assert_eq!(call_on(&found, 7).routing, Routing::OpenaiDirect);
+    // AgentScope 2 takes a credential first, then the model.
+    let v2_positional = call_on(&found, 8);
+    assert_eq!(value(v2_positional, "model"), Some("gpt-4.1"));
+    assert_eq!(v2_positional.values.len(), 1);
+    assert_eq!(call_on(&found, 9).routing, Routing::AnthropicDirect);
+    assert_eq!(call_on(&found, 10).routing, Routing::GoogleGenai);
+    assert_eq!(call_on(&found, 10).sdk, Sdk::Google);
+    // A model is required, so none given is not a default model.
+    assert!(gaps_on(&found, 12).is_empty());
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn agentscope_models_route_by_their_credential_and_client_arguments() {
+    let found = usages(
+        r#"from agentscope.model import OpenAIChatModel, GeminiChatModel
+from agentscope.credential import OpenAICredential
+
+proxy_v1 = OpenAIChatModel(model_name="gpt-4o", client_kwargs={"base_url": "https://proxy.example.com/v1"})
+own_host = OpenAIChatModel(model_name="gpt-4o", client_args={"base_url": "https://api.openai.com/v1", "timeout": 30})
+azure = OpenAIChatModel(model_name="gpt-4o", client_type="azure", client_kwargs={"azure_endpoint": endpoint})
+proxy_v2 = OpenAIChatModel(credential=OpenAICredential(base_url="https://proxy.example.com/v1"), model="gpt-4.1")
+named = OpenAIChatModel(credential=cred, model="gpt-4.1")
+opaque = OpenAIChatModel(model_name="gpt-4o", client_kwargs=settings)
+other_key = OpenAIChatModel(model_name="gpt-4o", client_kwargs={"http_client": transport})
+other_type = OpenAIChatModel(model_name="gpt-4o", client_type=kind)
+splat = OpenAIChatModel(model_name="gpt-4o", **options)
+vertex = GeminiChatModel(model_name="gemini-1.5-pro", client_kwargs={"vertexai": True})
+"#,
+    );
+    assert_eq!(call_on(&found, 4).routing, Routing::CustomBaseUrl);
+    assert_eq!(call_on(&found, 5).routing, Routing::OpenaiDirect);
+    assert_eq!(call_on(&found, 6).routing, Routing::AzureOpenai);
+    assert_eq!(call_on(&found, 7).routing, Routing::CustomBaseUrl);
+    for line in 4..=7 {
+        assert!(gaps_on(&found, line).is_empty(), "{line}");
+    }
+    for line in 8..=13 {
+        assert_eq!(call_on(&found, line).routing, Routing::Unknown, "{line}");
+        assert!(
+            gaps_on(&found, line).contains(&"ambiguous_client/endpoint_option".to_string()),
+            "{line}: {:?}",
+            gaps_on(&found, line)
+        );
+    }
+
+    let found = usages(
+        r#"import os
+from agentscope.model import AnthropicChatModel
+
+os.environ["ANTHROPIC_BASE_URL"] = "https://proxy.example.com"
+claude = AnthropicChatModel(model_name="claude-3-5-sonnet-20241022")
+claude.model_name = "claude-3-5-haiku-20241022"
+"#,
+    );
+    assert_eq!(call_on(&found, 5).routing, Routing::Unknown);
+    let gaps = gaps_on(&found, 5);
+    assert!(gaps.contains(&"ambiguous_client/endpoint_env".to_string()));
+    assert!(gaps.contains(&"unresolved_model/dynamic_feature".to_string()));
+}
