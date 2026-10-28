@@ -1200,8 +1200,8 @@ impl LeftOut {
                 ),
                 SkipReason::AddsArgument => ("needs an argument added", "need an argument added"),
                 SkipReason::ArgumentNotRenamable => (
-                    "has an argument to rename that is not written once at the call",
-                    "have an argument to rename that is not written once at the call",
+                    "has an argument Arbor cannot rename at the call (it already passes the new name)",
+                    "have an argument Arbor cannot rename at the call (they already pass the new name)",
                 ),
                 SkipReason::LiteralForm => (
                     "writes the model in a form Arbor does not rewrite",
