@@ -5,7 +5,9 @@ calls the OpenAI, Anthropic and Gemini SDKs, directly or through LangChain's
 OpenAI and Anthropic chat models ([LangChain chat
 models](#langchain-chat-models)), and where it calls models on Amazon Bedrock
 or through LiteLLM ([Amazon Bedrock and LiteLLM](#amazon-bedrock-and-litellm)),
-with each call's routing and model values. A consumer (a codemod, a reviewer)
+and where it posts JSON to OpenAI's or Anthropic's REST API with `requests` or
+`httpx` ([Raw HTTP requests](#raw-http-requests)), with each call's routing
+and model values. A consumer (a codemod, a reviewer)
 should treat the report this way:
 
 - **A value or route with no gap at its call is confirmed.** It comes from one
@@ -425,6 +427,90 @@ Gemini model with no prefix (`gemini-2.5-flash`) is looked up on Vertex AI's
 schedule, where LiteLLM sends it; only `gemini/<model>` reaches the Gemini
 API. As for LangChain, only the checks about the model apply (see
 [RETIREMENTS.md](RETIREMENTS.md)).
+
+## Raw HTTP requests
+
+Some code skips the SDK and posts JSON to the provider's REST API itself. A
+call to `requests.post(...)` or `httpx.post(...)` is recorded as a request
+when its URL resolves to one of the endpoints below.
+
+**The call.** The function must be named through an import alone:
+`requests.post` after `import requests` (or `r.post` after `import requests
+as r`), or `post` after `from requests import post` (under any alias). A name
+that is also assigned or is a parameter, a wildcard import, a session or
+client (`requests.Session().post`, `httpx.Client().post`),
+`requests.request("POST", ...)` and every other method are not followed.
+
+**The URL** is the first positional argument or `url=`. It is read under the
+value rules, and only a value with no gap counts: a literal, or a same-file
+constant or local. An f-string, an environment lookup (with or without a
+fallback), a parameter or a parameter default records nothing. The URL's
+scheme must be `https` or `http` and its host exactly `api.openai.com` or
+`api.anthropic.com` (in any case, with or without a port). Its path, without
+the query, the fragment or a trailing `/`, must be one of these:
+
+| Host | Path | Recorded as |
+|---|---|---|
+| `api.openai.com` | `/v1/chat/completions` | `chat.completions.create` |
+| | `/v1/completions` | `completions.create` |
+| | `/v1/responses` | `responses.create` |
+| | `/v1/embeddings` | `embeddings.create` |
+| | `/v1/images/generations`, `/v1/images/edits`, `/v1/images/variations` | `images.generate`, `images.edit`, `images.create_variation` |
+| | `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations` | `audio.speech.create`, `audio.transcriptions.create`, `audio.translations.create` |
+| | `/v1/moderations` | `moderations.create` |
+| | `/v1/fine_tuning/jobs` | `fine_tuning.jobs.create` |
+| | `/v1/assistants` | `assistants.create` |
+| `api.anthropic.com` | `/v1/messages` | `messages.create` |
+| | `/v1/messages/count_tokens` | `messages.count_tokens` |
+| | `/v1/messages/batches` | `messages.batches.create` |
+| | `/v1/complete` | `completions.create` |
+
+Any other URL records nothing: a gateway or proxy (OpenRouter, a local
+server), Azure OpenAI's `*.openai.azure.com` paths, Google's REST API, a host
+that only starts with a provider's name, and a provider path not listed.
+
+**The record** is a call record (`SdkCall`) with `request: true`, `sdk` and `routing`
+from the host (`openai` / `openai_direct`, `anthropic` / `anthropic_direct`),
+`package` the library (`requests` or `httpx`), `chain` as written
+(`requests.post`), `member` the SDK method from the table, `receiver`
+`module` (`requests.post`) or `symbol` (`post`), and `kwargs` the HTTP call's
+own keyword names (`url`, `headers`, `json`...). No import record is made
+for the library. The route has no endpoint variable to check: the libraries
+do not read `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL`.
+
+**The model** is read from the JSON body, the way a same-file dict expanded
+with `**` is read at an SDK call: the body is a dict literal written at the
+call, or a name bound once to one in the supported grammar (not mutated,
+passed elsewhere or aliased). `requests.post` and `httpx.post` only
+serialize the dict they are given, so passing it as `json=` does not count
+as passing it elsewhere; any other function given a dict that way still
+does. The body is:
+
+- `json=body`;
+- `data=json.dumps(body)` (httpx: also `content=json.dumps(body)`), with
+  `body` the only argument of `json.dumps`;
+- for requests, `body` as the third positional argument, or
+  `json.dumps(body)` as the second.
+
+Only the body's top-level `model` is read, plus the model keys nested in its
+containers (`requests[].params.model` in a Message Batch), as for any dict
+argument. An entry a later `**` expansion or computed key may replace is a
+`splat` gap that lists it. A body with no `model` is a `missing_model` gap,
+except a Message Batch, whose models are nested. A body the file cannot read
+(a parameter, a mutated dict, a string, form data, `files=`, more than one
+body) is an `unresolved_model` gap with the reason `request_body`. A call
+given `*args` or `**kwargs`, which may hold another body, keeps a `splat` gap
+with no key, which covers every model value of the call.
+
+**Replaced.** Writing `post` on the library's module (`requests.post =
+fake`, `setattr(requests, "post", ...)`, `del requests.post`) or any of its
+attributes with a run-time name is a `dynamic_feature` gap on every raw HTTP
+request in the file, as is any dynamic feature of the whole file.
+
+`arbor retirements` treats these as direct calls on the provider's schedule.
+Their argument names are the library's, and the scan reads only the model in
+the body, so only the checks about the model apply, with a check to review
+the body's other fields by hand.
 
 ## Dynamic features
 

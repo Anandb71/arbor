@@ -65,7 +65,10 @@
 //! construction and a call that binds the model, like
 //! `genai.GenerativeModel(...)`. A `boto3` `bedrock-runtime` client's
 //! requests (`converse(modelId=...)`) route `bedrock` for any model, and
-//! `litellm.completion(model=...)` routes `litellm`. The TypeScript/ESM slice will implement
+//! `litellm.completion(model=...)` routes `litellm`. A raw HTTP request,
+//! `requests.post(...)` or `httpx.post(...)` to a listed `api.openai.com` or
+//! `api.anthropic.com` endpoint, is a direct request whose model is read from
+//! its JSON body. The TypeScript/ESM slice will implement
 //! [`crate::LanguageParser::extract_usages`] for its parsers and reuse these
 //! types. Resolution is per file: a client or model constant imported from
 //! another module is a gap, not a usage.
@@ -402,14 +405,20 @@ pub struct CapturedValue {
 /// A call whose member chain is rooted at a tracked binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SdkCall {
+    /// The provider: for a raw HTTP request, the one whose API host the
+    /// URL names.
     pub sdk: Sdk,
+    /// As in [`SdkImport::package`], or the HTTP library (`requests`,
+    /// `httpx`) a raw HTTP request is sent with.
     pub package: String,
     /// The callee as written, arguments elided
     /// (`self.client.chat.completions.create`).
     pub chain: String,
     /// The part after the tracked root (`chat.completions.create`), with the
     /// response wrappers `with_raw_response` / `with_streaming_response` and
-    /// client copies (`with_options(...)`, `copy(...)`) removed.
+    /// client copies (`with_options(...)`, `copy(...)`) removed. For a raw
+    /// HTTP request (`package` `requests` or `httpx`), the SDK method its
+    /// endpoint is (`chat.completions.create` for `/v1/chat/completions`).
     pub member: String,
     /// Whether the call sends a request to the provider: its last member is
     /// a request method (`create`, `stream`, `generate_content`,

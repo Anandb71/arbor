@@ -88,7 +88,14 @@ model, since LiteLLM takes OpenAI-style arguments and translates them for each p
 A Gemini model with no prefix (`gemini-2.5-flash`) is looked up on Google Cloud's (Vertex
 AI) schedule, where LiteLLM sends it; `gemini/gemini-2.5-flash` reaches the Gemini API.
 AWS keeps Bedrock's model schedule, which the data does not hold, so nothing is looked up
-for a Bedrock call, whatever its model ID (`anthropic.claude-3-5-sonnet-20240620-v1:0`). Other LangChain models and
+for a Bedrock call, whatever its model ID (`anthropic.claude-3-5-sonnet-20240620-v1:0`).
+
+A raw HTTP request that posts JSON to the provider's REST API (`requests.post(...)` or
+`httpx.post(...)` to a listed `api.openai.com` or `api.anthropic.com` endpoint) is a
+direct call on that provider's schedule, with the model read from its JSON body
+([SDK_USAGES.md](SDK_USAGES.md#raw-http-requests)). Its argument names are the HTTP
+library's, and the scan reads only the model in the body, so only the checks about the
+model apply, with a check to review the body's other fields by hand. Other LangChain models and
 integrations, LlamaIndex and other wrappers are not checked yet, so a clean result says
 "No direct openai/anthropic/google SDK calls" and nothing more.
 
@@ -180,7 +187,8 @@ it too. The check runs on the runner and sends nothing anywhere.
   pages leave out, such as the four OpenAI aliases above.
 - **Direct SDK calls and LangChain chat models.** It reads the `openai`, `anthropic`,
   `google-genai` and `google-generativeai` SDKs, and LangChain's `ChatOpenAI`,
-  `AzureChatOpenAI` and `ChatAnthropic`. Calls through LiteLLM and on Amazon Bedrock are
+  `AzureChatOpenAI` and `ChatAnthropic`, and raw HTTP posts to OpenAI's and Anthropic's
+  REST APIs with `requests` or `httpx`. Calls through LiteLLM and on Amazon Bedrock are
   routed (`--include-routed`), and Bedrock's own schedule is not in the data. Other
   framework wrappers (LangChain's other integrations, LlamaIndex) are not checked yet. Model IDs in `.env`, YAML, JSON or notebooks are not read.
 - **Values it can see.** A model passed in from an environment variable, a function
