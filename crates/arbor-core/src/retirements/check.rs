@@ -2478,6 +2478,7 @@ mod tests {
             positional: 0,
             splat: false,
             values: vec![value(model, ValueOrigin::Literal, line)],
+            wrapper: None,
         }
     }
 

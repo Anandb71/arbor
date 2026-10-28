@@ -8200,6 +8200,7 @@ impl<'t> Ctx<'t> {
             positional: args.positional,
             splat: args.splat,
             values,
+            wrapper: None,
         });
     }
 
@@ -8781,6 +8782,7 @@ impl<'t> Ctx<'t> {
             positional: args.positional,
             splat: args.splat,
             values,
+            wrapper: None,
         });
     }
 

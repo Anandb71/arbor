@@ -71,7 +71,13 @@
 //! its JSON body. The TypeScript/ESM slice will implement
 //! [`crate::LanguageParser::extract_usages`] for its parsers and reuse these
 //! types. Resolution is per file: a client or model constant imported from
-//! another module is a gap, not a usage.
+//! another module is a gap, not a usage. The one exception is a call to a
+//! wrapper defined in another file of a repository scan: a module-level
+//! function or class whose parameter the extractor confirms is the model
+//! of a request in its own file ([`ModelParam`]). The scan's second pass
+//! records each call that passes it, in the calling file, as an
+//! [`SdkCall`] with a [`SdkCall::wrapper`]; the value's span stays in that
+//! file.
 
 pub mod python;
 
@@ -444,6 +450,86 @@ pub struct SdkCall {
     pub splat: bool,
     /// Values for allowlisted keys that resolved to string literals.
     pub values: Vec<CapturedValue>,
+    /// For a call to a function or class defined in another file of the
+    /// scan, whose parameter is the model of requests there
+    /// (`Sampler(model="o1")` after `from .sampler import Sampler`): that
+    /// function and those requests. The call's `sdk`, `package` and
+    /// `routing` are the requests' (`routing` is `unknown`, with an
+    /// `ambiguous_client` gap, when they differ or one is not confirmed),
+    /// `member` is the function's name, `request` is `false` (the requests
+    /// are recorded in that file) and `kwargs` are the call's own argument
+    /// names. Its values are what the call passes for the parameter, keyed
+    /// by the requests' model key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapper: Option<WrapperCall>,
+}
+
+/// The function or class a [`SdkCall::wrapper`] call reaches, in another
+/// file of the scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrapperCall {
+    /// The file that defines it, as the scan reports files.
+    pub file: String,
+    /// Its name there: a module-level function, or a class whose
+    /// `__init__` takes the parameter.
+    pub function: String,
+    /// The requests there whose model the call's argument is.
+    pub requests: Vec<WrapperRequest>,
+}
+
+/// One request a [`WrapperCall`]'s parameter reaches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrapperRequest {
+    /// The parameter of the function that is its model.
+    pub parameter: String,
+    /// The request as written there (`self.client.chat.completions.create`).
+    pub chain: String,
+    /// As in [`SdkCall::member`].
+    pub member: String,
+    pub line: u32,
+}
+
+/// A parameter of a module-level function or class that is the model of a
+/// request in the same file: what a call from another file passes for it
+/// is the model that request sends. The per-file extractor lists one only
+/// when it confirms the parameter reaches the request unchanged (see
+/// `docs/SDK_USAGES.md`, "Calls through a wrapper in another file"). The
+/// repository scan reads them for its second pass; they are not part of
+/// the JSON report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelParam {
+    /// The module-level name other files call: the function, or the class
+    /// whose `__init__` takes the parameter.
+    pub function: String,
+    pub parameter: String,
+    /// Its index among the positional arguments a call passes (`self`
+    /// excluded); `None` when it is keyword-only.
+    pub position: Option<u32>,
+    /// It may be passed by keyword (it is not positional-only).
+    pub keyword: bool,
+    /// For a class: the instance attribute `__init__` stores it in (`model`
+    /// for `self.model = model`), which a write on the instance replaces.
+    pub attribute: Option<String>,
+    /// The request's model key (`model`, `model_name`, `modelId`...).
+    pub key: String,
+    pub sdk: Sdk,
+    pub package: String,
+    pub chain: String,
+    pub member: String,
+    pub line: u32,
+    pub routing: Routing,
+    /// The request's routing has no client gap.
+    pub route_confirmed: bool,
+}
+
+/// The functions and classes of other files that an import names, as the
+/// repository scan resolved them, for [`python::extract_with`].
+pub trait WrapperLookup {
+    /// The file that defines module-level `name` and the model parameters
+    /// it lists for it ([`FileUsages::model_params`]), when `module` (as an
+    /// import statement in this file writes it: `.sampler`,
+    /// `pkg.llm.client`) is another file of the scan.
+    fn model_params(&self, module: &str, name: &str) -> Option<(String, Vec<ModelParam>)>;
 }
 
 /// Why something was reported as a gap instead of a usage.
@@ -559,6 +645,11 @@ pub struct FileUsages {
     /// region may be missing. Set only for files that mention an SDK.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub syntax_errors: bool,
+    /// Parameters of this file's module-level functions and classes that
+    /// are the model of a request here, for calls from other files (see
+    /// [`ModelParam`]). Not serialized.
+    #[serde(skip)]
+    pub model_params: Vec<ModelParam>,
 }
 
 impl FileUsages {
