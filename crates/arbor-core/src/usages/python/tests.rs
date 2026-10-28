@@ -7605,3 +7605,65 @@ fn a_replaced_post_or_a_dynamic_file_leaves_the_route_unconfirmed() {
         assert_eq!(call_on(&found, 3).routing, Routing::OpenaiDirect, "{setup}");
     }
 }
+
+#[test]
+fn a_dict_given_to_a_replaced_post_is_not_read() {
+    // A replaced `post` may change the dict it is given, and so may any
+    // code in a file that can rebind anything.
+    for setup in [
+        "requests.post = fake",
+        "setattr(requests, \"post\", fake)",
+        "exec(code)",
+    ] {
+        let source = format!(
+            "import requests\nfrom openai import OpenAI\nclient = OpenAI()\nbody = {{\"model\": \"gpt-4o\", \"messages\": []}}\n{setup}\nrequests.post(\"https://api.openai.com/v1/chat/completions\", json=body)\nclient.chat.completions.create(**body)\n"
+        );
+        let found = usages(&source);
+        assert!(call_on(&found, 7).values.is_empty(), "{setup}");
+        assert!(
+            gaps_on(&found, 7).contains(&"unresolved_model/splat".to_string()),
+            "{setup}: {:?}",
+            gaps_on(&found, 7)
+        );
+        assert!(call_on(&found, 6).values.is_empty(), "{setup}");
+    }
+}
+
+#[test]
+fn a_query_or_fragment_before_the_path_ends_the_host() {
+    for url in [
+        "https://api.openai.com?x/v1/chat/completions",
+        "https://api.openai.com#/v1/embeddings",
+    ] {
+        let source =
+            format!("import requests\nrequests.post(\"{url}\", json={{\"model\": \"gpt-4o\"}})\n");
+        assert!(usages(&source).calls.is_empty(), "{url}");
+    }
+}
+
+#[test]
+fn a_def_that_rebinds_an_imported_name_replaces_it() {
+    let found = usages(
+        r#"from openai import OpenAI
+from httpx import post
+
+def OpenAI(*args, **kwargs):
+    return make()
+
+class post:
+    pass
+
+client = OpenAI()
+client.chat.completions.create(model="gpt-4o", messages=[])
+post("https://api.openai.com/v1/chat/completions", json={"model": "gpt-4o"})
+"#,
+    );
+    // The client may be the SDK's or the local function's.
+    assert_eq!(call_on(&found, 11).routing, Routing::Unknown);
+    assert_eq!(
+        gaps_on(&found, 11),
+        ["ambiguous_client/multiple_assignments"]
+    );
+    // `post` is the local class, not httpx's.
+    assert!(found.calls.iter().all(|c| c.package != "httpx"));
+}

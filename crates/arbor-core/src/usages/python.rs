@@ -5047,7 +5047,11 @@ impl<'t> Ctx<'t> {
     fn bind_definitions(&mut self) {
         for (key, scope, place) in std::mem::take(&mut self.def_bindings) {
             let class_body = self.scopes[key.0].kind == ScopeKind::Class;
-            if !class_body && !self.assigns.contains_key(&key) {
+            // A `def` or `class` that rebinds an imported name (`from openai
+            // import OpenAI` then `def OpenAI(): ...`) replaces the import
+            // from there on, like an assignment.
+            let imported = self.imports.contains_key(&key) || self.other_imports.contains_key(&key);
+            if !class_body && !imported && !self.assigns.contains_key(&key) {
                 continue;
             }
             // `scope` is where the statement runs: a `global` def in a
