@@ -5,7 +5,7 @@
 
 use crate::languages::LanguageParser;
 use crate::node::{CodeNode, NodeKind, Visibility};
-use crate::usages::FileUsages;
+use crate::usages::{FileUsages, WrapperLookup};
 use tree_sitter::{Language, Node, Tree};
 
 pub struct PythonParser;
@@ -28,6 +28,21 @@ impl LanguageParser for PythonParser {
 
     fn extract_usages(&self, tree: &Tree, source: &str, file_path: &str) -> Option<FileUsages> {
         Some(crate::usages::python::extract(tree, source, file_path))
+    }
+
+    fn extract_usages_with(
+        &self,
+        tree: &Tree,
+        source: &str,
+        file_path: &str,
+        wrappers: &dyn WrapperLookup,
+    ) -> Option<FileUsages> {
+        Some(crate::usages::python::extract_with(
+            tree,
+            source,
+            file_path,
+            Some(wrappers),
+        ))
     }
 
     fn usages_language(&self) -> Option<&'static str> {

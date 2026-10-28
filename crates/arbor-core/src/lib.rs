@@ -33,7 +33,7 @@ pub use node::{
 };
 pub use parser::{
     detect_language, parse_file, parse_file_usages, parse_source, parse_source_usages,
-    parse_source_with_usages,
+    parse_source_usages_with, parse_source_with_usages,
 };
 pub use parser_v2::{ArborParser, ParseResult, RelationType, SymbolRelation};
 pub use usages::{FileUsages, Routing, Sdk};

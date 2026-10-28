@@ -17,18 +17,25 @@
 //!
 //! Extensionless files are scanned when their first line is a Python
 //! shebang (`#!/usr/bin/env python3`).
+//!
+//! A directory scan makes a second pass for calls through a wrapper in
+//! another file: a module-level function or class whose parameter the
+//! extractor confirms is the model of a request in its own file
+//! ([`ModelParam`]). Each project file that names one is read again with
+//! its imports resolved to the scanned files (see [`ModuleIndex::resolve`]),
+//! and a call that passes the parameter is recorded in that file.
 
 use crate::indexer::IgnoreMatcher;
 use arbor_core::languages::get_parser;
 use arbor_core::usages::{
-    is_python_shebang, is_usage_extension, ClientConstruction, FileUsages, GapKind, Sdk, SdkCall,
-    SdkImport, UsageGap, USAGE_LANGUAGES,
+    is_python_shebang, is_usage_extension, ClientConstruction, FileUsages, GapKind, ModelParam,
+    Sdk, SdkCall, SdkImport, UsageGap, WrapperLookup, USAGE_LANGUAGES,
 };
-use arbor_core::{detect_language, parse_source_usages};
+use arbor_core::{detect_language, parse_source_usages, parse_source_usages_with};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
@@ -201,13 +208,16 @@ pub fn scan_usages(root: &Path, options: &UsageScanOptions) -> std::io::Result<U
         walk(root, options.follow_symlinks, prefix.as_deref())
     };
 
-    let outcomes: Vec<(Candidate, Outcome)> = candidates
+    let mut outcomes: Vec<(Candidate, Outcome)> = candidates
         .into_par_iter()
         .map(|candidate| {
             let outcome = analyze(&candidate, options);
             (candidate, outcome)
         })
         .collect();
+    if !metadata.is_file() {
+        second_pass(root, &mut outcomes, options);
+    }
 
     let mut report = UsageReport {
         version: USAGE_REPORT_VERSION,
@@ -468,23 +478,34 @@ fn slash_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn analyze(candidate: &Candidate, options: &UsageScanOptions) -> Outcome {
+/// Why a candidate's text is not analyzed.
+enum Unread {
+    NotSource,
+    TooLarge,
+    Unreadable(String),
+}
+
+/// The text of a candidate.
+fn read_source(candidate: &Candidate, options: &UsageScanOptions) -> Result<String, Unread> {
     if candidate.shebang && !has_python_shebang(&candidate.path) {
-        return Outcome::NotSource;
+        return Err(Unread::NotSource);
     }
     let size = std::fs::metadata(&candidate.path)
         .map(|m| m.len())
         .unwrap_or(0);
     if size > options.max_file_bytes {
-        return Outcome::TooLarge;
+        return Err(Unread::TooLarge);
     }
-    let bytes = match std::fs::read(&candidate.path) {
-        Ok(bytes) => bytes,
-        Err(error) => return Outcome::Unreadable(error.to_string()),
-    };
-    let source = match String::from_utf8(bytes) {
+    let bytes = std::fs::read(&candidate.path).map_err(|e| Unread::Unreadable(e.to_string()))?;
+    String::from_utf8(bytes).map_err(|_| Unread::Unreadable("not valid UTF-8".to_string()))
+}
+
+fn analyze(candidate: &Candidate, options: &UsageScanOptions) -> Outcome {
+    let source = match read_source(candidate, options) {
         Ok(source) => source,
-        Err(_) => return Outcome::Unreadable("not valid UTF-8".to_string()),
+        Err(Unread::NotSource) => return Outcome::NotSource,
+        Err(Unread::TooLarge) => return Outcome::TooLarge,
+        Err(Unread::Unreadable(reason)) => return Outcome::Unreadable(reason),
     };
     let parser = if candidate.shebang {
         get_parser("py")
@@ -498,6 +519,185 @@ fn analyze(candidate: &Candidate, options: &UsageScanOptions) -> Outcome {
         Ok(Some(found)) => Outcome::Parsed(found),
         Ok(None) => Outcome::Parsed(FileUsages::new(&candidate.relative, "unknown")),
         Err(error) => Outcome::Unreadable(error.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Second pass: calls through a wrapper in another file
+// ---------------------------------------------------------------------------
+
+/// One project Python module, for resolving imports.
+struct Module {
+    /// Its path as the report names it.
+    display: String,
+    /// What its module-level functions and classes take as a request's model.
+    params: Vec<ModelParam>,
+}
+
+/// The project's Python modules (`.py` files outside vendored and hidden
+/// directories), by their path under the scan root (`pkg/llm.py`,
+/// `pkg/__init__.py`).
+struct ModuleIndex {
+    modules: HashMap<String, Module>,
+}
+
+impl ModuleIndex {
+    /// The module an import statement in the file at `from` names (both
+    /// paths under the root). A relative import (`.llm`, `..pkg.llm`)
+    /// starts from the directory of `from`, one level up for each dot past
+    /// the first. An absolute one (`pkg.llm`) is the one module at that path
+    /// under the directory of `from` or any directory above it, up to the
+    /// root: Python finds it there when that directory is on its path, and
+    /// when two of them could be meant the scan resolves neither. `pkg/llm`
+    /// is `pkg/llm.py` or `pkg/llm/__init__.py`, not both.
+    fn resolve(&self, from: &str, module: &str) -> Option<&str> {
+        let level = module.bytes().take_while(|b| *b == b'.').count();
+        let dotted = &module[level..];
+        let parts: Vec<&str> = if dotted.is_empty() {
+            Vec::new()
+        } else {
+            dotted.split('.').collect()
+        };
+        if parts.iter().any(|p| !is_identifier(p)) || (level == 0 && parts.is_empty()) {
+            return None;
+        }
+        let mut dir: Vec<&str> = from.split('/').collect();
+        dir.pop();
+        let found = if level > 0 {
+            let up = level - 1;
+            if up > dir.len() {
+                return None;
+            }
+            self.at(&dir[..dir.len() - up], &parts)
+        } else {
+            let mut found = None;
+            for depth in 0..=dir.len() {
+                if let Some(file) = self.at(&dir[..depth], &parts) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(file);
+                }
+            }
+            found
+        };
+        found.filter(|file| *file != from)
+    }
+
+    /// The module `parts` names inside directory `dir`.
+    fn at(&self, dir: &[&str], parts: &[&str]) -> Option<&str> {
+        let stem = dir
+            .iter()
+            .chain(parts)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("/");
+        let package = if stem.is_empty() {
+            "__init__.py".to_string()
+        } else {
+            format!("{stem}/__init__.py")
+        };
+        let module = (!parts.is_empty()).then(|| format!("{stem}.py"));
+        let package = self.modules.get_key_value(&package);
+        let module = module.and_then(|m| self.modules.get_key_value(&m));
+        match (package, module) {
+            (Some((path, _)), None) | (None, Some((path, _))) => Some(path.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// A Python identifier, as one segment of a module path.
+fn is_identifier(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// What the second pass tells the extractor about the imports of the file
+/// at `from`.
+struct ImportsOf<'a> {
+    index: &'a ModuleIndex,
+    from: &'a str,
+}
+
+impl WrapperLookup for ImportsOf<'_> {
+    fn model_params(&self, module: &str, name: &str) -> Option<(String, Vec<ModelParam>)> {
+        let file = self.index.resolve(self.from, module)?;
+        let found = self.index.modules.get(file)?;
+        let params: Vec<ModelParam> = found
+            .params
+            .iter()
+            .filter(|p| p.function == name)
+            .cloned()
+            .collect();
+        (!params.is_empty()).then(|| (found.display.clone(), params))
+    }
+}
+
+/// A candidate's path under the scan root, with forward slashes.
+fn under_root(root: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(root).ok().map(slash_path)
+}
+
+/// The second pass. When some project file lists model parameters
+/// ([`FileUsages::model_params`]), every other project file whose text
+/// names one of those functions or classes is read and analyzed again with
+/// its imports resolved, and its records replace the first pass's.
+fn second_pass(root: &Path, outcomes: &mut [(Candidate, Outcome)], options: &UsageScanOptions) {
+    let project =
+        |c: &Candidate| c.vendored_root.is_none() && c.hidden_root.is_none() && !c.shebang;
+    let mut modules = HashMap::new();
+    for (candidate, outcome) in outcomes.iter_mut() {
+        if !project(candidate) {
+            continue;
+        }
+        let Some(path) = under_root(root, &candidate.path) else {
+            continue;
+        };
+        let params = match outcome {
+            Outcome::Parsed(found) => std::mem::take(&mut found.model_params),
+            _ => Vec::new(),
+        };
+        let display = candidate.relative.clone();
+        modules.insert(path, Module { display, params });
+    }
+    let names: HashSet<String> = modules
+        .values()
+        .flat_map(|m| m.params.iter().map(|p| p.function.clone()))
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    let index = ModuleIndex { modules };
+    let redone: Vec<Option<FileUsages>> = outcomes
+        .par_iter()
+        .map(|(candidate, outcome)| {
+            if !project(candidate) || !matches!(outcome, Outcome::Parsed(_)) {
+                return None;
+            }
+            let from = under_root(root, &candidate.path)?;
+            let source = read_source(candidate, options).ok()?;
+            let names_one = source
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|word| names.contains(word));
+            if !names_one {
+                return None;
+            }
+            let parser = detect_language(&candidate.path)?;
+            let lookup = ImportsOf {
+                index: &index,
+                from: &from,
+            };
+            parse_source_usages_with(&source, &candidate.relative, parser.as_ref(), &lookup)
+                .ok()
+                .flatten()
+        })
+        .collect();
+    for ((_, outcome), found) in outcomes.iter_mut().zip(redone) {
+        if let Some(found) = found {
+            *outcome = Outcome::Parsed(found);
+        }
     }
 }
 
@@ -775,5 +975,191 @@ mod tests {
         let back: UsageReport = serde_json::from_str(&json).unwrap();
         assert_eq!(back, report);
         assert_eq!(back.version, USAGE_REPORT_VERSION);
+    }
+
+    const SAMPLER: &str = "from openai import OpenAI\n\nclass Sampler:\n    def __init__(self, model=\"o1-mini\"):\n        self.client = OpenAI()\n        self.model = model\n\n    def __call__(self, messages):\n        return self.client.chat.completions.create(model=self.model, messages=messages)\n";
+
+    /// The wrapper calls a scan records, as (file, line, function, model).
+    fn wrapper_calls(report: &UsageReport) -> Vec<(String, u32, String, Option<String>)> {
+        report
+            .usages
+            .iter()
+            .filter_map(|c| {
+                let wrapper = c.wrapper.as_ref()?;
+                let model = c.values.first().map(|v| v.value.clone());
+                Some((c.file.clone(), c.span.line, wrapper.function.clone(), model))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_call_to_a_wrapper_in_another_file_is_recorded_where_it_is() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "evals/sampler/o_sampler.py", SAMPLER);
+        // A relative import from the package, an absolute one from a
+        // script in a subdirectory, and a file that names no SDK at all.
+        write(
+            dir.path(),
+            "evals/run.py",
+            "from .sampler.o_sampler import Sampler\nMODELS = {\"o1\": Sampler(model=\"o1\")}\n",
+        );
+        write(
+            dir.path(),
+            "scripts/bench/main.py",
+            "from evals.sampler.o_sampler import Sampler\n\nSampler(model=\"o3-mini\")\nSampler()\n",
+        );
+        write(
+            dir.path(),
+            "evals/other.py",
+            "from .sampler.o_sampler import Sampler as S\nfrom .missing import Sampler\n",
+        );
+
+        let report = scan_usages(dir.path(), &UsageScanOptions::default()).unwrap();
+        assert_eq!(
+            wrapper_calls(&report),
+            [
+                (
+                    "evals/run.py".to_string(),
+                    2,
+                    "Sampler".to_string(),
+                    Some("o1".to_string())
+                ),
+                (
+                    "scripts/bench/main.py".to_string(),
+                    3,
+                    "Sampler".to_string(),
+                    Some("o3-mini".to_string())
+                ),
+            ]
+        );
+        let call = report
+            .usages
+            .iter()
+            .find(|c| c.file == "evals/run.py")
+            .unwrap();
+        assert_eq!(call.routing, Routing::OpenaiDirect);
+        assert!(!call.request);
+        let wrapper = call.wrapper.as_ref().unwrap();
+        assert_eq!(wrapper.file, "evals/sampler/o_sampler.py");
+        assert_eq!(wrapper.requests[0].line, 9);
+        // The wrapper's own request and default are reported as before.
+        let request = report
+            .usages
+            .iter()
+            .find(|c| c.file == "evals/sampler/o_sampler.py")
+            .unwrap();
+        assert!(request.request);
+        assert_eq!(request.values[0].value, "o1-mini");
+        assert_eq!(report.summary.requests, 1);
+        assert_eq!(report.summary.calls, 3);
+        assert_eq!(report.summary.files_with_calls, 3);
+        assert_eq!(report.summary.calls_with_model, 3);
+
+        // Paths in records follow the display root, resolution does not.
+        let options = UsageScanOptions {
+            display_root: Some("repo".to_string()),
+            ..UsageScanOptions::default()
+        };
+        let report = scan_usages(dir.path(), &options).unwrap();
+        let call = report
+            .usages
+            .iter()
+            .find(|c| c.file == "repo/evals/run.py")
+            .unwrap();
+        assert_eq!(
+            call.wrapper.as_ref().unwrap().file,
+            "repo/evals/sampler/o_sampler.py"
+        );
+
+        // A provider filter keeps the calls of that provider.
+        let options = UsageScanOptions {
+            sdk: Some(Sdk::Anthropic),
+            ..UsageScanOptions::default()
+        };
+        let report = scan_usages(dir.path(), &options).unwrap();
+        assert!(report.usages.is_empty());
+    }
+
+    #[test]
+    fn an_import_that_could_name_two_modules_is_not_followed() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "llm/sampler.py", SAMPLER);
+        write(dir.path(), "app/llm/sampler.py", SAMPLER);
+        write(
+            dir.path(),
+            "app/main.py",
+            "from llm.sampler import Sampler\nSampler(model=\"o1\")\n",
+        );
+        // A module and a package of the same name.
+        write(dir.path(), "dup/sampler.py", SAMPLER);
+        write(dir.path(), "dup/sampler/__init__.py", SAMPLER);
+        write(
+            dir.path(),
+            "dup/main.py",
+            "from .sampler import Sampler\nSampler(model=\"o1\")\n",
+        );
+        // Above the root, and a vendored copy.
+        write(
+            dir.path(),
+            "top.py",
+            "from ..sampler import Sampler\nSampler(model=\"o1\")\n",
+        );
+        write(dir.path(), "venv/lib/vendored.py", SAMPLER);
+        write(
+            dir.path(),
+            "venv_user.py",
+            "from venv.lib.vendored import Sampler\nSampler(model=\"o1\")\n",
+        );
+        let report = scan_usages(dir.path(), &UsageScanOptions::default()).unwrap();
+        assert_eq!(wrapper_calls(&report), []);
+
+        // A single-file scan has no other files.
+        let report = scan_usages(
+            &dir.path().join("app/main.py"),
+            &UsageScanOptions::default(),
+        )
+        .unwrap();
+        assert!(report.usages.is_empty());
+    }
+
+    #[test]
+    fn modules_resolve_like_python_imports() {
+        let mut modules = HashMap::new();
+        for path in [
+            "pkg/__init__.py",
+            "pkg/llm.py",
+            "pkg/sub/__init__.py",
+            "pkg/sub/client.py",
+            "src/lib/core.py",
+            "app.py",
+        ] {
+            let module = Module {
+                display: path.to_string(),
+                params: Vec::new(),
+            };
+            modules.insert(path.to_string(), module);
+        }
+        let index = ModuleIndex { modules };
+        let cases = [
+            ("pkg/sub/client.py", ".", Some("pkg/sub/__init__.py")),
+            ("pkg/sub/client.py", "..", Some("pkg/__init__.py")),
+            ("pkg/sub/client.py", "..llm", Some("pkg/llm.py")),
+            ("pkg/sub/client.py", "...", None),
+            ("pkg/sub/client.py", "....x", None),
+            ("pkg/llm.py", ".sub.client", Some("pkg/sub/client.py")),
+            ("pkg/llm.py", ".sub", Some("pkg/sub/__init__.py")),
+            ("pkg/llm.py", "pkg.sub.client", Some("pkg/sub/client.py")),
+            ("pkg/llm.py", "pkg", Some("pkg/__init__.py")),
+            ("pkg/llm.py", ".llm", None),
+            ("app.py", "pkg.llm", Some("pkg/llm.py")),
+            ("app.py", "lib.core", None),
+            ("src/lib/core.py", "lib.core", None),
+            ("src/main.py", "lib.core", Some("src/lib/core.py")),
+            ("app.py", "pkg.sub-client", None),
+            ("app.py", "", None),
+        ];
+        for (from, module, expected) in cases {
+            assert_eq!(index.resolve(from, module), expected, "{from}: {module}");
+        }
     }
 }
