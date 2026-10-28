@@ -1,0 +1,22 @@
+{
+  "corpus_version": 1,
+  "language": "typescript",
+  "covers": ["import alias resolution", "import { X as Y }", "alias named like another function"],
+  "symbols": [
+    "app.ts::label",
+    "format.ts::formatName",
+    "legacy/fmt.ts::fmt",
+    "legacy/report.ts::line"
+  ],
+  "edges_expected": [
+    ["app.ts::label", "format.ts::formatName"],
+    ["legacy/report.ts::line", "legacy/fmt.ts::fmt"]
+  ],
+  "edges_forbidden": [
+    ["app.ts::label", "legacy/fmt.ts::fmt"],
+    ["legacy/report.ts::line", "format.ts::formatName"]
+  ],
+  "known_missing": [],
+  "known_extra": [],
+  "notes": "app.ts imports formatName AS fmt from ./format; legacy/fmt.ts defines a real fmt that legacy/report.ts imports and calls. The alias call must reach format.ts (Arbor 3.0.5 bound it to legacy/fmt.ts at confidence 1.0)."
+}
