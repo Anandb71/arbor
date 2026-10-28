@@ -68,7 +68,10 @@
 //! `litellm.completion(model=...)` routes `litellm`. A raw HTTP request,
 //! `requests.post(...)` or `httpx.post(...)` to a listed `api.openai.com` or
 //! `api.anthropic.com` endpoint, is a direct request whose model is read from
-//! its JSON body. The TypeScript/ESM slice will implement
+//! its JSON body. The agent frameworks' classes that take a model (the OpenAI
+//! Agents SDK's `Agent(model=...)`, Claude Agent SDK options, AgentScope's
+//! models) are recorded like a LangChain chat model, routed by the model or
+//! client they are given. The TypeScript/ESM slice will implement
 //! [`crate::LanguageParser::extract_usages`] for its parsers and reuse these
 //! types. Resolution is per file: a client or model constant imported from
 //! another module is a gap, not a usage.
@@ -143,7 +146,9 @@ impl std::fmt::Display for Sdk {
 #[serde(rename_all = "snake_case")]
 pub enum Routing {
     /// `OpenAI()` / `AsyncOpenAI()` with no `base_url`, the module-level API,
-    /// or LangChain's `ChatOpenAI` built the same way.
+    /// LangChain's `ChatOpenAI` or an AgentScope OpenAI model built the same
+    /// way, or an OpenAI Agents SDK agent or run given a model name the SDK
+    /// sends to OpenAI.
     OpenaiDirect,
     /// `AzureOpenAI` / `AsyncAzureOpenAI`, `openai.api_type = "azure"`, or
     /// LangChain's `AzureChatOpenAI`.
@@ -154,8 +159,10 @@ pub enum Routing {
     /// of `api.openai.com` or `api.anthropic.com` is direct. A Bedrock
     /// client given an `endpoint_url` outside AWS is routed this way too.
     CustomBaseUrl,
-    /// `Anthropic()` / `AsyncAnthropic()` with no `base_url`, or LangChain's
-    /// `ChatAnthropic` built the same way.
+    /// `Anthropic()` / `AsyncAnthropic()` with no `base_url`, LangChain's
+    /// `ChatAnthropic` or AgentScope's Anthropic model built the same way, or
+    /// Claude Agent SDK options, whose Claude Code CLI uses Anthropic's API
+    /// unless its environment picks another provider.
     AnthropicDirect,
     /// `AnthropicBedrock` / `AsyncAnthropicBedrock`.
     AnthropicBedrock,
@@ -168,7 +175,8 @@ pub enum Routing {
     /// Amazon Bedrock, for any model it serves: a `boto3` `bedrock-runtime`
     /// client, or LangChain's `ChatBedrock` / `ChatBedrockConverse`.
     Bedrock,
-    /// A call through LiteLLM (`litellm.completion(...)`), which picks the
+    /// A call through LiteLLM (`litellm.completion(...)`, the OpenAI Agents
+    /// SDK's `LitellmModel` or a `litellm/` model name), which picks the
     /// provider and endpoint from the model string and its configuration.
     Litellm,
     /// Not decided by this version: `**kwargs` passed to a direct
@@ -240,9 +248,11 @@ pub enum BindingKind {
 pub struct SdkImport {
     pub sdk: Sdk,
     /// `openai`, `anthropic`, `google.genai`, `google.generativeai`, `boto3`
-    /// or `litellm`, or the LangChain package a chat model comes from
+    /// or `litellm`, the LangChain package a chat model comes from
     /// (`langchain_openai`, `langchain_anthropic`, `langchain_aws`,
-    /// `langchain_community`, `langchain`).
+    /// `langchain_community`, `langchain`), or the agent framework a class
+    /// comes from (`agents` for the OpenAI Agents SDK, `claude_agent_sdk`,
+    /// `claude_code_sdk`, `agentscope`).
     pub package: String,
     /// The module named in the statement (`openai.types.chat`).
     pub module: String,
