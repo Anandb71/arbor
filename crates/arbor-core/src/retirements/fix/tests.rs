@@ -166,6 +166,31 @@ def b(q):
 }
 
 #[test]
+fn a_call_with_another_model_value_that_needs_a_person_is_left_alone() {
+    // `extra_body` may override the top-level model, so swapping only the
+    // top-level one would change nothing at run time.
+    let source = project(&[
+        r#"client.chat.completions.create(model="o3-mini", max_tokens=1, messages=[], extra_body={"model": "o3-mini"})"#,
+        r#"client.chat.completions.create(model="o4-mini", messages=[])"#,
+    ]);
+    let (plan, fixed) = fix(&source);
+    assert_eq!(
+        fixed,
+        source.replace(r#"model="o4-mini""#, r#"model="gpt-5.6-terra""#),
+        "{plan:#?}"
+    );
+    let mut got = reasons(&plan);
+    got.sort_by_key(|(_, _, reason)| *reason);
+    assert_eq!(
+        got,
+        vec![
+            ("o3-mini", FixKind::Manual, SkipReason::NotPlainSwap),
+            ("o3-mini", FixKind::Swap, SkipReason::CallNeedsReview),
+        ]
+    );
+}
+
+#[test]
 fn a_call_that_already_passes_the_new_name_is_left_alone() {
     let source = project(&[
         r#"client.chat.completions.create(model="o1", max_tokens=5, max_completion_tokens=5, messages=[])"#,

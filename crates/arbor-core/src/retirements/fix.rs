@@ -15,10 +15,10 @@
 //!
 //! Everything else is left as it is and listed in [`SwapPlan::skipped`] with
 //! a [`SkipReason`]: a call that needs a decision (the reasoning effort,
-//! Claude's thinking) or a person, a model defined outside the call (a
-//! constant or a default other code may read too), a swap that adds an
-//! argument, and a call whose source does not read the way the usage scan
-//! recorded it. Nothing here bumps an SDK, reads files, runs code or reaches
+//! Claude's thinking) or a person, a call where any other model value needs
+//! one, a model defined outside the call (a constant or a default other
+//! code may read too), a swap that adds an argument, and a call whose
+//! source does not read the way the usage scan recorded it. Nothing here bumps an SDK, reads files, runs code or reaches
 //! the network.
 //!
 //! The edits are byte ranges in the text the usage scan read, so scan the
@@ -27,6 +27,13 @@
 use super::{CallKind, ChangeKind, Confidence, Finding, FixKind, MatchKind, RoutingClass};
 use crate::usages::{CapturedValue, FileUsages, SdkCall, Span, ValueOrigin};
 use serde::Serialize;
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// The usage scan's calls by their 1-based line and column.
+type CallIndex<'u> = HashMap<(u32, u32), Vec<&'u SdkCall>>;
+
+/// Where a finding's call is: line, column and chain.
+type CallAt<'f> = (u32, u32, Option<&'f str>);
 
 /// The longest replacement model ID that is written into code.
 const MAX_MODEL_ID_BYTES: usize = 200;
@@ -76,6 +83,10 @@ pub enum SkipReason {
     /// first, a manual check, or no change ([`SkippedSwap::fix`] says
     /// which).
     NotPlainSwap,
+    /// The finding is a plain swap, but another finding at the same call is
+    /// not swapped (a model nested in the call's arguments that needs a
+    /// manual check, say), so nothing at the call is edited.
+    CallNeedsReview,
     /// The model is not written at the call: it comes from a constant or a
     /// default, which other code (or another module) may read too.
     ValueNotAtCall,
@@ -106,6 +117,7 @@ impl SkipReason {
     pub fn as_str(self) -> &'static str {
         match self {
             SkipReason::NotPlainSwap => "not_plain_swap",
+            SkipReason::CallNeedsReview => "call_needs_review",
             SkipReason::ValueNotAtCall => "value_not_at_call",
             SkipReason::AddsArgument => "adds_argument",
             SkipReason::ArgumentNotRenamable => "argument_not_renamable",
@@ -153,16 +165,39 @@ pub struct SwapPlan {
 
 /// Plans the plain swaps in one file. `usages` is the usage scan of
 /// `source`; `findings` may hold other files' findings, which are ignored.
-/// A finding's edits go in together or not at all.
+/// A finding's edits go in together or not at all, and a call is edited
+/// only when every finding at it is swapped.
 pub fn plan_swaps(source: &str, usages: &FileUsages, findings: &[Finding]) -> SwapPlan {
     let mut plan = SwapPlan {
         file: usages.file.clone(),
         ..SwapPlan::default()
     };
+    let calls = calls_by_position(usages);
     // Parsed for the first swap; `Some(None)` if the parse failed.
     let mut tree = None;
-    for finding in findings.iter().filter(|f| f.file == usages.file) {
-        let (edits, swap) = match swap_edits(source, usages, finding, &mut tree) {
+    let findings: Vec<&Finding> = findings.iter().filter(|f| f.file == usages.file).collect();
+    let planned: Vec<_> = findings
+        .iter()
+        .map(|f| swap_edits(source, usages, &calls, f, &mut tree))
+        .collect();
+    // Calls with a finding that is not swapped (one that needs no change
+    // holds nothing back).
+    let held: HashSet<CallAt<'_>> = findings
+        .iter()
+        .zip(&planned)
+        .filter(|(f, p)| p.is_err() && f.fix != FixKind::None)
+        .map(|(f, _)| call_at(f))
+        .collect();
+
+    // Accepted edits by start; they never overlap.
+    let mut accepted: BTreeMap<u32, Edit> = BTreeMap::new();
+    for (finding, planned) in findings.into_iter().zip(planned) {
+        let (edits, swap) = match planned {
+            Ok(_) if held.contains(&call_at(finding)) => {
+                plan.skipped
+                    .push(skipped(finding, SkipReason::CallNeedsReview));
+                continue;
+            }
             Ok(planned) => planned,
             Err(reason) => {
                 plan.skipped.push(skipped(finding, reason));
@@ -172,10 +207,10 @@ pub fn plan_swaps(source: &str, usages: &FileUsages, findings: &[Finding]) -> Sw
         let mut new_edits: Vec<Edit> = Vec::new();
         let mut clash = false;
         for edit in edits {
-            if plan.edits.contains(&edit) || new_edits.contains(&edit) {
+            if accepted.get(&edit.start_byte) == Some(&edit) || new_edits.contains(&edit) {
                 continue;
             }
-            if overlaps(&plan.edits, &edit) || overlaps(&new_edits, &edit) {
+            if clashes(&accepted, &edit) || new_edits.iter().any(|e| overlap(e, &edit)) {
                 clash = true;
                 break;
             }
@@ -185,10 +220,12 @@ pub fn plan_swaps(source: &str, usages: &FileUsages, findings: &[Finding]) -> Sw
             plan.skipped.push(skipped(finding, SkipReason::Overlap));
             continue;
         }
-        plan.edits.append(&mut new_edits);
+        for edit in new_edits {
+            accepted.insert(edit.start_byte, edit);
+        }
         plan.swaps.push(swap);
     }
-    plan.edits.sort_by_key(|e| e.start_byte);
+    plan.edits = accepted.into_values().collect();
     plan
 }
 
@@ -224,6 +261,7 @@ pub fn apply_edits(source: &str, edits: &[Edit]) -> Result<String, String> {
 fn swap_edits(
     source: &str,
     usages: &FileUsages,
+    calls: &CallIndex<'_>,
     finding: &Finding,
     tree: &mut Option<Option<tree_sitter::Tree>>,
 ) -> Result<(Vec<Edit>, PlannedSwap), SkipReason> {
@@ -255,7 +293,7 @@ fn swap_edits(
         .as_deref()
         .filter(|m| is_plain_model_id(m))
         .ok_or(SkipReason::UnsafeReplacement)?;
-    let (call, value) = locate(usages, finding).ok_or(SkipReason::SourceMismatch)?;
+    let (call, value) = locate(calls, finding).ok_or(SkipReason::SourceMismatch)?;
     let tree = tree
         .get_or_insert_with(|| parse_python(source))
         .as_ref()
@@ -299,15 +337,12 @@ fn plain_swap(finding: &Finding) -> bool {
 /// the finding's value on the finding's value line, inside the call. `None`
 /// unless exactly one matches.
 fn locate<'u>(
-    usages: &'u FileUsages,
+    calls: &CallIndex<'u>,
     finding: &Finding,
 ) -> Option<(&'u SdkCall, &'u CapturedValue)> {
     let mut found = None;
-    for call in &usages.calls {
-        if call.span.line != finding.line
-            || call.span.column != finding.column
-            || finding.chain.as_deref() != Some(call.chain.as_str())
-        {
+    for &call in calls.get(&(finding.line, finding.column))? {
+        if finding.chain.as_deref() != Some(call.chain.as_str()) {
             continue;
         }
         for value in &call.values {
@@ -447,10 +482,32 @@ fn is_identifier(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn overlaps(edits: &[Edit], edit: &Edit) -> bool {
-    edits
-        .iter()
-        .any(|e| e.start_byte < edit.end_byte && edit.start_byte < e.end_byte)
+fn calls_by_position(usages: &FileUsages) -> CallIndex<'_> {
+    let mut index: CallIndex<'_> = HashMap::new();
+    for call in &usages.calls {
+        index
+            .entry((call.span.line, call.span.column))
+            .or_default()
+            .push(call);
+    }
+    index
+}
+
+fn call_at(finding: &Finding) -> CallAt<'_> {
+    (finding.line, finding.column, finding.chain.as_deref())
+}
+
+fn overlap(a: &Edit, b: &Edit) -> bool {
+    a.start_byte < b.end_byte && b.start_byte < a.end_byte
+}
+
+/// Whether `edit` overlaps an accepted edit. Accepted edits never overlap,
+/// so the last one starting before `edit` ends reaches furthest.
+fn clashes(accepted: &BTreeMap<u32, Edit>, edit: &Edit) -> bool {
+    accepted
+        .range(..edit.end_byte)
+        .next_back()
+        .is_some_and(|(_, e)| overlap(e, edit))
 }
 
 fn skipped(finding: &Finding, reason: SkipReason) -> SkippedSwap {
