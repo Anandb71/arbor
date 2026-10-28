@@ -140,6 +140,8 @@ const PREFILTER: &[&str] = &[
     "converse(",
     "converse_stream(",
     "litellm",
+    // The OpenAI Agents SDK's classes are imported from `agents`.
+    "agents",
 ];
 
 /// Whether `source` mentions anything the extractor tracks. A file that does
@@ -411,6 +413,12 @@ enum Pkg {
     Boto3,
     /// LiteLLM: only its request functions ([`LITELLM_REQUESTS`]).
     Litellm,
+    /// The OpenAI Agents SDK (`openai-agents`, imported as `agents`): only
+    /// its classes that take a model, imported by name (see [`REEXPORTS`]).
+    OpenaiAgents,
+    /// The Agents SDK's `LitellmModel`, which sends its requests through
+    /// LiteLLM.
+    OpenaiAgentsLitellm,
 }
 
 impl Pkg {
@@ -426,7 +434,8 @@ impl Pkg {
             | Pkg::LangchainLegacyAnthropic => Sdk::Anthropic,
             Pkg::GoogleGenai | Pkg::GoogleGenerativeai => Sdk::Google,
             Pkg::LangchainAws | Pkg::Boto3 => Sdk::Aws,
-            Pkg::Litellm => Sdk::Litellm,
+            Pkg::Litellm | Pkg::OpenaiAgentsLitellm => Sdk::Litellm,
+            Pkg::OpenaiAgents => Sdk::Openai,
         }
     }
 
@@ -445,6 +454,7 @@ impl Pkg {
             Pkg::LangchainAws => "langchain_aws",
             Pkg::Boto3 => "boto3",
             Pkg::Litellm => "litellm",
+            Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm => "agents",
         }
     }
 
@@ -463,11 +473,20 @@ impl Pkg {
         )
     }
 
+    /// An agent framework: only its classes that take a model are tracked,
+    /// and what they are built with is the model the framework's requests
+    /// use. Nothing called on what they build is recorded: those objects
+    /// configure a run, they are not clients.
+    fn is_agent_framework(self) -> bool {
+        matches!(self, Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm)
+    }
+
     /// A package whose tracked classes are built with the model their
     /// requests use, and build those requests themselves: LangChain's chat
-    /// models. Each construction is recorded as a call that binds the model.
+    /// models and the agent frameworks. Each construction is recorded as a
+    /// call that binds the model.
     fn binds_model(self) -> bool {
-        self.is_langchain()
+        self.is_langchain() || self.is_agent_framework()
     }
 
     /// A package followed only through the names it is tracked for: its
@@ -555,6 +574,18 @@ enum Family {
     /// Amazon Bedrock's runtime, for any model: `boto3.client(
     /// "bedrock-runtime")` and LangChain's Bedrock chat models.
     AwsBedrock,
+    /// An Agents SDK agent or run (`Agent`, `RunConfig`): a model name is
+    /// sent through the SDK's default `AsyncOpenAI()` client unless its
+    /// prefix names another provider, and a model object routes itself
+    /// (see [`Ctx::agents_route`]).
+    AgentsDefault,
+    /// An Agents SDK model object built on an OpenAI client
+    /// (`OpenAIResponsesModel`, `OpenAIChatCompletionsModel`): it routes
+    /// like the `openai_client` it is given.
+    AgentsModel,
+    /// A model object that sends its requests through LiteLLM
+    /// (`LitellmModel`).
+    Litellm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -638,11 +669,30 @@ const CLASSES: &[ClientClass] = &[
     class(Pkg::Boto3, "client", Family::AwsBedrock),
     class(Pkg::LangchainAws, "ChatBedrock", Family::AwsBedrock),
     class(Pkg::LangchainAws, "ChatBedrockConverse", Family::AwsBedrock),
+    // The OpenAI Agents SDK's classes that take a model.
+    class(Pkg::OpenaiAgents, "Agent", Family::AgentsDefault),
+    class(Pkg::OpenaiAgents, "RunConfig", Family::AgentsDefault),
+    class(
+        Pkg::OpenaiAgents,
+        "OpenAIResponsesModel",
+        Family::AgentsModel,
+    ),
+    class(
+        Pkg::OpenaiAgents,
+        "OpenAIChatCompletionsModel",
+        Family::AgentsModel,
+    ),
+    class(Pkg::OpenaiAgentsLitellm, "LitellmModel", Family::Litellm),
 ];
 
 /// LiteLLM's functions that send a request; the first argument is the
 /// model.
 const LITELLM_REQUESTS: &[&str] = &["completion", "acompletion"];
+
+/// An agent framework's classes that fall back to a default model when
+/// given none (`Agent(name="triage")`, which runs the SDK's default model
+/// unless a run gives it another), so that is a `missing_model` gap.
+const DEFAULT_MODEL_CLASSES: &[&str] = &["Agent"];
 
 const fn class(pkg: Pkg, name: &'static str, family: Family) -> ClientClass {
     ClientClass { pkg, name, family }
@@ -655,8 +705,12 @@ const fn class(pkg: Pkg, name: &'static str, family: Family) -> ClientClass {
 /// one of those classes; the modules themselves are not followed (`import
 /// langchain_community.chat_models as cm`, a wildcard import from them).
 ///
-/// The deprecated LangChain modules re-export several providers' chat
-/// models; their OpenAI and Anthropic classes are tracked.
+/// - The deprecated LangChain modules re-export several providers' chat
+///   models; their OpenAI and Anthropic classes are tracked.
+/// - The OpenAI Agents SDK is imported as `agents`, which is also a common
+///   name for a repository's own package, so `import agents` and its other
+///   names are not followed; its classes live in submodules too
+///   (`agents.models.openai_responses`, `agents.extensions.models.litellm_model`).
 const REEXPORTS: &[(&str, &[Pkg])] = &[
     (
         "langchain_community.chat_models",
@@ -669,6 +723,7 @@ const REEXPORTS: &[(&str, &[Pkg])] = &[
         "langchain.chat_models",
         &[Pkg::LangchainLegacyOpenai, Pkg::LangchainLegacyAnthropic],
     ),
+    ("agents", &[Pkg::OpenaiAgents, Pkg::OpenaiAgentsLitellm]),
 ];
 
 /// The packages of the [`REEXPORTS`] module `module` is, or is a submodule
@@ -723,6 +778,10 @@ impl ClientClass {
             Family::AwsBedrock if matches!(base_url, BaseUrl::Unknown { .. }) => Routing::Unknown,
             Family::AwsBedrock if splat && base_url == BaseUrl::Absent => Routing::Unknown,
             Family::AwsBedrock => Routing::Bedrock,
+            // Refined from the model it is given (see `Ctx::agents_route`).
+            Family::AgentsDefault => Routing::OpenaiDirect,
+            Family::AgentsModel => Routing::Unknown,
+            Family::Litellm => Routing::Litellm,
             Family::OpenaiDirect => Routing::OpenaiDirect,
             Family::AnthropicDirect => Routing::AnthropicDirect,
             Family::Azure => Routing::AzureOpenai,
@@ -739,9 +798,12 @@ impl ClientClass {
     /// endpoint), so it is `unknown`.
     fn typed_routing(self) -> Routing {
         match self.family {
-            Family::OpenaiDirect | Family::AnthropicDirect | Family::Genai | Family::AwsBedrock => {
-                Routing::Unknown
-            }
+            Family::OpenaiDirect
+            | Family::AnthropicDirect
+            | Family::Genai
+            | Family::AwsBedrock
+            | Family::AgentsDefault
+            | Family::AgentsModel => Routing::Unknown,
             _ => self.routing(&[], false, BaseUrl::Absent),
         }
     }
@@ -787,6 +849,9 @@ fn is_endpoint_key(pkg: Pkg, key: &str) -> bool {
     match pkg {
         Pkg::Boto3 => key == "endpoint_url",
         Pkg::LangchainAws => key == "endpoint_url" || key == "base_url",
+        // An agent, a run or a model object built on a client takes no
+        // endpoint of its own.
+        Pkg::OpenaiAgents => false,
         _ => is_base_url_key(key),
     }
 }
@@ -826,6 +891,15 @@ fn value_keys(pkg: Pkg, receiver: Receiver) -> ValueKeys {
         }
         Pkg::LangchainAws => ValueKeys::Only(&["model_id", "model"]),
         _ => ValueKeys::DEFAULT,
+    }
+}
+
+/// The attributes that hold the model of what an agent framework's class of
+/// `pkg` builds, which a write after it is built changes.
+fn framework_model_fields(pkg: Pkg) -> &'static [&'static str] {
+    match pkg {
+        Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm => &["model"],
+        _ => &[],
     }
 }
 
@@ -1061,6 +1135,17 @@ enum ClientCaveat {
     /// A LangChain chat model given an SDK client or resource to send its
     /// requests through (`field`, one of [`LANGCHAIN_CLIENT_FIELDS`]).
     GivenClient { field: &'static str },
+    /// An Agents SDK model object given, as `field`, a client this file
+    /// does not resolve to one tracked SDK client.
+    UnresolvedClient { field: &'static str },
+    /// An Agents SDK agent or run whose model decides where its requests
+    /// go and is not a name this scan routes: not confirmed, a model
+    /// object it cannot follow, or (`prefixed`) a name whose provider
+    /// prefix is neither `openai/` nor `litellm/`.
+    ModelRoute { prefixed: bool },
+    /// The file sets the client or model provider the Agents SDK sends a
+    /// model name's requests through.
+    AgentsProvider(Feature),
 }
 
 /// A Python feature that can change what a name, attribute, dict or the
@@ -1200,7 +1285,10 @@ fn endpoint_env_vars(pkg: Pkg) -> &'static [&'static str] {
             "AWS_ENDPOINT_URL",
             "LANGSMITH_GATEWAY",
         ],
-        Pkg::Litellm => &[],
+        // The Agents SDK's default client reads the SDK's own variable; a
+        // model object routes like the client it is given.
+        Pkg::OpenaiAgents => &["OPENAI_BASE_URL"],
+        Pkg::Litellm | Pkg::OpenaiAgentsLitellm => &[],
     }
 }
 
@@ -2169,6 +2257,17 @@ struct Ctx<'t> {
     /// The file mentions LiteLLM's `model_alias_map`, which may map the
     /// model a LiteLLM call is given to another one.
     litellm_aliases: Option<Feature>,
+    /// The file sets the client or model provider the Agents SDK sends a
+    /// model name's requests through (see [`Ctx::note_agents_provider`]).
+    agents_provider: Option<Feature>,
+    /// The file builds a `RunConfig` with a model, which every agent it
+    /// runs uses instead of its own (see [`Ctx::note_agents_run_model`]).
+    agents_run_model: Option<Feature>,
+    /// What an Agents SDK construction (by call id) sends its requests
+    /// through, as built: the client a model object is given, or the model
+    /// object an agent or run is given. [`Ctx::reroute`] routes it at each
+    /// use, so a client re-routed after it is built re-routes both.
+    agents_via: HashMap<usize, Client>,
     /// Namespace builtins used as a value, by name (see
     /// [`Ctx::note_builtin_value`]).
     builtin_values: HashMap<&'t str, Feature>,
@@ -2329,6 +2428,9 @@ impl<'t> Ctx<'t> {
             openai_caveat: None,
             langchain_configurable: None,
             litellm_aliases: None,
+            agents_provider: None,
+            agents_run_model: None,
+            agents_via: HashMap::new(),
             builtin_values: HashMap::new(),
             member_values: HashSet::new(),
             method_self_writes: Vec::new(),
@@ -4974,7 +5076,7 @@ impl<'t> Ctx<'t> {
 
     fn record_import(&mut self, binding: Binding<'_>, node: Node<'t>) {
         // Only the SDK itself makes a bare `messages.create` its shape.
-        if !binding.pkg.is_langchain() {
+        if !binding.pkg.binds_model() {
             self.sdk_imported.insert(binding.pkg.sdk());
         }
         self.legacy_imported |= binding.pkg == Pkg::GoogleGenerativeai;
@@ -6758,6 +6860,15 @@ impl<'t> Ctx<'t> {
         if caveat.is_some() {
             routing = Routing::Unknown;
         }
+        // An Agents SDK agent, run or model object routes by the model or
+        // the client it is given, which keeps its own routing and caveat.
+        if let Some((given, given_caveat, via)) = self.agents_route(call, class, scope, &args) {
+            routing = given;
+            caveat = given_caveat;
+            if let Some(via) = via {
+                self.agents_via.insert(call.id(), via);
+            }
+        }
         if direct {
             match base_url {
                 BaseUrl::CustomFallback => {
@@ -6897,7 +7008,11 @@ impl<'t> Ctx<'t> {
     fn endpoint_env(&self, class: ClientClass, base_url: BaseUrl) -> Option<ClientCaveat> {
         if !matches!(
             class.family,
-            Family::OpenaiDirect | Family::AnthropicDirect | Family::Genai | Family::AwsBedrock
+            Family::OpenaiDirect
+                | Family::AnthropicDirect
+                | Family::Genai
+                | Family::AwsBedrock
+                | Family::AgentsDefault
         ) || base_url != BaseUrl::Absent
         {
             return None;
@@ -6907,6 +7022,135 @@ impl<'t> Ctx<'t> {
             .find(|var| self.env_writes.contains(**var))
             .map(|var| ClientCaveat::EndpointEnv { var })
             .or_else(|| self.env_wild.map(ClientCaveat::EnvWrite))
+    }
+
+    /// The model an Agents SDK agent or run is given: `model=`, or a run's
+    /// first positional argument (an agent's `model` is its ninth field,
+    /// which is not read by position).
+    fn agents_model_arg(&self, call: Node<'t>, class: ClientClass) -> Option<Node<'t>> {
+        let (positional, keywords) = call_arguments(call, |n| self.text(n));
+        keywords
+            .iter()
+            .find_map(|(key, value)| (key == "model").then_some(*value))
+            .or_else(|| {
+                (class.name == "RunConfig")
+                    .then(|| positional.first().copied())
+                    .flatten()
+            })
+    }
+
+    /// The Agents SDK model object `expr` evaluates to, as built, if any
+    /// (`OpenAIChatCompletionsModel(...)`, or a name bound to one).
+    fn agents_model_object(&mut self, expr: Node<'t>, scope: usize) -> Option<Client> {
+        match self.eval(expr, scope, 0) {
+            Val::Client { client, path } if path.is_empty() && client.pkg.is_agent_framework() => {
+                Some(client)
+            }
+            _ => None,
+        }
+    }
+
+    /// Where an Agents SDK class sends its requests, when that is not its
+    /// family's route, why it may not hold, and the client or model object
+    /// it goes through (see [`Ctx::agents_via`]); `None` keeps the
+    /// family's route. Read from the construction alone, so it does not
+    /// depend on when the construction is first evaluated: what the file
+    /// does to a client after building it is applied at each use.
+    ///
+    /// - An agent or run given a model object routes like that object. One
+    ///   given a model name sends it through the SDK's model provider,
+    ///   which picks the provider from the name's prefix: none or `openai/`
+    ///   is the SDK's default `AsyncOpenAI()` client (the family's route),
+    ///   `litellm/` is LiteLLM, and any other prefix is not followed. So a
+    ///   model this scan does not confirm, or a `**` expansion that may
+    ///   hold one, leaves the route unconfirmed, and so does a file that
+    ///   sets the SDK's client or model provider.
+    /// - A model object built on an OpenAI client (`openai_client=`, or its
+    ///   second positional argument) routes like that client when it is
+    ///   one tracked client; otherwise its route is not known.
+    fn agents_route(
+        &mut self,
+        call: Node<'t>,
+        class: ClientClass,
+        scope: usize,
+        args: &Args<'t>,
+    ) -> Option<(Routing, Option<ClientCaveat>, Option<Client>)> {
+        match class.family {
+            Family::AgentsDefault => {
+                let unconfirmed = Some((
+                    Routing::Unknown,
+                    Some(ClientCaveat::ModelRoute { prefixed: false }),
+                    None,
+                ));
+                let provider = self.agents_provider.map(|feature| {
+                    (
+                        Routing::Unknown,
+                        Some(ClientCaveat::AgentsProvider(feature)),
+                        None,
+                    )
+                });
+                let Some(model) = self.agents_model_arg(call, class) else {
+                    // `*args` hides a run's first argument, its model.
+                    if args.splat || (class.name == "RunConfig" && args.list_splat) {
+                        return unconfirmed;
+                    }
+                    // No model: the SDK's default model name.
+                    return provider;
+                };
+                if let Some(object) = self.agents_model_object(model, scope) {
+                    if object.ambiguous {
+                        return unconfirmed;
+                    }
+                    return Some((object.routing, object.caveat.clone(), Some(object)));
+                }
+                let name = match self.resolve_value(model, scope, 0) {
+                    Ok(resolved) if resolved.is_certain() => resolved.value,
+                    _ => return unconfirmed,
+                };
+                let prefixed = match name.split_once('/') {
+                    None | Some(("openai", _)) => None,
+                    Some(("litellm", _)) => Some(Routing::Litellm),
+                    Some(_) => {
+                        return Some((
+                            Routing::Unknown,
+                            Some(ClientCaveat::ModelRoute { prefixed: true }),
+                            None,
+                        ))
+                    }
+                };
+                provider.or(prefixed.map(|routing| (routing, None, None)))
+            }
+            Family::AgentsModel => {
+                let (positional, keywords) = call_arguments(call, |n| self.text(n));
+                let given = keywords
+                    .iter()
+                    .find_map(|(key, value)| (key == "openai_client").then_some(*value))
+                    .or_else(|| {
+                        (!args.list_splat)
+                            .then(|| positional.get(1).copied())
+                            .flatten()
+                    });
+                let client = given.and_then(|expr| match self.eval(expr, scope, 0) {
+                    Val::Client { client, path }
+                        if path.is_empty() && client.pkg == Pkg::Openai && !client.ambiguous =>
+                    {
+                        Some(client)
+                    }
+                    _ => None,
+                });
+                Some(match client {
+                    Some(client) => (client.routing, client.caveat.clone(), Some(client)),
+                    None => (
+                        Routing::Unknown,
+                        Some(ClientCaveat::UnresolvedClient {
+                            field: "openai_client",
+                        }),
+                        None,
+                    ),
+                })
+            }
+            _ => None,
+        }
     }
 
     /// The name a constructed client is assigned to, and how it is held.
@@ -6989,6 +7233,9 @@ impl<'t> Ctx<'t> {
             });
             return;
         }
+        // Before anything is evaluated: an agent's route, read where it is
+        // built, depends on it.
+        self.note_agents_provider();
         // Calls inside a scope nested past the cap are not analyzed.
         for (node, scope) in std::mem::take(&mut self.scope_cuts) {
             if self.records() >= MAX_FILE_RECORDS {
@@ -7051,6 +7298,7 @@ impl<'t> Ctx<'t> {
                 line: self.src[..at].matches('\n').count() as u32 + 1,
             });
         }
+        self.note_agents_run_model();
         for (call, scope) in self.calls.clone() {
             if self.records() >= MAX_FILE_RECORDS {
                 return self.truncate_file(call, scope);
@@ -7403,6 +7651,85 @@ impl<'t> Ctx<'t> {
             .or_insert_with(|| Self::feature("an SDK member replaced in this file", assign.object));
     }
 
+    /// Whether the file imports one of the Agents SDK's tracked classes.
+    fn imports_agents(&self) -> bool {
+        self.out
+            .imports
+            .iter()
+            .any(|i| i.package == Pkg::OpenaiAgents.package())
+    }
+
+    /// What in this file changes where the Agents SDK sends a model name's
+    /// requests: setting its default client (`set_default_openai_client(
+    /// ...)`, by that name or imported under another) or passing a
+    /// `model_provider=` anywhere (`RunConfig(model_provider=...)`, a run's
+    /// second positional argument, or an expansion given to a run, which
+    /// may hold it). Read from names
+    /// and imports alone, before anything is evaluated, since where an
+    /// agent is built reads it (see [`Ctx::agents_route`]). Only in a file
+    /// that imports one of the SDK's tracked classes.
+    fn note_agents_provider(&mut self) {
+        if !self.imports_agents() {
+            return;
+        }
+        for (call, scope) in self.calls.clone() {
+            let Some(function) = call.child_by_field_name("function") else {
+                continue;
+            };
+            let name = match function.kind() {
+                "identifier" => Some(function),
+                "attribute" => function.child_by_field_name("attribute"),
+                _ => None,
+            };
+            let named = |wanted: &str| name.is_some_and(|n| self.text(n) == wanted);
+            let sets_client = named("set_default_openai_client")
+                || (function.kind() == "identifier"
+                    && self
+                        .import_target(function, scope)
+                        .is_some_and(|target| target.ends_with(".set_default_openai_client")));
+            let args = self.arguments(call);
+            let provider = args.kwargs.iter().any(|k| k == "model_provider")
+                || (named("RunConfig") && (args.positional > 1 || args.list_splat || args.splat));
+            if sets_client || provider {
+                self.agents_provider = Some(Self::feature(
+                    "the Agents SDK's client or model provider set",
+                    call,
+                ));
+                return;
+            }
+        }
+    }
+
+    /// A `RunConfig` given a model (by keyword, by position or through an
+    /// expansion), which every agent it runs uses instead of its own. Only
+    /// in a file that imports one of the Agents SDK's tracked classes.
+    fn note_agents_run_model(&mut self) {
+        if !self.imports_agents() {
+            return;
+        }
+        for (call, scope) in self.calls.clone() {
+            let Some(function) = call.child_by_field_name("function") else {
+                continue;
+            };
+            let is_run = matches!(
+                self.eval(function, scope, 0),
+                Val::Class(class) if class.pkg == Pkg::OpenaiAgents && class.name == "RunConfig"
+            );
+            let args = self.arguments(call);
+            let given = args.kwargs.iter().any(|k| k == "model")
+                || args.positional > 0
+                || args.list_splat
+                || args.splat;
+            if is_run && given {
+                self.agents_run_model = Some(Self::feature(
+                    "a `RunConfig` that gives every agent it runs its model",
+                    call,
+                ));
+                return;
+            }
+        }
+    }
+
     /// `llm.configurable_fields(model_name=ConfigurableField(...))` or
     /// `llm.configurable_alternatives(...)`: which model a LangChain chat
     /// model's requests use may then be chosen at run time. The receiver is
@@ -7570,6 +7897,15 @@ impl<'t> Ctx<'t> {
     /// `client` with its routing unknown when a `base_url` is assigned to it
     /// after it is built.
     fn reroute(&self, mut client: Client) -> Client {
+        // An Agents SDK model object, or an agent or run given one, routes
+        // like what it was built on, as that is routed at this use.
+        if let Some(via) = client.site.and_then(|site| self.agents_via.get(&site)) {
+            let via = self.reroute(via.clone());
+            client.routing = via.routing;
+            client.caveat = via.caveat;
+            client.ambiguous |= via.ambiguous;
+            return client;
+        }
         // A legacy Gemini model object: `configure(client_options=...)`
         // routes every one of them.
         if client.pkg == Pkg::GoogleGenerativeai && client.caveat.is_none() && !client.ambiguous {
@@ -7650,7 +7986,9 @@ impl<'t> Ctx<'t> {
             | Pkg::LangchainLegacyOpenai
             | Pkg::LangchainLegacyAnthropic
             | Pkg::LangchainAws
-            | Pkg::Boto3 => Routing::Unknown,
+            | Pkg::Boto3
+            | Pkg::OpenaiAgents
+            | Pkg::OpenaiAgentsLitellm => Routing::Unknown,
             // `litellm.completion(...)`: LiteLLM picks the provider.
             Pkg::Litellm => Routing::Litellm,
         }
@@ -7765,10 +8103,20 @@ impl<'t> Ctx<'t> {
         let callee = self.eval(function, scope, 0);
         match callee {
             Val::Class(class) if class.pkg.binds_model() => {
-                // A LangChain chat model is built with the model its
-                // requests use, and routes by the client it builds.
+                // A LangChain chat model or an agent framework's model,
+                // agent or options are built with the model their requests
+                // use, and route by the client they build or are given.
                 let built = self.construction(call, class);
                 let built = self.reroute(built);
+                // An agent or run given a model object: that object's own
+                // construction carries the model.
+                if class.family == Family::AgentsDefault
+                    && self.agents_via.get(&call.id()).is_some_and(|via| {
+                        via.pkg.is_agent_framework()
+                    })
+                {
+                    return;
+                }
                 let receiver = if function.kind() == "attribute" {
                     Receiver::Module
                 } else {
@@ -7841,6 +8189,9 @@ impl<'t> Ctx<'t> {
                 };
                 self.record_call(call, function, scope, target);
             }
+            // What an agent framework builds configures a run: nothing
+            // called on it is recorded.
+            Val::Client { client, .. } if client.pkg.is_agent_framework() => {}
             Val::Client { client, path } if !path.is_empty() => {
                 let client = self.reroute(client);
                 let target = CallTarget {
@@ -8228,11 +8579,20 @@ impl<'t> Ctx<'t> {
         let sdk = target.pkg.sdk();
         let member = clip_owned(strip_wrappers(&target.member));
         let request = is_request_of(target.pkg, &member);
-        // Only LiteLLM's request functions are recorded for it.
-        let model_bearing = is_model_bearing(&member) || target.pkg == Pkg::Litellm;
+        // Only LiteLLM's request functions are recorded for it, and only an
+        // agent framework's classes that take a model for it.
+        let model_bearing = is_model_bearing(&member)
+            || target.pkg == Pkg::Litellm
+            || target.pkg.is_agent_framework();
         // Bedrock, LangChain's Bedrock models and LiteLLM need a model: none
-        // given is an error, not a default.
-        let default_model = !matches!(target.pkg, Pkg::Boto3 | Pkg::LangchainAws | Pkg::Litellm);
+        // given is an error, not a default. Of an agent framework's classes,
+        // only an agent falls back to a default model: a run given none
+        // keeps its agents' own, and a model object needs one.
+        let default_model = match target.pkg {
+            Pkg::Boto3 | Pkg::LangchainAws | Pkg::Litellm => false,
+            pkg if pkg.is_agent_framework() => DEFAULT_MODEL_CLASSES.contains(&member.as_str()),
+            _ => true,
+        };
 
         // An unresolved model matters where it reaches a request, a model
         // object, or any call on a client or SDK module; on an SDK type
@@ -8522,6 +8882,46 @@ impl<'t> Ctx<'t> {
                 });
             }
         }
+        // What an agent framework builds reads its model field when it runs
+        // too (`agent.model = ...` after it is built changes it), and an
+        // agent runs with the model a `RunConfig` gives every agent instead
+        // of its own. These gaps hold no key: they cover every value.
+        if target.pkg.is_agent_framework() {
+            let written = self.wild_attr_any.or_else(|| {
+                framework_model_fields(target.pkg)
+                    .iter()
+                    .find_map(|attr| self.outside_attr_writes.get(attr).copied())
+            });
+            let run = (target.pkg == Pkg::OpenaiAgents && member == "Agent")
+                .then_some(self.agents_run_model)
+                .flatten();
+            let changed = written
+                .map(|feature| {
+                    format!(
+                        "may be given another model after it is built ({})",
+                        feature.describe()
+                    )
+                })
+                .into_iter()
+                .chain(run.map(|feature| {
+                    format!("may run with another model ({})", feature.describe())
+                }));
+            for what in changed {
+                self.out.gaps.push(UsageGap {
+                    kind: GapKind::UnresolvedModel,
+                    sdk: Some(sdk),
+                    file: self.file.clone(),
+                    span: Some(span),
+                    symbol: symbol.clone(),
+                    chain: Some(chain.clone()),
+                    key: None,
+                    reason: "dynamic_feature".to_string(),
+                    detail: format!("`{chain}` {what}"),
+                    values: Vec::new(),
+                    values_complete: false,
+                });
+            }
+        }
 
         // `ChatBedrockConverse` sends a model given to a call on it instead
         // of its own; `ChatBedrock` does only when it runs on the Converse
@@ -8556,8 +8956,10 @@ impl<'t> Ctx<'t> {
         // process-wide `model_alias_map`, or through a `model_list` passed to
         // the call (or held by a `**` expansion), which maps a model name to
         // the deployment it calls. These gaps hold no key, so they cover
-        // every model value of the call, nested fallbacks included.
-        if target.pkg == Pkg::Litellm {
+        // every model value of the call, nested fallbacks included. The
+        // alias map applies wherever LiteLLM sends the request: through the
+        // Agents SDK's `LitellmModel` or a `litellm/` model name too.
+        if target.pkg == Pkg::Litellm || target.routing == Routing::Litellm {
             let mut remapped = Vec::new();
             if let Some(feature) = self.litellm_aliases {
                 remapped.push((
@@ -8575,8 +8977,8 @@ impl<'t> Ctx<'t> {
                 ));
             }
             // With no value to cover, the `splat` gap on the model above
-            // says it.
-            if opaque_splat && !values.is_empty() {
+            // says it. Only LiteLLM's own functions take a `model_list`.
+            if opaque_splat && !values.is_empty() && target.pkg == Pkg::Litellm {
                 remapped.push((
                     "splat",
                     format!("`{chain}` is given a `**` expansion that may hold a `model_list`, which maps the model names it is given to the deployments LiteLLM calls"),
@@ -8722,6 +9124,31 @@ impl<'t> Ctx<'t> {
                     "given_client",
                     format!(
                         "the LangChain chat model behind `{chain}` is given `{field}=`, an SDK client it sends its requests through, so where they go is decided by that client"
+                    ),
+                ),
+                ClientCaveat::UnresolvedClient { field } => (
+                    "given_client",
+                    format!(
+                        "`{chain}` sends its requests through the client given as `{field}`, which this file does not resolve to one SDK client, so where they go is not confirmed"
+                    ),
+                ),
+                ClientCaveat::ModelRoute { prefixed: true } => (
+                    "model_route",
+                    format!(
+                        "the Agents SDK sends a model name to the provider its prefix names, and the prefix of the model `{chain}` is given is neither `openai/` nor `litellm/`, so where its requests go is not confirmed"
+                    ),
+                ),
+                ClientCaveat::ModelRoute { prefixed: false } => (
+                    "model_route",
+                    format!(
+                        "the Agents SDK sends requests where the model it is given says (a model object, or a name's provider prefix such as `litellm/`), and the model of `{chain}` is not confirmed, so neither is its routing"
+                    ),
+                ),
+                ClientCaveat::AgentsProvider(feature) => (
+                    "given_client",
+                    format!(
+                        "{} in this file, which decides where the Agents SDK sends a model name's requests, so the routing of `{chain}` is not confirmed",
+                        feature.describe()
                     ),
                 ),
             };
@@ -10718,6 +11145,10 @@ fn positional_model_key(pkg: Pkg, receiver: Receiver, member: &str) -> Option<&'
         Pkg::GoogleGenerativeai => LEGACY_POSITIONAL_MODEL.contains(&last),
         // `litellm.completion("gpt-4o", messages)`.
         Pkg::Litellm => LITELLM_REQUESTS.contains(&last),
+        // `RunConfig("gpt-4o")`, `OpenAIChatCompletionsModel("gpt-4o",
+        // client)`, `LitellmModel("anthropic/...")`: the first field is
+        // the model. An agent's first field is its name.
+        Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm => last != "Agent",
         _ => false,
     };
     (positional && receiver != Receiver::Client).then_some("model")

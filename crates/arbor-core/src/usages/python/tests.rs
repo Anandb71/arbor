@@ -7667,3 +7667,207 @@ post("https://api.openai.com/v1/chat/completions", json={"model": "gpt-4o"})
     // `post` is the local class, not httpx's.
     assert!(found.calls.iter().all(|c| c.package != "httpx"));
 }
+
+// ---------------------------------------------------------------------------
+// Agent frameworks: the OpenAI Agents SDK
+// ---------------------------------------------------------------------------
+
+#[test]
+fn openai_agents_classes_carry_their_model_and_route_by_it() {
+    let found = usages(
+        r#"from agents import Agent, Runner, RunConfig, OpenAIChatCompletionsModel
+from agents.extensions.models.litellm_model import LitellmModel
+from openai import AsyncOpenAI
+
+MODEL = "gpt-4o-mini"
+
+triage = Agent(name="triage", instructions="x", model="gpt-4o")
+writer = Agent(name="writer", model=MODEL)
+plain = Agent(name="plain")
+routed = Agent(name="routed", model="litellm/anthropic/claude-3-5-sonnet-20240620")
+stripped = Agent(name="stripped", model="openai/gpt-4.1")
+odd = Agent(name="odd", model="any-llm/mistral/mistral-small")
+local = AsyncOpenAI(base_url="http://localhost:11434/v1")
+ollama = OpenAIChatCompletionsModel(model="llama3.1", openai_client=local)
+direct_model = OpenAIChatCompletionsModel("gpt-4.1", AsyncOpenAI())
+helper = Agent(name="helper", model=ollama)
+lite = LitellmModel("anthropic/claude-3-haiku-20240307")
+claude_agent = Agent(name="claude", model=lite)
+"#,
+    );
+    let import = |name: &str| found.imports.iter().find(|i| i.local == name).unwrap();
+    assert_eq!(import("Agent").package, "agents");
+    assert_eq!(import("Agent").sdk, Sdk::Openai);
+    assert_eq!(import("Agent").kind, BindingKind::ClientClass);
+    assert_eq!(import("LitellmModel").sdk, Sdk::Litellm);
+    // `Runner` is not tracked.
+    assert!(found.imports.iter().all(|i| i.local != "Runner"));
+
+    for line in [7, 8, 9, 10, 11, 12, 14, 15, 17] {
+        let c = call_on(&found, line);
+        assert_eq!(c.package, "agents", "{line}");
+        assert!(!c.request, "{line}");
+    }
+    assert_eq!(value(call_on(&found, 7), "model"), Some("gpt-4o"));
+    assert_eq!(call_on(&found, 7).routing, Routing::OpenaiDirect);
+    assert_eq!(call_on(&found, 7).sdk, Sdk::Openai);
+    assert_eq!(value(call_on(&found, 8), "model"), Some("gpt-4o-mini"));
+    // No model: the SDK's default model, which depends on its version.
+    assert_eq!(call_on(&found, 9).routing, Routing::OpenaiDirect);
+    assert_eq!(gaps_on(&found, 9), ["unresolved_model/missing_model"]);
+    // A name's prefix picks the provider.
+    assert_eq!(call_on(&found, 10).routing, Routing::Litellm);
+    assert_eq!(call_on(&found, 11).routing, Routing::OpenaiDirect);
+    assert_eq!(call_on(&found, 12).routing, Routing::Unknown);
+    assert_eq!(gaps_on(&found, 12), ["ambiguous_client/model_route"]);
+    // A model object routes like the client it is given.
+    assert_eq!(value(call_on(&found, 14), "model"), Some("llama3.1"));
+    assert_eq!(call_on(&found, 14).routing, Routing::CustomBaseUrl);
+    let positional = call_on(&found, 15);
+    assert_eq!(value(positional, "model"), Some("gpt-4.1"));
+    assert!(positional.values[0].positional);
+    assert_eq!(positional.routing, Routing::OpenaiDirect);
+    // An agent given a model object records no call of its own: the
+    // object carries the model. Its construction routes like the object.
+    assert!(found
+        .calls
+        .iter()
+        .all(|c| c.span.line != 16 && c.span.line != 18));
+    assert_eq!(routing_of(&found, "helper"), Routing::CustomBaseUrl);
+    assert_eq!(routing_of(&found, "claude_agent"), Routing::Litellm);
+    let lite = call_on(&found, 17);
+    assert_eq!(lite.sdk, Sdk::Litellm);
+    assert_eq!(lite.routing, Routing::Litellm);
+    assert_eq!(
+        value(lite, "model"),
+        Some("anthropic/claude-3-haiku-20240307")
+    );
+    // Only the agent without a model and the unknown prefix have gaps.
+    assert_eq!(found.gaps.len(), 2, "{:?}", found.gaps);
+}
+
+#[test]
+fn openai_agents_is_followed_only_through_its_classes() {
+    // `agents` is also a common name for a repository's own package.
+    let found = usages(
+        r#"import agents
+from agents import get_sql_agent, Runner
+from agents import *
+from .agents import Agent as LocalAgent
+from agents_arcade import Agent as ArcadeAgent
+
+agents.Agent(name="a", model="gpt-4o")
+get_sql_agent(model_id="claude-3-5-sonnet-20241022")
+LocalAgent(name="b", model="gpt-4o")
+ArcadeAgent(name="c", model="gpt-4o")
+Agent(name="d", model="gpt-4o")
+"#,
+    );
+    assert!(found.imports.is_empty(), "{:?}", found.imports);
+    assert!(found.calls.is_empty(), "{:?}", found.calls);
+    assert!(found.clients.is_empty());
+}
+
+#[test]
+fn openai_agents_routes_keep_gaps_for_what_may_send_them_elsewhere() {
+    let found = usages(
+        r#"import os
+from agents import Agent, OpenAIResponsesModel, set_default_openai_client as use_client
+from openai import AsyncOpenAI
+
+use_client(AsyncOpenAI(base_url="https://gateway.example.com/v1"))
+first = Agent(name="first", model="gpt-4o")
+"#,
+    );
+    assert_eq!(call_on(&found, 6).routing, Routing::Unknown);
+    assert_eq!(gaps_on(&found, 6), ["ambiguous_client/given_client"]);
+
+    let found = usages(
+        r#"import os
+from agents import Agent, OpenAIResponsesModel
+from openai import AsyncOpenAI
+
+os.environ["OPENAI_BASE_URL"] = "https://gateway.example.com/v1"
+env_routed = Agent(name="a", model="gpt-4o")
+from_env = Agent(name="b", model=os.getenv("AGENT_MODEL"))
+splat = Agent(name="c", **options)
+client = AsyncOpenAI()
+responses = OpenAIResponsesModel(model="gpt-4o", openai_client=client)
+client.base_url = "https://gateway.example.com/v1"
+
+
+def make(given):
+    return OpenAIResponsesModel(model="gpt-4o", openai_client=given)
+"#,
+    );
+    assert_eq!(call_on(&found, 6).routing, Routing::Unknown);
+    assert_eq!(gaps_on(&found, 6), ["ambiguous_client/endpoint_env"]);
+    // The model decides the route, so an unconfirmed one leaves it open.
+    assert_eq!(call_on(&found, 7).routing, Routing::Unknown);
+    let from_env = gaps_on(&found, 7);
+    assert!(from_env.contains(&"ambiguous_client/model_route".to_string()));
+    assert!(from_env.contains(&"unresolved_model/env_var".to_string()));
+    assert_eq!(call_on(&found, 8).routing, Routing::Unknown);
+    assert!(gaps_on(&found, 8).contains(&"ambiguous_client/model_route".to_string()));
+    // The client it is given is re-routed after it is built.
+    assert_eq!(call_on(&found, 10).routing, Routing::Unknown);
+    assert_eq!(gaps_on(&found, 10), ["ambiguous_client/base_url_assigned"]);
+    // A client this file does not resolve.
+    assert_eq!(call_on(&found, 15).routing, Routing::Unknown);
+    assert_eq!(gaps_on(&found, 15), ["ambiguous_client/given_client"]);
+
+    // A model provider given to a run, or a `**` expansion a run is given.
+    for run in [
+        "RunConfig(model_provider=MultiProvider())",
+        "RunConfig(None, provider)",
+        "RunConfig(**settings)",
+    ] {
+        let source = format!(
+            "from agents import Agent, RunConfig\nagent = Agent(name=\"a\", model=\"gpt-4o\")\nconfig = {run}\n"
+        );
+        let found = usages(&source);
+        assert_eq!(call_on(&found, 2).routing, Routing::Unknown, "{run}");
+        assert!(
+            gaps_on(&found, 2).contains(&"ambiguous_client/given_client".to_string()),
+            "{run}: {:?}",
+            found.gaps
+        );
+    }
+}
+
+#[test]
+fn an_openai_agent_may_run_with_another_model() {
+    for run in ["RunConfig(model=\"o3-mini\")", "RunConfig(\"o3-mini\")"] {
+        let source = format!(
+            "from agents import Agent, Runner, RunConfig
+
+agent = Agent(name=\"a\", model=\"gpt-4o\")
+Runner.run_sync(agent, \"hi\", run_config={run})
+"
+        );
+        let found = usages(&source);
+        // A run's model replaces every agent's: the agent's value is not
+        // confirmed, the run's is.
+        assert_eq!(value(call_on(&found, 3), "model"), Some("gpt-4o"), "{run}");
+        assert_eq!(
+            gaps_on(&found, 3),
+            ["unresolved_model/dynamic_feature"],
+            "{run}"
+        );
+        assert_eq!(value(call_on(&found, 4), "model"), Some("o3-mini"), "{run}");
+        assert!(gaps_on(&found, 4).is_empty(), "{run}");
+    }
+
+    let found = usages(
+        r#"from agents import Agent
+
+agent = Agent(name="a", model="gpt-4o")
+agent.model = "gpt-4o-mini"
+copy = agent.clone(model="o3-mini")
+tool = agent.as_tool(tool_name="t", tool_description="d")
+"#,
+    );
+    assert_eq!(gaps_on(&found, 3), ["unresolved_model/dynamic_feature"]);
+    // Nothing called on an agent is recorded.
+    assert_eq!(found.calls.len(), 1);
+}

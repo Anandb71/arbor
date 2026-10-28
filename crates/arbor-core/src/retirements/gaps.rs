@@ -172,7 +172,12 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     (
         GapKind::AmbiguousClient,
         "given_client",
-        "the LangChain chat model sends its requests through an SDK client it is given",
+        "the requests go through an SDK client or model provider the chat model, agent or model object is given",
+    ),
+    (
+        GapKind::AmbiguousClient,
+        "model_route",
+        "the Agents SDK picks where requests go from the model, which is not confirmed or names a provider Arbor does not follow",
     ),
     (
         GapKind::AmbiguousClient,
