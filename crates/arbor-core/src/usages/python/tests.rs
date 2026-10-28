@@ -1029,6 +1029,135 @@ def wrapped(messages):
     assert!(!serde_json::to_string(&plain).unwrap().contains("spreads"));
 }
 
+/// The `(name, keys, complete)` of each `**` expression of the call on
+/// `line`.
+fn spreads_on(found: &FileUsages, line: u32) -> Vec<(Option<String>, Vec<String>, bool)> {
+    found
+        .calls
+        .iter()
+        .find(|c| c.span.line == line)
+        .unwrap_or_else(|| panic!("no call on line {line}: {found:#?}"))
+        .spreads
+        .iter()
+        .map(|s| (s.name.clone(), s.keys.clone(), s.complete))
+        .collect()
+}
+
+#[test]
+fn a_spread_dict_key_is_recorded_whatever_it_is_called() {
+    // #291 round 3 review: `max_tokens` holds "token", so the secret-name
+    // filter dropped it from `keys` while the dict still read as complete:
+    // the call lost its max_tokens -> max_completion_tokens rename.
+    let found = usages(
+        r#"
+from openai import OpenAI
+
+client = OpenAI()
+GEN = {"temperature": 0.2, "max_tokens": 512, "api_key": KEY}
+ODD = {"max-tokens": 5}
+SHAPED = {"sk_live_51Habcdefghijklmnop": 1, "top_p": 0.5}
+
+def gen(messages):
+    return client.chat.completions.create(model="gpt-4o", messages=messages, **GEN)
+
+def inline(messages):
+    return client.chat.completions.create(model="gpt-4o", messages=messages, **{"max_tokens": 50})
+
+def odd(messages):
+    return client.chat.completions.create(model="gpt-4o", messages=messages, **ODD)
+
+def shaped(messages):
+    return client.chat.completions.create(model="gpt-4o", messages=messages, **SHAPED)
+"#,
+    );
+    let owned = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+    // Secret-sounding names are argument names: listed, and complete.
+    assert_eq!(
+        spreads_on(&found, 10),
+        [(
+            Some("GEN".into()),
+            owned(&["temperature", "max_tokens", "api_key"]),
+            true
+        )]
+    );
+    assert_eq!(
+        spreads_on(&found, 13),
+        [(None, owned(&["max_tokens"]), true)]
+    );
+    // A key that is not an identifier is not recorded: the dict is not
+    // read in full.
+    assert_eq!(
+        spreads_on(&found, 16),
+        [(Some("ODD".into()), Vec::new(), false)]
+    );
+    // Nor is a credential-shaped one, which is never repeated.
+    assert_eq!(
+        spreads_on(&found, 19),
+        [(Some("SHAPED".into()), owned(&["top_p"]), false)]
+    );
+    let json = serde_json::to_string(&found).unwrap();
+    assert!(!json.contains("sk_live"), "{json}");
+    for value in ["0.2", "512", "KEY", "0.5"] {
+        assert!(!json.contains(value), "{value} in {json}");
+    }
+}
+
+#[test]
+fn a_spread_dict_changed_after_it_is_built_is_not_complete() {
+    // #291 round 3 review: "(no change)" relies on `complete`, so a dict
+    // that is changed or passed on in its file must never be complete.
+    let found = usages(
+        r#"
+from openai import OpenAI
+
+client = OpenAI()
+
+def subscript(messages):
+    p = {"messages": messages}
+    p["temperature"] = 0.2
+    return client.chat.completions.create(model="gpt-4o", **p)
+
+def update(messages):
+    p = {"messages": messages}
+    p.update(temperature=0.2)
+    return client.chat.completions.create(model="gpt-4o", **p)
+
+def merged(messages):
+    p = {"messages": messages}
+    p |= {"temperature": 0.2}
+    return client.chat.completions.create(model="gpt-4o", **p)
+
+def passed(messages, helper):
+    p = {"messages": messages}
+    helper(p)
+    return client.chat.completions.create(model="gpt-4o", **p)
+
+def aliased(messages):
+    p = {"messages": messages}
+    q = p
+    q["temperature"] = 0.2
+    return client.chat.completions.create(model="gpt-4o", **p)
+
+def untouched(messages):
+    kept = {"messages": messages}
+    return client.chat.completions.create(model="gpt-4o", **kept)
+"#,
+    );
+    for line in [9, 14, 19, 24, 30] {
+        let spreads = spreads_on(&found, line);
+        assert_eq!(spreads.len(), 1, "line {line}: {spreads:?}");
+        let (name, _, complete) = &spreads[0];
+        assert_eq!(name.as_deref(), Some("p"), "line {line}");
+        assert!(!complete, "line {line}: a changed dict read as complete");
+    }
+    // A dict nothing changes is read. (A name changed anywhere in the file
+    // counts as changed everywhere in it, so this one has its own name.)
+    assert_eq!(
+        spreads_on(&found, 34),
+        [(Some("kept".into()), vec!["messages".to_string()], true)]
+    );
+}
+
 #[test]
 fn messages_create_counts_only_where_anthropic_is_imported() {
     let twilio = usages(

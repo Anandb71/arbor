@@ -102,10 +102,10 @@
 //! gap listing the values the callers pass.
 
 use super::{
-    is_capturable_value, is_credential_value, is_identifier_key, is_secret_key, is_value_key,
-    model_family, BindingKind, CallArgs, CapturedValue, ClientConstruction, ClientScope,
-    FileUsages, GapKind, Receiver, Routing, Sdk, SdkCall, SdkImport, Span, Spread, UsageGap,
-    ValueOrigin, VertexAi,
+    is_argument_name, is_capturable_value, is_credential_value, is_identifier_key, is_secret_key,
+    is_value_key, model_family, BindingKind, CallArgs, CapturedValue, ClientConstruction,
+    ClientScope, FileUsages, GapKind, Receiver, Routing, Sdk, SdkCall, SdkImport, Span, Spread,
+    UsageGap, ValueOrigin, VertexAi,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -1387,12 +1387,15 @@ struct DictSummary<'t> {
     expansion: Vec<(String, usize, Node<'t>)>,
     /// Part of the dict could not be read, or the expansion list was cut.
     opaque: bool,
-    /// Its identifier keys in the order Python sends them (first
-    /// occurrence), at most [`MAX_SPREAD_KEYS`]: the argument names a `**`
-    /// expansion of it passes.
+    /// Its string keys in the order Python sends them (first occurrence),
+    /// at most [`MAX_SPREAD_KEYS`]: the argument names a `**` expansion of
+    /// it passes. Secret-sounding names (`max_tokens`) are listed: they are
+    /// names, never values.
     keys: Vec<String>,
-    /// It has more identifier keys than `keys` lists.
-    keys_cut: bool,
+    /// It sends a key `keys` does not list: one past [`MAX_SPREAD_KEYS`],
+    /// or one that is not an argument name Arbor records (not an
+    /// identifier, or shaped like a credential).
+    keys_missing: bool,
 }
 
 impl DictSummary<'_> {
@@ -8984,12 +8987,13 @@ impl<'t> Ctx<'t> {
             };
             // Read once per dict: a large dict spread into many calls costs
             // at most [`MAX_SPREAD_KEYS`] names per call. A dict with more
-            // keys than that is one Arbor could not read in full.
+            // keys than that, or with a key it does not record, is one Arbor
+            // could not read in full.
             let summary = &expansion.summary;
             out.push(Spread {
                 name,
                 keys: summary.keys.clone(),
-                complete: !expansion.opaque() && !summary.keys_cut,
+                complete: !expansion.opaque() && !summary.keys_missing,
             });
         }
         out
@@ -9034,7 +9038,7 @@ impl<'t> Ctx<'t> {
             expansion: Vec::new(),
             opaque: false,
             keys: Vec::new(),
-            keys_cut: false,
+            keys_missing: false,
         };
         let entries = dict_entries(dict, |n| self.literal(n).ok(), |n| self.text(n));
         for (index, entry) in entries.into_iter().enumerate() {
@@ -9057,11 +9061,15 @@ impl<'t> Ctx<'t> {
                     summary.opaque = true;
                 }
             }
-            if is_identifier_key(&key) && !summary.last.contains_key(&key) {
-                if summary.keys.len() < MAX_SPREAD_KEYS {
-                    summary.keys.push(key.clone());
+            // Every key is an argument the expansion sends, whatever it is
+            // called: `max_tokens` must be checked like the call's own
+            // `max_tokens=`. A key that is not recorded leaves the dict
+            // unread in full, so the call never reads as fully checked.
+            if !summary.last.contains_key(&key) {
+                if !is_argument_name(&key) || summary.keys.len() >= MAX_SPREAD_KEYS {
+                    summary.keys_missing = true;
                 } else {
-                    summary.keys_cut = true;
+                    summary.keys.push(key.clone());
                 }
             }
             summary.last.insert(key, (index, value));
