@@ -7,7 +7,9 @@ models](#langchain-chat-models)), and where it calls models on Amazon Bedrock
 or through LiteLLM ([Amazon Bedrock and LiteLLM](#amazon-bedrock-and-litellm)),
 and where it posts JSON to OpenAI's or Anthropic's REST API with `requests` or
 `httpx` ([Raw HTTP requests](#raw-http-requests)), with each call's routing
-and model values. A consumer (a codemod, a reviewer)
+and model values. A directory scan also follows a call to a function or class
+in another file of the project that passes the model on to one of these
+([Calls through a wrapper in another file](#calls-through-a-wrapper-in-another-file)). A consumer (a codemod, a reviewer)
 should treat the report this way:
 
 - **A value or route with no gap at its call is confirmed.** It comes from one
@@ -517,6 +519,133 @@ Their argument names are the library's, and the scan reads only the model in
 the body, so only the checks about the model apply, with a check to review
 the body's other fields by hand.
 
+## Calls through a wrapper in another file
+
+A project often wraps the SDK once and calls the wrapper everywhere else:
+
+```python
+# evals/sampler.py
+class Sampler:
+    def __init__(self, model="o1-mini"):
+        self.client = OpenAI()
+        self.model = model
+
+    def __call__(self, messages):
+        return self.client.chat.completions.create(model=self.model, messages=messages)
+
+# evals/run.py
+from .sampler import Sampler
+
+SAMPLERS = {"o1": Sampler(model="o1"), "o3-mini": Sampler(model="o3-mini")}
+```
+
+The model that request sends is whatever each caller passes, and the callers
+are in another file. A directory scan (`arbor usages`, `arbor retirements`,
+`find_api_usages`) follows that one hop.
+
+**The wrapper.** In the file that defines it, a request's model key must be,
+unchanged, one of:
+
+- a parameter of a module-level function (`def ask(prompt, model): return
+  client.chat.completions.create(model=model, ...)`);
+- `self.attr`, read in a method of a module-level class whose one assignment
+  of `attr` (counting its same-file base and subclasses) is `self.attr =
+  <parameter>` in its own `__init__`.
+
+The parameter reaches the request only through that name: it is not
+reassigned and not wrapped in an expression (`model.lower()`). With a base
+class, `__init__` calls no `__init__` (`super().__init__(...)`,
+`Base.__init__(self)`) after the assignment, since a base class's constructor
+may set the attribute again.
+
+The function or class must meet all of these:
+
+- defined once at module level and bound by nothing else;
+- no decorator, on it or on its `__init__`;
+- for a class, no class keyword (`metaclass=...`), at most one base, no
+  `__new__`, and nothing that rebinds `__init__`;
+- not in a script (an extensionless file or `__main__.py`), which nothing
+  imports;
+- not in a file with a dynamic feature of the whole file (`exec`,
+  `globals()`...), a wildcard import, or a write to the module namespace with
+  a run-time name;
+- for a class, an attribute that no dynamic feature of the class may change.
+
+Only a keyword argument at the request counts. A model passed there by
+position or inside a `**` dict is not followed.
+
+The request may carry gaps from reading the parameter itself: its default
+(`parameter_default`, `parameter_overridden`, `unseen_callers`), what in-file
+callers pass, or `subclass_override`. A caller that passes the parameter
+replaces all of them. Any other model gap at the request means it may send
+something other than the parameter, so nothing is followed: a LangChain
+model's model written after it is built, LiteLLM's `model_alias_map`, a
+`model_list`. The wrapper file's own report does not change.
+
+**The import.** In the calling file, the callee is a name bound by `from module
+import name` (under any alias) alone, at the call, as `post` is bound for a raw
+HTTP request. An import inside a function counts. A name that is also
+assigned, is a parameter or is followed by a wildcard import is not followed.
+Neither is a module attribute (`import sampler` then `sampler.Sampler(...)`).
+
+The module is resolved against the scanned files:
+
+- A relative import (`.sampler`, `..llm.client`) starts from the calling
+  file's directory, one level up for each dot past the first.
+- An absolute import (`evals.sampler`) is the one module at that path under
+  the calling file's directory or under any directory above it, up to the
+  scan root. Python finds it there when that directory is on its path.
+- `a/b` is `a/b.py` or `a/b/__init__.py`, not both.
+
+When two modules could be meant, the import is not followed, nor is a path
+above the scan root or a file in a vendored or hidden directory. A package's
+`__init__.py` that re-exports the name (`from .sampler import Sampler`) is not
+followed to where the name is defined. A scan of a single file has no other
+files to resolve against.
+
+**The record.** A call that passes the parameter is recorded in the calling
+file as a call that binds the model, like `ChatOpenAI(...)`. The call record
+(`SdkCall`) has:
+
+- `request: false`, `chain` as written, `member` the function's name and
+  `receiver` `symbol`;
+- `kwargs` the call's own argument names;
+- `sdk`, `package` and `routing` those of the requests it reaches;
+- `wrapper`: the defining file, the function's name, and each request there
+  (`parameter`, `chain`, `member`, `line`).
+
+What the call passes is read under the value rules in the calling file, keyed
+by the request's model key:
+
+- a literal or a constant is confirmed;
+- a parameter default keeps its gap;
+- an environment lookup is a gap, with its fallback as `env_default`;
+- an argument through `*args` or `**kwargs` is a `splat` gap.
+
+A call that leaves the parameter out is not recorded: its default is
+reported, with its gap, where it is defined. The value's span is in the
+calling file, so a codemod edits the literal there.
+
+The route is the requests' when the wrapper's file confirms it and they all
+agree. Otherwise it is `unknown`, with an `ambiguous_client` gap whose reason
+is `wrapper_route`. The calling file adds its own gaps:
+
+- a `dynamic_feature` gap on the route when the file may rebind anything;
+- a `dynamic_feature` gap on the model of a class wrapper's call when the
+  file writes the attribute the class keeps the model in on another object
+  (`s.model = "gpt-4o"`) or writes attributes with run-time names.
+
+Writes in other files are not seen, as for any value.
+
+`arbor retirements` checks such a call on the schedule of its route, for the
+model only, since its arguments are the wrapper's. A review item names the
+function, its file and its request's line. Its endpoint is the one its
+requests share.
+
+Only one hop is followed. These are not: a wrapper that calls another
+wrapper, a class whose `__init__` is inherited, and `super().__init__(model=
+model)`.
+
 ## Dynamic features
 
 The collection pass looks for the following features in the same linear walk
@@ -631,7 +760,9 @@ its items are not listed.
 
 ## Outside the file
 
-Resolution is per file. Writes in other modules are not seen: another
+Resolution is per file, except for the one hop into a wrapper in another file
+([Calls through a wrapper in another file](#calls-through-a-wrapper-in-another-file)).
+Writes in other modules are not seen: another
 module may assign this module's constants or write a class's attributes from
 outside. Two kinds of outside change are part of a module's interface, so
 they keep a gap instead: a public function's parameter default
