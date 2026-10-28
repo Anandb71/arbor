@@ -140,8 +140,11 @@ const PREFILTER: &[&str] = &[
     "converse(",
     "converse_stream(",
     "litellm",
-    // The OpenAI Agents SDK's classes are imported from `agents`.
+    // The OpenAI Agents SDK's classes are imported from `agents`, the
+    // Claude Agent SDK's from `claude_agent_sdk` or `claude_code_sdk`.
     "agents",
+    "claude_agent_sdk",
+    "claude_code_sdk",
 ];
 
 /// Whether `source` mentions anything the extractor tracks. A file that does
@@ -419,6 +422,12 @@ enum Pkg {
     /// The Agents SDK's `LitellmModel`, which sends its requests through
     /// LiteLLM.
     OpenaiAgentsLitellm,
+    /// The Claude Agent SDK (`claude_agent_sdk`) and its earlier name, the
+    /// Claude Code SDK (`claude_code_sdk`): only their options and agent
+    /// definitions, which carry the model the Claude Code CLI they run
+    /// uses.
+    ClaudeAgentSdk,
+    ClaudeCodeSdk,
 }
 
 impl Pkg {
@@ -436,6 +445,7 @@ impl Pkg {
             Pkg::LangchainAws | Pkg::Boto3 => Sdk::Aws,
             Pkg::Litellm | Pkg::OpenaiAgentsLitellm => Sdk::Litellm,
             Pkg::OpenaiAgents => Sdk::Openai,
+            Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk => Sdk::Anthropic,
         }
     }
 
@@ -455,6 +465,8 @@ impl Pkg {
             Pkg::Boto3 => "boto3",
             Pkg::Litellm => "litellm",
             Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm => "agents",
+            Pkg::ClaudeAgentSdk => "claude_agent_sdk",
+            Pkg::ClaudeCodeSdk => "claude_code_sdk",
         }
     }
 
@@ -478,7 +490,13 @@ impl Pkg {
     /// use. Nothing called on what they build is recorded: those objects
     /// configure a run, they are not clients.
     fn is_agent_framework(self) -> bool {
-        matches!(self, Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm)
+        matches!(
+            self,
+            Pkg::OpenaiAgents
+                | Pkg::OpenaiAgentsLitellm
+                | Pkg::ClaudeAgentSdk
+                | Pkg::ClaudeCodeSdk
+        )
     }
 
     /// A package whose tracked classes are built with the model their
@@ -551,6 +569,8 @@ impl Pkg {
             (Some("langchain_aws"), _) => Pkg::LangchainAws,
             (Some("boto3"), _) => Pkg::Boto3,
             (Some("litellm"), _) => Pkg::Litellm,
+            (Some("claude_agent_sdk"), _) => Pkg::ClaudeAgentSdk,
+            (Some("claude_code_sdk"), _) => Pkg::ClaudeCodeSdk,
             _ => return None,
         };
         if matches!(pkg, Pkg::GoogleGenai | Pkg::GoogleGenerativeai) {
@@ -586,6 +606,10 @@ enum Family {
     /// A model object that sends its requests through LiteLLM
     /// (`LitellmModel`).
     Litellm,
+    /// Options or an agent definition for the Claude Code CLI, which sends
+    /// its requests to Anthropic's API unless its environment picks another
+    /// provider or endpoint (see [`CLAUDE_CODE_ENDPOINT_ENV`]).
+    ClaudeCode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -683,6 +707,15 @@ const CLASSES: &[ClientClass] = &[
         Family::AgentsModel,
     ),
     class(Pkg::OpenaiAgentsLitellm, "LitellmModel", Family::Litellm),
+    // The Claude Agent SDK's options and agent definitions, and the
+    // options of the Claude Code SDK it replaces.
+    class(
+        Pkg::ClaudeAgentSdk,
+        "ClaudeAgentOptions",
+        Family::ClaudeCode,
+    ),
+    class(Pkg::ClaudeAgentSdk, "AgentDefinition", Family::ClaudeCode),
+    class(Pkg::ClaudeCodeSdk, "ClaudeCodeOptions", Family::ClaudeCode),
 ];
 
 /// LiteLLM's functions that send a request; the first argument is the
@@ -690,9 +723,29 @@ const CLASSES: &[ClientClass] = &[
 const LITELLM_REQUESTS: &[&str] = &["completion", "acompletion"];
 
 /// An agent framework's classes that fall back to a default model when
-/// given none (`Agent(name="triage")`, which runs the SDK's default model
-/// unless a run gives it another), so that is a `missing_model` gap.
-const DEFAULT_MODEL_CLASSES: &[&str] = &["Agent"];
+/// given none, so that is a `missing_model` gap: `Agent(name="triage")`
+/// runs the SDK's default model unless a run gives it another, and Claude
+/// Code options with no model run the CLI's default (an agent definition
+/// with none runs its parent's).
+const DEFAULT_MODEL_CLASSES: &[&str] = &["Agent", "ClaudeAgentOptions", "ClaudeCodeOptions"];
+
+/// What the Claude Code CLI reads its provider or endpoint from: the
+/// provider switches (Bedrock, Vertex AI, Foundry...) and the endpoint
+/// overrides. The SDK runs the CLI with the process environment, and the
+/// options' `env=` on top of it.
+const CLAUDE_CODE_ENDPOINT_ENV: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_AWS_BASE_URL",
+];
 
 const fn class(pkg: Pkg, name: &'static str, family: Family) -> ClientClass {
     ClientClass { pkg, name, family }
@@ -782,6 +835,9 @@ impl ClientClass {
             Family::AgentsDefault => Routing::OpenaiDirect,
             Family::AgentsModel => Routing::Unknown,
             Family::Litellm => Routing::Litellm,
+            // Options that may pick another provider are routed by
+            // `Ctx::claude_endpoint_option`.
+            Family::ClaudeCode => Routing::AnthropicDirect,
             Family::OpenaiDirect => Routing::OpenaiDirect,
             Family::AnthropicDirect => Routing::AnthropicDirect,
             Family::Azure => Routing::AzureOpenai,
@@ -803,7 +859,8 @@ impl ClientClass {
             | Family::Genai
             | Family::AwsBedrock
             | Family::AgentsDefault
-            | Family::AgentsModel => Routing::Unknown,
+            | Family::AgentsModel
+            | Family::ClaudeCode => Routing::Unknown,
             _ => self.routing(&[], false, BaseUrl::Absent),
         }
     }
@@ -850,8 +907,9 @@ fn is_endpoint_key(pkg: Pkg, key: &str) -> bool {
         Pkg::Boto3 => key == "endpoint_url",
         Pkg::LangchainAws => key == "endpoint_url" || key == "base_url",
         // An agent, a run or a model object built on a client takes no
-        // endpoint of its own.
-        Pkg::OpenaiAgents => false,
+        // endpoint of its own, and the Claude Code CLI reads its endpoint
+        // from its environment.
+        Pkg::OpenaiAgents | Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk => false,
         _ => is_base_url_key(key),
     }
 }
@@ -890,6 +948,8 @@ fn value_keys(pkg: Pkg, receiver: Receiver) -> ValueKeys {
             ValueKeys::Only(&["model_id", "modelId"])
         }
         Pkg::LangchainAws => ValueKeys::Only(&["model_id", "model"]),
+        // The model the CLI falls back to when the first is overloaded.
+        Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk => ValueKeys::Plus(&["fallback_model"]),
         _ => ValueKeys::DEFAULT,
     }
 }
@@ -899,6 +959,7 @@ fn value_keys(pkg: Pkg, receiver: Receiver) -> ValueKeys {
 fn framework_model_fields(pkg: Pkg) -> &'static [&'static str] {
     match pkg {
         Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm => &["model"],
+        Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk => &["model", "fallback_model"],
         _ => &[],
     }
 }
@@ -1288,6 +1349,7 @@ fn endpoint_env_vars(pkg: Pkg) -> &'static [&'static str] {
         // The Agents SDK's default client reads the SDK's own variable; a
         // model object routes like the client it is given.
         Pkg::OpenaiAgents => &["OPENAI_BASE_URL"],
+        Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk => CLAUDE_CODE_ENDPOINT_ENV,
         Pkg::Litellm | Pkg::OpenaiAgentsLitellm => &[],
     }
 }
@@ -6843,7 +6905,10 @@ impl<'t> Ctx<'t> {
             base_url = BaseUrl::Unknown { env: false };
         }
         let mut routing = class.routing(&args.kwargs, args.splat, base_url);
-        let mut caveat = match self.genai_endpoint_option(call, class, &args) {
+        let option = self
+            .genai_endpoint_option(call, class, &args)
+            .or_else(|| self.claude_endpoint_option(call, class, &args));
+        let mut caveat = match option {
             Some(option) => Some(ClientCaveat::EndpointOption { option }),
             None => self.endpoint_env(class, base_url),
         };
@@ -7000,6 +7065,69 @@ impl<'t> Ctx<'t> {
         (!names_no_endpoint).then_some("`http_options=`")
     }
 
+    /// For Claude Code options: the option that may make the CLI send its
+    /// requests to another provider or endpoint, if any. `env=` counts
+    /// unless it is `None` or a dict literal whose keys are all strings,
+    /// none of them a variable the CLI reads its provider or endpoint from
+    /// ([`CLAUDE_CODE_ENDPOINT_ENV`]), with no `**` in it; `settings=` (a
+    /// settings file or JSON, whose `env` the CLI applies) counts unless it
+    /// is `None`, and so does a `**` expansion. An agent definition takes
+    /// none of these: it runs where its options do.
+    fn claude_endpoint_option(
+        &self,
+        call: Node<'t>,
+        class: ClientClass,
+        args: &Args<'t>,
+    ) -> Option<&'static str> {
+        if class.family != Family::ClaudeCode || class.name == "AgentDefinition" {
+            return None;
+        }
+        if args.splat {
+            return Some("a `**` expansion");
+        }
+        let text = |n: Node<'t>| self.text(n);
+        if let Some(env) = keyword_value(call, text, |k| k == "env") {
+            let names_no_endpoint = match env.kind() {
+                "none" => true,
+                "dictionary" => dict_entries(env, |n| self.literal(n).ok(), text)
+                    .iter()
+                    .all(|entry| {
+                        entry
+                            .as_ref()
+                            .is_some_and(|(k, _)| !CLAUDE_CODE_ENDPOINT_ENV.contains(&k.as_str()))
+                    }),
+                _ => false,
+            };
+            if !names_no_endpoint {
+                return Some("`env=`");
+            }
+        }
+        keyword_value(call, text, |k| k == "settings")
+            .is_some_and(|settings| settings.kind() != "none")
+            .then_some("`settings=`")
+    }
+
+    /// Whether Claude Code options' `extra_args=` may hold a model flag:
+    /// anything but `None` or a dict literal whose keys are all strings,
+    /// none of them `model` or `fallback-model`, with no `**` in it.
+    fn extra_args_may_set_model(&self, call: Node<'t>) -> bool {
+        let text = |n: Node<'t>| self.text(n);
+        let Some(extra) = keyword_value(call, text, |k| k == "extra_args") else {
+            return false;
+        };
+        match extra.kind() {
+            "none" => false,
+            "dictionary" => !dict_entries(extra, |n| self.literal(n).ok(), text)
+                .iter()
+                .all(|entry| {
+                    entry.as_ref().is_some_and(|(k, _)| {
+                        !matches!(k.as_str(), "model" | "fallback-model" | "fallback_model")
+                    })
+                }),
+            _ => true,
+        }
+    }
+
     /// Why a client built by `class` may not reach the endpoint its
     /// constructor names: when it names none (`base_url` absent or `None`),
     /// the SDK reads its endpoint variable, which this file sets
@@ -7013,6 +7141,7 @@ impl<'t> Ctx<'t> {
                 | Family::Genai
                 | Family::AwsBedrock
                 | Family::AgentsDefault
+                | Family::ClaudeCode
         ) || base_url != BaseUrl::Absent
         {
             return None;
@@ -7988,7 +8117,9 @@ impl<'t> Ctx<'t> {
             | Pkg::LangchainAws
             | Pkg::Boto3
             | Pkg::OpenaiAgents
-            | Pkg::OpenaiAgentsLitellm => Routing::Unknown,
+            | Pkg::OpenaiAgentsLitellm
+            | Pkg::ClaudeAgentSdk
+            | Pkg::ClaudeCodeSdk => Routing::Unknown,
             // `litellm.completion(...)`: LiteLLM picks the provider.
             Pkg::Litellm => Routing::Litellm,
         }
@@ -8684,6 +8815,9 @@ impl<'t> Ctx<'t> {
         // same-file dict.
         let mut model_list =
             target.pkg == Pkg::Litellm && args.kwargs.iter().any(|k| k == "model_list");
+        // Claude Code options given `extra_args` in an expanded same-file
+        // dict (by keyword, see below).
+        let mut extra_args_expanded = false;
         let mut expanded: Vec<usize> = Vec::new();
         // The model keys the expanded same-file dicts give.
         let mut expanded_keys: HashSet<&'static str> = HashSet::new();
@@ -8740,6 +8874,7 @@ impl<'t> Ctx<'t> {
             if target.pkg == Pkg::Litellm && expansion.summary.last.contains_key("model_list") {
                 model_list = true;
             }
+            extra_args_expanded |= expansion.summary.last.contains_key("extra_args");
             if target.pkg != Pkg::Boto3 {
                 let list = self.dict_nested(&expansion);
                 let deployments =
@@ -8921,6 +9056,30 @@ impl<'t> Ctx<'t> {
                     values_complete: false,
                 });
             }
+        }
+        // Claude Code options pass `extra_args` to the CLI as flags, so they
+        // may give it another `--model` or `--fallback-model`; so may a `**`
+        // expansion that holds them, or one this file cannot read.
+        let options = matches!(target.pkg, Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk)
+            && member != "AgentDefinition";
+        if options
+            && (self.extra_args_may_set_model(call) || extra_args_expanded || opaque_splat)
+        {
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::UnresolvedModel,
+                sdk: Some(sdk),
+                file: self.file.clone(),
+                span: Some(span),
+                symbol: symbol.clone(),
+                chain: Some(chain.clone()),
+                key: None,
+                reason: "reassigned".to_string(),
+                detail: format!(
+                    "`{chain}` is given `extra_args`, which the SDK passes to the Claude Code CLI as flags and which may give it another model, so which model it uses is not confirmed"
+                ),
+                values: Vec::new(),
+                values_complete: false,
+            });
         }
 
         // `ChatBedrockConverse` sends a model given to a call on it instead

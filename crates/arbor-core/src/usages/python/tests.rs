@@ -7871,3 +7871,128 @@ tool = agent.as_tool(tool_name="t", tool_description="d")
     // Nothing called on an agent is recorded.
     assert_eq!(found.calls.len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Agent frameworks: the Claude Agent SDK
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claude_agent_sdk_options_carry_the_model_the_cli_runs() {
+    let found = usages(
+        r#"import os
+import claude_agent_sdk as sdk
+from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition
+from claude_code_sdk import ClaudeCodeOptions
+
+MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
+
+plain = ClaudeAgentOptions(model="claude-sonnet-4-5", fallback_model="claude-haiku-4-5")
+aliased = sdk.ClaudeAgentOptions(model="sonnet")
+default = ClaudeAgentOptions(allowed_tools=["Read"])
+from_env = ClaudeAgentOptions(model=MODEL, env={"ANTHROPIC_API_KEY": key})
+old = ClaudeCodeOptions(model="claude-3-7-sonnet-20250219")
+reviewer = AgentDefinition(description="r", prompt="p", model="haiku")
+inherits = AgentDefinition(description="r", prompt="p")
+query(prompt="hi", options=plain)
+"#,
+    );
+    let import = |name: &str| found.imports.iter().find(|i| i.local == name).unwrap();
+    assert_eq!(import("sdk").kind, BindingKind::Module);
+    assert_eq!(import("ClaudeAgentOptions").sdk, Sdk::Anthropic);
+    assert_eq!(import("ClaudeCodeOptions").package, "claude_code_sdk");
+    // `query` sends nothing this scan reads: the options carry the model.
+    assert!(found.imports.iter().all(|i| i.local != "query"));
+
+    let lines: Vec<u32> = found.calls.iter().map(|c| c.span.line).collect();
+    assert_eq!(lines, vec![8, 9, 10, 11, 12, 13, 14]);
+    for c in &found.calls {
+        assert_eq!(c.sdk, Sdk::Anthropic, "{}", c.chain);
+        assert_eq!(c.routing, Routing::AnthropicDirect, "{}", c.chain);
+        assert!(!c.request, "{}", c.chain);
+    }
+    let plain = call_on(&found, 8);
+    assert_eq!(plain.package, "claude_agent_sdk");
+    assert_eq!(value(plain, "model"), Some("claude-sonnet-4-5"));
+    assert_eq!(value(plain, "fallback_model"), Some("claude-haiku-4-5"));
+    // An alias is reported as written: what it resolves to is the CLI's.
+    assert_eq!(value(call_on(&found, 9), "model"), Some("sonnet"));
+    // No model: the CLI's default model.
+    assert_eq!(gaps_on(&found, 10), ["unresolved_model/missing_model"]);
+    let from_env = call_on(&found, 11);
+    assert_eq!(value(from_env, "model"), Some("claude-sonnet-4-5-20250929"));
+    assert_eq!(from_env.values[0].origin, ValueOrigin::EnvDefault);
+    assert_eq!(gaps_on(&found, 11), ["unresolved_model/env_var"]);
+    assert_eq!(call_on(&found, 12).package, "claude_code_sdk");
+    assert_eq!(
+        value(call_on(&found, 12), "model"),
+        Some("claude-3-7-sonnet-20250219")
+    );
+    assert_eq!(value(call_on(&found, 13), "model"), Some("haiku"));
+    // An agent definition given no model runs its parent's.
+    assert!(gaps_on(&found, 14).is_empty());
+    // No credential reaches the output.
+    assert!(found.calls.iter().all(|c| c
+        .values
+        .iter()
+        .all(|v| !v.key.contains("API_KEY"))));
+}
+
+#[test]
+fn claude_agent_sdk_options_that_may_pick_another_provider_are_gaps() {
+    let found = usages(
+        r#"import os
+from claude_agent_sdk import ClaudeAgentOptions, AgentDefinition
+
+bedrock = ClaudeAgentOptions(model="claude-opus-4-1", env={"CLAUDE_CODE_USE_BEDROCK": "1"})
+gateway = ClaudeAgentOptions(model="claude-opus-4-1", env={"ANTHROPIC_BASE_URL": url})
+expanded = ClaudeAgentOptions(model="claude-opus-4-1", env={"X": "1", **extra})
+passed = ClaudeAgentOptions(model="claude-opus-4-1", env=environment)
+settings = ClaudeAgentOptions(model="claude-opus-4-1", settings="settings.json")
+splat = ClaudeAgentOptions(model="claude-opus-4-1", **options)
+no_env = ClaudeAgentOptions(model="claude-opus-4-1", env=None, settings=None)
+subagent = AgentDefinition(description="r", prompt="p", model="claude-opus-4-1", **more)
+flags = ClaudeAgentOptions(model="claude-opus-4-1", extra_args={"model": "claude-3-opus-20240229"})
+other_flags = ClaudeAgentOptions(model="claude-opus-4-1", extra_args={"verbose": None})
+FLAGS = {"extra_args": {"verbose": None}}
+expanded_flags = ClaudeAgentOptions(model="claude-opus-4-1", **FLAGS)
+"#,
+    );
+    for line in 4..=8 {
+        assert_eq!(call_on(&found, line).routing, Routing::Unknown, "{line}");
+        assert_eq!(
+            gaps_on(&found, line),
+            ["ambiguous_client/endpoint_option"],
+            "{line}"
+        );
+    }
+    // A `**` expansion may also hold `extra_args` (below).
+    assert_eq!(call_on(&found, 9).routing, Routing::Unknown);
+    let splat = gaps_on(&found, 9);
+    assert!(splat.contains(&"ambiguous_client/endpoint_option".to_string()));
+    assert!(splat.contains(&"unresolved_model/reassigned".to_string()));
+    assert_eq!(call_on(&found, 10).routing, Routing::AnthropicDirect);
+    assert!(gaps_on(&found, 10).is_empty());
+    // An agent definition runs where its options do.
+    assert_eq!(call_on(&found, 11).routing, Routing::AnthropicDirect);
+    // `extra_args` become CLI flags, which may set the model.
+    assert_eq!(gaps_on(&found, 12), ["unresolved_model/reassigned"]);
+    assert!(gaps_on(&found, 13).is_empty());
+    assert_eq!(call_on(&found, 15).routing, Routing::Unknown);
+    assert!(gaps_on(&found, 15).contains(&"unresolved_model/reassigned".to_string()));
+
+    // The CLI's provider switches and endpoints, set in the file.
+    let found = usages(
+        r#"import os
+from claude_agent_sdk import ClaudeAgentOptions
+
+os.environ["CLAUDE_CODE_USE_VERTEX"] = "1"
+options = ClaudeAgentOptions(model="claude-opus-4-1")
+options.model = "claude-sonnet-4-5"
+"#,
+    );
+    assert_eq!(call_on(&found, 5).routing, Routing::Unknown);
+    let gaps = gaps_on(&found, 5);
+    assert!(gaps.contains(&"ambiguous_client/endpoint_env".to_string()));
+    // A model written after the options are built.
+    assert!(gaps.contains(&"unresolved_model/dynamic_feature".to_string()));
+}
