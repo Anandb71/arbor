@@ -7588,6 +7588,8 @@ client.chat.completions.create(**PARAMS)
 fn a_replaced_post_or_a_dynamic_file_leaves_the_route_unconfirmed() {
     for (setup, reason) in [
         ("requests.post = fake_post", "dynamic_feature"),
+        ("setattr(requests, \"post\", fake_post)", "dynamic_feature"),
+        ("del requests.post", "dynamic_feature"),
         ("setattr(requests, name, fake)", "dynamic_feature"),
         ("exec(code)", "dynamic_feature"),
     ] {
