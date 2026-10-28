@@ -479,7 +479,9 @@ impl Pkg {
             Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm => "agents",
             Pkg::ClaudeAgentSdk => "claude_agent_sdk",
             Pkg::ClaudeCodeSdk => "claude_code_sdk",
-            Pkg::AgentscopeOpenai | Pkg::AgentscopeAnthropic | Pkg::AgentscopeGemini => "agentscope",
+            Pkg::AgentscopeOpenai | Pkg::AgentscopeAnthropic | Pkg::AgentscopeGemini => {
+                "agentscope"
+            }
         }
     }
 
@@ -8505,9 +8507,10 @@ impl<'t> Ctx<'t> {
                 // An agent or run given a model object: that object's own
                 // construction carries the model.
                 if class.family == Family::AgentsDefault
-                    && self.agents_via.get(&call.id()).is_some_and(|via| {
-                        via.pkg.is_agent_framework()
-                    })
+                    && self
+                        .agents_via
+                        .get(&call.id())
+                        .is_some_and(|via| via.pkg.is_agent_framework())
                 {
                     return;
                 }
@@ -9290,17 +9293,18 @@ impl<'t> Ctx<'t> {
             let run = (target.pkg == Pkg::OpenaiAgents && member == "Agent")
                 .then_some(self.agents_run_model)
                 .flatten();
-            let changed = written
-                .map(|feature| {
-                    format!(
-                        "may be given another model after it is built ({})",
-                        feature.describe()
-                    )
-                })
-                .into_iter()
-                .chain(run.map(|feature| {
-                    format!("may run with another model ({})", feature.describe())
-                }));
+            let changed =
+                written
+                    .map(|feature| {
+                        format!(
+                            "may be given another model after it is built ({})",
+                            feature.describe()
+                        )
+                    })
+                    .into_iter()
+                    .chain(run.map(|feature| {
+                        format!("may run with another model ({})", feature.describe())
+                    }));
             for what in changed {
                 self.out.gaps.push(UsageGap {
                     kind: GapKind::UnresolvedModel,
@@ -9322,9 +9326,7 @@ impl<'t> Ctx<'t> {
         // expansion that holds them, or one this file cannot read.
         let options = matches!(target.pkg, Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk)
             && member != "AgentDefinition";
-        if options
-            && (self.extra_args_may_set_model(call) || extra_args_expanded || opaque_splat)
-        {
+        if options && (self.extra_args_may_set_model(call) || extra_args_expanded || opaque_splat) {
             self.out.gaps.push(UsageGap {
                 kind: GapKind::UnresolvedModel,
                 sdk: Some(sdk),

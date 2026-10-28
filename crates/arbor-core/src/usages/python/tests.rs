@@ -7931,10 +7931,10 @@ query(prompt="hi", options=plain)
     // An agent definition given no model runs its parent's.
     assert!(gaps_on(&found, 14).is_empty());
     // No credential reaches the output.
-    assert!(found.calls.iter().all(|c| c
-        .values
+    assert!(found
+        .calls
         .iter()
-        .all(|v| !v.key.contains("API_KEY"))));
+        .all(|c| c.values.iter().all(|v| !v.key.contains("API_KEY"))));
 }
 
 #[test]
