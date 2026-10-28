@@ -556,7 +556,10 @@ The parameter reaches the request only through that name: it is not
 reassigned and not wrapped in an expression (`model.lower()`). With a base
 class, `__init__` calls no `__init__` (`super().__init__(...)`,
 `Base.__init__(self)`) after the assignment, since a base class's constructor
-may set the attribute again.
+may set the attribute again, and a same-file base class assigns the attribute
+nowhere (`def with_model(self, model): self.model = model`). A base class in
+another file is not read: like any write in another module, its methods may
+set the attribute unseen.
 
 The function or class must meet all of these:
 
@@ -628,12 +631,31 @@ calling file, so a codemod edits the literal there.
 
 The route is the requests' when the wrapper's file confirms it and they all
 agree. Otherwise it is `unknown`, with an `ambiguous_client` gap whose reason
-is `wrapper_route`. The calling file adds its own gaps:
+is `wrapper_route`. What the calling file does to the whole process can
+change it too, and then the route is `unknown` with a gap:
 
-- a `dynamic_feature` gap on the route when the file may rebind anything;
-- a `dynamic_feature` gap on the model of a class wrapper's call when the
-  file writes the attribute the class keeps the model in on another object
-  (`s.model = "gpt-4o"`) or writes attributes with run-time names.
+- `endpoint_env`: the file sets an endpoint variable the requests' SDK reads
+  (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`...; for a request through the
+  module-level OpenAI API also `OPENAI_API_BASE` and `OPENAI_API_TYPE`);
+- `module_config`: the file configures the module-level API
+  (`openai.base_url = ...`, `openai.api_type = "azure"`, the legacy Gemini
+  SDK's `configure`), and a request goes through it rather than through a
+  client;
+- `dynamic_feature`: the file writes the environment with a run-time name,
+  replaces part of the SDK, writes a `base_url` on an object it cannot
+  identify, or may rebind any name.
+
+The model can change after the call returns, which gives a `dynamic_feature`
+gap with no key:
+
+- a class wrapper keeps the model in an instance attribute, and the file
+  writes that attribute on another object (`s.model = "gpt-4o"`) or writes
+  attributes with run-time names;
+- a wrapper hands back a LangChain chat model it builds, and the file writes
+  its model field (`llm.model_name = ...`), writes attributes with run-time
+  names, or makes a model configurable (`configurable_fields(model_name=...)`,
+  `configurable_alternatives(...)`);
+- the request is LiteLLM's, and the file mentions `litellm.model_alias_map`.
 
 Writes in other files are not seen, as for any value.
 
