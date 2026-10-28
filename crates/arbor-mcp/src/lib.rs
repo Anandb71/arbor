@@ -605,7 +605,9 @@ impl McpServer {
                 None => {
                     return Self::err_envelope(
                         TOOL,
-                        &format!("unknown sdk '{name}': use openai, anthropic or google"),
+                        &format!(
+                            "unknown sdk '{name}': use openai, anthropic, google, aws or litellm"
+                        ),
                     )
                 }
             },
@@ -910,11 +912,11 @@ impl McpServer {
                 },
                 {
                     "name": "find_api_usages",
-                    "description": "Finds calls to the OpenAI, Anthropic and Gemini SDKs (Python files and Python shebang scripts today): each call with file, line, enclosing symbol, client routing (openai_direct, azure_openai, custom_base_url, anthropic_bedrock, anthropic_vertex, google_genai...) and the model IDs passed as string literals, same-file constants, dict literals or parameter defaults. A literal fallback of an env/config lookup is returned with origin env_default and the call keeps a gap: confirm it before acting. Also returns client constructions, typed gaps for what could not be resolved (models from env/config, unknown client factories, getattr) and what was skipped: counts on every page, and the first 20 vendored and hidden directories, oversized, unreadable and syntax-error files on the first page. Use INSTEAD of grep to find where a deprecated model or SDK is used. Reads files directly; does not need the graph. Never returns credential values: a value is refused when any name it flows through looks like a secret (key, token, secret, password, pwd, auth, credential, private) or the value itself is credential-shaped (sk-, AIza, ghp_, xox..., URLs with a user or password, long random tokens).",
+                    "description": "Finds calls to the OpenAI, Anthropic and Gemini SDKs, LangChain's OpenAI, Anthropic and Bedrock chat models (ChatOpenAI, AzureChatOpenAI, ChatAnthropic, ChatBedrock, ChatBedrockConverse: the constructor carries the model), Amazon Bedrock through boto3 (a bedrock-runtime client's converse/invoke_model, model in modelId) LiteLLM's completion/acompletion, and raw HTTP posts to the OpenAI and Anthropic REST APIs with requests.post/httpx.post (model read from the JSON body) (Python files and Python shebang scripts today): each call with file, line, enclosing symbol, client routing (openai_direct, azure_openai, custom_base_url, anthropic_bedrock, anthropic_vertex, google_genai, bedrock, litellm...) and the model IDs passed as string literals, same-file constants, dict literals or parameter defaults. A literal fallback of an env/config lookup is returned with origin env_default and the call keeps a gap: confirm it before acting. Also returns client constructions, typed gaps for what could not be resolved (models from env/config, unknown client factories, getattr) and what was skipped: counts on every page, and the first 20 vendored and hidden directories, oversized, unreadable and syntax-error files on the first page. Use INSTEAD of grep to find where a deprecated model or SDK is used. Reads files directly; does not need the graph. Never returns credential values: a value is refused when any name it flows through looks like a secret (key, token, secret, password, pwd, auth, credential, private) or the value itself is credential-shaped (sk-, AIza, ghp_, xox..., URLs with a user or password, long random tokens).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "sdk": { "type": "string", "enum": ["openai", "anthropic", "google"], "description": "Only this provider's SDK" },
+                            "sdk": { "type": "string", "enum": ["openai", "anthropic", "google", "aws", "litellm"], "description": "Only this provider's SDK (aws: boto3 and LangChain's Bedrock models)" },
                             "path": { "type": "string", "description": "Project-relative directory or file to scan (default: the whole project)" },
                             "offset": { "type": "integer", "description": "Pagination offset for usages (default: 0)", "default": 0 },
                             "limit": { "type": "integer", "description": "Max usages per page (default: 100)", "default": 100 },

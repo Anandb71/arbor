@@ -23,7 +23,7 @@ pub fn run(path: &str, sdk: Option<&str>, json: bool) -> Result<()> {
             None => {
                 return fail(
                     json,
-                    format!("unknown sdk '{name}': use openai, anthropic or google (or gemini)"),
+                    format!("unknown sdk '{name}': use openai, anthropic, google (or gemini), aws (or bedrock) or litellm"),
                 )
             }
         },
@@ -126,7 +126,7 @@ fn print_report(report: &UsageReport) {
     );
 
     if report.usages.is_empty() {
-        println!("\nNo OpenAI, Anthropic or Gemini SDK calls found.");
+        println!("\nNo OpenAI, Anthropic, Gemini, Bedrock or LiteLLM calls found.");
     }
     for sdk in Sdk::ALL {
         let calls: Vec<&SdkCall> = report.usages.iter().filter(|c| c.sdk == sdk).collect();
