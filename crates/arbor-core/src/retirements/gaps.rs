@@ -180,6 +180,11 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
         "this file may rebind the client or the SDK's configuration at run time",
     ),
     (
+        GapKind::AmbiguousClient,
+        "wrapper_route",
+        "the model goes through a function in another file whose requests go to more than one route, or to one that file does not confirm",
+    ),
+    (
         GapKind::UnknownClientFactory,
         "factory_call",
         "the client comes from a function Arbor does not follow",

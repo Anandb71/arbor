@@ -46,7 +46,7 @@ use super::{
 use super::{Date, ModelEntry};
 use crate::usages::{
     model_family, CapturedValue, ClientConstruction, GapKind, Routing, Sdk, SdkCall, UsageGap,
-    ValueOrigin, VertexAi,
+    ValueOrigin, VertexAi, WrapperCall,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1320,9 +1320,13 @@ fn finding_for(
             Some(call.chain.clone()),
             call.kwargs.clone(),
             call.splat,
-            // A parameter object's arguments are not the request's.
+            // A parameter object's arguments are not the request's; a call
+            // through a wrapper in another file is the requests it reaches.
             (kind != CallKind::RequestParam)
-                .then(|| endpoint_of(&call.chain, &call.member))
+                .then(|| match &call.wrapper {
+                    Some(wrapper) => wrapper_endpoint(wrapper),
+                    None => endpoint_of(&call.chain, &call.member),
+                })
                 .flatten(),
             kind,
         ),
@@ -1587,9 +1591,25 @@ fn finding_for(
 }
 
 /// What a call that is not the provider's own SDK goes through, as people
-/// say it: a LangChain chat model built or called (`LangChain
-/// (langchain_openai)`), LiteLLM, or Amazon Bedrock through boto3.
+/// say it: a function or class defined in another file of the scan
+/// (`` `Sampler` in evals/sampler.py (its request on line 9) ``), a
+/// LangChain chat model built or called (`LangChain (langchain_openai)`),
+/// LiteLLM, or Amazon Bedrock through boto3.
 fn wrapper_of(call: &SdkCall) -> Option<String> {
+    if let Some(wrapper) = &call.wrapper {
+        let mut lines: Vec<u32> = wrapper.requests.iter().map(|r| r.line).collect();
+        lines.sort_unstable();
+        lines.dedup();
+        let lines: Vec<String> = lines.iter().map(u32::to_string).collect();
+        let requests = match lines.as_slice() {
+            [line] => format!("its request on line {line}"),
+            _ => format!("its requests on lines {}", lines.join(", ")),
+        };
+        return Some(format!(
+            "`{}` in {} ({requests})",
+            wrapper.function, wrapper.file
+        ));
+    }
     let package = call.package.as_str();
     match package {
         "langchain" => Some(format!("LangChain ({package})")),
@@ -1598,6 +1618,17 @@ fn wrapper_of(call: &SdkCall) -> Option<String> {
         "boto3" => Some("Amazon Bedrock (boto3)".to_string()),
         _ => None,
     }
+}
+
+/// The endpoint of the requests a call through a wrapper reaches, when they
+/// all have the same one.
+fn wrapper_endpoint(wrapper: &WrapperCall) -> Option<&'static str> {
+    let mut endpoints = wrapper
+        .requests
+        .iter()
+        .map(|r| endpoint_of(&r.chain, &r.member));
+    let first = endpoints.next()??;
+    endpoints.all(|e| e == Some(first)).then_some(first)
 }
 
 /// The HTTP library a raw HTTP request to a provider's API is sent with
@@ -3469,6 +3500,82 @@ def claude():
         assert_eq!(
             at("requests.post(\"https://api.anthropic").status,
             State::Retired
+        );
+        assert_eq!(report.exit_code, 1);
+    }
+
+    #[test]
+    fn a_call_through_a_wrapper_in_another_file_is_checked_for_the_model() {
+        use crate::usages::{ModelParam, WrapperLookup};
+        struct Sampler(Vec<ModelParam>);
+        impl WrapperLookup for Sampler {
+            fn model_params(&self, module: &str, name: &str) -> Option<(String, Vec<ModelParam>)> {
+                (module == ".sampler" && name == "Sampler")
+                    .then(|| ("evals/sampler.py".to_string(), self.0.clone()))
+            }
+        }
+        let wrapper = r#"from openai import OpenAI
+
+class Sampler:
+    def __init__(self, model="gpt-4o"):
+        self.client = OpenAI()
+        self.model = model
+
+    def __call__(self, messages):
+        return self.client.chat.completions.create(model=self.model, messages=messages, max_tokens=256)
+"#;
+        let caller = r#"from .sampler import Sampler
+
+SAMPLERS = {
+    "old": Sampler(model="gpt-3.5-turbo"),
+    "o1": Sampler(model="o1"),
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::language())
+            .unwrap();
+        let tree = parser.parse(wrapper, None).unwrap();
+        let defined = crate::usages::python::extract(&tree, wrapper, "evals/sampler.py");
+        let lookup = Sampler(defined.model_params.clone());
+        let tree = parser.parse(caller, None).unwrap();
+        let found =
+            crate::usages::python::extract_with(&tree, caller, "evals/run.py", Some(&lookup));
+        let calls: Vec<SdkCall> = defined.calls.into_iter().chain(found.calls).collect();
+        let gaps: Vec<UsageGap> = defined.gaps.into_iter().chain(found.gaps).collect();
+        let clients: Vec<ClientConstruction> =
+            defined.clients.into_iter().chain(found.clients).collect();
+        let input = ScanInput {
+            calls: &calls,
+            gaps: &gaps,
+            clients: &clients,
+        };
+        let report = check(input, bundled().unwrap(), &options("2026-10-27"));
+        let old: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.file == "evals/run.py" && f.line == 4)
+            .collect();
+        assert_eq!(old.len(), 1, "{:#?}", report.findings);
+        let old = old[0];
+        assert_eq!(old.model, "gpt-3.5-turbo");
+        assert_eq!(old.status, State::Retired);
+        assert_eq!(old.routing_class, RoutingClass::Direct);
+        assert_eq!(old.confidence, Confidence::Confirmed);
+        assert_eq!(old.call_kind, CallKind::ModelBinding);
+        assert_eq!(old.endpoint, Some("chat.completions"));
+        assert!(old.fails);
+        // The request's arguments are the wrapper's business: only the
+        // model is checked, and the review says where the request is.
+        assert!(old.changes.is_empty(), "{:#?}", old.changes);
+        assert!(old.decisions.is_empty(), "{:#?}", old.decisions);
+        assert_eq!(old.fix, FixKind::Manual);
+        assert!(
+            old.review.iter().any(|r| r
+                .message
+                .contains("`Sampler` in evals/sampler.py (its request on line 9)")),
+            "{:#?}",
+            old.review
         );
         assert_eq!(report.exit_code, 1);
     }
