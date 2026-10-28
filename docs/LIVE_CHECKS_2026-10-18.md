@@ -46,7 +46,7 @@ bodies are under [The messages, verbatim](#the-messages-verbatim).
 
 | Check | Model | Status | Recorded | Supports in the bundled data |
 |---|---|---|---|---|
-| L-OAI-1 | `gpt-4o`, `gpt-4o-mini`, `gpt-4.1`, `gpt-4.1-mini` (aliases) | 200 | `"shutdown_date": "2027-01-14"` | The entries for the four aliases: retiring on 2027-01-14, replacement `gpt-6-luna`, `verified: live`. OpenAI's deprecations page lists only their dated snapshots. |
+| L-OAI-1 | `gpt-4o`, `gpt-4o-mini`, `gpt-4.1`, `gpt-4.1-mini` (aliases) | 200 | `"shutdown_date": "2027-01-14"` | The entries for the four aliases: retiring on 2027-01-14, replacement `gpt-6-luna`, `verified: live`. OpenAI's deprecations page lists only their dated snapshots; its Chat Completions API reference lists each alias as "Deprecated. Announced shutdown date: 2027-01-14" (read 28 October 2026). |
 | L-OAI-1 | `gpt-4o-2024-08-06`, `gpt-4o-2024-11-20`, `gpt-4o-mini-2024-07-18`, `gpt-4.1-2025-04-14`, `gpt-4.1-mini-2025-04-14` | 200 | `"shutdown_date": "2027-01-14"` | Their entries (2027-01-14, `verified: docs`): the API agrees with the page. |
 | L-OAI-1 | `gpt-4o-2024-05-13`, `gpt-3.5-turbo`, `gpt-4` | 200 | `"shutdown_date": "2026-10-23"` | Their entries (2026-10-23, `verified: docs`): the API agrees with the page. |
 | L-OAI-1 | `gpt-4-1106-preview` | 404 | `The model 'gpt-4-1106-preview' does not exist` ([E8](#e8-gpt-4-1106-preview-does-not-exist)) | The `gpt-4-1106-preview` entry: `status: shut_down`, `verified: live`, note `OpenAI lists 23 Oct 2026, but the API already answers 404 (checked 18 Oct 2026).` |

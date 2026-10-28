@@ -3,9 +3,11 @@
 AI providers retire models on fixed dates, and a request to a retired model fails.
 OpenAI's deprecations page lists five dated snapshots for shutdown on
 **14 January 2027**: `gpt-4o-2024-08-06`, `gpt-4o-2024-11-20`, `gpt-4o-mini-2024-07-18`,
-`gpt-4.1-2025-04-14` and `gpt-4.1-mini-2025-04-14`. The page doesn't list the bare
-`gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini`, but OpenAI's models API gave each
-of them the same date when we checked on 18 October 2026.
+`gpt-4.1-2025-04-14` and `gpt-4.1-mini-2025-04-14`. The page gives the bare `gpt-4o`,
+`gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` no row, but OpenAI's
+[API reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+lists each of them as "Deprecated. Announced shutdown date: 2027-01-14", and OpenAI's
+models API returned that date for each when we checked on 18 October 2026.
 `arbor retirements` finds the direct `openai`, `anthropic` and
 Google SDK calls in your code that use a model its provider has retired or is
 retiring. For each call it shows the replacement the provider lists, the other
