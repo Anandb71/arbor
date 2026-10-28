@@ -7895,6 +7895,8 @@ fn a_parameter_is_not_listed_where_the_extractor_cannot_confirm_it() {
         // The parameter is changed before the request.
         "def ask(model):\n    model = model or \"gpt-4o\"\n    return client.chat.completions.create(model=model)\n",
         "def ask(model):\n    return client.chat.completions.create(model=model.lower())\n",
+        "def ask(model):\n    if model:\n        def model():\n            pass\n    return client.chat.completions.create(model=model)\n",
+        "def ask(model):\n    if model:\n        class model:\n            pass\n    return client.chat.completions.create(model=model)\n",
         // The attribute is set twice, from something else, or again by a
         // base class's constructor.
         "class S:\n    def __init__(self, model):\n        self.model = model\n    def reset(self):\n        self.model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",

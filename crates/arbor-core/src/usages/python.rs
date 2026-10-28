@@ -8266,7 +8266,13 @@ impl<'t> Ctx<'t> {
             "identifier" => {
                 let name = self.text(expr);
                 let (key, defs) = self.defs_at(name, scope, expr.start_byte());
-                let only_param = defs.param && defs.assigns == 0 && !defs.imported;
+                // A `def` or `class` of the same name in the function rebinds
+                // it too, without counting as an assignment there.
+                let shadowed = self.functions.contains_key(&key)
+                    || self.classes_by_name.get(name).is_some_and(|classes| {
+                        classes.iter().any(|c| self.class_home(*c) == key.0)
+                    });
+                let only_param = defs.param && defs.assigns == 0 && !defs.imported && !shadowed;
                 (only_param && self.scopes[key.0].kind == ScopeKind::Function).then(|| {
                     ParamSource {
                         func: key.0,
