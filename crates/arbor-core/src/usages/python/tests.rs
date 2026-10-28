@@ -7074,6 +7074,51 @@ llm.invoke("hi", config={"metadata": {"model_id": "x"}})
     assert_eq!(invoke.routing, Routing::Bedrock);
     assert!(invoke.values.is_empty());
 
+    // A call on the built model may name the model the Converse API sends
+    // instead (`model_id=`, or `modelId=`); `model=` is not a parameter
+    // there. `ChatBedrock` sends it only when it runs on the Converse API.
+    let found = usages(
+        r#"
+from langchain_aws import ChatBedrock, ChatBedrockConverse
+llm = ChatBedrockConverse(model_id="anthropic.claude-3-5-sonnet-20240620-v1:0")
+
+def ask(q):
+    return llm.invoke(q, model_id="anthropic.claude-v2")
+
+def ask_any(q, **kw):
+    return llm.invoke(q, **kw)
+
+old = ChatBedrock(model_id="anthropic.claude-3-haiku-20240307-v1:0")
+old.invoke("hi", modelId="amazon.nova-pro-v1:0")
+llm.invoke("hi", model="amazon.nova-lite-v1:0")
+"#,
+    );
+    assert_eq!(
+        value(call_on(&found, 6), "model_id"),
+        Some("anthropic.claude-v2")
+    );
+    assert!(gaps_on(&found, 6).is_empty());
+    assert!(call_on(&found, 9).values.is_empty());
+    assert_eq!(
+        gaps_on(&found, 9),
+        vec!["unresolved_model/splat".to_string()]
+    );
+    let splat = gaps(&found, GapKind::UnresolvedModel)
+        .into_iter()
+        .find(|g| g.span.unwrap().line == 9)
+        .unwrap();
+    assert_eq!(splat.key.as_deref(), Some("model_id"));
+    assert_eq!(
+        value(call_on(&found, 12), "modelId"),
+        Some("amazon.nova-pro-v1:0")
+    );
+    assert_eq!(
+        gaps_on(&found, 12),
+        vec!["unresolved_model/conditional".to_string()]
+    );
+    assert!(call_on(&found, 13).values.is_empty());
+    assert!(gaps_on(&found, 13).is_empty());
+
     // Its requests read `model_id` when they are sent.
     let found = usages(
         "from langchain_aws import ChatBedrock\nllm = ChatBedrock(model_id=\"amazon.nova-pro-v1:0\")\nllm.model_id = pick()\n",

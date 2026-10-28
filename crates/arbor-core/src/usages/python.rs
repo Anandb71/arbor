@@ -799,16 +799,18 @@ impl ValueKeys {
 }
 
 /// The value keys of a call of `pkg`: `modelId` alone on a Bedrock
-/// client's requests, and `model_id` as well where a LangChain Bedrock
-/// model is built (`receiver` is not a client).
+/// client's requests; `model_id` and its alias `model` where a LangChain
+/// Bedrock model is built (`receiver` is not a client), which has no
+/// `model_name`, `engine` or `deployment_id` field; and `model_id` or
+/// `modelId` on a call on the built model, which the Converse API sends
+/// instead of the model's own (`llm.invoke(q, model_id=...)`).
 fn value_keys(pkg: Pkg, receiver: Receiver) -> ValueKeys {
     match pkg {
         Pkg::Boto3 => ValueKeys::Only(&["modelId"]),
-        // `ChatBedrock` and `ChatBedrockConverse` have no `model_name`,
-        // `engine` or `deployment_id` field.
-        Pkg::LangchainAws if receiver != Receiver::Client => {
-            ValueKeys::Only(&["model_id", "model"])
+        Pkg::LangchainAws if receiver == Receiver::Client => {
+            ValueKeys::Only(&["model_id", "modelId"])
         }
+        Pkg::LangchainAws => ValueKeys::Only(&["model_id", "model"]),
         _ => ValueKeys::DEFAULT,
     }
 }
@@ -6454,6 +6456,21 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// Whether every client this file builds on `line` (one, normally) was
+    /// built by `constructor` (`langchain_aws.ChatBedrockConverse`).
+    fn built_as(&self, line: Option<u32>, constructor: &str) -> bool {
+        let Some(line) = line else {
+            return false;
+        };
+        let mut built = self
+            .out
+            .clients
+            .iter()
+            .filter(|c| c.span.line == line)
+            .peekable();
+        built.peek().is_some() && built.all(|c| c.constructor == constructor)
+    }
+
     /// Whether calling the constructor `class` builds a client: always,
     /// except `boto3.client(...)`, which is followed only when its service
     /// name (its first argument or `service_name=`) resolves, with no gap,
@@ -7888,7 +7905,11 @@ impl<'t> Ctx<'t> {
             Pkg::LangchainAws => "model_id",
             _ => "model",
         };
-        if !keyed && opaque_splat && (request || model_bearing) {
+        // A call on a built LangChain Bedrock model may be given its model
+        // through `**` too.
+        let bedrock_model_call =
+            target.pkg == Pkg::LangchainAws && target.receiver == Receiver::Client;
+        if !keyed && opaque_splat && (request || model_bearing || bedrock_model_call) {
             let unresolved = Unresolved::new("splat", "**kwargs".to_string());
             self.unresolved_gap(&site, model_key, &unresolved, None);
         } else if !keyed && model_bearing && default_model && !args.list_splat {
@@ -7959,6 +7980,35 @@ impl<'t> Ctx<'t> {
                     key: model_key.clone(),
                     reason: reason.to_string(),
                     detail: format!("the LangChain chat model `{chain}` {what}"),
+                    values: Vec::new(),
+                    values_complete: false,
+                });
+            }
+        }
+
+        // `ChatBedrockConverse` sends a model given to a call on it instead
+        // of its own; `ChatBedrock` does only when it runs on the Converse
+        // API (`beta_use_converse_api`, decided where it is built), and
+        // otherwise sends its own.
+        if bedrock_model_call
+            && !values.is_empty()
+            && !self.built_as(target.client_line, "langchain_aws.ChatBedrockConverse")
+        {
+            let mut keys: Vec<String> = values.iter().map(|v| v.key.clone()).collect();
+            keys.dedup();
+            for key in keys {
+                self.out.gaps.push(UsageGap {
+                    kind: GapKind::UnresolvedModel,
+                    sdk: Some(sdk),
+                    file: self.file.clone(),
+                    span: Some(span),
+                    symbol: symbol.clone(),
+                    chain: Some(chain.clone()),
+                    detail: format!(
+                        "`{key}` for `{chain}` replaces the model only when `ChatBedrock` runs on the Converse API (`beta_use_converse_api`), so which model this call sends is not confirmed"
+                    ),
+                    key: Some(key),
+                    reason: "conditional".to_string(),
                     values: Vec::new(),
                     values_complete: false,
                 });

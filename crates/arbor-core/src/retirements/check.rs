@@ -778,6 +778,10 @@ enum Schedule {
     /// Routed or unknown: a router prefix names the schedule, else the
     /// model ID's shape, else the SDK's own provider.
     Guess,
+    /// A route whose provider keeps a schedule the data does not hold
+    /// (Amazon Bedrock): nothing is looked up, so no other provider's dates
+    /// are applied to its model IDs.
+    Unlisted,
 }
 
 /// The routing [`crate::usages`] decided. A `base_url` is already routed by
@@ -817,14 +821,14 @@ fn call_routing(
         Routing::GoogleGenerativeaiLegacy => {
             (RoutingClass::Direct, Schedule::One(Table::GeminiApi))
         }
-        // Bedrock keeps its own schedule, which the data does not hold, and
         // LiteLLM picks the provider from the model string.
         Routing::AzureOpenai
         | Routing::CustomBaseUrl
         | Routing::AnthropicBedrock
         | Routing::AnthropicVertex
-        | Routing::Bedrock
         | Routing::Litellm => (RoutingClass::Routed, Schedule::Guess),
+        // AWS keeps Bedrock's schedule, which the data does not hold.
+        Routing::Bedrock => (RoutingClass::Routed, Schedule::Unlisted),
         // The usage scan leaves a client built with `vertexai=True` or a
         // run-time value unrouted (an `endpoint_option` gap); the schedule
         // still follows what its constructor says.
@@ -1087,6 +1091,7 @@ fn resolve<'d>(
             hit.schedule_unconfirmed = true;
             return Some((hit, RoutingClass::Unknown));
         }
+        Schedule::Unlisted => return None,
         Schedule::Guess => {}
     }
     // Routed or unknown: a router prefix names the schedule, else the model
@@ -1097,6 +1102,17 @@ fn resolve<'d>(
             hit.match_kind = MatchKind::RouterPrefix;
             return Some((hit, RoutingClass::Routed));
         }
+    }
+    // LiteLLM sends a Gemini model named with no provider prefix to Vertex
+    // AI (`get_llm_provider`); only `gemini/<model>`, above, reaches the
+    // Gemini API.
+    if routing.sdk == Some(Sdk::Litellm) && model_family(value) == Some(Sdk::Google) {
+        let mut hit = lookup(data, Table::Vertex, value)?;
+        hit.notes.push(
+            "LiteLLM sends a Gemini model named with no provider prefix to Vertex AI, so this is Google Cloud's (Vertex AI) schedule; `gemini/<model>` would reach the Gemini API instead."
+                .to_string(),
+        );
+        return Some((hit, RoutingClass::Routed));
     }
     let table = model_family(value)
         .and_then(sdk_table)
@@ -3316,6 +3332,37 @@ routed = litellm.completion(model="anthropic/claude-3-5-sonnet-20241022", messag
         assert!(at("old = ").fails);
         assert_eq!(at("routed = ").match_kind, MatchKind::RouterPrefix);
         assert_eq!(report.exit_code, 1);
+
+        // LiteLLM sends a bare Gemini model to Vertex AI, and only
+        // `gemini/...` to the Gemini API; a Bedrock route looks nothing up,
+        // even a first-party ID Bedrock would reject.
+        let source = r#"import boto3
+import litellm
+
+bare = litellm.completion(model="gemini-3.7-flash", messages=[])
+prefixed = litellm.completion(model="gemini/gemini-3.7-flash", messages=[])
+brt = boto3.client("bedrock-runtime")
+first_party = brt.converse(modelId="claude-3-5-sonnet-20240620", messages=[])
+"#;
+        let report = check_source(source, &opts);
+        let at = |needle: &str| {
+            let line = line_of(source, needle);
+            report.routed.iter().find(|f| f.line == line)
+        };
+        let bare = at("bare = ").expect("a finding on Vertex AI's schedule");
+        assert_eq!(bare.provider, Table::Vertex);
+        assert_eq!(bare.status, State::Retiring);
+        assert!(
+            bare.notes
+                .iter()
+                .any(|n| n.contains("LiteLLM sends a Gemini model")),
+            "{:#?}",
+            bare.notes
+        );
+        let prefixed = at("prefixed = ").expect("a finding on the Gemini API's schedule");
+        assert_eq!(prefixed.provider, Table::GeminiApi);
+        assert_eq!(prefixed.status, State::AutoRouted);
+        assert!(at("first_party = ").is_none(), "{:#?}", report.routed);
 
         // LiteLLM may map a model, a fallback's included, to another one:
         // through `model_alias_map` or a `model_list`. Both are confirm
