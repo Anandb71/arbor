@@ -8030,3 +8030,14 @@ fn a_wrapper_call_is_recorded_only_through_its_import_alone() {
     assert_eq!(value(call_on(&found, 3), "model"), Some("o1"));
     assert_eq!(call_on(&found, 3).symbol.as_deref(), Some("build"));
 }
+
+#[test]
+fn a_function_wrapper_keeps_no_attribute_to_write() {
+    // `setattr(obj, name, v)` may write any attribute of anything: a
+    // class's model attribute, but a function keeps its model in none.
+    let caller = "from .sampler import Sampler, ask\nsetattr(obj, name, value)\nask(\"hi\", model=\"o1\")\nSampler(model=\"o1\")\n";
+    let found = through(SAMPLER, ".sampler", caller);
+    assert_eq!(value(call_on(&found, 3), "model"), Some("o1"));
+    assert!(gaps_on(&found, 3).is_empty(), "{:?}", gaps_on(&found, 3));
+    assert_eq!(gaps_on(&found, 4), ["unresolved_model/dynamic_feature"]);
+}

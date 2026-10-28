@@ -8554,15 +8554,22 @@ impl<'t> Ctx<'t> {
             return;
         }
 
-        // The class keeps the model in an instance attribute, which this
-        // file may write after it is built.
-        let written = self.wild_attr_any.or_else(|| {
-            wrapper
-                .params
-                .iter()
-                .filter_map(|p| p.attribute.as_deref())
-                .find_map(|attr| self.outside_attr_writes.get(attr).copied())
-        });
+        // A class keeps the model in an instance attribute, which this file
+        // may write after it is built.
+        let attrs: Vec<&str> = wrapper
+            .params
+            .iter()
+            .filter_map(|p| p.attribute.as_deref())
+            .collect();
+        let written = if attrs.is_empty() {
+            None
+        } else {
+            self.wild_attr_any.or_else(|| {
+                attrs
+                    .iter()
+                    .find_map(|attr| self.outside_attr_writes.get(attr).copied())
+            })
+        };
         if let Some(feature) = written {
             self.out.gaps.push(UsageGap {
                 kind: GapKind::UnresolvedModel,
