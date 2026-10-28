@@ -1413,7 +1413,9 @@ fn arguments_that_need_reasoning_off_are_never_no_change() {
         "{text}"
     );
     // Named as the code names them (`**options`), not "**kwargs".
-    let unseen = "decide: keep reasoning off (add reasoning_effort=\"none\") or let the model reason (could not check the arguments from **options)";
+    // Each option names them: an unseen `max_tokens` or `stop` returns 400
+    // with reasoning off too (#291 round 3 review).
+    let unseen = "decide: keep reasoning off (add reasoning_effort=\"none\"; could not check the arguments from **options) or let the model reason (could not check the arguments from **options)";
     assert_eq!(text.matches(unseen).count(), 2, "{text}");
     assert!(
         text.contains(
@@ -1422,7 +1424,7 @@ fn arguments_that_need_reasoning_off_are_never_no_change() {
         "{text}"
     );
     assert!(
-        text.contains("decide: keep reasoning off (add reasoning_effort=\"none\") or let the model reason (could not check the arguments in extra_body)"),
+        text.contains("decide: keep reasoning off (add reasoning_effort=\"none\"; could not check the arguments in extra_body) or let the model reason (could not check the arguments in extra_body)"),
         "{text}"
     );
     assert!(
@@ -1708,7 +1710,7 @@ fn no_option_reads_no_change_next_to_a_check_line_that_says_otherwise() {
         "check: Non-default temperature, top_p or top_k return 400 on claude-sonnet-5-5",
         "decide: keep reasoning off (add reasoning_effort=\"none\"; check stop) or let the model reason (check stop)",
         "decide: keep reasoning off (add reasoning_effort=\"none\"; keep temperature) or let the model reason (remove temperature)",
-        "decide: keep reasoning off (add reasoning_effort=\"none\") or let the model reason (could not check the arguments from **settings.llm_options)",
+        "decide: keep reasoning off (add reasoning_effort=\"none\"; could not check the arguments from **settings.llm_options) or let the model reason (could not check the arguments from **settings.llm_options)",
         "check: Some arguments come from `**settings.llm_options`, so Arbor could not check them all.",
     ] {
         assert!(text.contains(line), "missing {line:?} in\n{text}");
@@ -1729,4 +1731,125 @@ fn no_option_reads_no_change_next_to_a_check_line_that_says_otherwise() {
         markdown.contains("let the model think (check temperature)"),
         "{markdown}"
     );
+}
+
+/// The round-3 review's cases on #291: `max_tokens` in a same-file `**`
+/// dict, a dict changed after it is built, `seed` and `n` (checked on
+/// gpt-6-luna only with reasoning off), and `logit_bias` on the Responses
+/// API (checked on Chat Completions only).
+const ROUND_3_REVIEW: &str = r#"from openai import OpenAI
+
+client = OpenAI()
+
+GEN = {"temperature": 0.2, "max_tokens": 512}
+LIMITS = {"max_tokens": 50}
+
+
+def generate(messages):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, **GEN)
+
+
+def limited(messages):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, **LIMITS)
+
+
+def limited_at_call(messages):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=50)
+
+
+def changed(messages):
+    p = {"messages": messages}
+    p["temperature"] = 0.2
+    return client.chat.completions.create(model="gpt-4o-mini", **p)
+
+
+def seeded(messages):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, seed=1)
+
+
+def several(messages):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, n=2)
+
+
+def respond_biased(text):
+    return client.responses.create(model="gpt-4o-mini", input=text, logit_bias={"1": 2})
+"#;
+
+#[test]
+fn a_spread_max_tokens_an_untested_seed_and_a_changed_dict_are_never_all_clear() {
+    let dir = project(ROUND_3_REVIEW);
+    let (_, report) = run_json(dir.path(), &[]);
+    let at = |symbol: &str| -> Value {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["symbol"] == symbol)
+            .cloned()
+            .unwrap_or_else(|| panic!("no finding for {symbol}: {report:#}"))
+    };
+    let option = |symbol: &str, id: &str| -> Value {
+        at(symbol)["decisions"][0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no option {id} for {symbol}"))
+    };
+    let json = |names: &[&str]| serde_json::json!(names);
+
+    // `max_tokens` in `**GEN` is renamed like one written at the call, and
+    // the dict's temperature is kept or removed.
+    let generate = at("generate");
+    assert_eq!(
+        generate["changes"][0]["param"], "max_tokens",
+        "{generate:#}"
+    );
+    assert_eq!(generate["changes"][0]["to"], "max_completion_tokens");
+    assert!(generate["decisions"][0].get("unchecked_args").is_none());
+    assert_eq!(
+        option("generate", "model_default")["remove"],
+        json(&["temperature"])
+    );
+    // `**LIMITS` reads exactly as `max_tokens=50` at the call.
+    assert_eq!(at("limited")["changes"], at("limited_at_call")["changes"]);
+    assert_eq!(
+        at("limited")["decisions"],
+        at("limited_at_call")["decisions"]
+    );
+    // A dict changed after it is built is named, not read.
+    let changed = &at("changed")["decisions"][0];
+    assert_eq!(changed["unchecked_args"], "splat", "{changed:#}");
+    assert_eq!(changed["unread_spreads"], json(&["p"]));
+    // seed and n were accepted on gpt-6-luna only with reasoning off.
+    for (symbol, arg) in [("seeded", "seed"), ("several", "n")] {
+        assert_eq!(
+            option(symbol, "model_default")["unverified"],
+            json(&[arg]),
+            "{symbol}"
+        );
+        assert!(option(symbol, "reasoning_none").get("unverified").is_none());
+    }
+
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    assert_eq!(
+        text.matches("also change: max_tokens → max_completion_tokens")
+            .count(),
+        3,
+        "{text}"
+    );
+    for line in [
+        "decide: keep reasoning off (add reasoning_effort=\"none\"; keep temperature) or let the model reason (remove temperature)",
+        "decide: keep reasoning off (add reasoning_effort=\"none\"; could not check the arguments from **p) or let the model reason (could not check the arguments from **p)",
+        "decide: keep reasoning off (add reasoning_effort=\"none\") or let the model reason (could not check seed)",
+        "decide: keep reasoning off (add reasoning_effort=\"none\") or let the model reason (could not check n)",
+        "decide: keep reasoning off (add reasoning={\"effort\": \"none\"}; could not check logit_bias) or let the model reason (could not check logit_bias)",
+        "check: stop and logit_bias are not supported on gpt-6-luna (400). Seen on Chat Completions only; the Responses API was not checked.",
+    ] {
+        assert!(text.contains(line), "missing {line:?} in\n{text}");
+    }
+    // Only the two max_tokens-only calls, read in full, need nothing else
+    // for letting the model reason.
+    assert_eq!(text.matches("(no change)").count(), 2, "{text}");
 }

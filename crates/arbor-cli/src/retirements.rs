@@ -388,13 +388,12 @@ fn describe_decision(decision: &Decision, code: bool) -> String {
             if !option.unverified.is_empty() {
                 edits.push(format!("could not check {}", option.unverified.join(", ")));
             }
-            // An option that adds nothing relies on what the call does not
-            // send: when Arbor could not read every argument, it cannot say
-            // the call needs no change.
-            if option.add.is_empty() {
-                if let Some(unchecked) = decision.unchecked_args {
-                    edits.push(unchecked_clause(unchecked, &decision.unread_spreads, code));
-                }
+            // When Arbor could not read every argument, no option's edits are
+            // complete: an unseen `max_tokens` or `stop` returns 400 with
+            // reasoning off too, and an unseen `temperature` must go when
+            // the model reasons. Like a check line, it holds either way.
+            if let Some(unchecked) = decision.unchecked_args {
+                edits.push(unchecked_clause(unchecked, &decision.unread_spreads, code));
             }
             if edits.is_empty() {
                 edits.push("no change".to_string());
