@@ -632,6 +632,107 @@ fn chained_replacements_and_fine_tunes_read_plainly() {
     );
 }
 
+fn git(dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn diff_prints_only_the_plain_swaps_and_writes_nothing() {
+    let dir = project(SWAPS);
+    let output = arbor(
+        dir.path(),
+        &["retirements", ".", "--diff", "--today", TODAY],
+    );
+    // The exit code is the check's: claude-3-haiku is already retired.
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("app.py")).unwrap(),
+        SWAPS,
+        "--diff writes no file"
+    );
+    let patch = stdout(&output);
+    assert!(
+        patch.starts_with("--- a/app.py\n+++ b/app.py\n@@ "),
+        "{patch}"
+    );
+    let lines = |sign: char| -> Vec<&str> {
+        patch
+            .lines()
+            .filter(|l| l.starts_with(sign) && !l.starts_with("---") && !l.starts_with("+++"))
+            .collect()
+    };
+    assert_eq!(
+        lines('+'),
+        [
+            r#"+    return client.chat.completions.create(model="gpt-5.6-sol", max_completion_tokens=100, messages=[])"#,
+            "+    return claude.messages.create(model='claude-haiku-4-5-20251001', max_tokens=10, messages=[])",
+        ]
+    );
+    assert_eq!(
+        lines('-'),
+        [
+            r#"-    return client.chat.completions.create(model="o3-mini", max_tokens=100, messages=[])"#,
+            "-    return claude.messages.create(model='claude-3-haiku-20240307', max_tokens=10, messages=[])",
+        ]
+    );
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("Diff: 2 calls swapped in 1 file."),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Left out 3 calls: 1 needs a choice this repository makes first, 1 takes its model from a constant or a default (other code may read it too) and 1 needs an argument added."),
+        "{stderr}"
+    );
+
+    // The patch applies, and what is left needs a decision or a person.
+    fs::write(dir.path().join("fix.patch"), &patch).unwrap();
+    git(dir.path(), &["init", "-q"]);
+    // Line ends as in the patch, whatever this machine's git config says.
+    git(
+        dir.path(),
+        &["-c", "core.autocrlf=false", "apply", "fix.patch"],
+    );
+    let fixed = fs::read_to_string(dir.path().join("app.py")).unwrap();
+    assert_eq!(
+        fixed,
+        SWAPS
+            .replace(
+                r#"model="o3-mini", max_tokens=100"#,
+                r#"model="gpt-5.6-sol", max_completion_tokens=100"#
+            )
+            .replace("'claude-3-haiku-20240307'", "'claude-haiku-4-5-20251001'")
+    );
+    fs::remove_file(dir.path().join("fix.patch")).unwrap();
+    let again = arbor(
+        dir.path(),
+        &["retirements", ".", "--diff", "--today", TODAY],
+    );
+    assert_eq!(again.status.code(), Some(0), "nothing retired is left");
+    assert_eq!(stdout(&again), "");
+    assert!(String::from_utf8_lossy(&again.stderr).contains("No plain model swaps to make."));
+
+    // --quiet keeps only the patch; --diff never mixes with other formats.
+    let quiet = arbor(
+        dir.path(),
+        &["retirements", ".", "--diff", "--quiet", "--today", TODAY],
+    );
+    assert!(quiet.stderr.is_empty(), "{:?}", quiet.stderr);
+    for other in ["--json", "--markdown", "--annotations"] {
+        let output = arbor(dir.path(), &["retirements", ".", "--diff", other]);
+        assert_eq!(output.status.code(), Some(2), "--diff {other}");
+    }
+}
+
 #[test]
 fn exit_codes_follow_the_window() {
     let dir = project(RETIRING_ONLY);
@@ -1254,105 +1355,4 @@ fn the_docs_count_the_bundled_data() {
         "docs/RETIREMENTS.md lacks {sentence:?}"
     );
     assert!(!docs.contains("283 model IDs"));
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("spawn git");
-    assert!(
-        output.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-fn diff_prints_only_the_plain_swaps_and_writes_nothing() {
-    let dir = project(SWAPS);
-    let output = arbor(
-        dir.path(),
-        &["retirements", ".", "--diff", "--today", TODAY],
-    );
-    // The exit code is the check's: claude-3-haiku is already retired.
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(
-        fs::read_to_string(dir.path().join("app.py")).unwrap(),
-        SWAPS,
-        "--diff writes no file"
-    );
-    let patch = stdout(&output);
-    assert!(
-        patch.starts_with("--- a/app.py\n+++ b/app.py\n@@ "),
-        "{patch}"
-    );
-    let lines = |sign: char| -> Vec<&str> {
-        patch
-            .lines()
-            .filter(|l| l.starts_with(sign) && !l.starts_with("---") && !l.starts_with("+++"))
-            .collect()
-    };
-    assert_eq!(
-        lines('+'),
-        [
-            r#"+    return client.chat.completions.create(model="gpt-5.6-sol", max_completion_tokens=100, messages=[])"#,
-            "+    return claude.messages.create(model='claude-haiku-4-5-20251001', max_tokens=10, messages=[])",
-        ]
-    );
-    assert_eq!(
-        lines('-'),
-        [
-            r#"-    return client.chat.completions.create(model="o3-mini", max_tokens=100, messages=[])"#,
-            "-    return claude.messages.create(model='claude-3-haiku-20240307', max_tokens=10, messages=[])",
-        ]
-    );
-    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
-    assert!(
-        stderr.contains("Diff: 2 calls swapped in 1 file."),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("Left out 3 calls: 1 needs a choice this repository makes first, 1 takes its model from a constant or a default (other code may read it too) and 1 needs an argument added."),
-        "{stderr}"
-    );
-
-    // The patch applies, and what is left needs a decision or a person.
-    fs::write(dir.path().join("fix.patch"), &patch).unwrap();
-    git(dir.path(), &["init", "-q"]);
-    // Line ends as in the patch, whatever this machine's git config says.
-    git(
-        dir.path(),
-        &["-c", "core.autocrlf=false", "apply", "fix.patch"],
-    );
-    let fixed = fs::read_to_string(dir.path().join("app.py")).unwrap();
-    assert_eq!(
-        fixed,
-        SWAPS
-            .replace(
-                r#"model="o3-mini", max_tokens=100"#,
-                r#"model="gpt-5.6-sol", max_completion_tokens=100"#
-            )
-            .replace("'claude-3-haiku-20240307'", "'claude-haiku-4-5-20251001'")
-    );
-    fs::remove_file(dir.path().join("fix.patch")).unwrap();
-    let again = arbor(
-        dir.path(),
-        &["retirements", ".", "--diff", "--today", TODAY],
-    );
-    assert_eq!(again.status.code(), Some(0), "nothing retired is left");
-    assert_eq!(stdout(&again), "");
-    assert!(String::from_utf8_lossy(&again.stderr).contains("No plain model swaps to make."));
-
-    // --quiet keeps only the patch; --diff never mixes with other formats.
-    let quiet = arbor(
-        dir.path(),
-        &["retirements", ".", "--diff", "--quiet", "--today", TODAY],
-    );
-    assert!(quiet.stderr.is_empty(), "{:?}", quiet.stderr);
-    for other in ["--json", "--markdown", "--annotations"] {
-        let output = arbor(dir.path(), &["retirements", ".", "--diff", other]);
-        assert_eq!(output.status.code(), Some(2), "--diff {other}");
-    }
 }

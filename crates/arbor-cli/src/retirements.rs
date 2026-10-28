@@ -21,11 +21,11 @@
 //! `--include-routed`.
 
 use arbor_core::languages::get_parser;
+use arbor_core::retirements::{apply_edits, plan_swaps, FixKind, SkipReason, SwapPlan};
 use arbor_core::retirements::{
-    apply_edits, bundled, check, plan_swaps, python_literal, routing_gap_text, value_gap_text,
-    BaseUrl, CallKind, Change, ChangeKind, CheckOptions, Confidence, Date, DateKind, Decision,
-    Finding, FixKind, MatchKind, OptionStatus, RetirementReport, RoutingClass, ScanInput,
-    SkipReason, State, SwapPlan, FINE_TUNING, REPORT_VERSION,
+    bundled, check, python_literal, routing_gap_text, value_gap_text, BaseUrl, CallKind, Change,
+    ChangeKind, CheckOptions, Confidence, Date, DateKind, Decision, Finding, MatchKind,
+    OptionStatus, RetirementReport, RoutingClass, ScanInput, State, FINE_TUNING, REPORT_VERSION,
 };
 use arbor_core::usages::{is_unsafe_char, ValueOrigin};
 use arbor_core::{detect_language, parse_source_usages};
