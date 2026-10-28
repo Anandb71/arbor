@@ -1,0 +1,43 @@
+{
+  "corpus_version": 1,
+  "suite": "usages",
+  "language": "python",
+  "covers": [
+    "a class whose __init__ stores its model parameter in self.model, read at a request in a method, and a module-level function whose parameter is a request's model: their requests report the defaults as before",
+    "calls from another file through a relative import record the model they pass in that file: a literal, a module constant and a positional argument; a call that leaves the parameter out is not recorded",
+    "a call from a script in another directory through an absolute import, with an environment fallback (env_default plus an env_var gap)",
+    "a module attribute (sampler.Sampler) and an import of a module that is not in the project are not followed"
+  ],
+  "usages_expected": [
+    {"at": "evals/sampler.py:13", "chain": "self.client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o-mini"}},
+    {"at": "evals/sampler.py:19", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "evals/claude.py:10", "chain": "self.client.messages.create", "routing": "anthropic_direct"},
+
+    {"at": "evals/run.py:7", "chain": "Sampler", "routing": "openai_direct", "values": {"model": "o1"}},
+    {"at": "evals/run.py:8", "chain": "Sampler", "routing": "openai_direct", "values": {"model": "gpt-4.1-mini"}},
+    {"at": "evals/run.py:10", "chain": "ClaudeSampler", "routing": "anthropic_direct", "values": {"model": "claude-3-5-haiku-20241022"}},
+    {"at": "evals/run.py:15", "chain": "ask", "routing": "openai_direct", "values": {"model": "gpt-3.5-turbo"}},
+
+    {"at": "scripts/bench.py:7", "chain": "Sampler", "routing": "openai_direct", "values": {"model": "o3-mini"}}
+  ],
+  "clients_expected": [
+    {"at": "evals/sampler.py:3", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "evals/sampler.py:8", "constructor": "openai.OpenAI", "binding": "self.client", "routing": "openai_direct"},
+    {"at": "evals/claude.py:7", "constructor": "anthropic.Anthropic", "binding": "self.client", "routing": "anthropic_direct"}
+  ],
+  "gaps_expected": [
+    {"at": "evals/sampler.py:13", "kind": "unresolved_model", "reason": "parameter_default"},
+    {"at": "evals/sampler.py:13", "kind": "unresolved_model", "reason": "subclass_override"},
+    {"at": "evals/sampler.py:19", "kind": "unresolved_model", "reason": "parameter_default"},
+    {"at": "evals/claude.py:10", "kind": "unresolved_model", "reason": "parameter"},
+    {"at": "scripts/bench.py:7", "kind": "unresolved_model", "reason": "env_var"}
+  ],
+  "forbidden_in_output": [
+    "o1-preview",
+    "o1-pro",
+    "BENCH_MODEL"
+  ],
+  "known_missing": [],
+  "known_extra": [],
+  "notes": "Synthetic. Truth is what each line does at run time, except where a policy turns it into a gap. evals/sampler.py:13 sends self.model, which Sampler.__init__ stores from its model parameter; :19 sends ask's model parameter. Each request still reports its default with its gaps. evals/run.py imports both with relative imports: :7 and :8 pass a literal and a module constant, :9 passes nothing (the default applies, reported in sampler.py), :10 passes ClaudeSampler's model by position, :15 passes ask's by name. scripts/bench.py imports evals.sampler absolutely from another directory and passes an environment fallback. scripts/unfollowed.py calls Sampler as a module attribute and imports a module the project does not have, so neither model is ever output."
+}
