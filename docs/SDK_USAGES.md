@@ -568,7 +568,8 @@ follows the model:
   records no call of its own (the object carries the model), and its
   construction routes like the object. Both route at each use through what
   they were built on, so a client given a `base_url` after it is handed to a
-  model object re-routes the object too.
+  model object re-routes the object too. An agent or run is no model object:
+  an agent given another agent has a model the scan does not confirm.
 
 A file that sets the SDK's default client (`set_default_openai_client(...)`,
 also imported under another name) or passes a `model_provider` anywhere
@@ -602,8 +603,18 @@ another provider or endpoint, so:
 - options given `env=` (unless `None` or a dict literal whose keys are all
   strings, none of them one of these, with no `**`), `settings=` (a settings
   file or JSON, whose `env` the CLI applies) or a `**` expansion route
-  `unknown` with an `endpoint_option` gap. An agent definition takes none of
-  these: it runs where its options do.
+  `unknown` with an `endpoint_option` gap;
+- options whose `env` or `settings` the file uses after they are built
+  (`options.env["CLAUDE_CODE_USE_BEDROCK"] = "1"`, `options.env.update(...)`,
+  `options.settings = ...`), or writes with a run-time name, route `unknown`
+  with a `dynamic_feature` gap, and so does every Claude Code options object
+  in a file that uses `env` or `settings` on an object it cannot identify
+  (other than `self`, `cls` or a same-file class).
+
+An agent definition runs where its options do: built inside the options'
+`agents=` dict (`ClaudeAgentOptions(agents={"r": AgentDefinition(...)})`),
+it routes like them, gaps included; built anywhere else, it routes `unknown`
+with an `options_route` gap.
 
 The options' `extra_args` become CLI flags and may pass another model: unless
 they are `None` or a dict literal that names no model flag, they, or a `**`
@@ -625,6 +636,9 @@ endpoint variable is an `endpoint_env` gap. `client_type="azure"` routes
 `organization`, `project`, `timeout`, `max_retries` and `default_headers`;
 for Gemini, anything but the API key), any other `client_type`, and a `**`
 expansion given to the model route `unknown` with an `endpoint_option` gap.
+So does a first positional argument that is neither a credential built in
+place (`OpenAICredential(...)`) nor a model name AgentScope 1 would take,
+such as a name holding a credential (`OpenAIChatModel(cred, model=...)`).
 
 `arbor retirements` checks only the model of these calls: each framework
 takes its own arguments and builds the request, so the SDK's argument rules
