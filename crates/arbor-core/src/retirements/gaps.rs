@@ -176,6 +176,11 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     ),
     (
         GapKind::AmbiguousClient,
+        "options_route",
+        "the agent definition runs where the options it is given to do, which are not built around it",
+    ),
+    (
+        GapKind::AmbiguousClient,
         "model_route",
         "the Agents SDK picks where requests go from the model, which is not confirmed or names a provider Arbor does not follow",
     ),

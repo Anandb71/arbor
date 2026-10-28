@@ -7891,8 +7891,8 @@ aliased = sdk.ClaudeAgentOptions(model="sonnet")
 default = ClaudeAgentOptions(allowed_tools=["Read"])
 from_env = ClaudeAgentOptions(model=MODEL, env={"ANTHROPIC_API_KEY": key})
 old = ClaudeCodeOptions(model="claude-3-7-sonnet-20250219")
-reviewer = AgentDefinition(description="r", prompt="p", model="haiku")
-inherits = AgentDefinition(description="r", prompt="p")
+team = ClaudeAgentOptions(agents={"reviewer": AgentDefinition(description="r", prompt="p", model="haiku")})
+inherits = ClaudeAgentOptions(model="opus", agents={"r": AgentDefinition(description="r", prompt="p")})
 query(prompt="hi", options=plain)
 "#,
     );
@@ -7904,7 +7904,7 @@ query(prompt="hi", options=plain)
     assert!(found.imports.iter().all(|i| i.local != "query"));
 
     let lines: Vec<u32> = found.calls.iter().map(|c| c.span.line).collect();
-    assert_eq!(lines, vec![8, 9, 10, 11, 12, 13, 14]);
+    assert_eq!(lines, vec![8, 9, 10, 11, 12, 13, 13, 14, 14]);
     for c in &found.calls {
         assert_eq!(c.sdk, Sdk::Anthropic, "{}", c.chain);
         assert_eq!(c.routing, Routing::AnthropicDirect, "{}", c.chain);
@@ -7927,8 +7927,18 @@ query(prompt="hi", options=plain)
         value(call_on(&found, 12), "model"),
         Some("claude-3-7-sonnet-20250219")
     );
-    assert_eq!(value(call_on(&found, 13), "model"), Some("haiku"));
-    // An agent definition given no model runs its parent's.
+    let definition = |line: u32| {
+        found
+            .calls
+            .iter()
+            .find(|c| c.span.line == line && c.chain == "AgentDefinition")
+            .unwrap()
+    };
+    assert_eq!(value(definition(13), "model"), Some("haiku"));
+    // Options with only agent definitions run the CLI's default model; an
+    // agent definition given no model runs its parent's.
+    assert_eq!(gaps_on(&found, 13), ["unresolved_model/missing_model"]);
+    assert!(definition(14).values.is_empty());
     assert!(gaps_on(&found, 14).is_empty());
     // No credential reaches the output.
     assert!(found
@@ -7950,7 +7960,7 @@ passed = ClaudeAgentOptions(model="claude-opus-4-1", env=environment)
 settings = ClaudeAgentOptions(model="claude-opus-4-1", settings="settings.json")
 splat = ClaudeAgentOptions(model="claude-opus-4-1", **options)
 no_env = ClaudeAgentOptions(model="claude-opus-4-1", env=None, settings=None)
-subagent = AgentDefinition(description="r", prompt="p", model="claude-opus-4-1", **more)
+inline = ClaudeAgentOptions(model="claude-opus-4-1", agents={"r": AgentDefinition(description="r", prompt="p", model="opus")})
 flags = ClaudeAgentOptions(model="claude-opus-4-1", extra_args={"model": "claude-3-opus-20240229"})
 other_flags = ClaudeAgentOptions(model="claude-opus-4-1", extra_args={"verbose": None})
 FLAGS = {"extra_args": {"verbose": None}}
@@ -7973,7 +7983,11 @@ expanded_flags = ClaudeAgentOptions(model="claude-opus-4-1", **FLAGS)
     assert_eq!(call_on(&found, 10).routing, Routing::AnthropicDirect);
     assert!(gaps_on(&found, 10).is_empty());
     // An agent definition runs where its options do.
-    assert_eq!(call_on(&found, 11).routing, Routing::AnthropicDirect);
+    assert!(found
+        .calls
+        .iter()
+        .filter(|c| c.span.line == 11)
+        .all(|c| c.routing == Routing::AnthropicDirect));
     // `extra_args` become CLI flags, which may set the model.
     assert_eq!(gaps_on(&found, 12), ["unresolved_model/reassigned"]);
     assert!(gaps_on(&found, 13).is_empty());
@@ -8123,4 +8137,136 @@ fn a_file_that_only_mentions_agents_is_not_read_for_them() {
     ] {
         assert!(super::may_use_sdk(source), "{source}");
     }
+}
+
+#[test]
+fn an_agent_definition_runs_where_its_options_do() {
+    let found = usages(
+        r#"from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions
+
+bedrock = ClaudeAgentOptions(
+    model="claude-sonnet-4-5-20250929",
+    env={"CLAUDE_CODE_USE_BEDROCK": "1"},
+    agents={"reviewer": AgentDefinition(description="d", prompt="p", model="opus")},
+)
+apart = AgentDefinition(description="d", prompt="p", model="claude-opus-4-1")
+direct = ClaudeAgentOptions(model="claude-opus-4-1", agents={"r": apart})
+"#,
+    );
+    let at = |line: u32, chain: &str| {
+        found
+            .calls
+            .iter()
+            .find(|c| c.span.line == line && c.chain == chain)
+            .unwrap()
+    };
+    assert_eq!(at(3, "ClaudeAgentOptions").routing, Routing::Unknown);
+    let inside = at(6, "AgentDefinition");
+    assert_eq!(inside.routing, Routing::Unknown);
+    assert_eq!(value(inside, "model"), Some("opus"));
+    assert_eq!(gaps_on(&found, 6), ["ambiguous_client/endpoint_option"]);
+    // Built apart from the options it is given to: its route is theirs,
+    // which this scan does not follow.
+    assert_eq!(at(8, "AgentDefinition").routing, Routing::Unknown);
+    assert_eq!(gaps_on(&found, 8), ["ambiguous_client/options_route"]);
+    assert_eq!(
+        at(9, "ClaudeAgentOptions").routing,
+        Routing::AnthropicDirect
+    );
+}
+
+#[test]
+fn claude_options_changed_after_they_are_built_are_gaps() {
+    for change in [
+        "options.env[\"CLAUDE_CODE_USE_BEDROCK\"] = \"1\"",
+        "options.env = {\"ANTHROPIC_BASE_URL\": url}",
+        "options.env.update(extra)",
+        "options.settings = \"settings.json\"",
+        "config.env[\"X\"] = \"1\"",
+    ] {
+        let source = format!(
+            "from claude_agent_sdk import ClaudeAgentOptions\noptions = ClaudeAgentOptions(model=\"claude-sonnet-4-5-20250929\")\n{change}\n"
+        );
+        let found = usages(&source);
+        assert_eq!(call_on(&found, 2).routing, Routing::Unknown, "{change}");
+        assert_eq!(
+            gaps_on(&found, 2),
+            ["ambiguous_client/dynamic_feature"],
+            "{change}"
+        );
+    }
+    // A write with a run-time name may set the model or the environment.
+    let found = usages(
+        "from claude_agent_sdk import ClaudeAgentOptions
+options = ClaudeAgentOptions(model=\"claude-sonnet-4-5-20250929\")
+setattr(options, name, value)
+",
+    );
+    assert_eq!(call_on(&found, 2).routing, Routing::Unknown);
+    assert_eq!(
+        gaps_on(&found, 2),
+        [
+            "unresolved_model/dynamic_feature",
+            "ambiguous_client/base_url_assigned"
+        ]
+    );
+    // `self.env` in a same-file class is not options'.
+    let found = usages(
+        r#"from claude_agent_sdk import ClaudeAgentOptions
+
+options = ClaudeAgentOptions(model="claude-sonnet-4-5-20250929")
+
+
+class Runner:
+    def __init__(self):
+        self.env = {}
+"#,
+    );
+    assert_eq!(call_on(&found, 3).routing, Routing::AnthropicDirect);
+    assert!(gaps_on(&found, 3).is_empty());
+}
+
+#[test]
+fn an_agent_given_an_agent_has_no_model_object() {
+    // An agent is no model object: it is not followed as one, and a model
+    // assigned the agent it builds in a loop ends.
+    let found = usages(
+        r#"from agents import Agent
+
+first = Agent(name="a", model="gpt-4o")
+second = Agent(name="b", model=first)
+model = "gpt-4o"
+for name in ["a", "b"]:
+    model = Agent(name=name, model=model)
+"#,
+    );
+    assert_eq!(call_on(&found, 4).routing, Routing::Unknown);
+    assert!(gaps_on(&found, 4).contains(&"ambiguous_client/model_route".to_string()));
+    assert_eq!(call_on(&found, 7).routing, Routing::Unknown);
+    // Each construction is recorded once.
+    let built: Vec<u32> = found.clients.iter().map(|c| c.span.line).collect();
+    assert_eq!(built, vec![3, 4, 7]);
+}
+
+#[test]
+fn an_agentscope_credential_passed_by_position_may_route_elsewhere() {
+    let found = usages(
+        r#"import os
+from agentscope.model import OpenAIChatModel
+from agentscope.credential import OpenAICredential
+
+MODEL = "gpt-4o"
+cred = OpenAICredential(api_key="k", base_url="http://localhost:8000/v1")
+named = OpenAIChatModel(cred, model="gpt-4o")
+v1_constant = OpenAIChatModel(MODEL)
+v1_env = OpenAIChatModel(os.getenv("AGENT_MODEL"))
+"#,
+    );
+    assert_eq!(call_on(&found, 7).routing, Routing::Unknown);
+    assert_eq!(gaps_on(&found, 7), ["ambiguous_client/endpoint_option"]);
+    // AgentScope 1's model name, by position.
+    assert_eq!(value(call_on(&found, 8), "model_name"), Some("gpt-4o"));
+    assert_eq!(call_on(&found, 8).routing, Routing::OpenaiDirect);
+    assert_eq!(call_on(&found, 9).routing, Routing::OpenaiDirect);
+    assert_eq!(gaps_on(&found, 9), ["unresolved_model/env_var"]);
 }

@@ -1271,6 +1271,12 @@ enum ClientCaveat {
     /// The file sets the client or model provider the Agents SDK sends a
     /// model name's requests through.
     AgentsProvider(Feature),
+    /// A Claude Code agent definition built outside the options it runs
+    /// in, whose route is theirs.
+    DefinitionRoute,
+    /// Claude Code options whose `env` or `settings` the file may change
+    /// after they are built.
+    OptionsRerouted(Feature),
 }
 
 /// A Python feature that can change what a name, attribute, dict or the
@@ -2316,6 +2322,22 @@ struct Ctx<'t> {
     /// Constructions recorded so far: the index of the record and why its
     /// routing may not hold.
     constructions: HashMap<usize, (usize, Option<ClientCaveat>)>,
+    /// Constructions being built, by call id: one evaluated again while it
+    /// is (its model argument names it) is not known yet.
+    constructing: HashSet<usize>,
+    /// The Agents SDK's model objects (`OpenAIResponsesModel`,
+    /// `OpenAIChatCompletionsModel`, `LitellmModel`) built in this file, by
+    /// call id: only these route an agent or run they are given.
+    agents_model_sites: HashSet<usize>,
+    /// The objects of every `env` or `settings` attribute in the file
+    /// (`options.env[...] = ...`), which may be Claude Code options' (see
+    /// [`Ctx::note_options_rerouted`]).
+    options_env_objects: Vec<(Node<'t>, usize)>,
+    /// Claude Code options whose `env` or `settings` the file uses after
+    /// they are built, by construction call id, and whether an object this
+    /// file cannot identify may be such options.
+    options_rerouted: HashMap<usize, Feature>,
+    options_rerouted_any: Option<Feature>,
     name_memo: HashMap<Key, Memo<Val>>,
     attr_memo: HashMap<Key, Memo<Val>>,
     /// The same for `self.x` / `cls.x`, read with subclasses and outside
@@ -2523,6 +2545,11 @@ impl<'t> Ctx<'t> {
             loops: HashMap::new(),
             env_reads: Vec::new(),
             constructions: HashMap::new(),
+            constructing: HashSet::new(),
+            agents_model_sites: HashSet::new(),
+            options_env_objects: Vec::new(),
+            options_rerouted: HashMap::new(),
+            options_rerouted_any: None,
             name_memo: HashMap::new(),
             attr_memo: HashMap::new(),
             dyn_attr_memo: HashMap::new(),
@@ -2891,6 +2918,7 @@ impl<'t> Ctx<'t> {
                         if is_value_reference(frame.parent, frame.field) {
                             self.refs.push((node, scope));
                         }
+                        self.note_options_env(node, scope);
                         self.note_attr_use(node, &frame, scope);
                         self.note_env_read(node);
                         self.note_dict_attribute(node, &frame);
@@ -6949,6 +6977,23 @@ impl<'t> Ctx<'t> {
                 caveat,
             };
         }
+        // Evaluated again while it is being built (an agent whose model is a
+        // name assigned that agent in a loop): what it builds is not known
+        // yet, so it is no single client.
+        if !self.constructing.insert(call.id()) {
+            return Client {
+                pkg: class.pkg,
+                routing: Routing::Unknown,
+                line: None,
+                site: None,
+                ambiguous: true,
+                typed: false,
+                caveat: None,
+            };
+        }
+        if matches!(class.family, Family::AgentsModel | Family::Litellm) {
+            self.agents_model_sites.insert(call.id());
+        }
         let scope = self.call_scope.get(&call.id()).copied().unwrap_or(0);
         let args = self.arguments(call);
         // Clients routed by their endpoint argument: a direct client's
@@ -7067,6 +7112,7 @@ impl<'t> Ctx<'t> {
         self.constructions
             .insert(call.id(), (self.out.clients.len(), caveat.clone()));
         self.out.clients.push(record);
+        self.constructing.remove(&call.id());
         Client {
             pkg: class.pkg,
             routing,
@@ -7238,11 +7284,54 @@ impl<'t> Ctx<'t> {
     }
 
     /// The Agents SDK model object `expr` evaluates to, as built, if any
-    /// (`OpenAIChatCompletionsModel(...)`, or a name bound to one).
+    /// (`OpenAIChatCompletionsModel(...)`, or a name bound to one). An agent
+    /// or a run is no model object, so what an agent goes through is at
+    /// most a model object and the client it is built on.
     fn agents_model_object(&mut self, expr: Node<'t>, scope: usize) -> Option<Client> {
         match self.eval(expr, scope, 0) {
-            Val::Client { client, path } if path.is_empty() && client.pkg.is_agent_framework() => {
+            Val::Client { client, path }
+                if path.is_empty()
+                    && client
+                        .site
+                        .is_some_and(|site| self.agents_model_sites.contains(&site)) =>
+            {
                 Some(client)
+            }
+            _ => None,
+        }
+    }
+
+    /// The Claude Code options an agent definition is built inside, by
+    /// their `agents=` dict (`ClaudeAgentOptions(agents={"r":
+    /// AgentDefinition(...)})`), as built.
+    fn enclosing_options(&mut self, call: Node<'t>) -> Option<Client> {
+        let pair = self.parents.get(&call.id()).copied()?;
+        if pair.kind() != "pair"
+            || pair.child_by_field_name("value").map(|v| v.id()) != Some(call.id())
+        {
+            return None;
+        }
+        let dict = pair.parent().filter(|d| d.kind() == "dictionary")?;
+        let keyword = dict.parent().filter(|k| k.kind() == "keyword_argument")?;
+        let named_agents = keyword
+            .child_by_field_name("name")
+            .is_some_and(|name| self.text(name) == "agents");
+        if !named_agents || keyword.child_by_field_name("value").map(|v| v.id()) != Some(dict.id())
+        {
+            return None;
+        }
+        let options = keyword
+            .parent()
+            .filter(|list| list.kind() == "argument_list")?
+            .parent()
+            .filter(|c| c.kind() == "call")?;
+        let function = options.child_by_field_name("function")?;
+        let scope = self.call_scope.get(&options.id()).copied().unwrap_or(0);
+        match self.eval(function, scope, 0) {
+            Val::Class(class)
+                if class.family == Family::ClaudeCode && class.name != "AgentDefinition" =>
+            {
+                Some(self.construction(options, class))
             }
             _ => None,
         }
@@ -7351,6 +7440,13 @@ impl<'t> Ctx<'t> {
                 let (routing, caveat) = self.agentscope_route(call, class, scope, args);
                 Some((routing, caveat, None))
             }
+            // An agent definition runs where the options it is given to do.
+            Family::ClaudeCode if class.name == "AgentDefinition" => {
+                Some(match self.enclosing_options(call) {
+                    Some(options) => (options.routing, options.caveat.clone(), Some(options)),
+                    None => (Routing::Unknown, Some(ClientCaveat::DefinitionRoute), None),
+                })
+            }
             _ => None,
         }
     }
@@ -7436,6 +7532,21 @@ impl<'t> Ctx<'t> {
         if args.splat {
             return option("a `**` expansion");
         }
+        let credential = self.agentscope_credential(call);
+        // AgentScope 2 takes its credential first, which a name may hold
+        // (`OpenAIChatModel(cred, model=...)`): a first positional argument
+        // that is not a model name AgentScope 1 would take may be one.
+        if let (None, Some(first)) = (credential, args.first_positional) {
+            let model_name = match self.resolve_value(first, scope, 0) {
+                Ok(_) => true,
+                Err(unresolved) => {
+                    unresolved.reason == "env_var" || unresolved.reason == "f_string"
+                }
+            };
+            if !model_name {
+                return option("a credential passed by position");
+            }
+        }
         let text = |n: Node<'t>| self.text(n);
         let gemini = class.pkg == Pkg::AgentscopeGemini;
         // Client arguments that do not change where requests go.
@@ -7465,7 +7576,7 @@ impl<'t> Ctx<'t> {
         // The `base_url` given: in the credential (AgentScope 2) or in the
         // client arguments (AgentScope 1).
         let mut endpoint: Option<Node<'t>> = None;
-        if let Some(credential) = self.agentscope_credential(call) {
+        if let Some(credential) = credential {
             if !self.builds_credential(credential) {
                 return option("`credential=`");
             }
@@ -7690,6 +7801,7 @@ impl<'t> Ctx<'t> {
             });
         }
         self.note_agents_run_model();
+        self.note_options_rerouted();
         for (call, scope) in self.calls.clone() {
             if self.records() >= MAX_FILE_RECORDS {
                 return self.truncate_file(call, scope);
@@ -8091,6 +8203,76 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// An attribute named `env` or `settings`, of any object: Claude Code
+    /// options hold the CLI's environment and settings there.
+    fn note_options_env(&mut self, node: Node<'t>, scope: usize) {
+        let named = node
+            .child_by_field_name("attribute")
+            .is_some_and(|attr| matches!(self.text(attr), "env" | "settings"));
+        if let (true, Some(object)) = (named, node.child_by_field_name("object")) {
+            self.options_env_objects.push((object, scope));
+        }
+    }
+
+    /// Claude Code options whose `env` or `settings` the file uses after
+    /// they are built (`options.env[...] = ...`, `options.env.update(...)`,
+    /// `options.settings = ...`), or writes with a run-time name: the CLI
+    /// may then run on another provider. A use on an object this file
+    /// cannot identify may be one on such options. Only in a file that
+    /// imports the Claude Agent SDK or the Claude Code SDK.
+    fn note_options_rerouted(&mut self) {
+        let claude = self
+            .out
+            .imports
+            .iter()
+            .any(|i| matches!(i.package.as_str(), "claude_agent_sdk" | "claude_code_sdk"));
+        if !claude {
+            return;
+        }
+        let objects: Vec<(Node<'t>, usize)> = self
+            .options_env_objects
+            .iter()
+            .chain(self.wild_attr_objects.iter())
+            .copied()
+            .collect();
+        for (object, scope) in objects {
+            match self.eval(object, scope, 0) {
+                Val::Client { client, path }
+                    if path.is_empty()
+                        && matches!(client.pkg, Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk) =>
+                {
+                    let feature = Self::feature(
+                        "the options' `env` or `settings` used after they are built",
+                        object,
+                    );
+                    match client.site {
+                        Some(site) => {
+                            self.options_rerouted.entry(site).or_insert(feature);
+                        }
+                        None => {
+                            self.options_rerouted_any.get_or_insert(feature);
+                        }
+                    }
+                }
+                Val::Client { .. }
+                | Val::Module { .. }
+                | Val::Symbol { .. }
+                | Val::Class(_)
+                | Val::Result(_)
+                | Val::GoogleNs => {}
+                _ if object.kind() == "identifier"
+                    && (matches!(self.text(object), "self" | "cls")
+                        || self.class_receiver(object, scope).is_some()) => {}
+                _ => {
+                    self.options_rerouted_any.get_or_insert(Self::feature(
+                        "an `env` or `settings` attribute of an object this file cannot identify, which may be Claude Code options",
+                        object,
+                    ));
+                }
+            }
+        }
+    }
+
     /// A `RunConfig` given a model (by keyword, by position or through an
     /// expansion), which every agent it runs uses instead of its own. Only
     /// in a file that imports one of the Agents SDK's tracked classes.
@@ -8296,6 +8478,22 @@ impl<'t> Ctx<'t> {
             client.caveat = via.caveat;
             client.ambiguous |= via.ambiguous;
             return client;
+        }
+        // Claude Code options whose `env` or `settings` the file uses after
+        // they are built (`options.env["CLAUDE_CODE_USE_BEDROCK"] = "1"`)
+        // may run the CLI on another provider.
+        if matches!(client.pkg, Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk)
+            && client.caveat.is_none()
+            && !client.ambiguous
+        {
+            let feature = client
+                .site
+                .and_then(|site| self.options_rerouted.get(&site).copied())
+                .or(self.options_rerouted_any);
+            if let Some(feature) = feature {
+                client.routing = Routing::Unknown;
+                client.caveat = Some(ClientCaveat::OptionsRerouted(feature));
+            }
         }
         // A legacy Gemini model object: `configure(client_options=...)`
         // routes every one of them.
@@ -9563,6 +9761,19 @@ impl<'t> Ctx<'t> {
                     "model_route",
                     format!(
                         "the Agents SDK sends requests where the model it is given says (a model object, or a name's provider prefix such as `litellm/`), and the model of `{chain}` is not confirmed, so neither is its routing"
+                    ),
+                ),
+                ClientCaveat::DefinitionRoute => (
+                    "options_route",
+                    format!(
+                        "the agent definition `{chain}` runs where the Claude Code options it is given to do, and it is not built inside them here, so its routing is not confirmed"
+                    ),
+                ),
+                ClientCaveat::OptionsRerouted(feature) => (
+                    "dynamic_feature",
+                    format!(
+                        "`{chain}` may run the Claude Code CLI on another provider or endpoint: {}",
+                        feature.describe()
                     ),
                 ),
                 ClientCaveat::AgentsProvider(feature) => (
