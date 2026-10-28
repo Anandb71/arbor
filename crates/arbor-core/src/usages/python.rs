@@ -106,10 +106,11 @@
 use super::{
     is_capturable_value, is_credential_value, is_identifier_key, is_secret_key, is_value_key,
     model_family, BindingKind, CapturedValue, ClientConstruction, ClientScope, FileUsages, GapKind,
-    Receiver, Routing, Sdk, SdkCall, SdkImport, Span, UsageGap, ValueOrigin, VertexAi,
-    BEDROCK_VALUE_KEYS,
+    ModelParam, Receiver, Routing, Sdk, SdkCall, SdkImport, Span, UsageGap, ValueOrigin, VertexAi,
+    WrapperCall, WrapperLookup, WrapperRequest, BEDROCK_VALUE_KEYS,
 };
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::rc::Rc;
 use tree_sitter::{Node, Tree};
 
@@ -367,11 +368,27 @@ const MAX_FILE_IMPORTS: usize = MAX_FILE_RECORDS;
 
 /// Extracts SDK usages from a parsed Python file.
 pub fn extract(tree: &Tree, source: &str, file_path: &str) -> FileUsages {
-    if !may_use_sdk(source) {
+    extract_with(tree, source, file_path, None)
+}
+
+/// [`extract`], also recording calls to the wrappers in other files that
+/// `wrappers` resolves this file's imports to (see [`SdkCall::wrapper`]).
+/// With a lookup, the file is analyzed even when it mentions no SDK: the
+/// repository scan passes one only for a file that names a wrapper.
+pub fn extract_with(
+    tree: &Tree,
+    source: &str,
+    file_path: &str,
+    wrappers: Option<&dyn WrapperLookup>,
+) -> FileUsages {
+    if wrappers.is_none() && !may_use_sdk(source) {
         return FileUsages::new(file_path, "python");
     }
     let mut cx = Ctx::new(source, file_path);
     cx.collect(tree.root_node());
+    if let Some(lookup) = wrappers {
+        cx.resolve_wrappers(lookup);
+    }
     cx.place_nonlocal_assigns();
     cx.note_rebound_receivers();
     cx.bind_definitions();
@@ -2221,6 +2238,12 @@ struct Ctx<'t> {
     /// [`MAX_FILE_IMPORTS`] was reached.
     import_bindings: usize,
     import_cut: Option<Node<'t>>,
+    /// The start of the last `x.__init__(...)` call directly in each
+    /// function, computed on first use (see [`Ctx::base_init_after`]).
+    base_inits: Option<HashMap<usize, usize>>,
+    /// Wrappers in other files, by the import target that names them
+    /// (`.sampler.Sampler`), from [`Ctx::resolve_wrappers`].
+    wrappers: HashMap<Rc<str>, Rc<Wrapper>>,
     out: FileUsages,
 }
 
@@ -2337,6 +2360,8 @@ impl<'t> Ctx<'t> {
             loop_iter: None,
             import_bindings: 0,
             import_cut: None,
+            base_inits: None,
+            wrappers: HashMap::new(),
             out: FileUsages::new(file, "python"),
         }
     }
@@ -7751,6 +7776,10 @@ impl<'t> Ctx<'t> {
             self.analyze_http(call, function, scope, library);
             return;
         }
+        if let Some(wrapper) = self.wrapper_callee(function, scope) {
+            self.record_wrapper_call(call, function, scope, &wrapper);
+            return;
+        }
 
         let callee = self.eval(function, scope, 0);
         match callee {
@@ -8204,6 +8233,449 @@ impl<'t> Ctx<'t> {
         });
     }
 
+    // ------------------------------------------------------------------
+    // Calls through a wrapper in another file
+    // ------------------------------------------------------------------
+
+    /// The parameter `expr` is, unchanged: a plain name whose only
+    /// definition reaching it is a parameter of the function that binds
+    /// it, or `self.attr` read in a method of a class whose one assignment
+    /// of `attr` (in it, its base and its subclasses) is `self.attr =
+    /// <parameter>` in its own `__init__`, which calls no base class's
+    /// `__init__` after it. `None` for anything else, and for an attribute
+    /// a dynamic feature of the class may change.
+    fn param_source(&mut self, expr: Node<'t>, scope: usize) -> Option<ParamSource> {
+        match expr.kind() {
+            "identifier" => {
+                let name = self.text(expr);
+                let (key, defs) = self.defs_at(name, scope, expr.start_byte());
+                let only_param = defs.param && defs.assigns == 0 && !defs.imported;
+                (only_param && self.scopes[key.0].kind == ScopeKind::Function).then(|| {
+                    ParamSource {
+                        func: key.0,
+                        param: name.to_string(),
+                        attribute: None,
+                    }
+                })
+            }
+            "attribute" => {
+                let object = expr.child_by_field_name("object")?;
+                if object.kind() != "identifier" || self.text(object) != "self" {
+                    return None;
+                }
+                let attr = self.text(expr.child_by_field_name("attribute")?);
+                if is_secret_key(attr) || self.rebound_receiver(object, scope).is_some() {
+                    return None;
+                }
+                let Some((class, true)) = self.class_receiver(object, scope) else {
+                    return None;
+                };
+                let lookup = self.attr_lookup(class, attr, true);
+                let ([assign], None) = (lookup.assigns.as_ref(), lookup.dynamic) else {
+                    return None;
+                };
+                let assign = *assign;
+                let init = &self.scopes[assign.scope];
+                let own_init = init.kind == ScopeKind::Function
+                    && !init.lambda
+                    && init.name == "__init__"
+                    && init.parent == Some(class);
+                if assign.unknowable || !own_init {
+                    return None;
+                }
+                let value = assign.value.filter(|v| v.kind() == "identifier")?;
+                let name = self.text(value);
+                let (key, defs) = self.defs_at(name, assign.scope, value.start_byte());
+                let only_param = defs.param && defs.assigns == 0 && !defs.imported;
+                if key.0 != assign.scope || !only_param || self.base_init_after(assign) {
+                    return None;
+                }
+                Some(ParamSource {
+                    func: assign.scope,
+                    param: name.to_string(),
+                    attribute: Some(attr.to_string()),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the function `assign` is in calls an `__init__` on
+    /// something (`super().__init__(...)`, `Base.__init__(self, ...)`)
+    /// after it: a base class's constructor may set the attribute again.
+    fn base_init_after(&mut self, assign: Assign<'t>) -> bool {
+        if self.base_inits.is_none() {
+            let mut last: HashMap<usize, usize> = HashMap::new();
+            for &(call, scope) in &self.calls {
+                let init = call.child_by_field_name("function").is_some_and(|f| {
+                    f.kind() == "attribute"
+                        && f.child_by_field_name("attribute")
+                            .is_some_and(|a| self.text(a) == "__init__")
+                });
+                if init {
+                    let at = last.entry(scope).or_default();
+                    *at = (*at).max(call.start_byte());
+                }
+            }
+            self.base_inits = Some(last);
+        }
+        self.base_inits
+            .as_ref()
+            .and_then(|last| last.get(&assign.scope))
+            .is_some_and(|&at| at > assign.place.at)
+    }
+
+    /// The module-level name other files call to pass a parameter of
+    /// `func`: a function, or the class whose `__init__` it is, defined
+    /// once at module level, undecorated (a class also with no class
+    /// keyword, second base or `__new__`), and bound by nothing else, in a
+    /// module other files may import (not a script) that no dynamic
+    /// feature may rewrite.
+    fn exported_callee(&self, func: usize) -> Option<String> {
+        if self.script
+            || self.file_dynamic.is_some()
+            || self.dynamic_globals
+            || !self.module_stars.is_empty()
+        {
+            return None;
+        }
+        let scope = &self.scopes[func];
+        if scope.kind != ScopeKind::Function
+            || scope.lambda
+            || scope.comprehension
+            || scope.decorated
+            || scope.staticmethod
+        {
+            return None;
+        }
+        let parent = scope.parent?;
+        let named = match self.scopes[parent].kind {
+            ScopeKind::Module => func,
+            ScopeKind::Class if scope.name == "__init__" => parent,
+            _ => return None,
+        };
+        let def = &self.scopes[named];
+        if def.parent != Some(0) {
+            return None;
+        }
+        let name = def.name.as_str();
+        let key = (0, name.to_string());
+        let functions = self.functions.get(&key).map_or(0, Vec::len);
+        let classes = self.classes_by_name.get(name).map_or(0, Vec::len);
+        let once = if named == func {
+            functions == 1 && classes == 0
+        } else {
+            // A `def` in a class body is also an assignment of its name
+            // there (see [`Ctx::bind_definitions`]): `__init__` is bound
+            // once when that is its only one.
+            let method = |m: &str| (named, m.to_string());
+            let bindings = |m: &str| {
+                let key = method(m);
+                self.functions.get(&key).map_or(0, Vec::len)
+                    + self.assigns.get(&key).map_or(0, Vec::len)
+                    + usize::from(self.imports.contains_key(&key))
+                    + usize::from(self.other_imports.contains_key(&key))
+            };
+            functions == 0
+                && classes == 1
+                && !def.decorated
+                && def.class_feature.is_none()
+                && self.functions.get(&method("__init__")).map_or(0, Vec::len) == 1
+                && bindings("__init__") == 2
+                && bindings("__new__") == 0
+        };
+        let rebound = self.assigns.contains_key(&key)
+            || self.imports.contains_key(&key)
+            || self.other_imports.contains_key(&key);
+        (once && !rebound).then(|| name.to_string())
+    }
+
+    /// Lists, for calls from other files, each model key of a call whose
+    /// value is a parameter of an exported function or class (see
+    /// [`Ctx::exported_callee`]). Gaps the parameter's own reading added
+    /// (its default, what in-file callers pass, a subclass that may set the
+    /// attribute) do not hold a call that passes it; any other model gap
+    /// at the call, added from `gaps_from` on, does.
+    fn note_model_params(
+        &mut self,
+        sources: Vec<(String, ParamSource, Range<usize>)>,
+        gaps_from: usize,
+        request: &ParamRequest<'_>,
+    ) {
+        let gaps = &self.out.gaps[gaps_from..];
+        let route_confirmed = request.routing != Routing::Unknown
+            && !gaps.iter().any(|g| g.kind == GapKind::AmbiguousClient);
+        let held: Vec<bool> = sources
+            .iter()
+            .map(|(key, _, own)| {
+                gaps.iter().enumerate().any(|(i, g)| {
+                    g.kind == GapKind::UnresolvedModel
+                        && g.key.as_deref().is_none_or(|k| k == key)
+                        && !own.contains(&(gaps_from + i))
+                })
+            })
+            .collect();
+        for ((key, source, _), held) in sources.into_iter().zip(held) {
+            if held {
+                continue;
+            }
+            let Some(function) = self.exported_callee(source.func) else {
+                continue;
+            };
+            let Some(slot) = self.param_slot(source.func, &source.param) else {
+                continue;
+            };
+            let param = ModelParam {
+                function,
+                parameter: source.param,
+                position: slot.position.and_then(|p| u32::try_from(p).ok()),
+                keyword: slot.keyword,
+                attribute: source.attribute,
+                key,
+                sdk: request.sdk,
+                package: request.package.to_string(),
+                chain: request.chain.to_string(),
+                member: request.member.to_string(),
+                line: request.line,
+                routing: request.routing,
+                route_confirmed,
+            };
+            if !self.out.model_params.contains(&param) {
+                self.out.model_params.push(param);
+            }
+        }
+    }
+
+    /// Asks `lookup` about every name this file imports with `from module
+    /// import name`, once per binding, and keeps the ones it resolves to
+    /// another file's model parameters.
+    fn resolve_wrappers(&mut self, lookup: &dyn WrapperLookup) {
+        let mut asked: HashSet<Rc<str>> = HashSet::new();
+        for defs in self.other_imports.values() {
+            for def in defs {
+                if !asked.insert(Rc::clone(&def.target)) {
+                    continue;
+                }
+                // `target` is `module.name` for `from module import name`
+                // (and not for `import module`), unless clipped.
+                let name = def
+                    .target
+                    .strip_prefix(def.module.trim())
+                    .and_then(|rest| rest.strip_prefix('.'))
+                    .filter(|name| !name.is_empty() && !name.contains('.'));
+                let Some(name) = name else {
+                    continue;
+                };
+                let module: String = def.module.chars().filter(|c| !c.is_whitespace()).collect();
+                let Some((file, params)) = lookup.model_params(&module, name.trim()) else {
+                    continue;
+                };
+                let Some(first) = params.first() else {
+                    continue;
+                };
+                let wrapper = Wrapper {
+                    file,
+                    function: first.function.clone(),
+                    params,
+                };
+                self.wrappers
+                    .insert(Rc::clone(&def.target), Rc::new(wrapper));
+            }
+        }
+    }
+
+    /// The wrapper in another file that `function` is: a name bound, at
+    /// the call, by `from module import name` alone (see
+    /// [`Ctx::import_target`]) to a function or class whose model
+    /// parameters [`Ctx::resolve_wrappers`] found.
+    fn wrapper_callee(&self, function: Node<'t>, scope: usize) -> Option<Rc<Wrapper>> {
+        if self.wrappers.is_empty() || function.kind() != "identifier" {
+            return None;
+        }
+        let target = self.import_target(function, scope)?;
+        self.wrappers.get(&target).map(Rc::clone)
+    }
+
+    /// `Sampler(model="o1")` where `Sampler` is a wrapper in another file:
+    /// a call that binds the model of that file's requests. Recorded only
+    /// when it passes one of the model parameters; what it passes is read
+    /// the way a model is read at an SDK call, keyed by the request's
+    /// model key. A call that leaves the parameter out uses its default,
+    /// which the defining file reports.
+    fn record_wrapper_call(
+        &mut self,
+        call: Node<'t>,
+        function: Node<'t>,
+        scope: usize,
+        wrapper: &Wrapper,
+    ) {
+        let Some(first) = wrapper.params.first() else {
+            return;
+        };
+        let chain = self.render(function);
+        let span = self.span(call);
+        let symbol = self.symbol(scope);
+        let args = self.arguments_with(call, ValueKeys::Only(&[]));
+        let site = Site {
+            sdk: first.sdk,
+            call,
+            chain: &chain,
+            scope,
+            gap_worthy: true,
+        };
+        let gaps_before = self.out.gaps.len();
+        let mut values = Vec::new();
+        let mut passed = false;
+        let mut read: HashSet<(&str, &str)> = HashSet::new();
+        for param in &wrapper.params {
+            if !read.insert((param.parameter.as_str(), param.key.as_str())) {
+                continue;
+            }
+            let position = param.position.map(|p| p as usize);
+            let keyword = param.keyword.then_some(param.parameter.as_str());
+            match argument_for(call, position, keyword, |n| self.text(n)) {
+                ArgFor::Found(expr) => {
+                    passed = true;
+                    let by_name = keyword.is_some_and(|k| args.kwargs.iter().any(|a| a == k));
+                    let result = self.resolve_value(expr, scope, 0);
+                    self.take_value(&site, &param.key, !by_name, result, &mut values);
+                }
+                ArgFor::Unknown => {
+                    passed = true;
+                    let unresolved = Unresolved::new("splat", "**kwargs".to_string());
+                    self.unresolved_gap(&site, &param.key, &unresolved, None);
+                }
+                ArgFor::Missing => {}
+            }
+        }
+        if !passed {
+            self.out.gaps.truncate(gaps_before);
+            return;
+        }
+
+        // The class keeps the model in an instance attribute, which this
+        // file may write after it is built.
+        let written = self.wild_attr_any.or_else(|| {
+            wrapper
+                .params
+                .iter()
+                .filter_map(|p| p.attribute.as_deref())
+                .find_map(|attr| self.outside_attr_writes.get(attr).copied())
+        });
+        if let Some(feature) = written {
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::UnresolvedModel,
+                sdk: Some(first.sdk),
+                file: self.file.clone(),
+                span: Some(span),
+                symbol: symbol.clone(),
+                chain: Some(chain.clone()),
+                key: None,
+                reason: "dynamic_feature".to_string(),
+                detail: format!(
+                    "`{chain}` keeps its model in an attribute this file may write after it is built ({})",
+                    feature.describe()
+                ),
+                values: Vec::new(),
+                values_complete: false,
+            });
+        }
+
+        // Where the model goes: the requests' route, when they agree and
+        // their file confirms it.
+        let route = (first.sdk, first.routing);
+        let agreed = wrapper
+            .params
+            .iter()
+            .all(|p| p.route_confirmed && (p.sdk, p.routing) == route);
+        let routing = if agreed {
+            first.routing
+        } else {
+            Routing::Unknown
+        };
+        let unconfirmed = if !agreed {
+            Some((
+                "wrapper_route",
+                format!(
+                    "`{chain}` passes its model to requests in `{}` that go to more than one route, or to one that file does not confirm, so where it is sent is not confirmed",
+                    wrapper.file
+                ),
+            ))
+        } else {
+            self.file_dynamic.map(|feature| {
+                (
+                    "dynamic_feature",
+                    format!(
+                        "this file may rebind any name or attribute at run time ({}), so the routing of `{chain}` is not confirmed",
+                        feature.describe()
+                    ),
+                )
+            })
+        };
+        if let Some((reason, detail)) = unconfirmed {
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::AmbiguousClient,
+                sdk: Some(first.sdk),
+                file: self.file.clone(),
+                span: Some(span),
+                symbol: symbol.clone(),
+                chain: Some(chain.clone()),
+                key: None,
+                reason: reason.to_string(),
+                detail,
+                values: Vec::new(),
+                values_complete: false,
+            });
+        }
+
+        let mut seen_values = HashSet::new();
+        values.retain(|v| seen_values.insert((v.key.clone(), v.span.start_byte, v.value.clone())));
+        let mut seen_gaps = HashSet::new();
+        for gap in self.out.gaps.split_off(gaps_before) {
+            if seen_gaps.insert((
+                gap.kind,
+                gap.key.clone(),
+                gap.reason.clone(),
+                gap.detail.clone(),
+            )) {
+                self.out.gaps.push(gap);
+            }
+        }
+
+        let requests = wrapper
+            .params
+            .iter()
+            .map(|p| WrapperRequest {
+                parameter: p.parameter.clone(),
+                chain: p.chain.clone(),
+                member: p.member.clone(),
+                line: p.line,
+            })
+            .collect();
+        self.out.calls.push(SdkCall {
+            sdk: first.sdk,
+            package: first.package.clone(),
+            chain,
+            member: wrapper.function.clone(),
+            request: false,
+            receiver: Receiver::Symbol,
+            routing,
+            client_line: None,
+            file: self.file.clone(),
+            span,
+            symbol,
+            kwargs: args.kwargs,
+            positional: args.positional,
+            splat: args.splat,
+            values,
+            wrapper: Some(WrapperCall {
+                file: wrapper.file.clone(),
+                function: wrapper.function.clone(),
+                requests,
+            }),
+        });
+    }
+
     fn record_call(
         &mut self,
         call: Node<'t>,
@@ -8244,6 +8716,9 @@ impl<'t> Ctx<'t> {
         let gaps_before = self.out.gaps.len();
         let mut values = Vec::new();
         let mut keyed = false;
+        // Model keys whose value is a parameter, with the gaps reading it
+        // added, for calls from other files (see [`Ctx::note_model_params`]).
+        let mut from_params: Vec<(String, ParamSource, Range<usize>)> = Vec::new();
         // A keyword repeated with the same expression (a syntax error
         // tree-sitter accepts) is read once.
         let mut read_args: HashSet<(&str, &str)> = HashSet::new();
@@ -8252,8 +8727,17 @@ impl<'t> Ctx<'t> {
             if !read_args.insert((key.as_str(), self.text(*expr))) {
                 continue;
             }
+            let source = if gap_worthy {
+                self.param_source(*expr, scope)
+            } else {
+                None
+            };
             let result = self.resolve_value(*expr, scope, 0);
+            let own_gaps = self.out.gaps.len();
             self.take_value(&site, key, false, result, &mut values);
+            if let Some(source) = source {
+                from_params.push((key.clone(), source, own_gaps..self.out.gaps.len()));
+            }
         }
 
         // `GenerativeModel("gemini-pro")`, `genai.embed_content("models/...", text)`:
@@ -8754,6 +9238,18 @@ impl<'t> Ctx<'t> {
         // fallback behind two names) is listed once.
         let mut seen_values = HashSet::new();
         values.retain(|v| seen_values.insert((v.key.clone(), v.span.start_byte, v.value.clone())));
+        if !from_params.is_empty() {
+            let request = ParamRequest {
+                sdk,
+                package: target.pkg.package(),
+                chain: &chain,
+                member: &member,
+                line: span.line,
+                routing: target.routing,
+            };
+            self.note_model_params(from_params, gaps_before, &request);
+        }
+
         let mut seen_gaps = HashSet::new();
         for gap in self.out.gaps.split_off(gaps_before) {
             if seen_gaps.insert((
@@ -10629,6 +11125,34 @@ struct CallTarget {
     client_line: Option<u32>,
     ambiguous: bool,
     caveat: Option<ClientCaveat>,
+}
+
+/// The parameter a model value is, unchanged (see [`Ctx::param_source`]).
+struct ParamSource {
+    /// The function that takes it.
+    func: usize,
+    param: String,
+    /// The instance attribute it reaches the call through (`self.model`).
+    attribute: Option<String>,
+}
+
+/// The request a [`ModelParam`] is the model of.
+struct ParamRequest<'a> {
+    sdk: Sdk,
+    package: &'static str,
+    chain: &'a str,
+    member: &'a str,
+    line: u32,
+    routing: Routing,
+}
+
+/// A function or class of another file whose parameters are the model of
+/// requests there, as [`WrapperLookup`] resolved an import of it.
+struct Wrapper {
+    file: String,
+    function: String,
+    /// Never empty.
+    params: Vec<ModelParam>,
 }
 
 /// The call a value or gap is reported for.

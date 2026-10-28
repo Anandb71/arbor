@@ -7667,3 +7667,216 @@ post("https://api.openai.com/v1/chat/completions", json={"model": "gpt-4o"})
     // `post` is the local class, not httpx's.
     assert!(found.calls.iter().all(|c| c.package != "httpx"));
 }
+
+// ---------------------------------------------------------------------------
+// Calls through a wrapper in another file
+// ---------------------------------------------------------------------------
+
+fn parse(source: &str) -> tree_sitter::Tree {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_python::language())
+        .unwrap();
+    parser.parse(source, None).unwrap()
+}
+
+/// What one other file (`file`, imported as `module`) lists.
+struct OneModule {
+    module: &'static str,
+    file: &'static str,
+    params: Vec<crate::usages::ModelParam>,
+}
+
+impl crate::usages::WrapperLookup for OneModule {
+    fn model_params(
+        &self,
+        module: &str,
+        name: &str,
+    ) -> Option<(String, Vec<crate::usages::ModelParam>)> {
+        let params: Vec<_> = self
+            .params
+            .iter()
+            .filter(|p| module == self.module && p.function == name)
+            .cloned()
+            .collect();
+        (!params.is_empty()).then(|| (self.file.to_string(), params))
+    }
+}
+
+/// The model parameters `source` lists, read as `file`.
+fn model_params(source: &str, file: &str) -> Vec<crate::usages::ModelParam> {
+    super::extract(&parse(source), source, file).model_params
+}
+
+/// `caller` (as `run.py`) after `wrapper` (as `sampler.py`, imported as
+/// `module`) is scanned.
+fn through(wrapper: &str, module: &'static str, caller: &str) -> FileUsages {
+    let lookup = OneModule {
+        module,
+        file: "sampler.py",
+        params: model_params(wrapper, "sampler.py"),
+    };
+    super::extract_with(&parse(caller), caller, "run.py", Some(&lookup))
+}
+
+const SAMPLER: &str = r#"from openai import OpenAI
+
+class Sampler:
+    def __init__(self, *, effort=None, model: str = "o1-mini"):
+        self.client = OpenAI()
+        self.model = model
+        self.effort = effort
+
+    def __call__(self, messages):
+        return self.client.chat.completions.create(
+            model=self.model, messages=messages, reasoning_effort=self.effort
+        )
+
+client = OpenAI()
+
+def ask(prompt, model="gpt-4o-mini"):
+    return client.chat.completions.create(model=model, messages=[prompt])
+"#;
+
+#[test]
+fn a_class_or_function_whose_parameter_is_a_requests_model_lists_it() {
+    let params = model_params(SAMPLER, "sampler.py");
+    let listed: Vec<_> = params
+        .iter()
+        .map(|p| {
+            (
+                p.function.as_str(),
+                p.parameter.as_str(),
+                p.position,
+                p.keyword,
+                p.attribute.as_deref(),
+                p.key.as_str(),
+                p.line,
+                p.routing,
+                p.route_confirmed,
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (
+                "Sampler",
+                "model",
+                None,
+                true,
+                Some("model"),
+                "model",
+                10,
+                Routing::OpenaiDirect,
+                true
+            ),
+            (
+                "ask",
+                "model",
+                Some(1),
+                true,
+                None,
+                "model",
+                17,
+                Routing::OpenaiDirect,
+                true
+            ),
+        ]
+    );
+    assert_eq!(params[0].chain, "self.client.chat.completions.create");
+    assert_eq!(params[0].member, "chat.completions.create");
+    assert_eq!(params[0].package, "openai");
+    // The file's own report is unchanged: the default, with its gap.
+    let found = usages(SAMPLER);
+    assert_eq!(value(call_on(&found, 10), "model"), Some("o1-mini"));
+    assert_eq!(
+        gaps_on(&found, 10),
+        [
+            "unresolved_model/parameter_default",
+            "unresolved_model/subclass_override"
+        ]
+    );
+}
+
+#[test]
+fn a_call_from_another_file_binds_the_model_it_passes() {
+    let found = through(
+        SAMPLER,
+        ".sampler",
+        r#"from .sampler import Sampler, ask
+from .sampler import Sampler as S
+
+MODEL = "o1"
+
+def main(fast="o3-mini"):
+    models = {
+        "o1": Sampler(model="o1", effort="high"),
+        "const": Sampler(model=MODEL),
+        "alias": S(model="o1-preview"),
+        "fast": Sampler(model=fast),
+        "default": Sampler(),
+    }
+    ask("hi", "gpt-4o")
+    ask("hi", model="gpt-4.1")
+    ask("hi")
+    return models
+"#,
+    );
+    let o1 = call_on(&found, 8);
+    assert_eq!(o1.chain, "Sampler");
+    assert_eq!(o1.member, "Sampler");
+    assert!(!o1.request);
+    assert_eq!(o1.receiver, Receiver::Symbol);
+    assert_eq!(o1.sdk, Sdk::Openai);
+    assert_eq!(o1.package, "openai");
+    assert_eq!(o1.routing, Routing::OpenaiDirect);
+    assert_eq!(o1.kwargs, ["model", "effort"]);
+    assert_eq!(value(o1, "model"), Some("o1"));
+    assert_eq!(o1.values[0].origin, ValueOrigin::Literal);
+    assert!(!o1.values[0].positional);
+    let wrapper = o1.wrapper.as_ref().expect("a wrapper call");
+    assert_eq!(wrapper.file, "sampler.py");
+    assert_eq!(wrapper.function, "Sampler");
+    assert_eq!(wrapper.requests.len(), 1);
+    assert_eq!(wrapper.requests[0].parameter, "model");
+    assert_eq!(wrapper.requests[0].line, 10);
+    assert_eq!(
+        wrapper.requests[0].chain,
+        "self.client.chat.completions.create"
+    );
+    assert!(gaps_on(&found, 8).is_empty());
+
+    let constant = call_on(&found, 9);
+    assert_eq!(value(constant, "model"), Some("o1"));
+    assert_eq!(constant.values[0].origin, ValueOrigin::ModuleConstant);
+    assert_eq!(constant.values[0].name.as_deref(), Some("MODEL"));
+    assert!(gaps_on(&found, 9).is_empty());
+
+    let alias = call_on(&found, 10);
+    assert_eq!(alias.chain, "S");
+    assert_eq!(alias.member, "Sampler");
+    assert_eq!(value(alias, "model"), Some("o1-preview"));
+
+    // A public function's default: other modules may call it.
+    let fast = call_on(&found, 11);
+    assert_eq!(value(fast, "model"), Some("o3-mini"));
+    assert_eq!(fast.values[0].origin, ValueOrigin::ParameterDefault);
+    assert_eq!(gaps_on(&found, 11), ["unresolved_model/parameter_default"]);
+
+    // No model passed: the default applies, reported where it is defined.
+    assert!(found.calls.iter().all(|c| c.span.line != 12));
+
+    let positional = call_on(&found, 14);
+    assert_eq!(positional.member, "ask");
+    assert_eq!(value(positional, "model"), Some("gpt-4o"));
+    assert!(positional.values[0].positional);
+    let by_name = call_on(&found, 15);
+    assert_eq!(value(by_name, "model"), Some("gpt-4.1"));
+    assert!(!by_name.values[0].positional);
+    assert!(found.calls.iter().all(|c| c.span.line != 16));
+    assert!(found
+        .gaps
+        .iter()
+        .all(|g| g.kind != GapKind::AmbiguousClient));
+}
