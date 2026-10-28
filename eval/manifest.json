@@ -99,6 +99,12 @@
       "language": "python",
       "suite": "usages",
       "covers": "Amazon Bedrock and LiteLLM: boto3 bedrock-runtime clients (converse, invoke_model, converse_stream; modelId from a constant, a ** dict and a literal), an endpoint_url outside AWS, a boto3.Session client passed to a helper, other boto3 services not tracked, LangChain's ChatBedrock and ChatBedrockConverse, litellm.completion and acompletion by keyword and by position"
+    },
+    {
+      "name": "py-sdk-raw-http",
+      "language": "python",
+      "suite": "usages",
+      "covers": "Raw HTTP requests: requests.post and httpx.post (and a bare post imported from httpx) to api.openai.com and api.anthropic.com endpoints, the model read from a json= dict or data=json.dumps(...), a parameter in the body, a body with no model, requests.get, a gateway host and /v1/models not recorded"
     }
   ]
 }
