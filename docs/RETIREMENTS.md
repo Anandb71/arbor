@@ -97,6 +97,7 @@ exit 1 only with `--count-unconfirmed`.
 | `--markdown` | A Markdown report, for a CI job summary |
 | `--annotations` | GitHub Actions annotations: one warning per affected call, the calls that fail the check first and then the most urgent, up to `--max-annotations` (default 10, GitHub's limit per step), then one notice saying how many more there are |
 | `--markdown-out <file>` | Also write the Markdown report to a file, from the same scan |
+| `--diff` | The plain model swaps as a unified diff on stdout ([below](#apply-the-plain-swaps)); writes no file |
 | `--fail-within <days>` | Also fail when a model retires within this many days |
 | `--count-unconfirmed` | Also let unconfirmed calls fail the check (see below) |
 | `--include-routed` | List calls through Azure, another host in `base_url` or another cloud, and let them fail the check |
@@ -120,6 +121,41 @@ call fails the check from 14 January 2027 (UTC) on, and reads "OpenAI shuts down
 today" that day. Google's "earliest" dates are a possibility, not a
 shutdown: from that day on the call, or a replacement in a chain, is listed as "may
 already be retired" and does not fail.
+
+## Apply the plain swaps
+
+`--diff` prints a patch for the calls that need nothing but the swap. It writes no
+file:
+
+```bash
+arbor retirements --diff . > retirements.patch
+git apply retirements.patch
+```
+
+A call is in the patch only when the check needs no judgement for it: a confirmed
+model written as a string literal at a direct call, an exact match, a listed
+replacement that still works, no decision to make and nothing to check by hand. The
+patch rewrites that string in place, keeping its quotes and prefix, and renames the
+arguments the replacement requires, such as `max_tokens` to `max_completion_tokens` on
+Chat Completions. It never adds or removes an argument, never bumps an SDK and never
+makes a decision for you.
+
+Everything else is left out, and stderr counts each reason:
+
+- a call that needs a choice your repository makes first (the reasoning effort on
+  gpt-6-luna and GPT-5.6, Claude's thinking) or a manual check;
+- a model that comes from a constant or a default: other code, or another module, may
+  read the same value, so edit it by hand;
+- a swap that needs an argument added, such as `reasoning={"mode": "pro"}` for `o1-pro`;
+- a call that already passes the new name of an argument to rename (both
+  `max_tokens` and `max_completion_tokens`);
+- a model written in another form, such as implicit concatenation (`"gpt-" "4"`);
+- a file with syntax errors, or one that changed while Arbor read it.
+
+`arbor retirements` without `--diff` lists every one of them. The patch names files as
+the report does, so apply it from the directory you ran Arbor in. The exit codes are the
+check's, and `--quiet` keeps only the patch. Read the patch before you apply it: a
+replacement can cost more or answer differently, and no static check sees that.
 
 ## In CI: GitHub Action
 
