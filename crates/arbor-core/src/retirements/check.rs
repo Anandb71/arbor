@@ -257,6 +257,17 @@ pub struct DecisionOption {
     pub remove: Vec<String>,
     /// The call's parameters to keep.
     pub keep: Vec<String>,
+    /// The call's parameters a check line flags (they fail or change on the
+    /// replacement) and this option leaves as they are: someone has to look
+    /// at them whichever way the choice goes, so the option is never "no
+    /// change".
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub check: Vec<String>,
+    /// The call's parameters this option leaves as they are, whose support
+    /// on the replacement no check verified for this API (a check line says
+    /// so): Arbor cannot say whether they work.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unverified: Vec<String>,
     pub effects: Vec<OptionEffect>,
 }
 
@@ -274,6 +285,76 @@ pub struct Decision {
     pub options: Vec<DecisionOption>,
     /// How the call's automatic changes depend on the choice.
     pub notes: Vec<String>,
+    /// Why Arbor could not read every argument the call sends. The options
+    /// then list changes only for the arguments it read: an option that
+    /// adds nothing (letting the model reason or think) may still need
+    /// arguments removed that Arbor could not see, so it is never "no
+    /// change". `None` (omitted from JSON) when every argument was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unchecked_args: Option<UncheckedArgs>,
+    /// With `unchecked_args` `splat`: the `**` expressions Arbor could not
+    /// read, by name as written (`PARAMS`, `kwargs`). Empty (omitted from
+    /// JSON) when they have no name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unread_spreads: Vec<String>,
+}
+
+/// Why Arbor could not read every argument a call sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UncheckedArgs {
+    /// Arguments are spread into the call with `**`.
+    Splat,
+    /// The call passes `extra_body`, whose entries the SDK sends as request
+    /// arguments.
+    ExtraBody,
+    /// The usage scan did not record the call's arguments (a call whose
+    /// client it could not resolve, from a scan that does not record them).
+    NotRecorded,
+}
+
+impl UncheckedArgs {
+    /// What a person has to check, for the report. `spreads` names the `**`
+    /// expressions Arbor could not read (`PARAMS`), for `Splat`.
+    pub fn message(self, spreads: &[String]) -> String {
+        match self {
+            UncheckedArgs::Splat if spreads.is_empty() => {
+                "Some arguments are spread into the call with `**`, so Arbor could not check them all."
+                    .to_string()
+            }
+            UncheckedArgs::Splat => format!(
+                "Some arguments come from {}, so Arbor could not check them all.",
+                spread_list(spreads, true)
+            ),
+            UncheckedArgs::ExtraBody => {
+                "The entries of `extra_body` are sent as request arguments, and Arbor could not check them."
+                    .to_string()
+            }
+            UncheckedArgs::NotRecorded => {
+                "Arbor did not record this call's arguments, so it could not check them."
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// `**PARAMS and **overrides` (each in backticks with `code`).
+pub fn spread_list(names: &[String], code: bool) -> String {
+    let names: Vec<String> = names
+        .iter()
+        .map(|n| {
+            if code {
+                format!("`**{n}`")
+            } else {
+                format!("**{n}")
+            }
+        })
+        .collect();
+    match names.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// One affected call site.
@@ -1289,14 +1370,15 @@ fn finding_for(
 ) -> Option<Finding> {
     let (hit, class) = resolve(data, routing, &value.value)?;
 
-    let (file, span, symbol, chain, kwargs, splat, endpoint, call_kind) = match site {
+    // `args`: the call's argument names and whether some are spread with
+    // `**`, or `None` when the usage scan did not record them.
+    let (file, span, symbol, chain, args, endpoint, call_kind) = match site {
         Site::Call(call, kind) => (
             call.file.clone(),
             Some(call.span),
             call.symbol.clone(),
             Some(call.chain.clone()),
-            call.kwargs.clone(),
-            call.splat,
+            Some((call.kwargs.clone(), call.splat, call.spreads.clone())),
             // A parameter object's arguments are not the request's.
             (kind != CallKind::RequestParam)
                 .then(|| endpoint_of(&call.chain, &call.member))
@@ -1310,13 +1392,35 @@ fn finding_for(
                 gap.span,
                 gap.symbol.clone(),
                 gap.chain.clone(),
-                Vec::new(),
-                false,
+                // A call whose client was not resolved still shows its
+                // arguments: the same rules apply to them.
+                gap.args
+                    .as_ref()
+                    .map(|a| (a.kwargs.clone(), a.splat, a.spreads.clone())),
                 endpoint_of(&chain, &chain),
                 CallKind::Request,
             )
         }
     };
+    let recorded = args.is_some();
+    let (mut kwargs, splat, spreads) = args.unwrap_or_default();
+    // A same-file dict spread in with `**` sends its keys as arguments: the
+    // rules check them like the call's own. A spread Arbor could not read in
+    // full, or a scan that recorded none, leaves arguments unseen.
+    for key in spreads.iter().flat_map(|s| &s.keys) {
+        if !kwargs.contains(key) {
+            kwargs.push(key.clone());
+        }
+    }
+    let unread_spread = splat && (spreads.is_empty() || spreads.iter().any(|s| !s.complete));
+    let mut unread_spreads: Vec<String> = Vec::new();
+    for name in spreads
+        .iter()
+        .filter(|s| !s.complete)
+        .filter_map(|s| s.name.clone())
+    {
+        push_unique(&mut unread_spreads, name);
+    }
     let gap_reason = match site {
         Site::Gap(gap) => Some(gap.reason.clone()),
         Site::Call(..) => None,
@@ -1395,8 +1499,36 @@ fn finding_for(
             outcome = apply_rules(rules, &context);
         }
     }
+    // Arguments the rules above could not see. `extra_body` is the call's
+    // own only for the call's own model: a nested model and a parameter
+    // object are checked by hand anyway (see below).
+    let unchecked = if !recorded {
+        Some(UncheckedArgs::NotRecorded)
+    } else if unread_spread {
+        Some(UncheckedArgs::Splat)
+    } else if nested.is_none()
+        && call_kind != CallKind::RequestParam
+        && kwargs.iter().any(|k| k == "extra_body")
+    {
+        Some(UncheckedArgs::ExtraBody)
+    } else {
+        None
+    };
+    if unchecked != Some(UncheckedArgs::Splat) {
+        unread_spreads.clear();
+    }
+    for decision in &mut outcome.decisions {
+        decision.unchecked_args = unchecked;
+        decision.unread_spreads = unread_spreads.clone();
+    }
 
-    let mut reasons = model_reasons(&hit, status, splat, source.is_some(), chained);
+    let mut reasons = model_reasons(
+        &hit,
+        status,
+        unchecked.map(|u| u.message(&unread_spreads)),
+        source.is_some(),
+        chained,
+    );
     if let Some(chain) = replacement_chain.as_ref().filter(|c| c.chained()) {
         reasons.push(ReviewItem {
             rule: None,
@@ -1587,6 +1719,17 @@ fn effective_state(status: EntryStatus, date: Option<Date>, kind: DateKind, toda
 /// pre-1.0 `FineTuningJob.create` and `FineTune.create`).
 pub const FINE_TUNING: &str = "fine_tuning";
 
+/// An endpoint as the docs name it, for a sentence.
+fn endpoint_name(endpoint: &str) -> &str {
+    match endpoint {
+        "chat.completions" => "Chat Completions",
+        "responses" => "the Responses API",
+        "completions_legacy" => "the legacy Completions API",
+        "assistants" => "the Assistants API",
+        other => other,
+    }
+}
+
 /// Which API a call uses, from its callee.
 fn endpoint_of(chain: &str, member: &str) -> Option<&'static str> {
     let text = if member.contains('.') { member } else { chain };
@@ -1628,7 +1771,7 @@ fn endpoint_of(chain: &str, member: &str) -> Option<&'static str> {
 fn model_reasons(
     hit: &Hit<'_>,
     status: State,
-    splat: bool,
+    unchecked: Option<String>,
     rules_known: bool,
     chained: bool,
 ) -> Vec<ReviewItem> {
@@ -1674,10 +1817,8 @@ fn model_reasons(
                 .to_string(),
         );
     }
-    if splat {
-        messages.push(
-            "Some arguments come from `**kwargs`, so Arbor could not check them all.".to_string(),
-        );
+    if let Some(unchecked) = unchecked {
+        messages.push(unchecked);
     }
     messages
         .into_iter()
@@ -1770,6 +1911,34 @@ impl RuleContext<'_> {
 
     fn endpoint_matches(&self, endpoint: &str) -> bool {
         endpoint == "*" || Some(endpoint) == self.endpoint
+    }
+
+    /// For a rule a live check saw on this model but on another API, the
+    /// sentence that says so: "stop and logit_bias are not supported on
+    /// gpt-6-luna (400)" was seen on Chat Completions, and no live check
+    /// called the Responses API. `None` when the check covers this call.
+    fn unchecked_endpoint(&self, rule: &ParamRule) -> Option<String> {
+        let model =
+            rule.live_models.is_empty() || rule.live_models.iter().any(|m| m == self.target);
+        let endpoint = self
+            .endpoint
+            .is_some_and(|e| rule.live_endpoints.iter().any(|x| x == e));
+        if rule.verified != Verified::Live || rule.live_endpoints.is_empty() || !model || endpoint {
+            return None;
+        }
+        let seen: Vec<&str> = rule
+            .live_endpoints
+            .iter()
+            .map(|e| endpoint_name(e))
+            .collect();
+        Some(match self.endpoint {
+            Some(here) => format!(
+                "Seen on {} only; {} was not checked.",
+                seen.join(" and "),
+                endpoint_name(here)
+            ),
+            None => format!("Seen on {} only.", seen.join(" and ")),
+        })
     }
 
     /// The label for this call: a live check vouches only for the models
@@ -1867,7 +2036,10 @@ fn apply_rules<'r>(
         match rule.effect {
             RuleEffect::Review => out.review.push(ReviewItem {
                 rule: Some(rule.id.clone()),
-                message: context.message(&rule.message),
+                message: match context.unchecked_endpoint(rule) {
+                    Some(scope) => format!("{} {scope}", context.message(&rule.message)),
+                    None => context.message(&rule.message),
+                },
                 because,
                 verified: Some(context.verified(rule)),
             }),
@@ -1902,6 +2074,28 @@ fn apply_rules<'r>(
                         .map(|o| o.label.as_str())
                         .unwrap_or("reasoning off")
                 ));
+                // Only an option that turns reasoning off runs the call the
+                // way it was checked. On any other, no check says whether
+                // the argument works, so that option is never "no change"
+                // (`seed=` on gpt-6-luna with the model reasoning). Off the
+                // checked endpoint, no option runs it that way.
+                let checked_here = context.verified(rule) != Verified::Unverified;
+                for option in decision.options.iter_mut().filter(|o| {
+                    !checked_here
+                        || !o
+                            .add
+                            .iter()
+                            .any(|a| is_effort_none(&a.name, Some(&a.value)))
+                }) {
+                    for name in &because {
+                        let settled = option.remove.contains(name)
+                            || option.keep.contains(name)
+                            || option.add.iter().any(|a| &a.name == name);
+                        if !settled {
+                            push_unique(&mut option.unverified, name.clone());
+                        }
+                    }
+                }
             } else {
                 out.review.push(ReviewItem {
                     rule: Some(rule.id.clone()),
@@ -1924,7 +2118,41 @@ fn apply_rules<'r>(
             None => out.notes.push(note),
         }
     }
+    flag_checked_arguments(&mut out);
     out
+}
+
+/// A check line about an argument the call sends holds whichever option is
+/// chosen: `temperature` returns 400 on claude-sonnet-5-5 with or without
+/// thinking, and whether gpt-6-luna takes it on the Responses API is not
+/// verified at any effort. Each option that neither removes, keeps nor sets
+/// that argument lists it, so no option reads "no change" next to a check
+/// line that says otherwise.
+fn flag_checked_arguments(out: &mut Outcome) {
+    for item in out.review.iter().filter(|r| r.rule.is_some()) {
+        let unverified = item.verified == Some(Verified::Unverified);
+        for option in out.decisions.iter_mut().flat_map(|d| &mut d.options) {
+            for name in &item.because {
+                let settled = option.remove.contains(name)
+                    || option.keep.contains(name)
+                    || option.add.iter().any(|a| &a.name == name);
+                if settled {
+                    continue;
+                }
+                let list = if unverified {
+                    &mut option.unverified
+                } else {
+                    &mut option.check
+                };
+                push_unique(list, name.clone());
+            }
+        }
+    }
+    // An argument flagged both ways reads once, as the firmer check.
+    for option in out.decisions.iter_mut().flat_map(|d| &mut d.options) {
+        let check = option.check.clone();
+        option.unverified.retain(|name| !check.contains(name));
+    }
 }
 
 /// Adds a choice rule's options to the call's decision for that choice. A
@@ -1974,10 +2202,15 @@ fn add_choice(rule: &ParamRule, context: &RuleContext<'_>, out: &mut Outcome) {
                         add: Vec::new(),
                         remove: Vec::new(),
                         keep: Vec::new(),
+                        check: Vec::new(),
+                        unverified: Vec::new(),
                         effects: Vec::new(),
                     })
                     .collect(),
                 notes: Vec::new(),
+                // Set by the caller, which knows what the scan read.
+                unchecked_args: None,
+                unread_spreads: Vec::new(),
             });
             out.decisions.len() - 1
         }
@@ -2129,16 +2362,21 @@ fn merge_change(changes: &mut Vec<Change>, change: Change) {
 
 /// Whether the changes set reasoning effort to `none`.
 fn effort_none(changes: &[Change]) -> bool {
-    changes.iter().any(|c| {
-        c.kind == ChangeKind::Add
-            && match (c.param.as_str(), &c.value) {
-                ("reasoning_effort", Some(serde_json::Value::String(v))) => v == "none",
-                ("reasoning", Some(serde_json::Value::Object(map))) => {
-                    map.get("effort").and_then(|v| v.as_str()) == Some("none")
-                }
-                _ => false,
-            }
-    })
+    changes
+        .iter()
+        .any(|c| c.kind == ChangeKind::Add && is_effort_none(&c.param, c.value.as_ref()))
+}
+
+/// Whether setting `param` to `value` turns reasoning off:
+/// `reasoning_effort="none"` or `reasoning={"effort": "none"}`.
+fn is_effort_none(param: &str, value: Option<&serde_json::Value>) -> bool {
+    match (param, value) {
+        ("reasoning_effort", Some(serde_json::Value::String(v))) => v == "none",
+        ("reasoning", Some(serde_json::Value::Object(map))) => {
+            map.get("effort").and_then(|v| v.as_str()) == Some("none")
+        }
+        _ => false,
+    }
 }
 
 /// A JSON value as a Python literal (`"none"`, `{"effort": "none"}`).
@@ -2371,7 +2609,7 @@ fn summarize(
 mod tests {
     use super::super::bundled;
     use super::*;
-    use crate::usages::{Receiver, Span};
+    use crate::usages::{CallArgs, Receiver, Span};
 
     fn span(line: u32) -> Span {
         Span {
@@ -2422,6 +2660,7 @@ mod tests {
             kwargs: all,
             positional: 0,
             splat: false,
+            spreads: Vec::new(),
             values: vec![value(model, ValueOrigin::Literal, line)],
         }
     }
@@ -2497,7 +2736,10 @@ mod tests {
         assert_eq!(finding.call_kind, CallKind::Request);
         assert_eq!(finding.endpoint, Some("chat.completions"));
         assert!(!finding.in_window, "retiring is not failing by default");
-        assert!(finding.notes.iter().any(|n| n.contains("efficient tier")));
+        assert!(finding
+            .notes
+            .iter()
+            .any(|n| n.contains("most efficient model for focused, high-volume tasks")));
 
         // The day after the date the call is retired.
         let report = run(&[openai("gpt-4o", &[])], &[], &options("2027-01-15"));
@@ -3065,15 +3307,32 @@ mod tests {
         assert!(advice.contains("does not support fine-tuning"), "{advice}");
         assert!(!advice.contains("retrain on gpt-6-luna"), "{advice}");
 
-        // A listed base that cannot be fine-tuned is named, not recommended.
-        let finding = one(&[openai("ft:gpt-3.5-turbo:acme::abc123", &[])]);
+        // A listed base that cannot be fine-tuned is named, not recommended:
+        // ft-o4-mini-2025-04-16 is the 23 Oct table's only fine-tune row.
+        let finding = one(&[openai("ft:o4-mini-2025-04-16:acme::abc123", &[])]);
         assert_eq!(
             finding.replacement_text.as_deref(),
             Some("no fine-tunable replacement is listed")
         );
         assert!(finding.review[0]
             .message
-            .contains("OpenAI lists gpt-5.6-terra for fine-tunes of gpt-3.5-turbo"));
+            .contains("OpenAI lists gpt-5.6-terra for fine-tunes of o4-mini-2025-04-16"));
+
+        // Since OpenAI removed its separate fine-tune table (26-27 Oct), the
+        // page names no replacement for fine-tunes of gpt-3.5-turbo: they
+        // follow their base model, and no base is named.
+        let finding = one(&[openai("ft:gpt-3.5-turbo:acme::abc123", &[])]);
+        assert_eq!(finding.date.unwrap().iso(), "2026-10-23");
+        assert_eq!(
+            finding.replacement_text.as_deref(),
+            Some("no fine-tunable replacement is listed")
+        );
+        let advice = &finding.review[0].message;
+        assert!(
+            advice.contains("OpenAI lists no replacement for fine-tunes of gpt-3.5-turbo"),
+            "{advice}"
+        );
+        assert!(!advice.contains("gpt-5.6-terra"), "{advice}");
     }
 
     #[test]
@@ -3134,10 +3393,20 @@ mod tests {
         );
         // A listed fine-tune base that cannot be fine-tuned is named, not
         // recommended.
-        let finding = one(&[job("gpt-3.5-turbo")]);
+        let finding = one(&[job("o4-mini-2025-04-16")]);
         assert!(finding.review[0]
             .message
-            .contains("OpenAI lists gpt-5.6-terra for fine-tunes of gpt-3.5-turbo"));
+            .contains("OpenAI lists gpt-5.6-terra for fine-tunes of o4-mini-2025-04-16"));
+        // gpt-3.5-turbo has no fine-tune row since OpenAI removed that table:
+        // its listed replacement is named as a replacement, not as a base.
+        let finding = one(&[job("gpt-3.5-turbo")]);
+        assert!(
+            finding.review[0].message.contains(
+                "OpenAI lists gpt-5.6-terra as the replacement for gpt-3.5-turbo, not as a base for fine-tuning"
+            ),
+            "{:#?}",
+            finding.review
+        );
         // An `ft:` model continued in a job keeps the fine-tune advice.
         let finding = one(&[job("ft:gpt-4o-mini-2024-07-18:acme::abc123")]);
         assert_eq!(finding.match_kind, MatchKind::FineTuned);
@@ -3499,6 +3768,7 @@ def known(model):
             detail: String::new(),
             values: Vec::new(),
             values_complete: false,
+            args: None,
         };
         let gaps = [
             gap(22, "base_url_env"),
@@ -3600,6 +3870,7 @@ def known(model):
             detail: String::new(),
             values: vec![value("gpt-4o-2024-08-06", ValueOrigin::Literal, 40)],
             values_complete: false,
+            args: None,
         };
         let report = run(&[], &[gap], &options("2026-10-18"));
         let finding = &report.findings[0];
@@ -3627,12 +3898,99 @@ def known(model):
             detail: String::new(),
             values: Vec::new(),
             values_complete: false,
+            args: None,
         };
         // Line 10 has a captured fallback; line 50 has nothing.
         let report = run(&[env], &[gap(10), gap(50), gap(50)], &options("2026-10-18"));
         assert_eq!(report.unreadable.len(), 1);
         assert_eq!(report.unreadable[0].line, 50);
         assert_eq!(report.summary.unreadable_calls, 1);
+    }
+
+    #[test]
+    fn bare_gpt_5_and_o3_shut_down_with_their_snapshots_on_11_december() {
+        // OpenAI's deprecations page lists each 11 Dec row as the bare ID and
+        // its snapshot (`gpt-5` | `gpt-5-2025-08-07`) since late October 2026;
+        // Arbor 3.1.0 had only the snapshots, so `model="gpt-5"` and
+        // `model="o3"` were not listed at all.
+        let source = r#"from openai import OpenAI
+
+client = OpenAI()
+
+
+def run(question):
+    messages = [{"role": "user", "content": question}]
+    client.chat.completions.create(model="gpt-5-2025-08-07", messages=messages)
+    client.chat.completions.create(model="gpt-5", messages=messages)
+    client.chat.completions.create(model="o3", messages=messages)
+    client.chat.completions.create(model="gpt-5-mini", messages=messages)
+    client.chat.completions.create(model="gpt-5-nano", messages=messages)
+    client.chat.completions.create(model="gpt-5-pro", messages=messages)
+    client.chat.completions.create(model="o3-pro", messages=messages)
+    client.chat.completions.create(model="o1-preview", messages=messages)
+"#;
+        let report = check_source(source, &options("2026-10-28"));
+        let at = |model: &str| -> Finding {
+            let line = line_of(source, &format!("model=\"{model}\""));
+            let found: Vec<&Finding> = report.findings.iter().filter(|f| f.line == line).collect();
+            assert_eq!(found.len(), 1, "{model}: {:#?}", report.findings);
+            found[0].clone()
+        };
+        for (model, replacement, text) in [
+            ("gpt-5-2025-08-07", "gpt-5.6-sol", None),
+            ("gpt-5", "gpt-5.6-sol", None),
+            ("o3", "gpt-5.6-sol", None),
+            ("gpt-5-mini", "gpt-5.6-terra", None),
+            ("gpt-5-nano", "gpt-5.6-luna", None),
+            (
+                "gpt-5-pro",
+                "gpt-5.6-sol",
+                Some("gpt-5.6-sol (reasoning.mode: pro)"),
+            ),
+            (
+                "o3-pro",
+                "gpt-5.6-sol",
+                Some("gpt-5.6-sol (reasoning.mode: pro)"),
+            ),
+        ] {
+            let finding = at(model);
+            assert_eq!(finding.matched, model, "matched exactly, never by prefix");
+            assert_eq!(finding.match_kind, MatchKind::Exact, "{model}");
+            assert_eq!(finding.provider, Table::Openai, "{model}");
+            assert_eq!(finding.status, State::Retiring, "{model}");
+            assert_eq!(finding.date.unwrap().iso(), "2026-12-11", "{model}");
+            assert_eq!(finding.days_left, Some(44), "{model}");
+            assert_eq!(finding.replacement.as_deref(), Some(replacement), "{model}");
+            assert_eq!(finding.replacement_text.as_deref(), text, "{model}");
+            assert_eq!(finding.confidence, Confidence::Confirmed, "{model}");
+            // The page is the source: these rows carry no models API note.
+            assert_eq!(
+                finding.source_url.as_deref(),
+                Some("https://developers.openai.com/api/docs/deprecations"),
+                "{model}"
+            );
+            assert!(finding.notes.is_empty(), "{model}: {:?}", finding.notes);
+            // No recipe has rules for GPT-5.6 targets of these rows yet: the
+            // date and replacement only, and a manual check, never a change.
+            assert!(finding.changes.is_empty(), "{model}");
+            assert!(finding.decisions.is_empty(), "{model}");
+            assert_eq!(finding.fix, FixKind::Manual, "{model}");
+            assert!(
+                finding.review.iter().any(|r| r.message
+                    == format!("The parameters {replacement} needs have not been checked yet.")),
+                "{model}: {:#?}",
+                finding.review
+            );
+        }
+        // o1-preview (shut down 28 Jul 2025) lists o3, which now has a date
+        // too, so the chain goes on to gpt-5.6-sol.
+        let preview = at("o1-preview");
+        assert_eq!(preview.status, State::Retired);
+        assert_eq!(preview.replacement.as_deref(), Some("o3"));
+        assert_eq!(preview.live_replacement.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(preview.replacement_chain[0].model, "o3");
+        assert_eq!(preview.replacement_chain[0].status, Some(State::Retiring));
+        assert_eq!(report.findings.len(), 8, "{:#?}", report.findings);
     }
 
     #[test]
@@ -3934,15 +4292,18 @@ def run():
         assert_eq!(report.findings[0].fix, FixKind::Manual);
 
         // Each provider's pages carry their own date; as_of is the oldest.
+        // The 28 Oct 2026 refresh read every provider's pages that day.
         let dates: Vec<(&str, String)> = report
             .data
             .providers
             .iter()
             .map(|p| (p.provider.as_str(), p.as_of.iso()))
             .collect();
-        assert_eq!(dates[0], ("OpenAI", "2026-10-18".to_string()));
-        assert_eq!(dates[1], ("Anthropic", "2026-10-16".to_string()));
-        assert_eq!(report.data.as_of.iso(), "2026-10-16");
+        assert_eq!(dates[0], ("OpenAI", "2026-10-28".to_string()));
+        assert_eq!(dates[1], ("Anthropic", "2026-10-28".to_string()));
+        let oldest = report.data.providers.iter().map(|p| p.as_of).min().unwrap();
+        assert_eq!(report.data.as_of, oldest);
+        assert_eq!(report.data.as_of.iso(), "2026-10-28");
 
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["version"], 1);
@@ -3971,6 +4332,7 @@ def run():
                 value("gpt-6-luna", ValueOrigin::Literal, 3),
             ],
             values_complete: true,
+            args: None,
         };
         let missing = UsageGap {
             kind: GapKind::UnresolvedModel,
@@ -4017,6 +4379,349 @@ def run():
             detail: String::new(),
             values: Vec::new(),
             values_complete: false,
+            args: None,
+        }
+    }
+
+    #[test]
+    fn a_call_through_an_unresolved_client_is_checked_with_its_arguments() {
+        // #290: the arguments of a call whose client Arbor could not resolve
+        // (a subclass of `OpenAI` exported under the same name) were
+        // dropped, so `temperature`, `tools` and `max_tokens` went unchecked
+        // and the decision read "let the model reason (no change)".
+        let at = |args: Option<CallArgs>| UsageGap {
+            args,
+            values: vec![value("gpt-4.1-mini", ValueOrigin::Literal, 40)],
+            ..gap_at(GapKind::UnknownClientFactory, "factory_call", 40, None)
+        };
+        let read = |kwargs: &[&str], splat: bool| {
+            Some(CallArgs {
+                kwargs: kwargs.iter().map(|k| k.to_string()).collect(),
+                splat,
+                spreads: Vec::new(),
+            })
+        };
+        let finding = |gap: UsageGap| {
+            let report = run(&[], &[gap], &options("2026-10-18"));
+            assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
+            report.findings[0].clone()
+        };
+
+        let sampled = finding(at(read(
+            &["model", "temperature", "max_tokens", "messages"],
+            false,
+        )));
+        assert_eq!(sampled.confidence, Confidence::Gap);
+        assert_eq!(sampled.fix, FixKind::Manual, "a gap is never a swap");
+        assert_eq!(
+            change(&sampled, "max_tokens").and_then(|c| c.to).as_deref(),
+            Some("max_completion_tokens")
+        );
+        assert_eq!(sampled.decisions[0].unchecked_args, None);
+        assert_eq!(option(&sampled, "model_default").remove, ["temperature"]);
+        assert_eq!(option(&sampled, "reasoning_none").keep, ["temperature"]);
+
+        let tools = finding(at(read(&["model", "tools", "messages"], false)));
+        assert_eq!(option(&tools, "model_default").remove, ["tools"]);
+
+        // Arguments it cannot see: the decision says so, and a person checks.
+        for (args, why) in [
+            (read(&["model", "messages"], true), UncheckedArgs::Splat),
+            (None, UncheckedArgs::NotRecorded),
+        ] {
+            let unseen = finding(at(args));
+            assert_eq!(unseen.decisions[0].unchecked_args, Some(why));
+            assert!(
+                unseen.review.iter().any(|r| r.message == why.message(&[])),
+                "{:#?}",
+                unseen.review
+            );
+        }
+    }
+
+    #[test]
+    fn a_decision_says_when_the_call_sends_arguments_arbor_did_not_read() {
+        let mut splat = openai("gpt-4o-mini", &["messages"]);
+        splat.splat = true;
+        let extra_body = openai("gpt-4o-mini", &["messages", "extra_body"]);
+        let plain = openai("gpt-4o-mini", &["messages"]);
+        for (call, why) in [
+            (splat, Some(UncheckedArgs::Splat)),
+            (extra_body, Some(UncheckedArgs::ExtraBody)),
+            (plain, None),
+        ] {
+            let finding = one(&[call]);
+            assert_eq!(finding.decisions[0].unchecked_args, why, "{finding:#?}");
+            match why {
+                Some(why) => {
+                    assert!(finding.review.iter().any(|r| r.message == why.message(&[])));
+                    assert_eq!(finding.fix, FixKind::Manual);
+                }
+                // Every argument was read and none conflicts: "no change"
+                // holds for letting the model reason.
+                None => assert!(option(&finding, "model_default").remove.is_empty()),
+            }
+        }
+
+        // Claude's thinking choice is marked the same way.
+        let mut claude = call(
+            Sdk::Anthropic,
+            Routing::AnthropicDirect,
+            "claude.messages.create",
+            "claude-3-5-sonnet-20241022",
+            &["max_tokens", "messages"],
+            20,
+        );
+        claude.splat = true;
+        let finding = one(&[claude]);
+        assert_eq!(finding.decisions[0].choice, "ANT-THINKING-DEFAULT");
+        assert_eq!(
+            finding.decisions[0].unchecked_args,
+            Some(UncheckedArgs::Splat)
+        );
+
+        // A model nested in `extra_body` has no decision; the nested check
+        // already says to look at its parameters by hand.
+        let mut nested = openai("gpt-4o", &["messages", "extra_body"]);
+        nested.values[0].key = "extra_body.model".into();
+        let finding = one(&[nested]);
+        assert!(finding.decisions.is_empty());
+        assert!(!finding
+            .review
+            .iter()
+            .any(|r| r.message == UncheckedArgs::ExtraBody.message(&[])));
+    }
+
+    #[test]
+    fn an_argument_a_check_line_flags_is_named_on_every_option() {
+        // #291 round 3: "let the model reason (no change)" sat next to "Whether
+        // gpt-6-luna accepts temperature ... on the Responses API is not
+        // verified", and "let the model think (no change)" next to "Non-default
+        // temperature ... return 400 on claude-sonnet-5-5".
+        let flags = |finding: &Finding| -> Vec<(String, Vec<String>, Vec<String>)> {
+            finding.decisions[0]
+                .options
+                .iter()
+                .map(|o| (o.id.clone(), o.check.clone(), o.unverified.clone()))
+                .collect()
+        };
+        let both = |a: (&str, Vec<String>, Vec<String>), b: (&str, Vec<String>, Vec<String>)| {
+            vec![(a.0.to_string(), a.1, a.2), (b.0.to_string(), b.1, b.2)]
+        };
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Responses API: no live call went to /v1/responses, but OpenAI's
+        // "Using GPT-6" guide documents the sampling rule there
+        // (G6-SAMPLING-RESPONSES, `docs` since the 28 Oct data, #297), so
+        // both options name temperature as a check.
+        let responses = one(&[call(
+            Sdk::Openai,
+            Routing::OpenaiDirect,
+            "client.responses.create",
+            "gpt-4o-mini",
+            &["temperature", "input"],
+            10,
+        )]);
+        assert!(responses
+            .review
+            .iter()
+            .any(|r| r.rule.as_deref() == Some("G6-SAMPLING-RESPONSES")));
+        assert_eq!(
+            flags(&responses),
+            both(
+                ("reasoning_none", names(&["temperature"]), vec![]),
+                ("model_default", names(&["temperature"]), vec![]),
+            )
+        );
+
+        // Claude: a non-default temperature returns 400 whichever way the
+        // thinking choice goes.
+        let claude = one(&[call(
+            Sdk::Anthropic,
+            Routing::AnthropicDirect,
+            "claude.messages.create",
+            "claude-3-5-sonnet-20241022",
+            &["max_tokens", "temperature", "messages"],
+            20,
+        )]);
+        assert_eq!(claude.decisions[0].choice, "ANT-THINKING-DEFAULT");
+        assert_eq!(
+            flags(&claude),
+            both(
+                ("thinking_between_tools", names(&["temperature"]), vec![]),
+                ("model_default", names(&["temperature"]), vec![]),
+            )
+        );
+
+        // Chat Completions `stop` returns 400 on gpt-6-luna (live).
+        let stop = one(&[openai("gpt-4o-mini", &["stop", "messages"])]);
+        assert_eq!(
+            flags(&stop),
+            both(
+                ("reasoning_none", names(&["stop"]), vec![]),
+                ("model_default", names(&["stop"]), vec![]),
+            )
+        );
+
+        // An argument the choice settles is not flagged again: Chat
+        // Completions temperature is kept or removed by the options.
+        let sampled = one(&[openai("gpt-4o-mini", &["temperature", "messages"])]);
+        assert!(flags(&sampled)
+            .iter()
+            .all(|(_, check, unverified)| check.is_empty() && unverified.is_empty()));
+        // Claude's thinking=... is removed by both options: not flagged.
+        let thinking = one(&[call(
+            Sdk::Anthropic,
+            Routing::AnthropicDirect,
+            "claude.messages.create",
+            "claude-3-5-sonnet-20241022",
+            &["max_tokens", "thinking", "messages"],
+            20,
+        )]);
+        assert!(flags(&thinking)
+            .iter()
+            .all(|(_, check, unverified)| check.is_empty() && unverified.is_empty()));
+        // A call with nothing a check names keeps both lists empty.
+        let plain = one(&[openai("gpt-4o-mini", &["messages"])]);
+        assert!(flags(&plain)
+            .iter()
+            .all(|(_, check, unverified)| check.is_empty() && unverified.is_empty()));
+    }
+
+    #[test]
+    fn an_argument_checked_only_with_reasoning_off_cannot_be_vouched_for_otherwise() {
+        // #291 round 3 review: `seed=1` on gpt-4o read "let the model reason
+        // (no change)" next to Arbor's own note that seed is untested with
+        // the model reasoning (LIVE_CHECKS_2026-10-18.md:77, :284).
+        let unverified = |finding: &Finding| -> Vec<(String, Vec<String>)> {
+            finding.decisions[0]
+                .options
+                .iter()
+                .map(|o| (o.id.clone(), o.unverified.clone()))
+                .collect()
+        };
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for arg in ["seed", "n"] {
+            let finding = one(&[openai("gpt-4o", &[arg, "messages"])]);
+            assert_eq!(
+                unverified(&finding),
+                [
+                    ("reasoning_none".to_string(), Vec::new()),
+                    ("model_default".to_string(), names(&[arg])),
+                ],
+                "{arg}"
+            );
+            assert!(
+                finding.decisions[0]
+                    .notes
+                    .iter()
+                    .any(|n| n.starts_with(&format!("{arg} was accepted on gpt-6-luna"))),
+                "{:?}",
+                finding.decisions[0].notes
+            );
+        }
+        // With temperature too: the reasoning option removes temperature and
+        // still cannot vouch for seed.
+        let finding = one(&[openai("gpt-4o", &["seed", "temperature", "messages"])]);
+        let model_default = &finding.decisions[0].options[1];
+        assert_eq!(model_default.remove, names(&["temperature"]));
+        assert_eq!(model_default.unverified, names(&["seed"]));
+        assert!(finding.decisions[0].options[0].unverified.is_empty());
+    }
+
+    #[test]
+    fn a_check_line_seen_on_another_api_says_where_it_was_seen() {
+        // #291 round 3 review: on the Responses API "stop and logit_bias are
+        // not supported on gpt-6-luna (400)" sat next to "could not check
+        // logit_bias"; the live check called Chat Completions only.
+        let message = |finding: &Finding, rule: &str| -> String {
+            finding
+                .review
+                .iter()
+                .find(|r| r.rule.as_deref() == Some(rule))
+                .unwrap_or_else(|| panic!("no {rule}: {:#?}", finding.review))
+                .message
+                .clone()
+        };
+        let responses = one(&[call(
+            Sdk::Openai,
+            Routing::OpenaiDirect,
+            "client.responses.create",
+            "gpt-4o-mini",
+            &["logit_bias", "input"],
+            10,
+        )]);
+        assert_eq!(
+            message(&responses, "G6-STOP-LOGIT-BIAS"),
+            "stop and logit_bias are not supported on gpt-6-luna (400). Seen on Chat Completions only; the Responses API was not checked."
+        );
+        assert!(responses.decisions[0]
+            .options
+            .iter()
+            .all(|o| o.unverified == ["logit_bias"]));
+        // On the API the live check called, the line is as before.
+        let chat = one(&[openai("gpt-4o-mini", &["logit_bias", "messages"])]);
+        assert_eq!(
+            message(&chat, "G6-STOP-LOGIT-BIAS"),
+            "stop and logit_bias are not supported on gpt-6-luna (400)."
+        );
+    }
+
+    #[test]
+    fn a_spread_dict_is_checked_and_one_arbor_cannot_read_is_named() {
+        let spread = |name: Option<&str>, keys: &[&str], complete: bool| crate::usages::Spread {
+            name: name.map(str::to_string),
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+            complete,
+        };
+        let with = |spreads: Vec<crate::usages::Spread>| {
+            let mut call = openai("gpt-4o-mini", &["messages"]);
+            call.splat = true;
+            call.spreads = spreads;
+            one(&[call])
+        };
+
+        // `**PARAMS`, a same-file literal holding temperature: checked like
+        // an argument written at the call, and nothing is left unseen.
+        let read = with(vec![spread(
+            Some("PARAMS"),
+            &["model", "temperature"],
+            true,
+        )]);
+        assert_eq!(read.decisions[0].unchecked_args, None);
+        assert_eq!(option(&read, "model_default").remove, ["temperature"]);
+        assert_eq!(option(&read, "reasoning_none").keep, ["temperature"]);
+        assert!(read.review.is_empty(), "{:#?}", read.review);
+
+        // Names it could not read are named, never "**kwargs" for all.
+        let unread = with(vec![
+            spread(Some("PARAMS"), &["temperature"], true),
+            spread(Some("settings.llm"), &[], false),
+            spread(Some("kwargs"), &[], false),
+        ]);
+        let decision = &unread.decisions[0];
+        assert_eq!(decision.unchecked_args, Some(UncheckedArgs::Splat));
+        assert_eq!(decision.unread_spreads, ["settings.llm", "kwargs"]);
+        // What it could read still counts.
+        assert_eq!(option(&unread, "model_default").remove, ["temperature"]);
+        let message = "Some arguments come from `**settings.llm` and `**kwargs`, so Arbor could not check them all.";
+        assert!(
+            unread.review.iter().any(|r| r.message == message),
+            "{:#?}",
+            unread.review
+        );
+        assert_eq!(unread.fix, FixKind::Manual);
+
+        // No name (a conditional), or a scan that recorded no spreads.
+        for spreads in [vec![spread(None, &[], false)], Vec::new()] {
+            let unnamed = with(spreads);
+            assert_eq!(
+                unnamed.decisions[0].unchecked_args,
+                Some(UncheckedArgs::Splat)
+            );
+            assert!(unnamed.decisions[0].unread_spreads.is_empty());
+            assert!(unnamed.review.iter().any(|r| r.message
+                == "Some arguments are spread into the call with `**`, so Arbor could not check them all."));
         }
     }
 
