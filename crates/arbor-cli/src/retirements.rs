@@ -648,7 +648,7 @@ fn summary_lines(report: &RetirementReport, markdown: bool) -> Vec<String> {
     let mut lines = Vec::new();
     if s.affected_calls == 0 {
         lines.push(format!(
-            "No direct openai/anthropic/google SDK calls to retired or retiring models in {} Python file{} (LangChain's ChatOpenAI and ChatAnthropic, raw HTTP posts to their APIs and the project's own wrappers of them included). Calls through LiteLLM count as routed; Bedrock's own model schedule and other wrapper libraries are not checked yet.",
+            "No direct openai/anthropic/google SDK calls to retired or retiring models in {} Python file{} (LangChain's ChatOpenAI and ChatAnthropic, raw HTTP posts to their APIs, and models passed one hop to the project's own wrappers of them, included). Calls through LiteLLM count as routed; Bedrock's own model schedule, other wrapper libraries and wrappers the scan does not follow are not checked yet.",
             s.files_scanned,
             if s.files_scanned == 1 { "" } else { "s" }
         ));
@@ -835,7 +835,7 @@ fn join_and(names: &[&str]) -> String {
 
 fn data_line(report: &RetirementReport) -> String {
     format!(
-        "Retirement data from the providers' deprecation pages: {}. Days are counted in UTC. Python only for now: direct SDK calls, raw HTTP posts to OpenAI's and Anthropic's APIs, the project's own wrappers of them, LangChain chat models and LiteLLM (routed). Runs locally: no code leaves this machine.",
+        "Retirement data from the providers' deprecation pages: {}. Days are counted in UTC. Python only for now: direct SDK calls, raw HTTP posts to OpenAI's and Anthropic's APIs, models passed one hop to the project's own wrappers of them, LangChain chat models and LiteLLM (routed). Runs locally: no code leaves this machine.",
         provider_dates(report)
     )
 }

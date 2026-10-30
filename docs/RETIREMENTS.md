@@ -105,13 +105,17 @@ model apply, with a check to review the body's other fields by hand.
 
 A model passed to the project's own wrapper, a function or class in another file whose
 parameter is the model of one of these requests (`Sampler(model="o1")` after `from
-.sampler import Sampler`), is found where it is passed, in the calling file
-([SDK_USAGES.md](SDK_USAGES.md#calls-through-a-wrapper-in-another-file)). It follows the
-schedule of the requests the wrapper sends it in. The call's arguments are the
+.sampler import Sampler`), is found where it is passed, in the calling file: one hop
+only, and only for the shapes
+[SDK_USAGES.md](SDK_USAGES.md#calls-through-a-wrapper-in-another-file) lists. It follows
+the schedule of the requests the wrapper sends it in. The call's arguments are the
 wrapper's, so only the checks about the model apply, with a check naming the wrapper and
-the line of its request, where the other parameters are set. Other LangChain models and
-integrations, LlamaIndex and other wrapper libraries are not checked yet, so a clean
-result says "No direct openai/anthropic/google SDK calls" and nothing more.
+the line of its request, where the other parameters are set. Wrappers the scan does not
+follow (a model passed on through a second wrapper or `super().__init__(model=...)`, a
+package's re-export, `module.Wrapper(...)`, a model passed to the request by position),
+other LangChain models and integrations, LlamaIndex and other wrapper libraries are not
+checked yet, and leave no record where they are called, so a clean result covers only the
+calls it names and says what is not checked yet.
 
 Fine-tuned models (`ft:<base>:...`) follow their base model's schedule. Arbor names a
 base model to retrain on only when the provider lists one that supports fine-tuning;
@@ -205,7 +209,8 @@ it too. The check runs on the runner and sends nothing anywhere.
   REST APIs with `requests` or `httpx`, and models passed to the project's own wrappers
   of these in another file (one hop). Calls through LiteLLM and on Amazon Bedrock are
   routed (`--include-routed`), and Bedrock's own schedule is not in the data. Other
-  framework wrappers (LangChain's other integrations, LlamaIndex) are not checked yet. Model IDs in `.env`, YAML, JSON or notebooks are not read.
+  framework wrappers (LangChain's other integrations, LlamaIndex), and the project's own
+  wrappers the scan does not follow, are not checked yet. Model IDs in `.env`, YAML, JSON or notebooks are not read.
 - **Values it can see.** A model passed in from an environment variable, a function
   argument or another module is counted under "Not checked"; `arbor usages` lists those
   calls. The exception is a call to a wrapper the scan follows: there the model is read

@@ -51,7 +51,7 @@ Seventeen tools. Start with `get_map` or `get_architecture_overview`.
 | `find_path` | Shortest path between two nodes |
 | `get_knowledge_path` | Markdown logic path with wiki links, for knowledge sections |
 | `audit_security` | Paths from a symbol to sensitive sinks (queries, file I/O, network, exec) |
-| `find_api_usages` | OpenAI, Anthropic and Gemini SDK call sites and LangChain's OpenAI and Anthropic chat models (Python) with routing, model IDs and typed gaps; reads files, no graph needed |
+| `find_api_usages` | OpenAI, Anthropic and Gemini SDK call sites, LangChain's OpenAI, Anthropic and Bedrock chat models, `boto3` Bedrock runtime and LiteLLM calls, raw `requests`/`httpx` posts to OpenAI's and Anthropic's APIs, and models passed one hop to the project's own wrappers of these (Python), with routing, model IDs and typed gaps; reads files, no graph needed |
 
 ## Why MCP?
 
