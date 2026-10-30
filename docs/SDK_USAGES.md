@@ -650,6 +650,11 @@ The receiver must be one of these:
   host. `client.withOptions({ baseURL })` re-routes the copy it returns. A
   custom `fetch` (in the constructor or `withOptions`) receives every
   request's URL: an `endpoint_option` gap, like OpenAI's `dataResidency`.
+  So does an Anthropic client's `middleware`, which may change a request
+  before passing it on or answer it itself, unless it is an array literal
+  whose items are all calls of the SDK's own `betaRefusalFallbackMiddleware`
+  (imported from `@anthropic-ai/sdk`, under any name): that one only sends
+  the request again with a fallback model, so the route stays.
 - **A Gemini client** also needs no `vertexai` or `enterprise` option other
   than `false`, `null` or `undefined`, no `httpOptions` that names a
   `baseUrl` (or is not an object literal), no spread, and no
