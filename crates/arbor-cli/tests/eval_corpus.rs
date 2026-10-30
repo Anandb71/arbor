@@ -64,6 +64,9 @@ fn index_dir(source: &Path, tag: &str) -> (BTreeSet<String>, BTreeSet<(String, S
     let tmp = std::env::temp_dir().join(format!("arbor-eval-{tag}"));
     let _ = fs::remove_dir_all(&tmp);
     copy_dir(source, &tmp);
+    // Its own project root, so `arbor index .` never walks up from the temp
+    // folder to a parent's marker, such as `~/.arbor` (#273).
+    fs::create_dir_all(tmp.join(".arbor")).unwrap();
 
     let started = std::time::Instant::now();
     let status = Command::new(env!("CARGO_BIN_EXE_arbor"))
