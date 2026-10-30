@@ -71,6 +71,10 @@ jobs:
             echo "::error::Release $TAG has $COUNT binary assets (expected 5). npm postinstall downloads from GitHub Releases."
             exit 1
           fi
+          if ! gh release view "$TAG" --json assets -q '.assets[].name' | grep -x SHA256SUMS >/dev/null; then
+            echo "::error::Release $TAG has no SHA256SUMS. The npm wrapper verifies every download against it and installs nothing without it."
+            exit 1
+          fi
           echo "Release $TAG has $COUNT assets — OK"
 
       - name: Setup Node

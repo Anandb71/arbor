@@ -15,5 +15,5 @@
   "edges_forbidden": [],
   "known_missing": [],
   "known_extra": [],
-  "notes": "a.py calls pong unqualified while b.py imports ping explicitly; both directions must resolve."
+  "notes": "b.py imports ping at module level; a.py imports pong inside ping, the way real code breaks an import cycle (a module-level import in both files would fail at import time, and the old a.py called pong with no import at all, a NameError for any n > 0). Both directions must resolve."
 }

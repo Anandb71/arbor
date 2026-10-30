@@ -101,22 +101,52 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     }
 }
 
+/// The project a command runs on: the nearest folder at or above `start` that
+/// holds a root marker, or `start` itself when none does.
+///
+/// The home folder is never adopted from below and never walked past.
+/// `~/.arbor` is not a project marker: it holds the global config
+/// (`~/.arbor/config.json`) and, from `install.ps1`, the installed binary, so
+/// counting it made every unmarked folder under home index the whole home
+/// folder (#273). A `.git` or `package.json` left in the home folder would do
+/// the same. Arbor run in the home folder itself still uses it, and passing
+/// the home folder as the path does too.
 fn find_workspace_root(start: &Path) -> PathBuf {
-    let mut current =
-        strip_verbatim_prefix(fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf()));
+    find_workspace_root_below(start, &home_folders(), HOST_PATH_RULES)
+}
+
+/// [`find_workspace_root`] with the home folders given, so tests can choose them.
+fn find_workspace_root_below(start: &Path, homes: &[PathBuf], rules: PathRules) -> PathBuf {
+    let mut current = resolve_start(start);
     if current.is_file() {
         if let Some(parent) = current.parent() {
             current = parent.to_path_buf();
         }
     }
 
+    // The home folders as open folders, to recognise spellings no string
+    // comparison can (`\\localhost\C$\Users\ana` for `C:\Users\ana`).
+    let home_ids: Vec<same_file::Handle> = homes
+        .iter()
+        .filter_map(|home| same_file::Handle::from_path(home).ok())
+        .collect();
+
     let fallback = current.clone();
     loop {
+        let at_home = homes.iter().any(|home| same_folder(&current, home, rules))
+            || is_one_of(&current, &home_ids);
+        // A home folder is the project only when the walk starts there.
+        if at_home && current != fallback {
+            break;
+        }
         if ROOT_MARKERS
             .iter()
             .any(|marker| current.join(marker).exists())
         {
             return current;
+        }
+        if at_home {
+            break;
         }
 
         match current.parent() {
@@ -128,6 +158,114 @@ fn find_workspace_root(start: &Path) -> PathBuf {
     fallback
 }
 
+/// `start` as an absolute path with its existing part resolved by
+/// `fs::canonicalize`.
+///
+/// A path that does not exist yet can't be canonicalized as a whole, so its
+/// deepest existing folder is and the missing rest is added back. Otherwise a
+/// junction, symlink or 8.3 short name of the home folder in such a path, or a
+/// relative path given in the home folder, would never be seen as home.
+fn resolve_start(start: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let absolute = std::path::absolute(start).unwrap_or_else(|_| start.to_path_buf());
+    let parts: Vec<Component> = absolute.components().collect();
+    for existing in (1..=parts.len()).rev() {
+        let Ok(canonical) = fs::canonicalize(parts[..existing].iter().collect::<PathBuf>()) else {
+            continue;
+        };
+        let mut resolved = strip_verbatim_prefix(canonical);
+        for part in &parts[existing..] {
+            match part {
+                Component::ParentDir => {
+                    resolved.pop();
+                }
+                Component::Normal(name) => resolved.push(name),
+                _ => {}
+            }
+        }
+        return resolved;
+    }
+    absolute
+}
+
+/// Whether `folder` is, on disk, one of the already opened `folders`.
+fn is_one_of(folder: &Path, folders: &[same_file::Handle]) -> bool {
+    !folders.is_empty()
+        && same_file::Handle::from_path(folder)
+            .map(|handle| folders.contains(&handle))
+            .unwrap_or(false)
+}
+
+/// How a platform spells paths, for comparing two spellings of one folder.
+#[derive(Clone, Copy)]
+struct PathRules {
+    /// `\` separates components and `\\?\` may prefix a path (Windows).
+    windows: bool,
+    /// `C:\Users\Ana` and `c:\users\ana` are one folder (Windows, macOS).
+    ignore_case: bool,
+}
+
+const HOST_PATH_RULES: PathRules = PathRules {
+    windows: cfg!(windows),
+    ignore_case: cfg!(any(windows, target_os = "macos")),
+};
+
+/// Whether `a` and `b` name the same folder, ignoring a verbatim prefix,
+/// separator style and trailing separators, and case where the platform does.
+fn same_folder(a: &Path, b: &Path, rules: PathRules) -> bool {
+    folder_key(&a.to_string_lossy(), rules) == folder_key(&b.to_string_lossy(), rules)
+}
+
+fn folder_key(path: &str, rules: PathRules) -> String {
+    let mut key = path.to_string();
+    if rules.windows {
+        if let Some(rest) = key.strip_prefix(r"\\?\UNC\") {
+            key = format!(r"\\{rest}");
+        } else if let Some(rest) = key.strip_prefix(r"\\?\") {
+            key = rest.to_string();
+        }
+        key = key.replace('\\', "/");
+    }
+    // Keep the `/` of a filesystem root (`/`, `C:/`).
+    while key.len() > 1 && key.ends_with('/') && !key.ends_with(":/") {
+        key.pop();
+    }
+    if rules.ignore_case {
+        key = key.to_lowercase();
+    }
+    key
+}
+
+/// Every spelling of the user's home folder: the one the OS reports, plus
+/// `HOME` and `USERPROFILE` when set, each also canonicalized. Each counts,
+/// so a home folder named by any of them is never adopted from below.
+fn home_folders() -> Vec<PathBuf> {
+    home_folders_from(dirs::home_dir(), |name| std::env::var_os(name))
+}
+
+fn home_folders_from(
+    os_home: Option<PathBuf>,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    let named = ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(&env)
+        .map(PathBuf::from);
+    // A relative value (`HOME=.`) names no folder; it would stop every walk.
+    for home in os_home.into_iter().chain(named) {
+        if !home.is_absolute() {
+            continue;
+        }
+        if let Ok(canonical) = fs::canonicalize(&home) {
+            homes.push(strip_verbatim_prefix(canonical));
+        }
+        homes.push(home);
+    }
+    homes
+}
+
 pub(crate) fn resolve_project_path(path: &Path) -> Result<PathBuf> {
     let base = if path == Path::new(".") {
         std::env::current_dir()?
@@ -135,6 +273,205 @@ pub(crate) fn resolve_project_path(path: &Path) -> Result<PathBuf> {
         path.to_path_buf()
     };
     Ok(find_workspace_root(&base))
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod workspace_root_tests {
+    use super::{
+        find_workspace_root_below, folder_key, home_folders_from, same_folder, PathRules,
+        HOST_PATH_RULES,
+    };
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    const WINDOWS: PathRules = PathRules {
+        windows: true,
+        ignore_case: true,
+    };
+    const LINUX: PathRules = PathRules {
+        windows: false,
+        ignore_case: false,
+    };
+
+    /// `root/home` set up like a home folder Arbor has been installed or run
+    /// in (`.arbor/bin`, `.arbor/config.json`), with an unmarked project
+    /// `root/home/projects/demo`.
+    fn home_with_arbor_dir() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        // The temp folder is its own project, so nothing above it is reached.
+        fs::create_dir(root.path().join(".arbor")).unwrap();
+        let home = root.path().join("home");
+        fs::create_dir_all(home.join(".arbor").join("bin")).unwrap();
+        fs::write(home.join(".arbor").join("config.json"), "{}").unwrap();
+        let demo = home.join("projects").join("demo");
+        fs::create_dir_all(&demo).unwrap();
+        fs::write(demo.join("app.py"), "def main():\n    pass\n").unwrap();
+        (root, canonical(&home), canonical(&demo))
+    }
+
+    fn canonical(path: &Path) -> PathBuf {
+        super::strip_verbatim_prefix(fs::canonicalize(path).unwrap())
+    }
+
+    fn root_from(start: &Path, homes: &[PathBuf]) -> PathBuf {
+        find_workspace_root_below(start, homes, HOST_PATH_RULES)
+    }
+
+    #[test]
+    fn an_unmarked_folder_under_home_is_its_own_project() {
+        let (_root, home, demo) = home_with_arbor_dir();
+        assert_eq!(root_from(&demo, std::slice::from_ref(&home)), demo);
+        assert_eq!(root_from(&demo.join("app.py"), &[home]), demo);
+    }
+
+    #[test]
+    fn without_a_known_home_the_nearest_marker_still_wins() {
+        // The behavior the home rule changes: `.arbor` alone made `home` the
+        // project.
+        let (_root, home, demo) = home_with_arbor_dir();
+        assert_eq!(root_from(&demo, &[]), home);
+    }
+
+    #[test]
+    fn arbor_run_in_the_home_folder_uses_it() {
+        let (_root, home, _demo) = home_with_arbor_dir();
+        assert_eq!(root_from(&home, std::slice::from_ref(&home)), home);
+    }
+
+    #[test]
+    fn a_marker_between_home_and_the_start_is_still_the_project() {
+        let (_root, home, demo) = home_with_arbor_dir();
+        let projects = home.join("projects");
+        fs::create_dir(projects.join(".git")).unwrap();
+        assert_eq!(root_from(&demo, &[home]), projects);
+    }
+
+    #[test]
+    fn other_markers_in_home_do_not_make_it_the_project_either() {
+        let (_root, home, demo) = home_with_arbor_dir();
+        fs::remove_dir_all(home.join(".arbor")).unwrap();
+        fs::write(home.join("package.json"), "{}").unwrap();
+        fs::create_dir(home.join(".git")).unwrap();
+        assert_eq!(root_from(&demo, &[home]), demo);
+    }
+
+    #[test]
+    fn the_walk_never_goes_above_home() {
+        // `root` has a marker; `home` under it has none.
+        let (root, home, demo) = home_with_arbor_dir();
+        fs::remove_dir_all(home.join(".arbor")).unwrap();
+        assert!(root.path().join(".arbor").is_dir());
+        assert_eq!(root_from(&demo, std::slice::from_ref(&home)), demo);
+        assert_eq!(root_from(&home, std::slice::from_ref(&home)), home);
+    }
+
+    #[test]
+    fn home_matches_with_a_trailing_separator() {
+        let (_root, home, demo) = home_with_arbor_dir();
+        let trailing = PathBuf::from(format!("{}{}", home.display(), std::path::MAIN_SEPARATOR));
+        assert_eq!(root_from(&demo, &[trailing]), demo);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn home_matches_in_another_case() {
+        let (_root, home, demo) = home_with_arbor_dir();
+        let upper = PathBuf::from(home.to_string_lossy().to_uppercase());
+        assert_eq!(root_from(&demo, &[upper]), demo);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn home_matches_with_a_verbatim_prefix_or_forward_slashes() {
+        let (_root, home, demo) = home_with_arbor_dir();
+        let verbatim = PathBuf::from(format!(r"\\?\{}", home.display()));
+        assert_eq!(root_from(&demo, &[verbatim]), demo);
+        let forward = PathBuf::from(home.to_string_lossy().replace('\\', "/"));
+        assert_eq!(root_from(&demo, &[forward]), demo);
+    }
+
+    #[test]
+    fn windows_spellings_of_one_folder_are_the_same_folder() {
+        let same = |a: &str, b: &str| same_folder(Path::new(a), Path::new(b), WINDOWS);
+        assert!(same(r"C:\Users\anand", r"C:\Users\anand"));
+        assert!(same(r"C:\Users\Anand", r"c:\users\anand"));
+        assert!(same(r"C:\Users\anand\", r"C:\Users\anand"));
+        assert!(same(r"\\?\C:\Users\anand", r"C:\Users\anand"));
+        assert!(same("C:/Users/anand", r"C:\Users\anand"));
+        assert!(same(r"\\?\UNC\server\share\home", r"\\server\share\home"));
+        assert!(same(r"C:\", "c:/"));
+        assert!(!same(r"C:\Users\anand", r"C:\Users\anandx"));
+        assert!(!same(r"C:\Users\anand", r"C:\Users"));
+        assert!(!same(r"C:\Users\anand", r"D:\Users\anand"));
+        assert_eq!(folder_key(r"C:\", WINDOWS), "c:/");
+    }
+
+    #[test]
+    fn unix_paths_keep_case_and_backslashes() {
+        let same = |a: &str, b: &str| same_folder(Path::new(a), Path::new(b), LINUX);
+        assert!(same("/home/ana", "/home/ana/"));
+        assert!(!same("/home/Ana", "/home/ana"));
+        assert!(!same(r"/home/a\b", "/home/a/b"));
+        assert_eq!(folder_key("/", LINUX), "/");
+    }
+
+    #[test]
+    fn a_missing_start_spelled_with_dot_dot_does_not_reach_home() {
+        // `demo/../..` is home. A path that does not exist yet can't be
+        // canonicalized, and its raw ancestors never spelled home.
+        let (_root, home, demo) = home_with_arbor_dir();
+        let start = demo
+            .join("..")
+            .join("..")
+            .join("projects")
+            .join("new")
+            .join("app");
+        let expected = home.join("projects").join("new").join("app");
+        assert_eq!(root_from(&start, std::slice::from_ref(&home)), expected);
+    }
+
+    #[test]
+    fn a_relative_missing_start_resolves_from_the_current_folder() {
+        let cwd = canonical(&std::env::current_dir().unwrap());
+        let start = Path::new("no-such-folder").join("deeper");
+        assert_eq!(super::resolve_start(&start), cwd.join(&start));
+    }
+
+    #[test]
+    fn home_named_by_another_spelling_is_still_home() {
+        // `projects/..` names home without spelling it; only the folder on
+        // disk shows it is home (as `\\localhost\C$\Users\ana` is `C:\Users\ana`).
+        let (_root, home, demo) = home_with_arbor_dir();
+        let other_spelling = home.join("projects").join("..");
+        assert!(!same_folder(&other_spelling, &home, HOST_PATH_RULES));
+        assert_eq!(root_from(&demo, &[other_spelling]), demo);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_start_through_a_symlink_to_home_does_not_reach_home() {
+        let (root, home, demo) = home_with_arbor_dir();
+        let link = root.path().join("homelink");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        let start = link.join("projects").join("demo").join("missing");
+        assert_eq!(root_from(&start, &[home]), demo.join("missing"));
+    }
+
+    #[test]
+    fn home_comes_from_the_os_and_from_home_and_userprofile() {
+        let dir = tempfile::tempdir().unwrap();
+        let os_home = dir.path().join("os");
+        let env_home = dir.path().join("env");
+        let homes = home_folders_from(Some(os_home.clone()), |name| match name {
+            "HOME" => Some(env_home.clone().into_os_string()),
+            "USERPROFILE" => Some("relative".into()),
+            _ => None,
+        });
+        // Missing folders can't be canonicalized; they are kept as given.
+        assert_eq!(homes, vec![os_home, env_home]);
+        assert!(home_folders_from(None, |_| Some(".".into())).is_empty());
+    }
 }
 
 /// Whether Arbor may index a project that has no `.arbor/` directory yet.
@@ -1624,8 +1961,10 @@ fn index_changed_only(path: &Path, output: Option<&Path>, follow_symlinks: bool)
     );
     let base_graph = load_or_index_graph(path)?;
 
+    // Untouched files come back from the saved graph: their code nodes, and
+    // the import nodes kept beside it, which their calls resolve against.
     let mut retained_nodes = Vec::new();
-    for node in base_graph.nodes() {
+    for node in base_graph.nodes().chain(base_graph.import_nodes()) {
         let changed = changed_files
             .iter()
             .any(|f| node_matches_changed_file(&node.file, f, path));
