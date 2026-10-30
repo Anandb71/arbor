@@ -8381,6 +8381,29 @@ fn a_parameter_another_request_sends_changed_is_not_listed() {
 }
 
 #[test]
+fn a_wrapper_request_of_a_package_this_file_cannot_check_is_routed_unknown() {
+    // What another scan exported for a package this one does not follow:
+    // the calling file's checks do not cover it, so the route is not
+    // confirmed.
+    let mut params = model_params(SAMPLER, "sampler.py");
+    params.retain(|p| p.function == "ask");
+    params[0].package = "agents".to_string();
+    let lookup = OneModule {
+        module: ".sampler",
+        file: "sampler.py",
+        params,
+    };
+    let caller = "from .sampler import ask
+ask(\"hi\", model=\"o1\")
+";
+    let found = super::extract_with(&parse(caller), caller, "run.py", Some(&lookup));
+    let call = call_on(&found, 2);
+    assert_eq!(value(call, "model"), Some("o1"));
+    assert_eq!(call.routing, Routing::Unknown);
+    assert_eq!(gaps_on(&found, 2), ["ambiguous_client/wrapper_route"]);
+}
+
+#[test]
 fn a_wrapper_call_keeps_what_the_calling_file_changes() {
     // A LangChain chat model the wrapper builds and hands back, given
     // another model or made configurable where it is called.

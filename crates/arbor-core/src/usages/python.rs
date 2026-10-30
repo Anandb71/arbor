@@ -436,6 +436,33 @@ enum Pkg {
 }
 
 impl Pkg {
+    /// Whether a model passed to the project's own wrapper of this
+    /// package's requests is followed from another file. That needs the
+    /// checks [`Ctx::record_wrapper_call`] makes in the calling file to
+    /// cover what it can do to the package's models and routes (endpoint
+    /// variables, module-level configuration, a replaced SDK, model aliases,
+    /// writes to a returned object's model field), and [`ALL_PKGS`] to list
+    /// it, so its name reads back there. Every package is named here, so a
+    /// new one is decided, not followed by default.
+    fn followed_across_files(self) -> bool {
+        let covered = match self {
+            Pkg::Openai
+            | Pkg::Anthropic
+            | Pkg::GoogleGenai
+            | Pkg::GoogleGenerativeai
+            | Pkg::LangchainOpenai
+            | Pkg::LangchainAnthropic
+            | Pkg::LangchainCommunityOpenai
+            | Pkg::LangchainCommunityAnthropic
+            | Pkg::LangchainLegacyOpenai
+            | Pkg::LangchainLegacyAnthropic
+            | Pkg::LangchainAws
+            | Pkg::Boto3
+            | Pkg::Litellm => true,
+        };
+        covered && ALL_PKGS.contains(&self)
+    }
+
     fn sdk(self) -> Sdk {
         match self {
             Pkg::Openai
@@ -846,7 +873,8 @@ fn langchain_model_names(pkg: Pkg) -> [&'static str; 2] {
     }
 }
 
-/// Every package, for reading one back from its name.
+/// Every package followed across files, for reading one back from its
+/// name (see [`Pkg::followed_across_files`]).
 const ALL_PKGS: [Pkg; 13] = [
     Pkg::Openai,
     Pkg::Anthropic,
@@ -8489,7 +8517,7 @@ impl<'t> Ctx<'t> {
             })
             .collect();
         for ((key, source, _), held) in sources.into_iter().zip(held) {
-            if held {
+            if held || !request.pkg.followed_across_files() {
                 continue;
             }
             let Some(function) = self.exported_callee(source.func) else {
@@ -8506,7 +8534,7 @@ impl<'t> Ctx<'t> {
                 attribute: source.attribute,
                 key,
                 sdk: request.sdk,
-                package: request.package.to_string(),
+                package: request.pkg.package().to_string(),
                 chain: request.chain.to_string(),
                 member: request.member.to_string(),
                 line: request.line,
@@ -8942,13 +8970,15 @@ impl<'t> Ctx<'t> {
             });
         }
 
-        // Where the model goes: the requests' route, when they agree and
-        // their file confirms it.
+        // Where the model goes: the requests' route, when they agree, their
+        // file confirms it and this file's checks above know their package
+        // (one a newer scan exported, say).
         let route = (first.sdk, first.routing);
-        let agreed = wrapper
-            .params
-            .iter()
-            .all(|p| p.route_confirmed && (p.sdk, p.routing) == route);
+        let agreed = wrapper.params.iter().all(|p| {
+            p.route_confirmed
+                && (p.sdk, p.routing) == route
+                && pkgs.iter().any(|pkg| pkg.package() == p.package)
+        });
         let unconfirmed = if !agreed {
             Some((
                 "wrapper_route",
@@ -9702,7 +9732,7 @@ impl<'t> Ctx<'t> {
         if !from_params.is_empty() {
             let request = ParamRequest {
                 sdk,
-                package: target.pkg.package(),
+                pkg: target.pkg,
                 chain: &chain,
                 member: &member,
                 line: span.line,
@@ -11686,7 +11716,7 @@ struct Taint<'a> {
 /// The request a [`ModelParam`] is the model of.
 struct ParamRequest<'a> {
     sdk: Sdk,
-    package: &'static str,
+    pkg: Pkg,
     chain: &'a str,
     member: &'a str,
     line: u32,
