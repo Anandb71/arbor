@@ -13,6 +13,11 @@
 </p>
 
 <p align="center">
+  <code>arbor retirements</code> finds direct OpenAI, Anthropic and Google SDK calls in Python code that use a retired or retiring model, and says what has to change.<br>
+  OpenAI shuts down the dated gpt-4o and gpt-4.1 snapshots on 14 January 2027. <a href="https://getarbor.dev/retirements">Shutdown list</a>
+</p>
+
+<p align="center">
   <a href="https://github.com/Anandb71/arbor/actions"><img src="https://img.shields.io/github/actions/workflow/status/Anandb71/arbor/rust.yml?style=flat-square&label=Rust%20CI" alt="Rust CI" /></a>
   <a href="https://crates.io/crates/arbor-graph-cli"><img src="https://img.shields.io/crates/v/arbor-graph-cli?style=flat-square&label=crates.io" alt="Crates.io" /></a>
   <a href="https://github.com/Anandb71/arbor/releases"><img src="https://img.shields.io/github/v/release/Anandb71/arbor?style=flat-square&label=release" alt="Latest release" /></a>
