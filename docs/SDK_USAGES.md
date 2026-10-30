@@ -551,9 +551,13 @@ These are reported with no gap (`model`, and the other keys in `VALUE_KEYS`):
    Read through `this` in a class another module may extend (it is exported,
    anonymous, or passed or stored), the value keeps a `subclass_override` gap.
    Read in a method that may run with another object as `this` (its name is
-   read without being called, as in `setTimeout(bot.ask)` or `{ ask: bot.ask
-   }`, or it is called through `call`, `apply` or `bind`), it keeps an
-   `attribute` gap. Reads by class name are confirmed.
+   read without being called, as in `setTimeout(bot.ask)`, `{ ask: bot.ask }`
+   or `const { ask } = bot`, or it is called through `call`, `apply` or
+   `bind`), it keeps an `attribute` gap. A method reached under a name known
+   only at run time and called through `call`, `apply` or `bind`
+   (`this[m].call(other)`), or a computed key in an object pattern (`const {
+   [m]: f } = this`), may be any method: then every method's reads of `this`
+   keep the gap. Reads by class name are confirmed.
 6. **A parameter default, when every call of the function is in this file**
    and none passes another value. The calls are all seen for:
    - a function declaration, or a `const` bound to an arrow function or
@@ -563,8 +567,13 @@ These are reported with no gap (`model`, and the other keys in `VALUE_KEYS`):
      passing `f` anywhere make them unseen). Calls through a function
      expression's own name (`function retry() { retry() }`) are its calls
      too;
-   - a `private` or `#private` method or class-field function: every call of
-     its name in the file is listed;
+   - a `private` or `#private` method or class-field function whose name is
+     never read without a call (`bot.ask` passed or stored, or any key of an
+     object pattern, as in `const { ask } = this`): every call of its name in
+     the file is listed. A method called under a name known only at run time
+     (`this[kind](...)`, `r[name](...)`, `this[m].call(...)`) may be any
+     method, as with Python's `getattr(self, kind)(...)`: then no private
+     method's calls are all seen;
    - the constructor of a class that is not exported, is only constructed by
      name (`new Bot(...)`, or a class expression's own name), has no
      same-file subclass, no `new this()` and no `.constructor` used as a
@@ -579,7 +588,7 @@ These are reported with no gap (`model`, and the other keys in `VALUE_KEYS`):
    `parameter_overridden` (an in-file call passes another value, listed),
    `parameter_default` (the function is exported, or is a public method) or
    `unseen_callers` (it is passed, stored, used as a callback or a method of
-   an object literal). A parameter written in its function (`model = "x"`, a
+   an object literal, or the file calls a method under a run-time name). A parameter written in its function (`model = "x"`, a
    `var` of its name, `??=`) is `reassigned`, listing the default, what
    callers pass and each write; in a function with a simple parameter list
    that writes, passes or stores `arguments`, which aliases the parameters
@@ -732,6 +741,10 @@ a gap at the call. The report assumes the rest, in particular:
 - A write under a computed key (`obj[key] = v`) on anything but `this` does not
   set a class property, and an SDK request does not modify the options object
   it is passed.
+- A member read under a computed key without being called (`const f =
+  this[kind]`, `Reflect.apply(this[kind], ...)`) is a value, not a method:
+  only a computed member that is called, or followed by `call`, `apply` or
+  `bind`, counts as calling a method under a run-time name.
 - A client a class reads through `this` is confirmed although a subclass in
   another module may replace it, as in Python.
 - The process environment, a `.env` file loaded at start-up and an Anthropic
