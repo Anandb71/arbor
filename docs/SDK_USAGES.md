@@ -1,8 +1,16 @@
 # SDK usages: what a report confirms
 
 `arbor usages` and the MCP tool `find_api_usages` list where a Python project
-calls the OpenAI, Anthropic and Gemini SDKs, with each call's routing and model
-values. A consumer (a codemod, a reviewer) should treat the report this way:
+calls the OpenAI, Anthropic and Gemini SDKs, directly or through LangChain's
+OpenAI and Anthropic chat models ([LangChain chat
+models](#langchain-chat-models)), and where it calls models on Amazon Bedrock
+or through LiteLLM ([Amazon Bedrock and LiteLLM](#amazon-bedrock-and-litellm)),
+where it posts JSON to OpenAI's or Anthropic's REST API with `requests` or
+`httpx` ([Raw HTTP requests](#raw-http-requests)), and where an agent
+framework is given a model: the OpenAI Agents SDK, the Claude Agent SDK and
+AgentScope ([Agent frameworks](#agent-frameworks)), with each call's routing
+and model values. A consumer (a codemod, a reviewer)
+should treat the report this way:
 
 - **A value or route with no gap at its call is confirmed.** It comes from one
   of the shapes in the supported grammar below, and nothing in the file can
@@ -36,7 +44,7 @@ gap inside this grammar is a bug. A shape outside it is reported as a gap.
 ### Model values
 
 These are reported with no gap (`model`, `engine`, `deployment_id`,
-`model_name`):
+`model_name`, and on a Bedrock call `modelId` or `model_id`):
 
 1. **A string literal at the call.** This covers a keyword argument, the
    positional model argument (`GenerativeModel("gemini-pro")`), and a dict or
@@ -242,6 +250,468 @@ The file must not do any of these:
   `dynamic_feature` gap. Settings such as `openai.api_key` or
   `client.max_retries` change nothing.
 
+## LangChain chat models
+
+LangChain's chat models call the OpenAI and Anthropic SDKs for you. The report
+follows these classes:
+
+| Class | Imported from | Routes like |
+|---|---|---|
+| `ChatOpenAI` | `langchain_openai`, `langchain_community.chat_models`, `langchain.chat_models` | `OpenAI()` |
+| `AzureChatOpenAI` | the same | `AzureOpenAI()`: `azure_openai` |
+| `ChatAnthropic` | `langchain_anthropic`, `langchain_community.chat_models`, `langchain.chat_models` | `Anthropic()` |
+| `ChatBedrock`, `ChatBedrockConverse` | `langchain_aws` | `boto3.client("bedrock-runtime")`: `bedrock` ([below](#amazon-bedrock-and-litellm)) |
+
+The partner packages (`langchain_openai`, `langchain_anthropic`,
+`langchain_aws`) are followed the way an SDK is: `from ... import`, `import
+langchain_openai` and a wildcard import. The deprecated
+`langchain_community.chat_models` and `langchain.chat_models` re-export other
+providers' models too, so they, and their submodules
+(`langchain_community.chat_models.openai`), are followed only through `from
+... import` of one of these classes; `import langchain_community.chat_models as
+cm` is not followed. No other LangChain name is tracked: other providers' chat
+models (`ChatOllama`, `ChatGoogleGenerativeAI`, `ChatVertexAI`, the deprecated
+`BedrockChat`), embeddings (`OpenAIEmbeddings`, `BedrockEmbeddings`),
+completion models (`langchain_openai.OpenAI`, `BedrockLLM`),
+`init_chat_model(...)` and LangChain's helpers report nothing.
+
+- **The constructor binds the model.** `ChatOpenAI(model="gpt-4o")` is a
+  construction and a call (`request: false`) whose `model` or `model_name`
+  value is read under the value rules above (`model_id` or `model` on the
+  Bedrock models, and no other key). LangChain takes the model under either
+  name:
+  - given both (by keyword or through a same-file dict expanded with `**`),
+    a `reassigned` gap with no key keeps both values unconfirmed;
+  - given one next to a `**` expansion the file cannot read, a `splat` gap
+    on that name keeps it unconfirmed: the expansion may hold the other name,
+    which is no `TypeError` as a second `model=` would be;
+  - given neither, `ChatOpenAI` and `ChatAnthropic` get a `missing_model` gap
+    (LangChain's default model applies). `AzureChatOpenAI` serves its
+    deployment, so a missing `model` there is not a gap, and the Bedrock
+    models fail to build without one, so neither is it there.
+
+  The classes are pydantic models that take keyword arguments only, so a
+  positional argument is not read. A built model's requests read its model
+  field when they are sent, so a write of either of its names (`model` or
+  `model_name`; `model_id` or `model`) on any object other than `self` or a
+  same-file class (`llm.model_name = ...`, `settings.model = ...`), or of an
+  attribute with a run-time name, gives the LangChain chat model values in
+  the file a `dynamic_feature` gap. So does making the model configurable at
+  run time (`configurable_fields(model_name=...)`,
+  `configurable_alternatives(...)`).
+- **The route.** A chat model routes like the SDK client it builds, under the
+  client rules in [Routes](#routes). Its endpoint is `base_url` or LangChain's
+  own name for it (`openai_api_base`, `anthropic_api_url`), routed by host.
+  Given none, LangChain reads `OPENAI_API_BASE` or `ANTHROPIC_API_URL`, the SDK
+  it builds then reads `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL`, and the
+  partner packages fall back to the LangSmith gateway (`LANGSMITH_GATEWAY`). A
+  Bedrock model's endpoint is `endpoint_url` (`base_url` on
+  `ChatBedrockConverse`), routed like a `bedrock-runtime` client's, and its
+  variables are boto3's and `LANGSMITH_GATEWAY`. A
+  file that sets any of these is an `endpoint_env` gap, as for an SDK client,
+  and the client rules' other gaps apply as well (an environment written with
+  a run-time name, a `**` expansion that may hold the endpoint). Two writes
+  after the model is built count too: an endpoint attribute
+  (`llm.openai_api_base = ...`) is `base_url_assigned`, and replacing the SDK
+  client it holds (`llm.client`, `root_client`, `_client` and their async
+  versions) is a `dynamic_feature` gap. Passing one of those to the
+  constructor (`ChatOpenAI(client=OpenAI(base_url=...).chat.completions)`)
+  routes it `unknown` with a `given_client` gap.
+- **The pre-1.0 SDK.** The deprecated `ChatOpenAI` also runs on `openai<1.0`,
+  where a chat model given no endpoint sends its requests through the
+  module-level API. In a file that configures the module-level API (any
+  routing setting, anywhere in the file), such a model routes `unknown` with a
+  `langchain_module_config` gap. `langchain_openai` needs `openai>=1`, so this
+  does not apply to it.
+- **Calls on a chat model** (`llm.invoke(...)`,
+  `llm.with_structured_output(...)`) are recorded with its routing, as calls on
+  a client are. What such a call returns, including a copy
+  (`llm.copy(update=...)`, which may change any field), is not followed.
+  LangChain's run options (`config`, `configurable`, `metadata`, `tags`,
+  `callbacks`, `run_name`) and a call's positional input never reach the
+  provider's request, so a `model` key inside them is not read.
+  On a Bedrock model, the Converse API sends a `model_id=` (or `modelId=`)
+  given to the call instead of the model's own
+  (`llm.invoke(q, model_id=...)`), so it is read there, and a `**` expansion
+  the file cannot read is a `splat` gap on `model_id`. `ChatBedrock` sends it
+  only when it runs on the Converse API (`beta_use_converse_api`), so there
+  the value keeps a `conditional` gap; `ChatBedrockConverse` always does.
+
+`arbor retirements` checks only the model of these calls: LangChain takes its
+own arguments and builds the request, so the SDK's argument rules do not
+describe them (see [RETIREMENTS.md](RETIREMENTS.md)).
+
+## Amazon Bedrock and LiteLLM
+
+Both send a request to whichever model their argument names, from many
+providers, so their calls have routings of their own: `bedrock` and
+`litellm`. Their records say `sdk: "aws"` (package `boto3` or
+`langchain_aws`) and `sdk: "litellm"`.
+
+**boto3.** Only Bedrock's runtime client is followed: `boto3.client(...)`
+(also imported, `from boto3 import client`, or through a session,
+`boto3.Session(...).client(...)` and `boto3.session.Session`) whose service
+name, the first argument or `service_name=`, resolves under the value rules
+to `"bedrock-runtime"`. A client for any other service, a service name the
+file cannot resolve, `boto3.resource(...)`, boto3's other functions, and a
+session given `botocore_session` or a `**` expansion are not followed.
+
+- **Requests.** `converse`, `converse_stream`, `invoke_model`,
+  `invoke_model_with_response_stream`, `invoke_model_with_bidirectional_stream`,
+  `start_async_invoke` and `count_tokens`. The model is `modelId`, read under
+  the value rules, by keyword (boto3 takes keyword arguments only) or from a
+  same-file dict expanded with `**`. Only `modelId` is read: botocore rejects
+  any other parameter, `model=` included, and the request's other fields
+  (`inferenceConfig`, `additionalModelRequestFields`, `requestMetadata`) do
+  not name the model it goes to, so nothing nested is read either. A request
+  with no `modelId` fails before it is sent, so it is not a gap; a `**`
+  expansion the file cannot read is a `splat` gap.
+- **The route** is `bedrock` for any model: Anthropic's, Amazon's, Meta's,
+  Mistral's, an inference profile or an ARN. An `endpoint_url` routes by
+  host: a Bedrock runtime host of a region on AWS
+  (`bedrock-runtime.<region>.amazonaws.com`, its `.amazonaws.com.cn`,
+  dual-stack `.api.aws` and `bedrock-runtime-fips` forms, a VPC endpoint's
+  `vpce-<id>.bedrock-runtime.<region>.vpce.amazonaws.com`) stays `bedrock`,
+  any other host (a bucket named `bedrock-runtime` on S3 included) is
+  `custom_base_url`, and an environment lookup, a value that does not
+  resolve or a `**` expansion routes `unknown` with a gap, as for a direct
+  client's `base_url` ([Routes](#routes)). `endpoint_url` is also boto3's
+  sixth positional argument: a client given six or more positional
+  arguments, or `*args`, routes `unknown` the same way. A file that sets
+  `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` or `AWS_ENDPOINT_URL` is an
+  `endpoint_env` gap.
+- **Replaced or hooked.** Replacing a request or the constructor
+  (`client.converse = ...`, `boto3.client = ...`), or registering a
+  botocore event handler, which may rewrite a request's parameters or send
+  it elsewhere, is a `dynamic_feature` gap on every Bedrock route of the
+  file. A handler counts when it is registered on a Bedrock client's or a
+  session's events (`client.meta.events.register(...)`,
+  `session.events.register(...)`), when any `register`, `register_first`
+  or `register_last` call names a botocore event
+  (`"before-parameter-build.bedrock-runtime.Converse"`, wherever the
+  session comes from), and when the default session is set up from a
+  botocore session (`boto3.setup_default_session(botocore_session=...)`).
+- **Unknown receivers.** In a file that imports boto3, a Bedrock-shaped call
+  (`.converse(...)`, `.converse_stream(...)`, `.invoke_model(...)`,
+  `.invoke_model_with_response_stream(...)`) on a receiver that is not a
+  tracked client (a parameter, a factory's result) is an
+  `unknown_client_factory` gap that lists the `modelId` it passes. A file
+  is read only when it names `bedrock-runtime`, `invoke_model`, `converse(`
+  or `converse_stream(` (or another SDK), so a service name built from parts
+  in a file that names none of them reports nothing.
+- **Not followed:** `aioboto3`, a botocore session or client built directly,
+  the `bedrock-agent-runtime` client, the Anthropic SDK's `AnthropicBedrock`
+  (routed `anthropic_bedrock`, above) and type annotations from
+  `mypy_boto3_bedrock_runtime`.
+
+**LiteLLM.** `litellm.completion(...)` and `litellm.acompletion(...)`,
+however they are imported (`from litellm import completion`,
+`litellm.main.completion`). The model is `model`, by keyword or as the first
+positional argument, read under the value rules; a `fallbacks=[{"model":
+...}]` entry is a nested value, while plain-string fallbacks
+(`fallbacks=["gpt-4o-mini"]`) and `litellm.model_fallbacks` are not read.
+No other LiteLLM function is followed
+(`embedding`, `text_completion`, `responses`, `Router`, `token_counter`,
+`supports_function_calling`...). A missing model is a `TypeError`, so it is
+not a gap.
+
+- **The route** is `litellm`. LiteLLM picks the provider and endpoint from
+  the model string (`anthropic/...`, `azure/...`, `bedrock/...`) and its
+  arguments and configuration (`custom_llm_provider=`, `api_base=`, the
+  environment, `litellm.api_base`), so the report does not say which
+  provider's API the call reaches. Replacing `litellm.completion` is a
+  `dynamic_feature` gap on the route; a setting
+  (`litellm.drop_params = True`) changes nothing.
+- **Remapped models.** LiteLLM may send a model name it is given to another
+  model, and these gaps hold no key, so they cover every model value of the
+  call, nested fallbacks included:
+  - `litellm.model_alias_map` maps it process-wide: a file that mentions it
+    anywhere gives every LiteLLM call a `dynamic_feature` gap;
+  - a `model_list` passed to the call, by keyword or in a same-file dict
+    expanded with `**`, maps it to a deployment: a `model_list` gap, and the
+    list's entries are not read as models;
+  - a `**` expansion the file cannot read may hold a `model_list`: a
+    `splat` gap.
+
+`arbor retirements` lists both only with `--include-routed`. AWS keeps
+Bedrock's model schedule, which the bundled data does not hold, so nothing is
+looked up for a call routed `bedrock`, whatever its model ID. A LiteLLM model
+is looked up on the schedule its router prefix names (`openai/`,
+`anthropic/`, `gemini/`, `vertex_ai/`), else by its shape, except that a
+Gemini model with no prefix (`gemini-2.5-flash`) is looked up on Vertex AI's
+schedule, where LiteLLM sends it; only `gemini/<model>` reaches the Gemini
+API. As for LangChain, only the checks about the model apply (see
+[RETIREMENTS.md](RETIREMENTS.md)).
+
+## Raw HTTP requests
+
+Some code skips the SDK and posts JSON to the provider's REST API itself. A
+call to `requests.post(...)` or `httpx.post(...)` is recorded as a request
+when its URL resolves to one of the endpoints below.
+
+**The call.** The function must be named through an import alone:
+`requests.post` after `import requests` (or `r.post` after `import requests
+as r`), or `post` after `from requests import post` (under any alias). A name
+that is also assigned or is a parameter, a wildcard import, a session or
+client (`requests.Session().post`, `httpx.Client().post`),
+`requests.request("POST", ...)` and every other method are not followed.
+
+**The URL** is the first positional argument or `url=`. It is read under the
+value rules, and only a value with no gap counts: a literal, or a same-file
+constant or local. An f-string, an environment lookup (with or without a
+fallback), a parameter or a parameter default records nothing. The URL's
+scheme must be `https` or `http` and its host exactly `api.openai.com` or
+`api.anthropic.com` (in any case, with or without a port). Its path, without
+the query, the fragment or a trailing `/`, must be one of these:
+
+| Host | Path | Recorded as |
+|---|---|---|
+| `api.openai.com` | `/v1/chat/completions` | `chat.completions.create` |
+| | `/v1/completions` | `completions.create` |
+| | `/v1/responses` | `responses.create` |
+| | `/v1/embeddings` | `embeddings.create` |
+| | `/v1/images/generations`, `/v1/images/edits`, `/v1/images/variations` | `images.generate`, `images.edit`, `images.create_variation` |
+| | `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations` | `audio.speech.create`, `audio.transcriptions.create`, `audio.translations.create` |
+| | `/v1/moderations` | `moderations.create` |
+| | `/v1/fine_tuning/jobs` | `fine_tuning.jobs.create` |
+| | `/v1/assistants` | `assistants.create` |
+| `api.anthropic.com` | `/v1/messages` | `messages.create` |
+| | `/v1/messages/count_tokens` | `messages.count_tokens` |
+| | `/v1/messages/batches` | `messages.batches.create` |
+| | `/v1/complete` | `completions.create` |
+
+Any other URL records nothing: a gateway or proxy (OpenRouter, a local
+server), Azure OpenAI's `*.openai.azure.com` paths, Google's REST API, a host
+that only starts with a provider's name, and a provider path not listed.
+
+**The record** is a call record (`SdkCall`) with `request: true`, `sdk` and `routing`
+from the host (`openai` / `openai_direct`, `anthropic` / `anthropic_direct`),
+`package` the library (`requests` or `httpx`), `chain` as written
+(`requests.post`), `member` the SDK method from the table, `receiver`
+`module` (`requests.post`) or `symbol` (`post`), and `kwargs` the HTTP call's
+own keyword names (`url`, `headers`, `json`...). No import record is made
+for the library. The route has no endpoint variable to check: the libraries
+do not read `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL`.
+
+**The model** is read from the JSON body, the way a same-file dict expanded
+with `**` is read at an SDK call: the body is a dict literal written at the
+call, or a name bound once to one in the supported grammar (not mutated,
+passed elsewhere or aliased). `requests.post` and `httpx.post` only
+serialize the dict they are given, so passing it as `json=` does not count
+as passing it elsewhere; any other function given a dict that way still
+does. The body is:
+
+- `json=body`;
+- `data=json.dumps(body)` (httpx: also `content=json.dumps(body)`), with
+  `body` the only argument of `json.dumps`;
+- for requests, `json.dumps(body)` as the second positional argument
+  (`data`). A third positional argument (`json`) comes with a positional
+  `data`, so it is a second body: a `request_body` gap.
+
+Only the body's top-level `model` is read, plus the model keys nested in its
+containers (`requests[].params.model` in a Message Batch), as for any dict
+argument. An entry a later `**` expansion or computed key may replace is a
+`splat` gap that lists it. A body with no `model` is a `missing_model` gap,
+except a Message Batch, whose models are nested. A body the file cannot read
+(a parameter, a mutated dict, a string, form data, `files=`, more than one
+body) is an `unresolved_model` gap with the reason `request_body`. A call
+given `*args` or `**kwargs`, which may hold another body, keeps a `splat` gap
+with no key, which covers every model value of the call.
+
+**Replaced.** Writing `post` on the library's module (`requests.post =
+fake`, `setattr(requests, "post", ...)`, `del requests.post`) or any of its
+attributes with a run-time name is a `dynamic_feature` gap on every raw HTTP
+request in the file, as is any dynamic feature of the whole file. A replaced
+`post` may also change the dict it is given, so in such a file a dict passed
+as `json=` counts as passed elsewhere again, for SDK calls that expand it
+too. A `def` or `class` that rebinds the imported `post` (or any other
+imported name) is a definition of that name from there on.
+
+`arbor retirements` treats these as direct calls on the provider's schedule.
+Their argument names are the library's, and the scan reads only the model in
+the body, so only the checks about the model apply, with a check to review
+the body's other fields by hand.
+
+## Agent frameworks
+
+An agent framework builds the provider's request itself from a model it is
+given. The report follows the classes below that take a model; each one is
+recorded like a LangChain chat model, as a construction and a call
+(`request: false`) that binds the model, read under the value rules above.
+Nothing called on what they build is recorded (`agent.clone(...)`,
+`agent.as_tool(...)`): those objects configure a run, they are not clients.
+The OpenAI Agents SDK's and the Claude Agent SDK's other arguments configure
+a run or the CLI (`trace_metadata`, `model_settings`, `extra_args`), so a
+`model` key nested in them, written at the call or in a dict expanded with
+`**`, is not read as a model. AgentScope's are read: it sends
+`generate_kwargs` (AgentScope 1) and `extra_body` (AgentScope 2) in its
+request over its own model (below).
+
+| Framework | Classes | Imported from | Model |
+|---|---|---|---|
+| OpenAI Agents SDK (`openai-agents`) | `Agent`, `RunConfig` | `agents`; `agents.agent`, `agents.run`, `agents.run_config` | `model`; a run's first positional argument |
+| | `OpenAIResponsesModel`, `OpenAIChatCompletionsModel` | `agents`; `agents.models.openai_responses`, `agents.models.openai_chatcompletions` | `model` or the first positional argument |
+| | `LitellmModel` | `agents.extensions.models.litellm_model` | the same |
+| Claude Agent SDK, Claude Code SDK | `ClaudeAgentOptions`, `AgentDefinition`; `ClaudeCodeOptions` | `claude_agent_sdk`; `claude_code_sdk` | `model`, `fallback_model` |
+| AgentScope | `OpenAIChatModel`, `OpenAIResponseModel`, `AnthropicChatModel`, `GeminiChatModel` | `agentscope.model` | `model_name` (AgentScope 1, also its first positional argument) or `model` (AgentScope 2, also after a credential passed by position) |
+
+`agents` is also a common name for a repository's own package, so the OpenAI
+Agents SDK is followed only through `from <module> import` of one of these
+classes from a module of the SDK that defines or re-exports it (the table):
+`import agents`, a wildcard import, any other name (`from agents import
+get_sql_agent`), another `agents` module (`from agents.tools import Agent`)
+and a relative import are not followed. When the scanned tree has an `agents`
+module of its own (an `agents.py`, a directory `agents` holding Python
+files, or a link named `agents` or `agents.py`, outside vendored, hidden and
+ignored directories), or the scan is of a directory inside an `agents`
+package (an `agents` directory with an `__init__.py`, the scan root or one of
+its parents), `from agents import Agent` may load it instead: every Agents
+SDK record then routes `unknown`, and each call gets a `local_module` gap on
+its routing and, when it has values, on its model. A single file scanned
+alone shows only the package it is inside. AgentScope is
+followed only through `from agentscope.model... import`; its models for
+other providers (`DashScopeChatModel`, `OllamaChatModel`...) and its 0.x
+model configurations are not. The Claude Agent SDK's modules are followed
+like an SDK's (`import claude_agent_sdk as sdk` too). A name that is not on
+this list reports nothing.
+
+**OpenAI Agents SDK.** The SDK sends a model name through its model
+provider, which picks the provider from the name's prefix. So the route
+follows the model:
+
+- a name with no prefix, or `openai/`, goes through the SDK's default
+  `AsyncOpenAI()` client: `openai_direct`, with an `endpoint_env` gap in a
+  file that sets `OPENAI_BASE_URL`, as for an SDK client;
+- `litellm/` is LiteLLM: `litellm`, and a file that mentions
+  `litellm.model_alias_map` gives its values a `dynamic_feature` gap, as for
+  a LiteLLM call ([Amazon Bedrock and LiteLLM](#amazon-bedrock-and-litellm));
+- any other prefix (`any-llm/`, a provider map's), a model the scan does not
+  confirm, and a `**` expansion that may hold one route `unknown` with a
+  `model_route` gap;
+- a model object routes like itself: `OpenAIResponsesModel` and
+  `OpenAIChatCompletionsModel` like the `openai_client` they are given (a
+  client the file does not resolve to one tracked client is `unknown` with a
+  `given_client` gap), `LitellmModel` `litellm`. An agent or run given one
+  records no call of its own (the object carries the model), and its
+  construction routes like the object. Both route at each use through what
+  they were built on, so a client given a `base_url` after it is handed to a
+  model object re-routes the object too. An agent or run is no model object:
+  an agent given another agent has a model the scan does not confirm.
+
+A file that sets the SDK's default client (`set_default_openai_client(...)`,
+also imported under another name) or passes a `model_provider` anywhere
+(`RunConfig(model_provider=...)`, a run's second positional argument, or a
+`**` expansion given to a run) routes every model name `unknown` with a
+`given_client` gap. An agent given no model runs the SDK's default model,
+which depends on the SDK version (`gpt-4.1` from 0.3 to 0.6) and on
+`OPENAI_DEFAULT_MODEL`: a `missing_model` gap. A run given none keeps its
+agents' models, and a model object needs one, so neither is a gap. A run's
+model replaces that of every agent and model object it runs, so the values
+of every agent and model object in a file keep a `dynamic_feature` gap where
+the file may give a run one:
+
+- a `RunConfig` given a model (by keyword, by position, also under another
+  name, or through an expansion);
+- a `run_config=` given anywhere that is not `None` or a same-file
+  `RunConfig` built without a model (a parameter, one from another module);
+- a `**` expansion given to `run`, `run_sync` or `run_streamed` on a
+  receiver named like a runner (`Runner`, `agents.Runner`, `runner = Runner`,
+  `self.runner`) or the SDK's `Runner` imported under another name, which may
+  hold a `run_config`.
+
+So do they in a file that writes `model` on another object (`agent.model =
+...`). A run configured in another module is not seen. `Agent.clone(model=
+...)` is not read.
+
+**Claude Agent SDK.** The SDK runs the Claude Code CLI with the options'
+`model` and `fallback_model`. An alias (`"sonnet"`, `"opus"`, an agent
+definition's `"inherit"`) is reported as written: what it resolves to is the
+CLI's. Options given no model run the CLI's default model: a `missing_model`
+gap; an agent definition given none runs its parent's, so it is not one. The
+CLI uses Anthropic's API (`anthropic_direct`) unless its environment picks
+another provider or endpoint, so:
+
+- a file that sets one of the CLI's provider switches or endpoints
+  (`ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`,
+  `CLAUDE_CODE_USE_FOUNDRY`, `CLAUDE_CODE_USE_MANTLE`,
+  `CLAUDE_CODE_USE_ANTHROPIC_AWS`, `ANTHROPIC_BEDROCK_BASE_URL`,
+  `ANTHROPIC_BEDROCK_MANTLE_BASE_URL`, `ANTHROPIC_VERTEX_BASE_URL`,
+  `ANTHROPIC_FOUNDRY_BASE_URL`, `ANTHROPIC_AWS_BASE_URL`) is an `endpoint_env`
+  gap;
+- options given `env=` (unless `None` or a dict literal whose keys are all
+  strings, none of them one of these, with no `**`), `settings=` (a settings
+  file or JSON, whose `env` the CLI applies) or a `**` expansion route
+  `unknown` with an `endpoint_option` gap;
+- options whose `env` or `settings` the file uses after they are built
+  (`options.env["CLAUDE_CODE_USE_BEDROCK"] = "1"`, `options.env.update(...)`,
+  `options.settings = ...`), or writes with a run-time name, route `unknown`
+  with a `dynamic_feature` gap, and so does every Claude Code options object
+  in a file that uses `env` or `settings` on an object it cannot identify
+  (other than `self`, `cls` or a same-file class). The attribute's name may
+  be written as a string too (`setattr(options, "env", ...)`,
+  `options.__setattr__("env", ...)`, `options.__dict__["env"]`,
+  `vars(options)["env"]`). A write of `base_url` is not one: the CLI has
+  no such setting;
+- options whose `extra_args` give the CLI `--settings` (`extra_args=
+  {"settings": ...}`, or `extra_args` the file cannot read whole) route
+  `unknown` with an `endpoint_option` gap. `extra_args` used after the
+  options are built (`options.extra_args["settings"] = ...`, `setattr(options,
+  "extra_args", ...)`) count as their environment above, and also give their
+  values a `reassigned` gap: the flags may pass another model.
+
+An agent definition runs where its options do: built inside the options'
+`agents=` dict (`ClaudeAgentOptions(agents={"r": AgentDefinition(...)})`),
+it routes like them, gaps included; built anywhere else, it routes `unknown`
+with an `options_route` gap.
+
+The options' `extra_args` become CLI flags and may pass another model: unless
+they are `None` or a dict literal that names no model flag, they, or a `**`
+expansion that may hold them, are a `reassigned` gap with no key, which
+covers every value of the call. The CLI's model variables
+(`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`,
+`ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`,
+`ANTHROPIC_DEFAULT_FABLE_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`,
+`CLAUDE_CODE_SUBAGENT_MODEL`) pick what an alias resolves to, a subagent's
+model and the model of a session given none; a full model ID given as
+`--model` wins over them. Where they may be set (the file sets one or writes
+the environment with a run-time name; the options' `env=` may name one, a
+`**` expansion, `settings=` or `extra_args` may set one, or the file changes
+their environment after they are built), an alias the options are given
+(`"sonnet"`, `"opus"`, `"default"`...) and every model of an agent definition
+built inside them keep an `env_var` gap on their key; options given a full
+model ID do not. `query(...)`,
+`ClaudeSDKClient` and its `set_model(...)` are not read.
+
+**AgentScope.** Each model builds its provider's SDK client: OpenAI's for
+`OpenAIChatModel` and `OpenAIResponseModel`, Anthropic's for
+`AnthropicChatModel`, Gemini's for `GeminiChatModel` (`google_genai`). The
+model is required, so none given is not a gap. The route is the provider's
+own API, and its endpoint is a `base_url` in the AgentScope 2 credential
+(`credential=OpenAICredential(base_url=...)`) or in AgentScope 1's
+`client_kwargs` (earlier `client_args`), routed by host like a direct
+client's ([Routes](#routes)); with neither, a file that sets the SDK's
+endpoint variable is an `endpoint_env` gap. `client_type="azure"` routes
+`azure_openai`. A credential or client arguments the file cannot read whole
+(a name, a `**` expansion, a key other than the API key and the client's
+`organization`, `project`, `timeout`, `max_retries` and `default_headers`;
+for Gemini, anything but the API key), any other `client_type`, and a `**`
+expansion given to the model route `unknown` with an `endpoint_option` gap.
+So does a first positional argument that is neither a credential built in
+place (`OpenAICredential(...)`) nor a model name AgentScope 1 would take,
+such as a name holding a credential (`OpenAIChatModel(cred, model=...)`).
+AgentScope sends `generate_kwargs` (AgentScope 1) and `extra_body`
+(AgentScope 2) in its request over its own model: the model nested in them
+is read, and one that may hold a `model` (a dict literal naming one, one the
+file cannot read whole, or a `**` expansion that may hold them) gives the
+model the class is built with a `reassigned` gap. A credential counts only
+when an `agentscope` import binds its class
+(`from agentscope.credential import OpenAICredential`): another library's
+(`DefaultAzureCredential()`) is a credential this scan cannot read.
+
+`arbor retirements` checks only the model of these calls: each framework
+takes its own arguments and builds the request, so the SDK's argument rules
+do not describe them (see [RETIREMENTS.md](RETIREMENTS.md)).
+
 ## Dynamic features
 
 The collection pass looks for the following features in the same linear walk
@@ -370,7 +840,35 @@ The report assumes the rest. In particular:
 - The process environment at run time is not known: a direct client built
   without a `base_url` is reported direct, although the deployment (or a
   `.env` file loaded with `load_dotenv`) may set `OPENAI_BASE_URL`,
-  `ANTHROPIC_BASE_URL` or `GOOGLE_GENAI_USE_VERTEXAI`.
+  `ANTHROPIC_BASE_URL` or `GOOGLE_GENAI_USE_VERTEXAI`, for a LangChain
+  chat model `OPENAI_API_BASE`, `ANTHROPIC_API_URL` or `LANGSMITH_GATEWAY`,
+  and for the Claude Code CLI one of its provider switches. The model an
+  agent given none runs may come from `OPENAI_DEFAULT_MODEL`, and Claude
+  Code options given none from `ANTHROPIC_MODEL`.
+- Claude Code's settings files (`.claude/settings.json` and the user's),
+  may set the CLI's `env`, and so its provider. claude-agent-sdk 0.2 loads
+  every source when `setting_sources` is `None` (its default, which matches
+  the CLI's), and only the sources it names otherwise (`[]` loads none);
+  earlier versions loaded them only when named. They are not read, whichever
+  sources are loaded.
+- The OpenAI Agents SDK's default client or model provider set in another
+  module (`set_default_openai_client(...)` at start-up), and a `RunConfig`
+  with a model built in another module, are not seen: an agent's model name
+  is reported routed as the SDK's default would send it.
+- Where a Bedrock client sends its requests may also come from the AWS
+  configuration: an `endpoint_url` in `~/.aws/config`, under whichever
+  profile the environment or the file selects (`AWS_PROFILE`,
+  `boto3.Session(profile_name=...)`). A LiteLLM call's may come from
+  settings another module makes (`litellm.api_base`,
+  `litellm.model_alias_map`). Neither is seen.
+- A LangChain chat model's field names and aliases are those of the current
+  `langchain-openai`, `langchain-anthropic` and `langchain-aws`; which LangChain version the
+  project runs is not known. The agent frameworks' classes and fields are
+  those of `openai-agents` 0.24, `claude-agent-sdk` 0.2 (and the last
+  `claude-code-sdk`, 0.0.25), and AgentScope 1.0 and 2.0. The deprecated classes are read the same way.
+  Where they differ, that can only add a gap: the deprecated `ChatAnthropic`
+  has no `base_url` alias and does not read `ANTHROPIC_BASE_URL`, so for it a
+  `base_url=` or that variable is a gap or a custom route it does not need.
 - The module-level API's state is process-wide: in a file that does not
   configure it, a call is reported direct, although another module may
   configure it. A call that passes `engine` or `deployment_id` is the

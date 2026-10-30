@@ -195,11 +195,18 @@ enum Outcome {
 pub fn scan_usages(root: &Path, options: &UsageScanOptions) -> std::io::Result<UsageReport> {
     let metadata = std::fs::metadata(root)?;
     let prefix = display_prefix(options.display_root.as_deref());
-    let candidates = if metadata.is_file() {
-        single_file(root, prefix.as_deref())
+    let (candidates, agents_links) = if metadata.is_file() {
+        (single_file(root, prefix.as_deref()), Vec::new())
     } else {
         walk(root, options.follow_symlinks, prefix.as_deref())
     };
+
+    // `agents` is the OpenAI Agents SDK's module, and also a common name for
+    // a repository's own: with one in the tree, or a scan inside one,
+    // `from agents import Agent` may load it instead.
+    let local_agents = enclosing_agents_package(root)
+        .or_else(|| local_agents_module(&candidates, root, prefix.as_deref()))
+        .or_else(|| agents_links.into_iter().next());
 
     let outcomes: Vec<(Candidate, Outcome)> = candidates
         .into_par_iter()
@@ -240,6 +247,9 @@ pub fn scan_usages(root: &Path, options: &UsageScanOptions) -> std::io::Result<U
                 continue;
             }
         };
+        if let Some(local) = &local_agents {
+            found.shadow_agents_sdk(local);
+        }
         if let Some(sdk) = options.sdk {
             found.retain_sdk(sdk);
         }
@@ -315,6 +325,35 @@ pub fn scan_usages(root: &Path, options: &UsageScanOptions) -> std::io::Result<U
     Ok(report)
 }
 
+/// The first module of the scanned tree named like the OpenAI Agents SDK's
+/// `agents`, as a display path: an `agents.py`, or a directory `agents`
+/// holding a Python file (a package or a namespace package, `src/agents/`).
+/// Vendored and hidden directories do not count: the SDK itself is
+/// installed under a virtual environment's `site-packages`.
+fn local_agents_module(
+    candidates: &[Candidate],
+    root: &Path,
+    prefix: Option<&str>,
+) -> Option<String> {
+    candidates
+        .iter()
+        .filter(|c| {
+            c.vendored_root.is_none()
+                && c.hidden_root.is_none()
+                && c.path.extension().is_some_and(|e| e == "py")
+        })
+        .find_map(|c| {
+            let relative = slash_path(c.path.strip_prefix(root).unwrap_or(&c.path));
+            let segments: Vec<&str> = relative.split('/').collect();
+            let (file, dirs) = segments.split_last()?;
+            if *file == "agents.py" {
+                return Some(c.relative.clone());
+            }
+            let at = dirs.iter().position(|dir| *dir == "agents")?;
+            Some(under(prefix, &format!("{}/", segments[..=at].join("/"))))
+        })
+}
+
 /// The display prefix, normalised: forward slashes, no trailing slash, and
 /// `None` for the root itself.
 fn display_prefix(display_root: Option<&str>) -> Option<String> {
@@ -357,7 +396,11 @@ fn single_file(path: &Path, prefix: Option<&str>) -> Vec<Candidate> {
     }]
 }
 
-fn walk(root: &Path, follow_symlinks: bool, prefix: Option<&str>) -> Vec<Candidate> {
+/// The files to scan under `root`, and the links named like the OpenAI
+/// Agents SDK's module (`agents`, `agents.py`) outside vendored, hidden and
+/// ignored paths, as display paths: a link is walked only when
+/// `follow_symlinks` is set, but Python follows it.
+fn walk(root: &Path, follow_symlinks: bool, prefix: Option<&str>) -> (Vec<Candidate>, Vec<String>) {
     let matcher = IgnoreMatcher::new(root);
     let walker = WalkBuilder::new(root)
         // Hidden entries are filtered below, so `.venv` and `.tox` can be
@@ -381,7 +424,19 @@ fn walk(root: &Path, follow_symlinks: bool, prefix: Option<&str>) -> Vec<Candida
 
     let mut venv_dirs: HashMap<PathBuf, bool> = HashMap::new();
     let mut candidates = Vec::new();
+    let mut agents_links = Vec::new();
     for entry in walker.filter_map(Result::ok) {
+        if entry.file_type().is_some_and(|ft| ft.is_symlink())
+            && matches!(entry.file_name().to_str(), Some("agents" | "agents.py"))
+        {
+            let path = entry.path();
+            let relative_path = path.strip_prefix(root).unwrap_or(path);
+            let vendored = vendored_root(root, relative_path, &mut venv_dirs).is_some();
+            if !vendored && hidden_root(relative_path).is_none() && !matcher.is_ignored(path, false)
+            {
+                agents_links.push(under(prefix, &slash_path(relative_path)));
+            }
+        }
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
@@ -414,7 +469,32 @@ fn walk(root: &Path, follow_symlinks: bool, prefix: Option<&str>) -> Vec<Candida
         });
     }
     candidates.sort_by(|a, b| a.relative.cmp(&b.relative));
-    candidates
+    agents_links.sort();
+    (candidates, agents_links)
+}
+
+/// The `agents` package the scan root is, or is inside: a directory named
+/// `agents` holding an `__init__.py`, the root or one of its ancestors
+/// (at most 32 up). Its own files' `from agents import Agent` then loads it.
+fn enclosing_agents_package(root: &Path) -> Option<String> {
+    let root = std::fs::canonicalize(root).ok()?;
+    let start = if root.is_file() {
+        root.parent()?
+    } else {
+        root.as_path()
+    };
+    start
+        .ancestors()
+        .take(32)
+        .find(|dir| {
+            dir.file_name().is_some_and(|name| name == "agents")
+                && dir.join("__init__.py").is_file()
+        })
+        .map(|dir| {
+            let shown = slash_path(dir);
+            // A canonical Windows path's verbatim prefix.
+            shown.strip_prefix("//?/").unwrap_or(&shown).to_string() + "/"
+        })
 }
 
 /// The vendored directory containing `relative` (a path under `root`), as a
@@ -562,6 +642,121 @@ mod tests {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn a_repositorys_own_agents_module_leaves_the_agents_sdk_unconfirmed() {
+        const AGENT: &str = "from agents import Agent\nbot = Agent(name=\"a\", model=\"gpt-4o\")\n";
+        // Without one, the call is the SDK's.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "app.py", AGENT);
+        write(
+            dir.path(),
+            ".venv/lib/site-packages/agents/__init__.py",
+            "x = 1\n",
+        );
+        let report = scan_usages(dir.path(), &UsageScanOptions::default()).unwrap();
+        assert_eq!(report.usages[0].routing, Routing::OpenaiDirect);
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+
+        for local in ["agents/__init__.py", "src/agents/tools.py", "agents.py"] {
+            let dir = tempdir().unwrap();
+            write(dir.path(), "app.py", AGENT);
+            write(dir.path(), local, "class Agent:\n    pass\n");
+            let report = scan_usages(dir.path(), &UsageScanOptions::default()).unwrap();
+            let call = &report.usages[0];
+            assert_eq!(call.routing, Routing::Unknown, "{local}");
+            assert_eq!(report.clients[0].routing, Routing::Unknown, "{local}");
+            let mut reasons: Vec<String> = report
+                .gaps
+                .iter()
+                .map(|g| format!("{}/{}", g.kind.as_str(), g.reason))
+                .collect();
+            reasons.sort();
+            assert_eq!(
+                reasons,
+                [
+                    "ambiguous_client/local_module",
+                    "unresolved_model/local_module"
+                ],
+                "{local}"
+            );
+            let shown = if local == "agents.py" {
+                "agents.py".to_string()
+            } else {
+                format!("{}/", local.rsplit_once('/').unwrap().0)
+            };
+            assert!(
+                report
+                    .gaps
+                    .iter()
+                    .all(|g| g.detail.contains(&format!("`{shown}`"))),
+                "{:?}",
+                report.gaps
+            );
+        }
+    }
+
+    #[test]
+    fn a_scan_inside_the_repositorys_own_agents_package_sees_it() {
+        const AGENT: &str = "from agents import Agent\nbot = Agent(name=\"a\", model=\"gpt-4o\")\n";
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "agents/__init__.py",
+            "from .base import Agent\n",
+        );
+        write(dir.path(), "agents/base.py", "class Agent:\n    pass\n");
+        write(dir.path(), "agents/bots/bot.py", AGENT);
+        for scanned in ["agents", "agents/bots"] {
+            let report =
+                scan_usages(&dir.path().join(scanned), &UsageScanOptions::default()).unwrap();
+            assert_eq!(report.usages.len(), 1, "{scanned}");
+            assert_eq!(report.usages[0].routing, Routing::Unknown, "{scanned}");
+            assert!(
+                report.gaps.iter().any(|g| g.reason == "local_module"),
+                "{scanned}: {:?}",
+                report.gaps
+            );
+        }
+        // A folder named `agents` that is no package is not the import's.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "agents/app.py", AGENT);
+        let report = scan_usages(&dir.path().join("agents"), &UsageScanOptions::default()).unwrap();
+        assert_eq!(report.usages[0].routing, Routing::OpenaiDirect);
+    }
+
+    #[test]
+    fn a_linked_agents_package_is_seen_without_following_it() {
+        const AGENT: &str = "from agents import Agent\nbot = Agent(name=\"a\", model=\"gpt-4o\")\n";
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "shared/agents/__init__.py",
+            "class Agent:\n    pass\n",
+        );
+        write(dir.path(), "repo/app.py", AGENT);
+        let target = dir.path().join("shared/agents");
+        let link = dir.path().join("repo/agents");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&target, &link);
+        if linked.is_err() {
+            // Creating a link needs a privilege this machine does not grant.
+            return;
+        }
+        let report = scan_usages(&dir.path().join("repo"), &UsageScanOptions::default()).unwrap();
+        assert_eq!(report.usages.len(), 1);
+        assert_eq!(report.usages[0].routing, Routing::Unknown);
+        assert!(
+            report
+                .gaps
+                .iter()
+                .any(|g| g.reason == "local_module" && g.detail.contains("`agents`")),
+            "{:?}",
+            report.gaps
+        );
     }
 
     #[test]

@@ -102,6 +102,30 @@
       "language": "python",
       "suite": "usages",
       "covers": "the third review of #276: nonlocal, match, except and wildcard-import bindings, globals() writes, constructor calls against __init__ defaults, subclasses and outside writes against self attributes, functions used as values, constructors chosen at run time, dict aliases through chains and attributes, candidate values with no credential, a clipped import path"
+    },
+    {
+      "name": "py-sdk-langchain",
+      "language": "python",
+      "suite": "usages",
+      "covers": "LangChain chat models: ChatOpenAI, ChatAnthropic and AzureChatOpenAI as clients and model-bearing calls, base_url routing, a missing model, OPENAI_API_BASE set in the file, the deprecated langchain.chat_models import, calls on the built model, OpenAIEmbeddings not tracked"
+    },
+    {
+      "name": "py-sdk-bedrock-litellm",
+      "language": "python",
+      "suite": "usages",
+      "covers": "Amazon Bedrock and LiteLLM: boto3 bedrock-runtime clients (converse, invoke_model, converse_stream; modelId from a constant, a ** dict and a literal), an endpoint_url outside AWS, a boto3.Session client passed to a helper, other boto3 services not tracked, LangChain's ChatBedrock and ChatBedrockConverse, litellm.completion and acompletion by keyword and by position"
+    },
+    {
+      "name": "py-sdk-raw-http",
+      "language": "python",
+      "suite": "usages",
+      "covers": "Raw HTTP requests: requests.post and httpx.post (and a bare post imported from httpx) to api.openai.com and api.anthropic.com endpoints, the model read from a json= dict or data=json.dumps(...), a parameter in the body, a body with no model, requests.get, a gateway host and /v1/models not recorded"
+    },
+    {
+      "name": "py-sdk-agent-frameworks",
+      "language": "python",
+      "suite": "usages",
+      "covers": "Agent frameworks: OpenAI Agents SDK agents, model objects (on a local client) and LitellmModel, a litellm/ model name and an agent with no model; Claude Agent SDK options, an agent definition and options whose env= turns on Bedrock; AgentScope 1 and 2 models and one on a gateway base_url; a repository's own agents package and DashScope not tracked"
     }
   ]
 }

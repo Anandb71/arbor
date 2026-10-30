@@ -1,0 +1,37 @@
+{
+  "corpus_version": 1,
+  "suite": "usages",
+  "language": "python",
+  "covers": [
+    "requests.post to api.openai.com endpoints: the URL from a module constant or a literal, the model read from a json= dict bound to a local and from data=json.dumps(...)",
+    "a model passed as a parameter inside the JSON body is a parameter gap on the raw HTTP request",
+    "httpx.post and a bare post imported from httpx to api.anthropic.com/v1/messages; a body with no model is a missing_model gap",
+    "requests.get, another host (a gateway) and the provider's /v1/models endpoint are not recorded; the HTTP libraries get no import records"
+  ],
+  "usages_expected": [
+    {"at": "app/openai_rest.py:14", "chain": "requests.post", "routing": "openai_direct", "values": {"model": "gpt-4o-mini"}},
+    {"at": "app/openai_rest.py:20", "chain": "requests.post", "routing": "openai_direct", "values": {"model": "text-embedding-3-small"}},
+    {"at": "app/openai_rest.py:24", "chain": "requests.post", "routing": "openai_direct"},
+
+    {"at": "app/anthropic_rest.py:11", "chain": "httpx.post", "routing": "anthropic_direct", "values": {"model": "claude-3-5-haiku-20241022"}},
+    {"at": "app/anthropic_rest.py:15", "chain": "post", "routing": "anthropic_direct"}
+  ],
+  "clients_expected": [],
+  "gaps_expected": [
+    {"at": "app/openai_rest.py:24", "kind": "unresolved_model", "reason": "parameter"},
+    {"at": "app/anthropic_rest.py:15", "kind": "unresolved_model", "reason": "missing_model"}
+  ],
+  "skipped_expected": {"vendored_files": 0, "vendored_calls": 0, "hidden_files": 0, "hidden_calls": 0},
+  "forbidden_in_output": [
+    "Bearer",
+    "OPENAI_API_KEY",
+    "x-api-key",
+    "2023-06-01",
+    "llm-gateway.internal.example.com",
+    "claude-3-opus-20240229",
+    "/v1/models"
+  ],
+  "known_missing": [],
+  "known_extra": [],
+  "notes": "Synthetic. Truth is what each line does at run time, except where a policy turns it into a gap. A requests.post or httpx.post is recorded only when its URL resolves with no gap to a listed api.openai.com or api.anthropic.com endpoint; it routes direct and its model is read from the JSON body the way a dict expanded with ** is read. openai_rest.py:14 posts a local dict as json=, which requests.post only serializes, so the dict stays readable; :20 sends json.dumps(body) as data=; :24 puts a parameter in the body (a parameter gap); :28 is requests.get to /v1/models, not recorded. anthropic_rest.py:11 uses httpx.post with a module-constant URL; :15 is post imported from httpx and its body names no model (missing_model); :19 posts to a gateway host, which records nothing, so its model is never output. No header, key or API version is ever output."
+}
