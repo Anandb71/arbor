@@ -212,10 +212,10 @@ it too. The check runs on the runner and sends nothing anywhere.
   framework wrappers (LangChain's other integrations, LlamaIndex), and the project's own
   wrappers the scan does not follow, are not checked yet. Model IDs in `.env`, YAML, JSON or notebooks are not read.
 - **Values it can see.** A model passed in from an environment variable, a function
-  argument or another module is counted under "Not checked"; `arbor usages` lists those
-  calls. The exception is a call to a wrapper the scan follows: there the model is read
-  where the caller passes it. So is a call that passes no model, where the SDK's or the server's default
-  applies. Argument checks look at the argument *names* a call passes, not their values,
+  argument or another module is counted under "Not checked" (except a model passed to a
+  wrapper the scan follows, which is read where the caller passes it); `arbor usages`
+  lists those calls. So is a call that passes no model, where the SDK's or the server's
+  default applies. Argument checks look at the argument *names* a call passes, not their values,
   and not at parameters nested in config objects such as Gemini's
   `GenerateContentConfig`.
 - **What it did not read.** Every part of the scan that could hide a call gets its own
