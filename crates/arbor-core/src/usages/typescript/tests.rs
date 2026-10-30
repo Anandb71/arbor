@@ -2956,6 +2956,12 @@ fn a_global_fetch_written_in_the_file_is_a_custom_fetch() {
         "Reflect.set(globalThis, \"fetch\", proxy);",
         "Object.defineProperty(globalThis, \"fetch\", { value: proxy });",
         "function install() { fetch = proxy; }",
+        // Test doubles replace it too.
+        "jest.spyOn(globalThis, \"fetch\").mockImplementation(proxy);",
+        "vi.spyOn(global, \"fetch\");",
+        "sinon.stub(window, \"fetch\").callsFake(proxy);",
+        "vi.stubGlobal(\"fetch\", proxy);",
+        "vi.stubGlobal(name, proxy);",
     ] {
         let source = format!("{OPENAI}const client = new OpenAI();\n{write}\n{request}");
         let found = usages(&source);
@@ -3009,6 +3015,8 @@ client.chat.completions.create({ model: \"gpt-4o\", messages: [] });",
     // Read, or written on an object literal of the file: nothing replaced.
     for other in [
         "const original = globalThis.fetch;",
+        "vi.stubGlobal(\"location\", { href: \"/\" });",
+        "jest.spyOn(console, \"log\");",
         "const api = { fetch: proxy };\napi.fetch = other;",
         "let fetch = proxy;\nfetch = other;",
     ] {

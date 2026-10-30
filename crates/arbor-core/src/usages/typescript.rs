@@ -5072,6 +5072,15 @@ impl<'t> Ctx<'t> {
             let Some(callee) = self.global_callee(function, *scope) else {
                 continue;
             };
+            // `vi.stubGlobal("fetch", mock)`, or a name known only at run
+            // time: the global itself replaced.
+            if callee == "vi.stubGlobal" {
+                let name = first_argument(*call).map(unwrap_expression);
+                if name.is_none_or(|n| static_key(n, self.src).is_none_or(|k| k == "fetch")) {
+                    self.global_fetch = true;
+                }
+                continue;
+            }
             let spy = METHOD_MOCKS.contains(&callee.as_str());
             if !spy && !REFLECTIVE_WRITES.contains(&callee.as_str()) {
                 continue;
@@ -5094,8 +5103,14 @@ impl<'t> Ctx<'t> {
                         line,
                     });
                 }
-                // `Object.assign(globalThis, { fetch })`.
-                if keys.contains(&"fetch") {
+                // `Object.assign(globalThis, { fetch })`, and a spy that
+                // replaces it (`jest.spyOn(globalThis, "fetch")`).
+                let spied = spy
+                    .then(|| nth_argument(*call, 1))
+                    .flatten()
+                    .and_then(|k| static_key(unwrap_expression(k), self.src))
+                    .filter(|_| !matches!(val, Val::Untracked(Origin::Placeholder)));
+                if keys.contains(&"fetch") || spied == Some("fetch") {
                     self.global_fetch = true;
                 }
                 continue;
