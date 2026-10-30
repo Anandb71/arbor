@@ -1370,3 +1370,635 @@ fn the_docs_count_the_bundled_data() {
     );
     assert!(!docs.contains("283 model IDs"));
 }
+
+/// A package that subclasses `openai.OpenAI` and exports it under the same
+/// name (tracing, analytics), so Arbor cannot resolve the client (#290).
+const WRAPPED: &str = r#"from tracing_sdk.ai.openai import OpenAI
+
+SUGGESTION_MODEL = "gpt-4.1-mini"
+
+
+def explain(prompt, report):
+    return OpenAI(tracker=None).chat.completions.create(
+        model="gpt-4.1-2025-04-14",
+        temperature=0.1,
+        messages=[{"role": "system", "content": prompt}, {"role": "user", "content": report}],
+    )
+
+
+def label(text):
+    client = OpenAI(tracker=None)
+    return client.chat.completions.create(
+        model=SUGGESTION_MODEL,
+        temperature=0.2,
+        max_tokens=32,
+        messages=[{"role": "user", "content": text}],
+    )
+
+
+def plan(text, tools):
+    return OpenAI(tracker=None).chat.completions.create(
+        model="gpt-4o-mini",
+        tools=tools,
+        messages=[{"role": "user", "content": text}],
+    )
+
+
+def plain(text):
+    return OpenAI(tracker=None).chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": text}],
+    )
+
+
+def passthrough(text, **options):
+    return OpenAI(tracker=None).chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": text}],
+        **options,
+    )
+"#;
+
+/// A plain client whose arguments come from the caller, and one that sends
+/// some in `extra_body`.
+const UNSEEN: &str = r#"from openai import OpenAI
+
+client = OpenAI()
+
+
+def forward(text, **options):
+    return client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": text}],
+        **options,
+    )
+
+
+def raw(text, body):
+    return client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[{"role": "user", "content": text}],
+        extra_body=body,
+    )
+"#;
+
+/// A Claude client passed in as a parameter: not resolved either.
+const PASSED_IN: &str = r#"import anthropic
+
+
+def reply(client, text):
+    return client.messages.create(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=512,
+        temperature=0.3,
+        messages=[{"role": "user", "content": text}],
+    )
+"#;
+
+#[test]
+fn arguments_that_need_reasoning_off_are_never_no_change() {
+    // #290: a call through a wrapped client that sends temperature=0.1 read
+    // "let the model reason (no change)", and on gpt-6-luna a non-default
+    // temperature returns 400 unless reasoning_effort="none"
+    // (docs/LIVE_CHECKS_2026-10-18.md, E2).
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("wrapped.py"), WRAPPED).unwrap();
+    fs::write(dir.path().join("unseen.py"), UNSEEN).unwrap();
+    fs::write(dir.path().join("passed_in.py"), PASSED_IN).unwrap();
+    let (code, report) = run_json(dir.path(), &[]);
+    assert_eq!(code, Some(0), "{report:#}");
+    let at = |file: &str, symbol: &str| -> Value {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| {
+                f["file"].as_str().is_some_and(|p| p.ends_with(file)) && f["symbol"] == symbol
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("no finding for {file} {symbol}: {report:#}"))
+    };
+    let option = |finding: &Value, id: &str| -> Value {
+        finding["decisions"][0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no option {id}: {finding:#}"))
+    };
+
+    // The wrapped client is not resolved, but its arguments are checked as
+    // a plain client's would be.
+    for (symbol, removed) in [
+        ("explain", "temperature"),
+        ("label", "temperature"),
+        ("plan", "tools"),
+    ] {
+        let finding = at("wrapped.py", symbol);
+        assert_eq!(finding["confidence"], "gap", "{finding:#}");
+        assert_eq!(
+            option(&finding, "model_default")["remove"],
+            serde_json::json!([removed]),
+            "{finding:#}"
+        );
+        assert_eq!(
+            option(&finding, "reasoning_none")["keep"],
+            serde_json::json!([removed]),
+            "{finding:#}"
+        );
+        assert!(finding["decisions"][0].get("unchecked_args").is_none());
+    }
+    let label = at("wrapped.py", "label");
+    assert_eq!(label["changes"][0]["param"], "max_tokens");
+    assert_eq!(label["changes"][0]["to"], "max_completion_tokens");
+
+    // Every argument of this one was read, and none needs a change.
+    let plain = at("wrapped.py", "plain");
+    assert_eq!(
+        option(&plain, "model_default")["remove"],
+        serde_json::json!([])
+    );
+    assert!(plain["decisions"][0].get("unchecked_args").is_none());
+
+    // Arguments Arbor cannot see: never "no change".
+    for (file, symbol, why) in [
+        ("wrapped.py", "passthrough", "splat"),
+        ("unseen.py", "forward", "splat"),
+        ("unseen.py", "raw", "extra_body"),
+    ] {
+        let finding = at(file, symbol);
+        assert_eq!(
+            finding["decisions"][0]["unchecked_args"], why,
+            "{finding:#}"
+        );
+        assert_eq!(finding["fix"], "manual", "{finding:#}");
+        assert!(!finding["review"].as_array().unwrap().is_empty());
+    }
+
+    // The Claude call's temperature is checked too.
+    let reply = at("passed_in.py", "reply");
+    assert_eq!(reply["gap_reason"], "parameter");
+    assert!(
+        reply["review"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["rule"] == "ANT-SAMPLING"),
+        "{reply:#}"
+    );
+
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    let decide = |edits: &str| {
+        format!("decide: keep reasoning off (add reasoning_effort=\"none\"; keep {edits}) or let the model reason (remove {edits})")
+    };
+    assert_eq!(text.matches(&decide("temperature")).count(), 2, "{text}");
+    assert_eq!(text.matches(&decide("tools")).count(), 1, "{text}");
+    assert!(
+        text.contains("also change: max_tokens → max_completion_tokens"),
+        "{text}"
+    );
+    // Named as the code names them (`**options`), not "**kwargs".
+    // Each option names them: an unseen `max_tokens` or `stop` returns 400
+    // with reasoning off too (#291 round 3 review).
+    let unseen = "decide: keep reasoning off (add reasoning_effort=\"none\"; could not check the arguments from **options) or let the model reason (could not check the arguments from **options)";
+    assert_eq!(text.matches(unseen).count(), 2, "{text}");
+    assert!(
+        text.contains(
+            "check: Some arguments come from `**options`, so Arbor could not check them all."
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("decide: keep reasoning off (add reasoning_effort=\"none\"; could not check the arguments in extra_body) or let the model reason (could not check the arguments in extra_body)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("check: The entries of `extra_body` are sent as request arguments, and Arbor could not check them."),
+        "{text}"
+    );
+    assert!(
+        text.contains("check: temperature, top_p or top_k return 400 on claude-sonnet-5-5"),
+        "{text}"
+    );
+    // Only the call Arbor read in full, with nothing to change, says so.
+    let reasoning_no_change = "let the model reason (no change)";
+    assert_eq!(text.matches(reasoning_no_change).count(), 1, "{text}");
+
+    let markdown = stdout(&arbor(
+        dir.path(),
+        &["retirements", ".", "--markdown", "--today", TODAY],
+    ));
+    assert!(
+        markdown.contains("let the model reason (could not check the arguments from `**options`)"),
+        "{markdown}"
+    );
+}
+
+/// Other shapes of a wrapped client (#290 review): a class that keeps the
+/// client on `self` and forwards `**kwargs`, `tools` spread in only when
+/// given, the async client behind `await`, and the Responses API.
+const WRAPPER_SHAPES: &str = r#"from tracing_sdk.ai.openai import AsyncOpenAI, OpenAI
+
+traced = OpenAI(tracker=None)
+traced_async = AsyncOpenAI(tracker=None)
+
+
+class Assistant:
+    def __init__(self):
+        self.client = OpenAI(tracker=None)
+
+    def ask(self, prompt, **kwargs):
+        return self.client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            **kwargs,
+        )
+
+
+def ask_maybe_tools(prompt, tools=None):
+    return traced.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        **({"tools": tools} if tools else {}),
+    )
+
+
+async def ask_async(prompt, temperature=0.7):
+    return await traced_async.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=temperature,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+
+async def ask_async_plain(prompt):
+    return await traced_async.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+
+def respond(prompt):
+    return traced.responses.create(model="gpt-4o-mini", temperature=0.1, input=prompt)
+
+
+def respond_with_tools(prompt, tools):
+    return traced.responses.create(model="gpt-4o-mini", tools=tools, input=prompt)
+"#;
+
+#[test]
+fn wrapped_client_shapes_keep_their_arguments_checked() {
+    let dir = project(WRAPPER_SHAPES);
+    let (code, report) = run_json(dir.path(), &[]);
+    assert_eq!(code, Some(0), "{report:#}");
+    let at = |symbol: &str| -> Value {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["symbol"] == symbol)
+            .cloned()
+            .unwrap_or_else(|| panic!("no finding for {symbol}: {report:#}"))
+    };
+    let decision = |finding: &Value| -> Value {
+        assert_eq!(finding["confidence"], "gap", "{finding:#}");
+        let decisions = finding["decisions"].as_array().unwrap();
+        assert_eq!(decisions.len(), 1, "{finding:#}");
+        decisions[0].clone()
+    };
+    let option = |decision: &Value, id: &str| -> Value {
+        decision["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no option {id}: {decision:#}"))
+    };
+    let names = |list: &Value| -> Vec<String> {
+        list.as_array()
+            .map(|l| l.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+            .unwrap_or_default()
+    };
+    let rules = |finding: &Value| -> Vec<String> {
+        finding["review"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["rule"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    // `**kwargs` forwarded by a method, and `tools` spread in conditionally:
+    // Arbor cannot see them, so it never says "no change".
+    for symbol in ["Assistant.ask", "ask_maybe_tools"] {
+        let decision = decision(&at(symbol));
+        assert_eq!(decision["unchecked_args"], "splat", "{decision:#}");
+    }
+
+    // The async client behind `await`: a temperature from a parameter is
+    // checked like any other.
+    let ask_async = decision(&at("ask_async"));
+    assert!(ask_async.get("unchecked_args").is_none(), "{ask_async:#}");
+    assert_eq!(
+        names(&option(&ask_async, "model_default")["remove"]),
+        ["temperature"]
+    );
+    assert_eq!(
+        names(&option(&ask_async, "reasoning_none")["keep"]),
+        ["temperature"]
+    );
+
+    // Precision: a call that sends only defaults keeps "no change".
+    let plain = decision(&at("ask_async_plain"));
+    assert!(plain.get("unchecked_args").is_none(), "{plain:#}");
+    assert!(names(&option(&plain, "model_default")["remove"]).is_empty());
+
+    // The Responses API takes `reasoning={"effort": "none"}`; its sampling
+    // rule is a check (documented, not live-checked), and its tools need no
+    // change.
+    let respond = at("respond");
+    let respond_decision = decision(&respond);
+    let add = &option(&respond_decision, "reasoning_none")["add"];
+    assert_eq!(add[0]["name"], "reasoning", "{respond:#}");
+    assert!(
+        rules(&respond).contains(&"G6-SAMPLING-RESPONSES".to_string()),
+        "{respond:#}"
+    );
+    let tools = at("respond_with_tools");
+    let tools_decision = decision(&tools);
+    assert!(tools_decision.get("unchecked_args").is_none());
+    assert!(names(&option(&tools_decision, "model_default")["remove"]).is_empty());
+    assert!(
+        !rules(&tools).iter().any(|r| r.contains("TOOLS")),
+        "{tools:#}"
+    );
+
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    // A method's own `**kwargs` is named; a conditional has no name.
+    let unseen = "let the model reason (could not check the arguments from **kwargs)";
+    assert_eq!(text.matches(unseen).count(), 1, "{text}");
+    let unnamed = "let the model reason (could not check the arguments spread in with **)";
+    assert_eq!(text.matches(unnamed).count(), 1, "{text}");
+    // The Responses API's temperature: no live call checked it there, but
+    // OpenAI's "Using GPT-6" guide documents the rule (G6-SAMPLING-RESPONSES,
+    // `docs` since the 28 Oct data, #297), so each option names it.
+    assert!(
+        text.contains("let the model reason (check temperature)"),
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("let the model reason (remove temperature)")
+            .count(),
+        1,
+        "{text}"
+    );
+}
+
+/// Calls whose decide line said "(no change)" next to a check line saying
+/// otherwise (#291 round 3), a `**` dict Arbor can read, one it cannot, and
+/// `temperature=1`.
+const CHECK_LINES: &str = r#"import anthropic
+from openai import OpenAI
+
+client = OpenAI()
+claude = anthropic.Anthropic()
+
+PARAMS = {"model": "gpt-4o-mini", "temperature": 0.1}
+
+
+def respond(text):
+    return client.responses.create(model="gpt-4o-mini", temperature=0.1, input=text)
+
+
+def reply(text):
+    return claude.messages.create(model="claude-3-5-sonnet-20241022", max_tokens=512, temperature=0.3, messages=[])
+
+
+def stop_early(text):
+    return client.chat.completions.create(model="gpt-4o-mini", stop=["\n"], messages=[])
+
+
+def from_params(messages):
+    return client.chat.completions.create(messages=messages, **PARAMS)
+
+
+def from_settings(messages, settings):
+    return client.chat.completions.create(model="gpt-4.1-mini", messages=messages, **settings.llm_options)
+
+
+def default_temperature(text):
+    return client.chat.completions.create(model="gpt-4.1-mini", temperature=1, messages=[])
+"#;
+
+#[test]
+fn no_option_reads_no_change_next_to_a_check_line_that_says_otherwise() {
+    let dir = project(CHECK_LINES);
+    let (_, report) = run_json(dir.path(), &[]);
+    let at = |symbol: &str| -> Value {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["symbol"] == symbol)
+            .cloned()
+            .unwrap_or_else(|| panic!("no finding for {symbol}: {report:#}"))
+    };
+    let option = |symbol: &str, id: &str| -> Value {
+        at(symbol)["decisions"][0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no option {id} for {symbol}"))
+    };
+    let json = |names: &[&str]| serde_json::json!(names);
+
+    // The Responses API: no live call checked temperature there, so the
+    // Chat Completions rule is not applied. OpenAI's "Using GPT-6" guide
+    // documents it (G6-SAMPLING-RESPONSES, `docs` since the 28 Oct data,
+    // #297), so both options name temperature as a check.
+    for id in ["reasoning_none", "model_default"] {
+        assert_eq!(option("respond", id)["check"], json(&["temperature"]));
+        assert!(option("respond", id).get("unverified").is_none());
+    }
+    // Claude: temperature returns 400 whichever way the thinking goes.
+    for id in ["thinking_between_tools", "model_default"] {
+        assert_eq!(option("reply", id)["check"], json(&["temperature"]));
+    }
+    assert_eq!(
+        option("stop_early", "model_default")["check"],
+        json(&["stop"])
+    );
+    // `**PARAMS`, a dict literal in this file: its temperature is checked.
+    assert_eq!(
+        option("from_params", "model_default")["remove"],
+        json(&["temperature"])
+    );
+    assert!(at("from_params")["decisions"][0]
+        .get("unchecked_args")
+        .is_none());
+    // `**settings.llm_options` cannot be read: named, not "**kwargs".
+    let settings = &at("from_settings")["decisions"][0];
+    assert_eq!(settings["unchecked_args"], "splat");
+    assert_eq!(settings["unread_spreads"], json(&["settings.llm_options"]));
+    // Arbor reads argument names, not values: temperature=1 is still
+    // removed for letting the model reason (no live call sent 1).
+    assert_eq!(
+        option("default_temperature", "model_default")["remove"],
+        json(&["temperature"])
+    );
+
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    for line in [
+        "decide: keep reasoning off (add reasoning={\"effort\": \"none\"}; check temperature) or let the model reason (check temperature)",
+        "check: OpenAI's \"Using GPT-6\" guide says to remove temperature, top_p and top_logprobs on gpt-6-luna unless reasoning effort is \"none\"",
+        "decide: think only between tools (add thinking={\"type\": \"between_tools\"}; check temperature) or let the model think (check temperature)",
+        "check: temperature, top_p or top_k return 400 on claude-sonnet-5-5",
+        "decide: keep reasoning off (add reasoning_effort=\"none\"; check stop) or let the model reason (check stop)",
+        "decide: keep reasoning off (add reasoning_effort=\"none\"; keep temperature) or let the model reason (remove temperature)",
+        "decide: keep reasoning off (add reasoning_effort=\"none\"; could not check the arguments from **settings.llm_options) or let the model reason (could not check the arguments from **settings.llm_options)",
+        "check: Some arguments come from `**settings.llm_options`, so Arbor could not check them all.",
+    ] {
+        assert!(text.contains(line), "missing {line:?} in\n{text}");
+    }
+    // Every call here sends something a check names: none reads no change.
+    assert!(!text.contains("(no change)"), "{text}");
+    assert!(!text.contains("**kwargs"), "{text}");
+
+    let markdown = stdout(&arbor(
+        dir.path(),
+        &["retirements", ".", "--markdown", "--today", TODAY],
+    ));
+    assert!(
+        markdown.contains("could not check the arguments from `**settings.llm_options`"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("let the model think (check temperature)"),
+        "{markdown}"
+    );
+}
+
+/// The round-3 review's cases on #291: `max_tokens` in a same-file `**`
+/// dict, a dict changed after it is built, `seed` and `n` (checked on
+/// gpt-6-luna only with reasoning off), and `logit_bias` on the Responses
+/// API (checked on Chat Completions only).
+const ROUND_3_REVIEW: &str = r#"from openai import OpenAI
+
+client = OpenAI()
+
+GEN = {"temperature": 0.2, "max_tokens": 512}
+LIMITS = {"max_tokens": 50}
+
+
+def generate(messages):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, **GEN)
+
+
+def limited(messages):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, **LIMITS)
+
+
+def limited_at_call(messages):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=50)
+
+
+def changed(messages):
+    p = {"messages": messages}
+    p["temperature"] = 0.2
+    return client.chat.completions.create(model="gpt-4o-mini", **p)
+
+
+def seeded(messages):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, seed=1)
+
+
+def several(messages):
+    return client.chat.completions.create(model="gpt-4o-mini", messages=messages, n=2)
+
+
+def respond_biased(text):
+    return client.responses.create(model="gpt-4o-mini", input=text, logit_bias={"1": 2})
+"#;
+
+#[test]
+fn a_spread_max_tokens_an_untested_seed_and_a_changed_dict_are_never_all_clear() {
+    let dir = project(ROUND_3_REVIEW);
+    let (_, report) = run_json(dir.path(), &[]);
+    let at = |symbol: &str| -> Value {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["symbol"] == symbol)
+            .cloned()
+            .unwrap_or_else(|| panic!("no finding for {symbol}: {report:#}"))
+    };
+    let option = |symbol: &str, id: &str| -> Value {
+        at(symbol)["decisions"][0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no option {id} for {symbol}"))
+    };
+    let json = |names: &[&str]| serde_json::json!(names);
+
+    // `max_tokens` in `**GEN` is renamed like one written at the call, and
+    // the dict's temperature is kept or removed.
+    let generate = at("generate");
+    assert_eq!(
+        generate["changes"][0]["param"], "max_tokens",
+        "{generate:#}"
+    );
+    assert_eq!(generate["changes"][0]["to"], "max_completion_tokens");
+    assert!(generate["decisions"][0].get("unchecked_args").is_none());
+    assert_eq!(
+        option("generate", "model_default")["remove"],
+        json(&["temperature"])
+    );
+    // `**LIMITS` reads exactly as `max_tokens=50` at the call.
+    assert_eq!(at("limited")["changes"], at("limited_at_call")["changes"]);
+    assert_eq!(
+        at("limited")["decisions"],
+        at("limited_at_call")["decisions"]
+    );
+    // A dict changed after it is built is named, not read.
+    let changed = &at("changed")["decisions"][0];
+    assert_eq!(changed["unchecked_args"], "splat", "{changed:#}");
+    assert_eq!(changed["unread_spreads"], json(&["p"]));
+    // seed and n were accepted on gpt-6-luna only with reasoning off.
+    for (symbol, arg) in [("seeded", "seed"), ("several", "n")] {
+        assert_eq!(
+            option(symbol, "model_default")["unverified"],
+            json(&[arg]),
+            "{symbol}"
+        );
+        assert!(option(symbol, "reasoning_none").get("unverified").is_none());
+    }
+
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    assert_eq!(
+        text.matches("also change: max_tokens → max_completion_tokens")
+            .count(),
+        3,
+        "{text}"
+    );
+    for line in [
+        "decide: keep reasoning off (add reasoning_effort=\"none\"; keep temperature) or let the model reason (remove temperature)",
+        "decide: keep reasoning off (add reasoning_effort=\"none\"; could not check the arguments from **p) or let the model reason (could not check the arguments from **p)",
+        "decide: keep reasoning off (add reasoning_effort=\"none\") or let the model reason (could not check seed)",
+        "decide: keep reasoning off (add reasoning_effort=\"none\") or let the model reason (could not check n)",
+        "decide: keep reasoning off (add reasoning={\"effort\": \"none\"}; could not check logit_bias) or let the model reason (could not check logit_bias)",
+        "check: stop and logit_bias are not supported on gpt-6-luna (400). Seen on Chat Completions only; the Responses API was not checked.",
+    ] {
+        assert!(text.contains(line), "missing {line:?} in\n{text}");
+    }
+    // Only the two max_tokens-only calls, read in full, need nothing else
+    // for letting the model reason.
+    assert_eq!(text.matches("(no change)").count(), 2, "{text}");
+}

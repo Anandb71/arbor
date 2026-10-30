@@ -20,9 +20,10 @@
 //! `--include-routed`.
 
 use arbor_core::retirements::{
-    bundled, check, python_literal, routing_gap_text, value_gap_text, BaseUrl, CallKind, Change,
-    ChangeKind, CheckOptions, Confidence, Date, DateKind, Decision, Finding, MatchKind,
-    OptionStatus, RetirementReport, RoutingClass, ScanInput, State, FINE_TUNING, REPORT_VERSION,
+    bundled, check, python_literal, routing_gap_text, spread_list, value_gap_text, BaseUrl,
+    CallKind, Change, ChangeKind, CheckOptions, Confidence, Date, DateKind, Decision, Finding,
+    MatchKind, OptionStatus, RetirementReport, RoutingClass, ScanInput, State, UncheckedArgs,
+    FINE_TUNING, REPORT_VERSION,
 };
 use arbor_core::usages::{is_unsafe_char, ValueOrigin};
 use arbor_watcher::usages::{scan_usages, UsageScanOptions};
@@ -380,6 +381,20 @@ fn describe_decision(decision: &Decision, code: bool) -> String {
             if !removed.is_empty() {
                 edits.push(format!("remove {}", removed.join(", ")));
             }
+            // Arguments a check line flags whichever way the choice goes.
+            if !option.check.is_empty() {
+                edits.push(format!("check {}", option.check.join(", ")));
+            }
+            if !option.unverified.is_empty() {
+                edits.push(format!("could not check {}", option.unverified.join(", ")));
+            }
+            // When Arbor could not read every argument, no option's edits are
+            // complete: an unseen `max_tokens` or `stop` returns 400 with
+            // reasoning off too, and an unseen `temperature` must go when
+            // the model reasons. Like a check line, it holds either way.
+            if let Some(unchecked) = decision.unchecked_args {
+                edits.push(unchecked_clause(unchecked, &decision.unread_spreads, code));
+            }
             if edits.is_empty() {
                 edits.push("no change".to_string());
             }
@@ -387,6 +402,27 @@ fn describe_decision(decision: &Decision, code: bool) -> String {
         })
         .collect::<Vec<_>>()
         .join(" or ")
+}
+
+/// `could not check the arguments from **PARAMS`: said in place of "no
+/// change" when Arbor could not read every argument the call sends.
+/// `spreads` names the `**` expressions it could not read.
+fn unchecked_clause(unchecked: UncheckedArgs, spreads: &[String], code: bool) -> String {
+    match unchecked {
+        UncheckedArgs::Splat if spreads.is_empty() => format!(
+            "could not check the arguments spread in with {}",
+            tick("**", code)
+        ),
+        UncheckedArgs::Splat => format!(
+            "could not check the arguments from {}",
+            spread_list(spreads, code)
+        ),
+        UncheckedArgs::ExtraBody => format!(
+            "could not check the arguments in {}",
+            tick("extra_body", code)
+        ),
+        UncheckedArgs::NotRecorded => "could not check this call's arguments".to_string(),
+    }
 }
 
 /// What to keep in mind about how the value was found and where the call

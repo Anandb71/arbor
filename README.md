@@ -250,7 +250,7 @@ npx @anandb71/arbor-cli retirements .
                   also change: max_tokens → max_completion_tokens
                   decide: keep reasoning off (add reasoning_effort="none"; keep temperature) or let the model reason (remove temperature)
   app/chat.py:21  gpt-4o-mini (line 22) → gpt-6-luna  fallback of an environment or config lookup: confirm the deployed value
-                  decide: keep reasoning off (add reasoning_effort="none") or let the model reason (no change)
+                  decide: keep reasoning off (add reasoning_effort="none"; check stop) or let the model reason (check stop)
                   check: stop and logit_bias are not supported on gpt-6-luna (400).
 ```
 
