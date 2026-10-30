@@ -146,7 +146,8 @@ pub enum Routing {
     /// a `base_url` read from the environment with no fallback or one that
     /// does not resolve to a string, a module-level API routed by an
     /// `openai.api_type` that is not a string literal or by an
-    /// `openai.bedrock_*` setting, and a v0 resource call
+    /// `openai.bedrock_*` setting (next to an Azure setting, the Azure
+    /// route is kept instead, under the same gap), and a v0 resource call
     /// (`openai.ChatCompletion.create`) that passes its own `api_base` or
     /// `api_type`. With no gap, because the route is known to be a platform
     /// this list does not name: a literal `openai.api_type` other than Azure

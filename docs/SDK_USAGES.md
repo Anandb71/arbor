@@ -197,12 +197,15 @@ these:
   so none of its own code can run before the configuration is complete. The
   report does not follow import-time execution any further than that.
 
-  In the block, a string literal decides `openai.api_type`: `azure` or
-  `azure_ad` routes to Azure, `openai` or `open_ai` direct, and any other
-  (`amazon-bedrock`) `unknown` with no gap, a platform this version does
-  not name. An `api_type` that is not a string literal (`os.environ[...]`,
-  a name bound to one), and any `openai.bedrock_*` setting, route `unknown`
-  with a `module_routing` gap.
+  In the block, a string literal decides `openai.api_type`: `azure`,
+  `azure_ad` or `azuread` routes to Azure, `openai` or `open_ai` direct,
+  and any other (`amazon-bedrock`) `unknown` with no gap, a platform this
+  version does not name. An `api_type` that is not a string literal
+  (`os.environ[...]`, a name bound to one), and any `openai.bedrock_*`
+  setting, give a `module_routing` gap. The route is `unknown`, unless an
+  Azure setting is next to them: then `azure_openai` is kept as the
+  candidate, under the gap, as `module_config` keeps the routing the
+  settings suggest.
 
   A v0 resource call (`openai<1.0`: `openai.ChatCompletion.create`,
   `Completion`, `Embedding`, `Audio`, `Model` and the other resources) also
@@ -233,10 +236,11 @@ A client known only from a type annotation (`def ask(client: OpenAI)`,
 decides the route (`AzureOpenAI`, `AnthropicBedrock`, `AnthropicVertex`). A
 direct class (`OpenAI`, `Anthropic`, `genai.Client`) may have been given a
 `base_url` or another endpoint, so its calls route `unknown` with an
-`annotation` gap. An annotation that names several classes
+`annotation` gap. An annotation that names several client classes
 (`AzureOpenAI | OpenAI`, `Union[AnthropicBedrock, Anthropic]`) decides the
 route only when every one of them does, and all the same way; otherwise its
-calls get the same gap.
+calls get the same gap. Its other members (`None`, a class of the
+project's own, as in `AzureOpenAI | Gateway`) are not read.
 
 When the name or attribute is given other values too:
 
