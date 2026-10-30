@@ -654,7 +654,12 @@ The receiver must be one of these:
   before passing it on or answer it itself, unless it is an array literal
   whose items are all calls of the SDK's own `betaRefusalFallbackMiddleware`
   (imported from `@anthropic-ai/sdk`, under any name): that one only sends
-  the request again with a fallback model, so the route stays.
+  the request again with a fallback model, so the route stays. The SDKs
+  send their requests through the global `fetch`, so a `fetch` the file
+  writes on an object it cannot identify (`globalThis.fetch = ...`,
+  `(window as any).fetch = ...`, `Object.assign(globalThis, { fetch })`, a
+  bare `fetch = ...`) gives the same gap to every call whose client would
+  route to a provider's own API.
 - **A Gemini client** also needs no `vertexai` or `enterprise` option other
   than `false`, `null` or `undefined`, no `httpOptions` that names a
   `baseUrl` (or is not an object literal), no spread, and no
@@ -755,6 +760,8 @@ a gap at the call. The report assumes the rest, in particular:
 - The process environment, a `.env` file loaded at start-up and an Anthropic
   profile file are not known: a direct client built without a `baseURL` is
   reported direct.
+- A `fetch` replaced or intercepted outside the file (nock, msw, a polyfill
+  installed at start-up) is not seen.
 - TypeScript's `private` is checked by the compiler, not at run time: a
   `private` method's callers are taken to be the calls of its name in the
   file.
