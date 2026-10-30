@@ -814,9 +814,12 @@ a gap at the call. The report assumes the rest, in particular:
   set a class property, and an SDK request does not modify the options object
   it is passed.
 - A member read under a computed key without being called (`const f =
-  this[kind]`, `Reflect.apply(this[kind], ...)`) is a value, not a method:
-  only a computed member that is called, or followed by `call`, `apply` or
-  `bind`, counts as calling a method under a run-time name.
+  this[kind]`, `Reflect.apply(this[kind], ...)`), or looked up by a run-time
+  name (`Reflect.get(this, kind)(...)`), is a value, not a method: only a
+  computed member that is called, or followed by `call`, `apply` or `bind`,
+  counts as calling a method under a run-time name. Parentheses and type
+  assertions around it change nothing (`(this[kind] as any)(...)` is a
+  call).
 - A client a class reads through `this` is confirmed although a subclass in
   another module may replace it, as in Python.
 - The process environment, a `.env` file loaded at start-up and an Anthropic
