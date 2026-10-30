@@ -675,6 +675,18 @@ fn base_url_key(family: Family) -> Option<&'static str> {
     }
 }
 
+/// Routes to a provider's own API, whose requests the SDK sends through the
+/// global `fetch` unless the client is given its own.
+fn through_global_fetch(routing: Routing) -> bool {
+    matches!(
+        routing,
+        Routing::OpenaiDirect
+            | Routing::AnthropicDirect
+            | Routing::GoogleGenai
+            | Routing::GoogleGenerativeaiLegacy
+    )
+}
+
 /// The provider an SDK-shaped chain on an unknown receiver most likely
 /// belongs to, and whether the shape alone is distinctive enough to report.
 fn sdk_shape(chain: &str) -> Option<(Sdk, bool)> {
@@ -1700,6 +1712,11 @@ struct Ctx<'t> {
     rerouted: HashSet<usize>,
     /// A `baseURL` written on an object the file cannot identify.
     rerouted_any: Option<Feature>,
+    /// A `fetch` written on an object the file cannot identify, which may be
+    /// the global one every SDK request goes through (`globalThis.fetch =
+    /// ...`, `fetch = ...`): a direct client may send its requests
+    /// elsewhere.
+    global_fetch: bool,
     /// `setDefaultBaseUrls(...)` from `@google/genai`.
     genai_base_urls: Option<Feature>,
     /// A legacy Gemini request, or an `@google/genai` one, passes options that
@@ -1809,6 +1826,7 @@ impl<'t> Ctx<'t> {
             sdk_patched: HashMap::new(),
             rerouted: HashSet::new(),
             rerouted_any: None,
+            global_fetch: false,
             genai_base_urls: None,
             legacy_request_endpoint: None,
             genai_request_endpoint: None,
@@ -4076,6 +4094,10 @@ impl<'t> Ctx<'t> {
                         self.note_file_dynamic("`eval`", call);
                     }
                 }
+                // `fetch = custom`: the global `fetch` replaced.
+                if r.name == "fetch" && matches!(r.kind, RefKind::Write(_)) {
+                    self.global_fetch = true;
+                }
                 // `arguments[0] = x`, or `arguments` passed or stored.
                 if r.name == "arguments"
                     && matches!(
@@ -4698,6 +4720,10 @@ impl<'t> Ctx<'t> {
                 line: w.line,
             });
         }
+        // `globalThis.fetch = ...`, `(window as any).fetch = ...`.
+        if name == "fetch" {
+            self.global_fetch = true;
+        }
     }
 
     /// Calls that write what other lookups read: reflective writes
@@ -4978,14 +5004,18 @@ impl<'t> Ctx<'t> {
                 // A `baseURL` written on an object that may be a client.
                 let keys = (!spy)
                     .then(|| self.reflective_keys(*call, &callee))
-                    .flatten();
-                if keys.is_some_and(|keys| keys.iter().any(|k| BASE_URL_PROPS.contains(k)))
-                    && !matches!(val, Val::Untracked(Origin::Placeholder))
-                {
+                    .flatten()
+                    .filter(|_| !matches!(val, Val::Untracked(Origin::Placeholder)))
+                    .unwrap_or_default();
+                if keys.iter().any(|k| BASE_URL_PROPS.contains(k)) {
                     self.rerouted_any.get_or_insert(Feature {
                         what: "a `baseURL` written on an object Arbor cannot identify",
                         line,
                     });
+                }
+                // `Object.assign(globalThis, { fetch })`.
+                if keys.contains(&"fetch") {
+                    self.global_fetch = true;
                 }
                 continue;
             };
@@ -8445,6 +8475,12 @@ impl<'t> Ctx<'t> {
                 option: "`setDefaultBaseUrls`, which this file calls",
             });
         }
+        if self.global_fetch && through_global_fetch(client.routing) {
+            client.routing = Routing::Unknown;
+            client.caveat.get_or_insert(ClientCaveat::EndpointOption {
+                option: "the global `fetch`, which this file may replace",
+            });
+        }
         client
     }
 
@@ -9403,14 +9439,16 @@ impl<'t> Ctx<'t> {
     }
 
     fn finish(mut self) -> FileUsages {
-        // A client built from a mocked or replaced SDK is not the SDK's, and
-        // `setDefaultBaseUrls` re-routes every Gemini client.
+        // A client built from a mocked or replaced SDK is not the SDK's,
+        // `setDefaultBaseUrls` re-routes every Gemini client, and a replaced
+        // global `fetch` every direct one.
         for client in &mut self.out.clients {
             if self
                 .sdk_patched
                 .keys()
                 .any(|pkg| pkg.package() == client.package)
                 || (self.genai_base_urls.is_some() && client.package == Pkg::GoogleGenai.package())
+                || (self.global_fetch && through_global_fetch(client.routing))
             {
                 client.routing = Routing::Unknown;
             }

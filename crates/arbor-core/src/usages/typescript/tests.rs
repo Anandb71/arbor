@@ -2809,6 +2809,66 @@ const MIDDLEWARE = [{fallback}];"
 }
 
 #[test]
+fn a_global_fetch_written_in_the_file_is_a_custom_fetch() {
+    // The SDKs send every request through the global `fetch` unless the
+    // client is given its own: the in-file form of what nock and msw do.
+    let request = "client.chat.completions.create({ model: \"gpt-4o\", messages: [] });";
+    for write in [
+        "globalThis.fetch = (url: any, init: any) => proxy(url, init);",
+        "global.fetch = proxy;",
+        "window.fetch = proxy;",
+        "self.fetch = proxy;",
+        "globalThis[\"fetch\"] = proxy;",
+        "(globalThis as any).fetch = proxy;",
+        "const g: any = globalThis;\ng.fetch = proxy;",
+        "Object.assign(globalThis, { fetch: proxy });",
+        "Reflect.set(globalThis, \"fetch\", proxy);",
+        "Object.defineProperty(globalThis, \"fetch\", { value: proxy });",
+        "function install() { fetch = proxy; }",
+    ] {
+        let source = format!("{OPENAI}const client = new OpenAI();\n{write}\n{request}");
+        let found = usages(&source);
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(c.routing, Routing::Unknown, "{write}");
+        assert_eq!(
+            gaps_at(&found, c),
+            vec!["ambiguous_client/endpoint_option"],
+            "{write}"
+        );
+        assert_eq!(routing_of(&found, "client"), Routing::Unknown, "{write}");
+    }
+    // Anthropic's and Gemini's clients go through it too.
+    for (client, request) in [
+        (
+            "import Anthropic from \"@anthropic-ai/sdk\";\nconst client = new Anthropic();",
+            "client.messages.create({ model: \"claude-3-5-sonnet-20241022\", max_tokens: 1, messages: [] });",
+        ),
+        (
+            "import { GoogleGenAI } from \"@google/genai\";\nconst client = new GoogleGenAI({});",
+            "client.models.generateContent({ model: \"gemini-1.5-flash\", contents: \"x\" });",
+        ),
+    ] {
+        let source = format!("{client}\nglobalThis.fetch = proxy;\n{request}");
+        let found = usages(&source);
+        let c = &found.calls[0];
+        assert_eq!(c.routing, Routing::Unknown, "{source}");
+        assert_eq!(gaps_at(&found, c), vec!["ambiguous_client/endpoint_option"]);
+    }
+    // Read, or written on an object literal of the file: nothing replaced.
+    for other in [
+        "const original = globalThis.fetch;",
+        "const api = { fetch: proxy };\napi.fetch = other;",
+        "let fetch = proxy;\nfetch = other;",
+    ] {
+        let source = format!("{OPENAI}const client = new OpenAI();\n{other}\n{request}");
+        let found = usages(&source);
+        let c = call(&found, "client.chat.completions.create");
+        assert_eq!(c.routing, Routing::OpenaiDirect, "{other}");
+        assert!(gaps_at(&found, c).is_empty(), "{other}");
+    }
+}
+
+#[test]
 fn an_unresolved_client_on_any_model_bearing_member_is_a_gap() {
     for (call_text, sdk) in [
         (
