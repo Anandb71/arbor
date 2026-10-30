@@ -284,7 +284,10 @@ fn print_call(call: &SdkCall) {
         .wrapper
         .as_ref()
         .map(|w| {
-            let lines: Vec<String> = w.requests.iter().map(|r| r.line.to_string()).collect();
+            let mut lines: Vec<u32> = w.requests.iter().map(|r| r.line).collect();
+            lines.sort_unstable();
+            lines.dedup();
+            let lines: Vec<String> = lines.iter().map(u32::to_string).collect();
             format!("  via {}:{}", clean(&w.file), lines.join(","))
         })
         .unwrap_or_default();
