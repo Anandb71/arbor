@@ -23,11 +23,13 @@
     "arbor": "bin/arbor.js"
   },
   "scripts": {
-    "postinstall": "node install.js"
+    "postinstall": "node install.js",
+    "test": "node --test test/download.test.js"
   },
   "files": [
     "install.js",
-    "bin/"
+    "bin/arbor.js",
+    "lib/"
   ],
   "os": ["darwin", "linux", "win32"],
   "cpu": ["x64", "arm64"],

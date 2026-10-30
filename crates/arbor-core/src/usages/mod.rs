@@ -448,6 +448,11 @@ pub struct SdkCall {
     /// Whether arguments were spread into the call (`**kwargs`; TypeScript
     /// `...opts` in the options object).
     pub splat: bool,
+    /// Each expression spread into the call with `**`, in source order:
+    /// its name and the argument names it was read to hold. Empty when
+    /// nothing is spread, or when the extractor does not record them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spreads: Vec<Spread>,
     /// Values for allowlisted keys that resolved to string literals.
     pub values: Vec<CapturedValue>,
     /// For a call to a function or class defined in another file of the
@@ -534,6 +539,32 @@ pub trait WrapperLookup {
     /// import statement in this file writes it: `.sampler`,
     /// `pkg.llm.client`) is another file of the scan.
     fn model_params(&self, module: &str, name: &str) -> Option<(String, Vec<ModelParam>)>;
+}
+
+/// An expression spread into a call with `**`: names only, never values.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Spread {
+    /// The expression as written, values elided (`PARAMS`, `kwargs`,
+    /// `self.options`). `None` (omitted from JSON) for an expression with no
+    /// name (`{...}` written inline, a conditional) or a credential-named
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The argument names it sends, in source order, read from a dict
+    /// literal in the same file. A literal key is sent whatever an
+    /// unreadable entry next to it holds, so these are listed even when
+    /// [`Self::complete`] is `false`. Names only, secret-sounding ones
+    /// (`max_tokens`, `api_key`) included: a value is never recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+    /// `keys` are every argument it sends: a same-file dict literal with
+    /// only string keys, each recorded, and no `**` of its own, that is
+    /// never changed or passed on later in that file. `false` for a
+    /// parameter (`**kwargs`), an attribute, a dict with a key Arbor does
+    /// not record (not an identifier, or shaped like a credential) or
+    /// anything else Arbor cannot read. Another module that imports the
+    /// dict and changes it is not seen.
+    pub complete: bool,
 }
 
 /// Why something was reported as a gap instead of a usage.
@@ -634,6 +665,26 @@ pub struct UsageGap {
     /// may call the function, or a limit cut the list.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub values_complete: bool,
+    /// For an `unknown_client_factory` gap at a call: the call's argument
+    /// names, so the retirement check can apply its argument rules to a call
+    /// whose client was not resolved. `None` (omitted from JSON) when the
+    /// extractor did not record them; the check then says it could not
+    /// check the call's arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<CallArgs>,
+}
+
+/// The argument names of a call, as [`SdkCall`] records them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallArgs {
+    /// Argument names in source order (see [`SdkCall::kwargs`]).
+    pub kwargs: Vec<String>,
+    /// Whether arguments were spread into the call (`**kwargs`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub splat: bool,
+    /// What each `**` expression is (see [`SdkCall::spreads`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spreads: Vec<Spread>,
 }
 
 /// Everything one file says about tracked SDKs.
@@ -750,6 +801,16 @@ pub fn is_value_key(key: &str) -> bool {
 /// identifier of at most 64 characters that is neither secret-named nor
 /// credential-shaped. A dict under any other key is never descended into.
 pub fn is_identifier_key(key: &str) -> bool {
+    is_argument_name(key) && !is_secret_key(key)
+}
+
+/// Whether a key of a dict spread into a call with `**` is recorded as an
+/// argument name ([`Spread::keys`]): an ASCII identifier of at most 64
+/// characters that is not shaped like a credential. Unlike
+/// [`is_identifier_key`], a secret-sounding name such as `max_tokens` or
+/// `api_key` passes: it is a name, never a value, and a call's own keyword
+/// arguments are recorded the same way.
+pub(crate) fn is_argument_name(key: &str) -> bool {
     let mut chars = key.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -757,7 +818,6 @@ pub fn is_identifier_key(key: &str) -> bool {
     key.len() <= 64
         && (first.is_ascii_alphabetic() || first == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !is_secret_key(key)
         && !is_credential_value(key)
 }
 
