@@ -429,7 +429,12 @@ def bedrock_direct():
     return client.converse(modelId="anthropic.claude-3-haiku")
 "#,
     );
-    assert!(found.calls.is_empty(), "{:?}", found.calls);
+    // The local Bedrock client, not the module's Anthropic one.
+    assert_eq!(found.calls.len(), 1, "{:?}", found.calls);
+    let converse = call(&found, "client.converse");
+    assert_eq!(converse.sdk, Sdk::Aws);
+    assert_eq!(converse.routing, Routing::Bedrock);
+    assert_eq!(converse.client_line, Some(8));
 }
 
 // ---------------------------------------------------------------------------
@@ -6388,4 +6393,2121 @@ fn exports_built_from_names_mangled_getattr_and_exported_private_classes_count()
         keyed_rows(&source, "model"),
         vec![(5, vec!["gpt-4o".to_string()], vec![])]
     );
+}
+
+// ---------------------------------------------------------------------------
+// LangChain chat models
+// ---------------------------------------------------------------------------
+
+/// The call recorded on `line`.
+fn call_on(found: &FileUsages, line: u32) -> &SdkCall {
+    found
+        .calls
+        .iter()
+        .find(|c| c.span.line == line)
+        .unwrap_or_else(|| {
+            let lines: Vec<(u32, &str)> = found
+                .calls
+                .iter()
+                .map(|c| (c.span.line, c.chain.as_str()))
+                .collect();
+            panic!("no call on line {line}; calls: {lines:?}")
+        })
+}
+
+/// `kind/reason` of every gap on `line`.
+fn gaps_on(found: &FileUsages, line: u32) -> Vec<String> {
+    found
+        .gaps
+        .iter()
+        .filter(|g| g.span.is_some_and(|s| s.line == line))
+        .map(|g| format!("{}/{}", g.kind.as_str(), g.reason))
+        .collect()
+}
+
+#[test]
+fn langchain_chat_models_bind_their_model_and_route_like_their_client() {
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI, AzureChatOpenAI as Azure
+from langchain_anthropic import ChatAnthropic
+
+MODEL = "gpt-4o-mini"
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+small = ChatOpenAI(model_name=MODEL, max_tokens=256)
+claude = ChatAnthropic(model_name="claude-3-5-sonnet-20241022")
+azure = Azure(azure_deployment="prod-4o", model="gpt-4o", api_version="2024-06-01")
+"#,
+    );
+    let import = |name: &str| found.imports.iter().find(|i| i.local == name).unwrap();
+    assert_eq!(import("ChatOpenAI").package, "langchain_openai");
+    assert_eq!(import("ChatOpenAI").sdk, Sdk::Openai);
+    assert_eq!(import("ChatOpenAI").kind, BindingKind::ClientClass);
+    assert_eq!(import("Azure").name.as_deref(), Some("AzureChatOpenAI"));
+    assert_eq!(import("ChatAnthropic").package, "langchain_anthropic");
+    assert_eq!(import("ChatAnthropic").sdk, Sdk::Anthropic);
+
+    assert_eq!(found.clients[0].constructor, "langchain_openai.ChatOpenAI");
+    assert_eq!(found.clients[0].package, "langchain_openai");
+    assert_eq!(routing_of(&found, "llm"), Routing::OpenaiDirect);
+    assert_eq!(routing_of(&found, "small"), Routing::OpenaiDirect);
+    assert_eq!(routing_of(&found, "claude"), Routing::AnthropicDirect);
+    assert_eq!(routing_of(&found, "azure"), Routing::AzureOpenai);
+
+    // The constructor binds the model its requests use.
+    let llm = call_on(&found, 6);
+    assert_eq!(llm.chain, "ChatOpenAI");
+    assert_eq!(llm.member, "ChatOpenAI");
+    assert_eq!(llm.package, "langchain_openai");
+    assert_eq!(llm.sdk, Sdk::Openai);
+    assert!(!llm.request);
+    assert_eq!(llm.receiver, Receiver::Symbol);
+    assert_eq!(llm.routing, Routing::OpenaiDirect);
+    assert_eq!(llm.client_line, Some(6));
+    assert_eq!(llm.kwargs, vec!["model", "temperature"]);
+    assert_eq!(value(llm, "model"), Some("gpt-4o"));
+    assert_eq!(llm.values[0].origin, ValueOrigin::Literal);
+
+    let small = call_on(&found, 7);
+    assert_eq!(value(small, "model_name"), Some("gpt-4o-mini"));
+    assert_eq!(small.values[0].origin, ValueOrigin::ModuleConstant);
+    assert_eq!(small.values[0].name.as_deref(), Some("MODEL"));
+
+    let claude = call_on(&found, 8);
+    assert_eq!(claude.sdk, Sdk::Anthropic);
+    assert_eq!(claude.routing, Routing::AnthropicDirect);
+    assert_eq!(
+        value(claude, "model_name"),
+        Some("claude-3-5-sonnet-20241022")
+    );
+
+    let azure = call_on(&found, 9);
+    assert_eq!(azure.chain, "Azure");
+    assert_eq!(azure.member, "AzureChatOpenAI");
+    assert_eq!(azure.routing, Routing::AzureOpenai);
+    assert_eq!(value(azure, "model"), Some("gpt-4o"));
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn langchain_endpoints_route_by_host() {
+    let found = usages(
+        r#"
+import os
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+router = ChatOpenAI(model="gpt-4o", base_url="https://openrouter.ai/api/v1")
+legacy_name = ChatOpenAI(model="gpt-4o", openai_api_base="http://localhost:4000/v1")
+own_host = ChatOpenAI(model="gpt-4o", openai_api_base="https://api.openai.com/v1")
+none = ChatOpenAI(model="gpt-4o", base_url=None)
+proxy = ChatAnthropic(model="claude-3-5-haiku-20241022", anthropic_api_url="http://litellm:4000")
+env = ChatOpenAI(model="gpt-4o", base_url=os.environ["GATEWAY_URL"])
+
+def build(options):
+    return ChatOpenAI(**options)
+"#,
+    );
+    assert_eq!(routing_of(&found, "router"), Routing::CustomBaseUrl);
+    assert_eq!(routing_of(&found, "legacy_name"), Routing::CustomBaseUrl);
+    assert_eq!(routing_of(&found, "own_host"), Routing::OpenaiDirect);
+    assert_eq!(routing_of(&found, "none"), Routing::OpenaiDirect);
+    assert_eq!(routing_of(&found, "proxy"), Routing::CustomBaseUrl);
+    assert_eq!(call_on(&found, 6).routing, Routing::CustomBaseUrl);
+    assert_eq!(call_on(&found, 10).routing, Routing::CustomBaseUrl);
+    for line in [6, 7, 8, 9, 10] {
+        assert!(gaps_on(&found, line).is_empty(), "line {line}");
+    }
+    // An environment lookup with no fallback: not known.
+    assert_eq!(call_on(&found, 11).routing, Routing::Unknown);
+    assert_eq!(
+        gaps_on(&found, 11),
+        vec!["ambiguous_client/base_url_env".to_string()]
+    );
+    // `**options` may hold the model and the endpoint.
+    let built = call_on(&found, 14);
+    assert_eq!(built.routing, Routing::Unknown);
+    let mut gaps = gaps_on(&found, 14);
+    gaps.sort();
+    assert_eq!(
+        gaps,
+        vec![
+            "ambiguous_client/base_url_unresolved".to_string(),
+            "unresolved_model/splat".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn langchain_endpoint_variables_leave_the_route_unconfirmed() {
+    for (var, openai, anthropic) in [
+        ("OPENAI_API_BASE", true, false),
+        ("OPENAI_BASE_URL", true, false),
+        ("ANTHROPIC_API_URL", false, true),
+        ("ANTHROPIC_BASE_URL", false, true),
+        ("LANGSMITH_GATEWAY", true, true),
+    ] {
+        let source = format!(
+            "import os\nfrom langchain_openai import ChatOpenAI\nfrom langchain_anthropic import ChatAnthropic\nos.environ[\"{var}\"] = \"http://gateway:4000\"\nllm = ChatOpenAI(model=\"gpt-4o\")\nclaude = ChatAnthropic(model=\"claude-3-5-haiku-20241022\")\nrouted = ChatOpenAI(model=\"gpt-4o\", base_url=\"https://api.openai.com/v1\")\n"
+        );
+        let found = usages(&source);
+        let endpoint_env = vec!["ambiguous_client/endpoint_env".to_string()];
+        let (routing, gaps) = if openai {
+            (Routing::Unknown, endpoint_env.clone())
+        } else {
+            (Routing::OpenaiDirect, Vec::new())
+        };
+        assert_eq!(call_on(&found, 5).routing, routing, "{var}");
+        assert_eq!(gaps_on(&found, 5), gaps, "{var}");
+        let (routing, gaps) = if anthropic {
+            (Routing::Unknown, endpoint_env.clone())
+        } else {
+            (Routing::AnthropicDirect, Vec::new())
+        };
+        assert_eq!(call_on(&found, 6).routing, routing, "{var}");
+        assert_eq!(gaps_on(&found, 6), gaps, "{var}");
+        // An endpoint given to the constructor wins over the environment.
+        assert_eq!(call_on(&found, 7).routing, Routing::OpenaiDirect, "{var}");
+        assert!(gaps_on(&found, 7).is_empty(), "{var}");
+    }
+    // `OPENAI_API_BASE` is LangChain's: the SDK's own client ignores it.
+    let found = usages(
+        "import os\nfrom openai import OpenAI\nos.environ[\"OPENAI_API_BASE\"] = \"http://gateway:4000\"\nclient = OpenAI()\nclient.chat.completions.create(model=\"gpt-4o\", messages=[])\n",
+    );
+    assert_eq!(call_on(&found, 5).routing, Routing::OpenaiDirect);
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn langchain_models_that_are_missing_or_given_twice_are_gaps() {
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI, AzureChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+default = ChatOpenAI(temperature=0)
+both = ChatOpenAI(model="gpt-4o", model_name="gpt-4o-mini")
+claude = ChatAnthropic(model=pick_model())
+azure = AzureChatOpenAI(azure_deployment="prod-4o")
+"#,
+    );
+    // `ChatOpenAI()` uses LangChain's default model.
+    let missing = gaps(&found, GapKind::UnresolvedModel)
+        .into_iter()
+        .find(|g| g.span.unwrap().line == 5)
+        .unwrap();
+    assert_eq!(missing.reason, "missing_model");
+    assert_eq!(missing.key.as_deref(), Some("model"));
+    // Given both names, either value may be the one LangChain keeps: both
+    // are listed, and a gap with no key leaves both unconfirmed.
+    let both = call_on(&found, 6);
+    assert_eq!(value(both, "model"), Some("gpt-4o"));
+    assert_eq!(value(both, "model_name"), Some("gpt-4o-mini"));
+    let twice = found
+        .gaps
+        .iter()
+        .find(|g| g.span.unwrap().line == 6)
+        .unwrap();
+    assert_eq!(twice.kind, GapKind::UnresolvedModel);
+    assert_eq!(twice.reason, "reassigned");
+    assert_eq!(twice.key, None);
+    assert!(twice.chain.is_some());
+    assert_eq!(gaps_on(&found, 6).len(), 1);
+    assert_eq!(
+        gaps_on(&found, 7),
+        vec!["unresolved_model/function_call".to_string()]
+    );
+    // An Azure chat model serves its deployment: no model is not a gap.
+    assert!(gaps_on(&found, 8).is_empty(), "{:?}", gaps_on(&found, 8));
+    assert_eq!(call_on(&found, 8).routing, Routing::AzureOpenai);
+
+    // The other name may come through `**`: from a same-file dict, or from
+    // an expansion the file cannot read. A second `model=` there would be a
+    // `TypeError`, but `model_name` is not.
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI
+
+DEFAULTS = {"model_name": "gpt-4o-mini", "temperature": 0}
+OPTIONS = {"temperature": 0}
+
+def build(**kwargs):
+    return ChatOpenAI(model="gpt-4o", **kwargs)
+
+both = ChatOpenAI(model="gpt-4o", **DEFAULTS)
+plain = ChatOpenAI(model="gpt-4o", **OPTIONS)
+"#,
+    );
+    let unresolved = |line: u32| -> Vec<(String, Option<String>)> {
+        found
+            .gaps
+            .iter()
+            .filter(|g| g.span.unwrap().line == line && g.kind == GapKind::UnresolvedModel)
+            .map(|g| (g.reason.clone(), g.key.clone()))
+            .collect()
+    };
+    assert_eq!(value(call_on(&found, 8), "model"), Some("gpt-4o"));
+    assert_eq!(
+        unresolved(8),
+        vec![("splat".to_string(), Some("model".to_string()))]
+    );
+    assert_eq!(
+        value(call_on(&found, 10), "model_name"),
+        Some("gpt-4o-mini")
+    );
+    assert_eq!(unresolved(10), vec![("reassigned".to_string(), None)]);
+    assert!(unresolved(11).is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn deprecated_langchain_chat_models_are_tracked_by_class() {
+    let found = usages(
+        r#"
+from langchain.chat_models import ChatOpenAI, ChatAnthropic
+from langchain_community.chat_models.openai import ChatOpenAI as CommunityOpenAI
+from langchain_community.chat_models import AzureChatOpenAI, ChatOllama
+import langchain_community.chat_models as chat_models
+
+old = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0)
+claude = ChatAnthropic(model="claude-2.1")
+community = CommunityOpenAI(model="gpt-4")
+azure = AzureChatOpenAI(deployment_name="gpt35", openai_api_version="2023-05-15")
+local = ChatOllama(model="llama3")
+followed_not = chat_models.ChatOpenAI(model="gpt-4-0613")
+"#,
+    );
+    let import = |name: &str| found.imports.iter().find(|i| i.local == name);
+    assert_eq!(import("ChatOpenAI").unwrap().package, "langchain");
+    assert_eq!(
+        import("ChatOpenAI").unwrap().module,
+        "langchain.chat_models"
+    );
+    assert_eq!(import("ChatAnthropic").unwrap().sdk, Sdk::Anthropic);
+    assert_eq!(
+        import("CommunityOpenAI").unwrap().package,
+        "langchain_community"
+    );
+    assert_eq!(
+        import("CommunityOpenAI").unwrap().name.as_deref(),
+        Some("ChatOpenAI")
+    );
+    assert!(import("ChatOllama").is_none());
+    assert!(import("chat_models").is_none());
+
+    let old = call_on(&found, 7);
+    assert_eq!(old.package, "langchain");
+    assert_eq!(old.routing, Routing::OpenaiDirect);
+    assert_eq!(value(old, "model_name"), Some("gpt-3.5-turbo"));
+    assert_eq!(found.clients[0].constructor, "langchain.ChatOpenAI");
+    let claude = call_on(&found, 8);
+    assert_eq!(claude.sdk, Sdk::Anthropic);
+    assert_eq!(claude.routing, Routing::AnthropicDirect);
+    assert_eq!(value(claude, "model"), Some("claude-2.1"));
+    assert_eq!(call_on(&found, 9).package, "langchain_community");
+    assert_eq!(value(call_on(&found, 9), "model"), Some("gpt-4"));
+    assert_eq!(call_on(&found, 10).routing, Routing::AzureOpenai);
+    // Other providers' chat models, and the re-exporting modules
+    // themselves, are not followed.
+    assert_eq!(found.calls.len(), 4, "{:?}", found.calls);
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+
+    // A file that names no SDK in lower case is still read; one that uses
+    // only LangChain's other packages is not.
+    let source = "from langchain.chat_models import ChatOpenAI\nllm = ChatOpenAI(model_name=\"gpt-3.5-turbo\")\n";
+    assert!(super::may_use_sdk(source));
+    assert!(!super::may_use_sdk(
+        "from langchain_core.prompts import ChatPromptTemplate\nfrom langchain_ollama import ChatOllama\n"
+    ));
+    let found = usages(source);
+    assert_eq!(
+        value(call_on(&found, 2), "model_name"),
+        Some("gpt-3.5-turbo")
+    );
+}
+
+#[test]
+fn deprecated_langchain_openai_follows_the_module_configuration() {
+    let found = usages(
+        r#"
+import openai
+from langchain.chat_models import ChatOpenAI
+from langchain_community.chat_models import ChatOpenAI as CommunityOpenAI
+from langchain_openai import ChatOpenAI as PartnerOpenAI
+
+openai.api_type = "azure"
+openai.api_base = "https://example.openai.azure.com/"
+
+old = ChatOpenAI(model_name="gpt-35-turbo")
+community = CommunityOpenAI(model_name="gpt-35-turbo")
+given = ChatOpenAI(model_name="gpt-35-turbo", openai_api_base="http://localhost:4000")
+partner = PartnerOpenAI(model="gpt-4o")
+"#,
+    );
+    // On the pre-1.0 SDK their requests go through the module-level API.
+    for line in [10, 11] {
+        assert_eq!(
+            call_on(&found, line).routing,
+            Routing::Unknown,
+            "line {line}"
+        );
+        assert_eq!(
+            gaps_on(&found, line),
+            vec!["ambiguous_client/langchain_module_config".to_string()],
+            "line {line}"
+        );
+    }
+    assert_eq!(call_on(&found, 12).routing, Routing::CustomBaseUrl);
+    assert!(gaps_on(&found, 12).is_empty());
+    // `langchain_openai` needs openai>=1, whose module-level settings do
+    // not reach a client built with its own options.
+    assert_eq!(call_on(&found, 13).routing, Routing::OpenaiDirect);
+    assert!(gaps_on(&found, 13).is_empty());
+
+    // With no routing setting they are direct.
+    let found = usages(
+        "import openai\nfrom langchain.chat_models import ChatOpenAI\nopenai.api_key = \"placeholder\"\nllm = ChatOpenAI(model_name=\"gpt-4\")\n",
+    );
+    assert_eq!(call_on(&found, 4).routing, Routing::OpenaiDirect);
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn only_langchain_chat_models_and_their_objects_are_followed() {
+    let found = usages(
+        r#"
+import langchain_openai
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_anthropic import convert_to_anthropic_tool
+
+module_form = langchain_openai.ChatOpenAI(model="gpt-4o")
+embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
+other = langchain_openai.OpenAIEmbeddings(model="text-embedding-3-small")
+tool = convert_to_anthropic_tool(search)
+checked = ChatOpenAI.model_validate({"model": "gpt-4"})
+
+llm = ChatOpenAI(model="gpt-4o-mini", base_url="https://openrouter.ai/api/v1")
+llm.invoke("hi")
+structured = llm.with_structured_output(Answer)
+structured.invoke("hi")
+gateway.messages.create(model="claude-3-haiku-20240307", messages=[])
+"#,
+    );
+    let module_form = call_on(&found, 6);
+    assert_eq!(module_form.chain, "langchain_openai.ChatOpenAI");
+    assert_eq!(module_form.receiver, Receiver::Module);
+    assert_eq!(value(module_form, "model"), Some("gpt-4o"));
+    let import = |name: &str| found.imports.iter().find(|i| i.local == name);
+    assert_eq!(
+        import("langchain_openai").unwrap().kind,
+        BindingKind::Module
+    );
+    assert!(import("OpenAIEmbeddings").is_none());
+    assert!(import("convert_to_anthropic_tool").is_none());
+    for line in [7, 8, 9, 10, 15, 16] {
+        assert!(
+            found.calls.iter().all(|c| c.span.line != line),
+            "line {line}: {:?}",
+            found.calls
+        );
+    }
+    // A call on the chat model keeps its routing.
+    let invoke = call(&found, "llm.invoke");
+    assert_eq!(invoke.receiver, Receiver::Client);
+    assert_eq!(invoke.routing, Routing::CustomBaseUrl);
+    assert_eq!(invoke.client_line, Some(12));
+    assert_eq!(invoke.package, "langchain_openai");
+    assert!(!invoke.request);
+    assert!(invoke.values.is_empty());
+    // Importing LangChain's Anthropic package does not make an unknown
+    // receiver's `messages.create` the Anthropic SDK's.
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn langchain_chat_models_rerouted_or_replaced_after_they_are_built() {
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+llm = ChatOpenAI(model="gpt-4o")
+llm.openai_api_base = "http://localhost:4000"
+llm.invoke("hi")
+
+claude = ChatAnthropic(model="claude-3-5-haiku-20241022")
+claude._client = Recorder()
+claude.invoke("hi")
+"#,
+    );
+    assert_eq!(call(&found, "llm.invoke").routing, Routing::Unknown);
+    assert_eq!(
+        gaps_on(&found, 7),
+        vec!["ambiguous_client/base_url_assigned".to_string()]
+    );
+    assert_eq!(
+        gaps_on(&found, 11),
+        vec!["ambiguous_client/dynamic_feature".to_string()]
+    );
+    // The constructors route the same way; neither write touches the model.
+    assert_eq!(
+        gaps_on(&found, 5),
+        vec!["ambiguous_client/base_url_assigned".to_string()]
+    );
+    assert_eq!(
+        gaps_on(&found, 9),
+        vec!["ambiguous_client/dynamic_feature".to_string()]
+    );
+
+    // A copy may change any field: it is not followed.
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-4o")
+local = llm.copy(update={"openai_api_base": "http://localhost:4000"})
+local.invoke("hi")
+"#,
+    );
+    assert!(found.calls.iter().all(|c| c.chain != "local.invoke"));
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+
+    // Its requests read the model field when they are sent: a write of it,
+    // or of an attribute named at run time, after it is built.
+    for write in [
+        "llm.model_name = \"gpt-5\"",
+        "settings.model = choose()",
+        "setattr(llm, field, value)",
+    ] {
+        let source = format!(
+            "from langchain_openai import ChatOpenAI\nllm = ChatOpenAI(model=\"gpt-4o\")\n{write}\nllm.invoke(\"hi\")\n"
+        );
+        let found = usages(&source);
+        let built = call_on(&found, 2);
+        assert_eq!(value(built, "model"), Some("gpt-4o"), "{write}");
+        let rewritten = found
+            .gaps
+            .iter()
+            .find(|g| g.span.unwrap().line == 2 && g.kind == GapKind::UnresolvedModel)
+            .unwrap_or_else(|| panic!("{write}: {:?}", found.gaps));
+        assert_eq!(rewritten.reason, "dynamic_feature", "{write}");
+        assert_eq!(rewritten.key.as_deref(), Some("model"), "{write}");
+        assert!(rewritten.detail.contains("line 3"), "{}", rewritten.detail);
+    }
+    // `configurable_fields` on the model, or `configurable_alternatives`,
+    // choose it at run time; another field made configurable does not.
+    for (made, gapped) in [
+        (
+            "configurable_fields(model_name=ConfigurableField(id=\"model\"))",
+            true,
+        ),
+        (
+            "configurable_alternatives(ConfigurableField(id=\"llm\"), default_key=\"openai\")",
+            true,
+        ),
+        (
+            "configurable_fields(temperature=ConfigurableField(id=\"t\"))",
+            false,
+        ),
+    ] {
+        let source = format!(
+            "from langchain_openai import ChatOpenAI\nllm = ChatOpenAI(model=\"gpt-4o\")\nchooser = llm.{made}\n"
+        );
+        let found = usages(&source);
+        let model_gaps: Vec<&UsageGap> = found
+            .gaps
+            .iter()
+            .filter(|g| g.span.unwrap().line == 2 && g.kind == GapKind::UnresolvedModel)
+            .collect();
+        assert_eq!(
+            model_gaps.len(),
+            usize::from(gapped),
+            "{made}: {model_gaps:?}"
+        );
+        if gapped {
+            assert_eq!(model_gaps[0].reason, "dynamic_feature");
+            assert!(
+                model_gaps[0].detail.contains("line 3"),
+                "{}",
+                model_gaps[0].detail
+            );
+        }
+    }
+
+    // An SDK client given to the constructor decides where requests go.
+    let found = usages(
+        r#"
+from openai import OpenAI
+from langchain_openai import ChatOpenAI
+
+gateway = OpenAI(base_url="http://localhost:4000/v1")
+llm = ChatOpenAI(model="gpt-4o", client=gateway.chat.completions, root_client=gateway)
+"#,
+    );
+    let built = call_on(&found, 6);
+    assert_eq!(built.routing, Routing::Unknown);
+    assert_eq!(value(built, "model"), Some("gpt-4o"));
+    assert_eq!(
+        gaps_on(&found, 6),
+        vec!["ambiguous_client/given_client".to_string()]
+    );
+
+    // LangChain's run options never reach the request: a model key there
+    // is not a model value.
+    let found = usages(
+        r#"
+from langchain_anthropic import ChatAnthropic
+
+llm = ChatAnthropic(model="claude-sonnet-5-5", metadata={"model": "claude-3-opus-20240229"}, tags=["x"])
+llm.invoke("hi", config={"configurable": {"model": "gpt-3.5-turbo"}})
+llm.invoke("hi", {"metadata": {"model": "gpt-4"}})
+tuned = llm.with_config(metadata={"model_name": "gpt-4"}, configurable={"model": "gpt-4"})
+"#,
+    );
+    let keys: Vec<(u32, &str, &str)> = found
+        .calls
+        .iter()
+        .flat_map(|c| {
+            c.values
+                .iter()
+                .map(move |v| (c.span.line, v.key.as_str(), v.value.as_str()))
+        })
+        .collect();
+    assert_eq!(keys, vec![(4, "model", "claude-sonnet-5-5")]);
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+
+    // A write on `self` of a same-file class is that class's attribute.
+    let found = usages(
+        "from langchain_openai import ChatOpenAI\nclass Bot:\n    def __init__(self):\n        self.model = \"gpt-4o\"\n        self.llm = ChatOpenAI(model=\"gpt-4o\")\n",
+    );
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+// ---------------------------------------------------------------------------
+// Amazon Bedrock (boto3, LangChain) and LiteLLM
+// ---------------------------------------------------------------------------
+
+const MODEL_ID: &str = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+
+#[test]
+fn bedrock_runtime_clients_route_bedrock_for_any_model() {
+    let found = usages(
+        r#"
+import boto3
+from boto3 import client as make_client
+from boto3.session import Session
+
+MODEL = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+runtime = boto3.client("bedrock-runtime", region_name="us-east-1")
+other = make_client(service_name="bedrock-runtime")
+pooled = boto3.Session(profile_name="dev").client("bedrock-runtime")
+s3 = boto3.client("s3")
+control = boto3.client("bedrock")
+
+runtime.converse(modelId=MODEL, messages=[], inferenceConfig={"maxTokens": 512})
+runtime.invoke_model(modelId="amazon.nova-pro-v1:0", body="{}")
+other.converse_stream(modelId="meta.llama3-70b-instruct-v1:0", messages=[])
+pooled.invoke_model_with_response_stream(modelId="anthropic.claude-3-haiku-20240307-v1:0", body="{}")
+Session().client("bedrock-runtime").converse(modelId="mistral.mistral-large-2402-v1:0", messages=[])
+s3.put_object(Bucket="b", Key="k", Body=b"")
+control.list_foundation_models()
+boto3.resource("dynamodb")
+"#,
+    );
+    let import = |name: &str| found.imports.iter().find(|i| i.local == name).unwrap();
+    assert_eq!(import("boto3").sdk, Sdk::Aws);
+    assert_eq!(import("boto3").package, "boto3");
+    assert_eq!(import("boto3").kind, BindingKind::Module);
+    assert_eq!(import("make_client").kind, BindingKind::ClientClass);
+    assert_eq!(import("Session").kind, BindingKind::Symbol);
+
+    // Only the `bedrock-runtime` clients are followed.
+    assert_eq!(found.clients.len(), 4, "{:?}", found.clients);
+    assert!(found
+        .clients
+        .iter()
+        .all(|c| c.constructor == "boto3.client" && c.sdk == Sdk::Aws));
+    assert_eq!(routing_of(&found, "runtime"), Routing::Bedrock);
+    assert_eq!(routing_of(&found, "other"), Routing::Bedrock);
+    assert_eq!(routing_of(&found, "pooled"), Routing::Bedrock);
+
+    let converse = call(&found, "runtime.converse");
+    assert_eq!(converse.sdk, Sdk::Aws);
+    assert_eq!(converse.package, "boto3");
+    assert_eq!(converse.member, "converse");
+    assert!(converse.request);
+    assert_eq!(converse.receiver, Receiver::Client);
+    assert_eq!(converse.routing, Routing::Bedrock);
+    assert_eq!(converse.client_line, Some(7));
+    assert_eq!(value(converse, "modelId"), Some(MODEL_ID));
+    assert_eq!(converse.values[0].origin, ValueOrigin::ModuleConstant);
+    assert_eq!(converse.values[0].model_family, Some(Sdk::Anthropic));
+    // The other request fields name no model.
+    assert_eq!(converse.values.len(), 1);
+
+    for (chain, model) in [
+        ("runtime.invoke_model", "amazon.nova-pro-v1:0"),
+        ("other.converse_stream", "meta.llama3-70b-instruct-v1:0"),
+        (
+            "pooled.invoke_model_with_response_stream",
+            "anthropic.claude-3-haiku-20240307-v1:0",
+        ),
+        (
+            "Session().client(...).converse",
+            "mistral.mistral-large-2402-v1:0",
+        ),
+    ] {
+        let request = call(&found, chain);
+        assert!(request.request, "{chain}");
+        assert_eq!(request.routing, Routing::Bedrock, "{chain}");
+        assert_eq!(value(request, "modelId"), Some(model), "{chain}");
+    }
+    // Other services and boto3's other functions are not followed.
+    assert_eq!(found.calls.len(), 5, "{:?}", found.calls);
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn bedrock_service_names_resolve_under_the_value_rules() {
+    let found = usages(
+        r#"
+import os
+import boto3
+
+SERVICE = "bedrock-runtime"
+named = boto3.client(SERVICE)
+chosen = boto3.client(os.getenv("SERVICE", "bedrock-runtime"))
+
+def ask(brt, model_id):
+    return brt.converse(modelId=model_id, messages=[])
+
+named.converse(modelId="amazon.titan-text-express-v1", messages=[])
+chosen.converse(modelId="amazon.titan-text-lite-v1", messages=[])
+"#,
+    );
+    assert_eq!(routing_of(&found, "named"), Routing::Bedrock);
+    assert_eq!(call_on(&found, 12).routing, Routing::Bedrock);
+    // A service name read from the environment is not followed, and a
+    // parameter is not a known client: Bedrock-shaped calls on either
+    // are gaps.
+    assert_eq!(found.clients.len(), 1);
+    let unknown = gaps(&found, GapKind::UnknownClientFactory);
+    let reasons: Vec<(u32, &str)> = unknown
+        .iter()
+        .map(|g| (g.span.unwrap().line, g.reason.as_str()))
+        .collect();
+    assert_eq!(reasons, vec![(10, "parameter"), (13, "sdk_call_result")]);
+    assert!(unknown.iter().all(|g| g.sdk == Some(Sdk::Aws)));
+    assert_eq!(unknown[1].values[0].key, "modelId");
+    assert_eq!(unknown[1].values[0].value, "amazon.titan-text-lite-v1");
+
+    // Without a boto3 import, `converse` is not taken for Bedrock's.
+    let found = usages(
+        "from chatkit import bot\nimport openai\n\ndef run(agent):\n    agent.converse(modelId=\"x\")\n",
+    );
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
+fn bedrock_model_values_and_gaps() {
+    let found = usages(
+        r#"
+import os
+import boto3
+
+client = boto3.client("bedrock-runtime")
+PARAMS = {"modelId": "amazon.titan-text-express-v1", "body": "{}"}
+client.invoke_model(**PARAMS)
+client.converse(messages=[])
+client.converse(**load_params())
+client.converse(modelId=os.getenv("MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0"), messages=[])
+client.converse(modelId="amazon.nova-lite-v1:0", model="gpt-4o", requestMetadata={"model": "gpt-4o"}, additionalModelRequestFields={"model": "x"})
+"#,
+    );
+    let expanded = call_on(&found, 7);
+    assert_eq!(
+        value(expanded, "modelId"),
+        Some("amazon.titan-text-express-v1")
+    );
+    assert_eq!(expanded.values[0].origin, ValueOrigin::ModuleConstant);
+    assert_eq!(
+        expanded.values[0].name.as_deref(),
+        Some("PARAMS[\"modelId\"]")
+    );
+    assert!(gaps_on(&found, 7).is_empty());
+    // No `modelId`: botocore rejects the request, no default applies.
+    assert!(call_on(&found, 8).values.is_empty());
+    assert!(gaps_on(&found, 8).is_empty());
+    // An expansion the file cannot read may hold the model.
+    let splat = gaps(&found, GapKind::UnresolvedModel)
+        .into_iter()
+        .find(|g| g.span.unwrap().line == 9)
+        .unwrap();
+    assert_eq!(splat.reason, "splat");
+    assert_eq!(splat.key.as_deref(), Some("modelId"));
+    let env = call_on(&found, 10);
+    assert_eq!(
+        value(env, "modelId"),
+        Some("anthropic.claude-3-haiku-20240307-v1:0")
+    );
+    assert_eq!(env.values[0].origin, ValueOrigin::EnvDefault);
+    assert_eq!(
+        gaps_on(&found, 10),
+        vec!["unresolved_model/env_var".to_string()]
+    );
+    // Only `modelId` is a Bedrock request's model: botocore rejects
+    // `model=`, and the other fields do not name the model the request
+    // goes to.
+    let only = call_on(&found, 11);
+    let keys: Vec<(&str, &str)> = only
+        .values
+        .iter()
+        .map(|v| (v.key.as_str(), v.value.as_str()))
+        .collect();
+    assert_eq!(keys, vec![("modelId", "amazon.nova-lite-v1:0")]);
+}
+
+#[test]
+fn bedrock_endpoints_route_by_host() {
+    let found = usages(
+        r#"
+import os
+import boto3
+
+aws = boto3.client("bedrock-runtime", endpoint_url="https://bedrock-runtime.us-west-2.amazonaws.com")
+vpce = boto3.client("bedrock-runtime", endpoint_url="https://vpce-0a1b2c3d.bedrock-runtime.us-east-1.vpce.amazonaws.com")
+fips = boto3.client("bedrock-runtime", endpoint_url="https://bedrock-runtime-fips.us-gov-west-1.amazonaws.com")
+none = boto3.client("bedrock-runtime", endpoint_url=None)
+proxy = boto3.client("bedrock-runtime", endpoint_url="http://localhost:4000/bedrock")
+lookalike = boto3.client("bedrock-runtime", endpoint_url="https://bedrock-runtime.amazonaws.com.example.net")
+s3_host = boto3.client("bedrock-runtime", endpoint_url="https://s3.us-east-1.amazonaws.com")
+env = boto3.client("bedrock-runtime", endpoint_url=os.environ["BEDROCK_URL"])
+env.converse(modelId="amazon.nova-pro-v1:0", messages=[])
+
+def build(options):
+    built = boto3.client("bedrock-runtime", **options)
+    return built.converse(modelId="amazon.nova-pro-v1:0", messages=[])
+"#,
+    );
+    for name in ["aws", "vpce", "fips", "none"] {
+        assert_eq!(routing_of(&found, name), Routing::Bedrock, "{name}");
+    }
+    for name in ["proxy", "lookalike", "s3_host"] {
+        assert_eq!(routing_of(&found, name), Routing::CustomBaseUrl, "{name}");
+    }
+    assert_eq!(routing_of(&found, "env"), Routing::Unknown);
+    assert_eq!(call_on(&found, 13).routing, Routing::Unknown);
+    assert_eq!(
+        gaps_on(&found, 13),
+        vec!["ambiguous_client/base_url_env".to_string()]
+    );
+    let env_gap = &gaps(&found, GapKind::AmbiguousClient)[0];
+    assert!(
+        env_gap.detail.contains("`endpoint_url`"),
+        "{}",
+        env_gap.detail
+    );
+    // `**options` may hold an `endpoint_url`.
+    assert_eq!(call_on(&found, 17).routing, Routing::Unknown);
+    assert_eq!(
+        gaps_on(&found, 17),
+        vec!["ambiguous_client/base_url_unresolved".to_string()]
+    );
+
+    // `endpoint_url` is boto3's sixth positional argument: by position or
+    // through `*args` it is not read. A bucket named `bedrock-runtime` on
+    // S3, or a host with no region, is not Bedrock's.
+    let found = usages(
+        r#"
+import boto3
+
+positional = boto3.client("bedrock-runtime", "us-east-1", None, True, None, "https://proxy.example.com")
+positional.converse(modelId="amazon.nova-pro-v1:0", messages=[])
+spread = boto3.client("bedrock-runtime", *REGION_AND_ENDPOINT)
+spread.converse(modelId="amazon.nova-pro-v1:0", messages=[])
+region = boto3.client("bedrock-runtime", "us-east-1")
+bucket = boto3.client("bedrock-runtime", endpoint_url="https://bedrock-runtime.s3.amazonaws.com")
+no_region = boto3.client("bedrock-runtime", endpoint_url="https://bedrock-runtime.amazonaws.com")
+dual = boto3.client("bedrock-runtime", endpoint_url="https://bedrock-runtime.us-east-1.api.aws")
+china = boto3.client("bedrock-runtime", endpoint_url="https://bedrock-runtime.cn-north-1.amazonaws.com.cn")
+"#,
+    );
+    for line in [5, 7] {
+        assert_eq!(call_on(&found, line).routing, Routing::Unknown, "{line}");
+        assert_eq!(
+            gaps_on(&found, line),
+            vec!["ambiguous_client/base_url_unresolved".to_string()],
+            "{line}"
+        );
+    }
+    assert_eq!(routing_of(&found, "region"), Routing::Bedrock);
+    assert_eq!(routing_of(&found, "bucket"), Routing::CustomBaseUrl);
+    assert_eq!(routing_of(&found, "no_region"), Routing::CustomBaseUrl);
+    assert_eq!(routing_of(&found, "dual"), Routing::Bedrock);
+    assert_eq!(routing_of(&found, "china"), Routing::Bedrock);
+}
+
+#[test]
+fn bedrock_endpoint_variables_leave_the_route_unconfirmed() {
+    for (var, boto, langchain) in [
+        ("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", true, true),
+        ("AWS_ENDPOINT_URL", true, true),
+        ("LANGSMITH_GATEWAY", false, true),
+        ("OPENAI_BASE_URL", false, false),
+    ] {
+        let source = format!(
+            "import os\nimport boto3\nfrom langchain_aws import ChatBedrockConverse\nos.environ[\"{var}\"] = \"http://gateway:4000\"\nclient = boto3.client(\"bedrock-runtime\")\nclient.converse(modelId=\"amazon.nova-pro-v1:0\", messages=[])\nllm = ChatBedrockConverse(model=\"amazon.nova-pro-v1:0\")\nfixed = boto3.client(\"bedrock-runtime\", endpoint_url=\"https://bedrock-runtime.eu-west-1.amazonaws.com\")\nfixed.converse(modelId=\"amazon.nova-pro-v1:0\", messages=[])\n"
+        );
+        let found = usages(&source);
+        let endpoint_env = vec!["ambiguous_client/endpoint_env".to_string()];
+        for (line, affected) in [(6, boto), (7, langchain)] {
+            let (routing, gaps) = if affected {
+                (Routing::Unknown, endpoint_env.clone())
+            } else {
+                (Routing::Bedrock, Vec::new())
+            };
+            assert_eq!(call_on(&found, line).routing, routing, "{var} {line}");
+            assert_eq!(gaps_on(&found, line), gaps, "{var} {line}");
+        }
+        // An endpoint given to the constructor wins over the environment.
+        assert_eq!(call_on(&found, 9).routing, Routing::Bedrock, "{var}");
+        assert!(gaps_on(&found, 9).is_empty(), "{var}");
+    }
+}
+
+#[test]
+fn langchain_bedrock_models_bind_their_model() {
+    let found = usages(
+        r#"
+import boto3
+from langchain_aws import ChatBedrock, ChatBedrockConverse
+from langchain_aws.chat_models.bedrock import ChatBedrock as Legacy
+from langchain_aws import BedrockEmbeddings
+
+llm = ChatBedrock(model_id="anthropic.claude-3-5-sonnet-20240620-v1:0", region_name="us-east-1", provider="anthropic")
+conv = ChatBedrockConverse(model="us.amazon.nova-pro-v1:0", temperature=0)
+legacy = Legacy(model_id="meta.llama3-1-70b-instruct-v1:0")
+both = ChatBedrockConverse(model="amazon.nova-lite-v1:0", model_id="amazon.nova-pro-v1:0")
+opaque = ChatBedrock(model_id="amazon.nova-pro-v1:0", **settings)
+proxy = ChatBedrockConverse(model="amazon.nova-pro-v1:0", base_url="http://localhost:4000")
+given = ChatBedrock(model_id="amazon.nova-pro-v1:0", client=boto3.client("bedrock-runtime", endpoint_url=URL))
+missing = ChatBedrock(region_name="us-east-1")
+embed = BedrockEmbeddings(model_id="amazon.titan-embed-text-v2:0")
+llm.invoke("hi", config={"metadata": {"model_id": "x"}})
+"#,
+    );
+    let import = |name: &str| found.imports.iter().find(|i| i.local == name).unwrap();
+    assert_eq!(import("ChatBedrock").package, "langchain_aws");
+    assert_eq!(import("ChatBedrock").sdk, Sdk::Aws);
+    assert_eq!(import("Legacy").name.as_deref(), Some("ChatBedrock"));
+    assert!(found.imports.iter().all(|i| i.local != "BedrockEmbeddings"));
+
+    let llm = call_on(&found, 7);
+    assert_eq!(llm.chain, "ChatBedrock");
+    assert_eq!(llm.sdk, Sdk::Aws);
+    assert_eq!(llm.package, "langchain_aws");
+    assert!(!llm.request);
+    assert_eq!(llm.routing, Routing::Bedrock);
+    assert_eq!(
+        value(llm, "model_id"),
+        Some("anthropic.claude-3-5-sonnet-20240620-v1:0")
+    );
+    assert!(gaps_on(&found, 7).is_empty());
+    assert_eq!(
+        value(call_on(&found, 8), "model"),
+        Some("us.amazon.nova-pro-v1:0")
+    );
+    assert_eq!(call_on(&found, 8).routing, Routing::Bedrock);
+    assert_eq!(
+        value(call_on(&found, 9), "model_id"),
+        Some("meta.llama3-1-70b-instruct-v1:0")
+    );
+    // Given its model under both names, which one LangChain keeps is not
+    // confirmed; next to an opaque `**`, the other name may be in it.
+    assert_eq!(
+        gaps_on(&found, 10),
+        vec!["unresolved_model/reassigned".to_string()]
+    );
+    assert_eq!(gaps(&found, GapKind::UnresolvedModel)[0].key, None);
+    let mut opaque = gaps_on(&found, 11);
+    opaque.sort();
+    assert_eq!(
+        opaque,
+        vec![
+            "ambiguous_client/base_url_unresolved".to_string(),
+            "unresolved_model/splat".to_string(),
+        ]
+    );
+    assert_eq!(call_on(&found, 12).routing, Routing::CustomBaseUrl);
+    assert!(gaps_on(&found, 12).is_empty());
+    assert_eq!(call_on(&found, 13).routing, Routing::Unknown);
+    assert!(gaps_on(&found, 13).contains(&"ambiguous_client/given_client".to_string()));
+    // Only its own fields are read: no `model_name` or `engine`.
+    let found_names = usages(
+        "from langchain_aws import ChatBedrock\nllm = ChatBedrock(model_id=\"amazon.nova-pro-v1:0\", model_name=\"x\", engine=\"y\")\n",
+    );
+    let keys: Vec<&str> = call_on(&found_names, 2)
+        .values
+        .iter()
+        .map(|v| v.key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["model_id"]);
+    // `model_id` is required: no default applies, so no gap.
+    assert!(gaps_on(&found, 14).is_empty());
+    // Embeddings are not tracked; run options are not read.
+    assert!(found.calls.iter().all(|c| c.span.line != 15));
+    let invoke = call_on(&found, 16);
+    assert_eq!(invoke.routing, Routing::Bedrock);
+    assert!(invoke.values.is_empty());
+
+    // A call on the built model may name the model the Converse API sends
+    // instead (`model_id=`, or `modelId=`); `model=` is not a parameter
+    // there. `ChatBedrock` sends it only when it runs on the Converse API.
+    let found = usages(
+        r#"
+from langchain_aws import ChatBedrock, ChatBedrockConverse
+llm = ChatBedrockConverse(model_id="anthropic.claude-3-5-sonnet-20240620-v1:0")
+
+def ask(q):
+    return llm.invoke(q, model_id="anthropic.claude-v2")
+
+def ask_any(q, **kw):
+    return llm.invoke(q, **kw)
+
+old = ChatBedrock(model_id="anthropic.claude-3-haiku-20240307-v1:0")
+old.invoke("hi", modelId="amazon.nova-pro-v1:0")
+llm.invoke("hi", model="amazon.nova-lite-v1:0")
+"#,
+    );
+    assert_eq!(
+        value(call_on(&found, 6), "model_id"),
+        Some("anthropic.claude-v2")
+    );
+    assert!(gaps_on(&found, 6).is_empty());
+    assert!(call_on(&found, 9).values.is_empty());
+    assert_eq!(
+        gaps_on(&found, 9),
+        vec!["unresolved_model/splat".to_string()]
+    );
+    let splat = gaps(&found, GapKind::UnresolvedModel)
+        .into_iter()
+        .find(|g| g.span.unwrap().line == 9)
+        .unwrap();
+    assert_eq!(splat.key.as_deref(), Some("model_id"));
+    assert_eq!(
+        value(call_on(&found, 12), "modelId"),
+        Some("amazon.nova-pro-v1:0")
+    );
+    assert_eq!(
+        gaps_on(&found, 12),
+        vec!["unresolved_model/conditional".to_string()]
+    );
+    assert!(call_on(&found, 13).values.is_empty());
+    assert!(gaps_on(&found, 13).is_empty());
+
+    // Its requests read `model_id` when they are sent.
+    let found = usages(
+        "from langchain_aws import ChatBedrock\nllm = ChatBedrock(model_id=\"amazon.nova-pro-v1:0\")\nllm.model_id = pick()\n",
+    );
+    let rewritten = gaps(&found, GapKind::UnresolvedModel);
+    assert_eq!(rewritten.len(), 1, "{rewritten:?}");
+    assert_eq!(rewritten[0].reason, "dynamic_feature");
+    assert_eq!(rewritten[0].key.as_deref(), Some("model_id"));
+}
+
+#[test]
+fn litellm_completion_calls_route_litellm() {
+    let found = usages(
+        r#"
+import litellm
+from litellm import completion, acompletion as achat
+from litellm.main import completion as main_completion
+from litellm import Router
+
+completion(model="gpt-4o", messages=[])
+litellm.completion("anthropic/claude-3-5-sonnet-20241022", messages=[])
+achat(model="gemini/gemini-1.5-pro", messages=[])
+main_completion(model="o3-mini", messages=[], fallbacks=[{"model": "gpt-4o-mini"}])
+litellm.completion(messages=[])
+litellm.completion(**params)
+litellm.token_counter(model="gpt-4o", messages=[])
+litellm.supports_function_calling(model="gpt-4o")
+litellm.embedding(model="text-embedding-3-small", input=["x"])
+Router(model_list=[]).completion(model="gpt-4o", messages=[])
+"#,
+    );
+    let import = |name: &str| found.imports.iter().find(|i| i.local == name).unwrap();
+    assert_eq!(import("litellm").sdk, Sdk::Litellm);
+    assert_eq!(import("completion").kind, BindingKind::Symbol);
+    assert_eq!(import("achat").name.as_deref(), Some("acompletion"));
+    assert!(found.imports.iter().all(|i| i.local != "Router"));
+
+    let lines: Vec<u32> = found.calls.iter().map(|c| c.span.line).collect();
+    assert_eq!(lines, vec![7, 8, 9, 10, 11, 12]);
+    for c in &found.calls {
+        assert_eq!(c.sdk, Sdk::Litellm, "{}", c.chain);
+        assert_eq!(c.package, "litellm");
+        assert_eq!(c.routing, Routing::Litellm, "{}", c.chain);
+        assert!(c.request, "{}", c.chain);
+    }
+    assert_eq!(value(call_on(&found, 7), "model"), Some("gpt-4o"));
+    assert_eq!(call_on(&found, 7).receiver, Receiver::Symbol);
+    let positional = call_on(&found, 8);
+    assert_eq!(positional.receiver, Receiver::Module);
+    assert_eq!(
+        value(positional, "model"),
+        Some("anthropic/claude-3-5-sonnet-20241022")
+    );
+    assert!(positional.values[0].positional);
+    assert_eq!(
+        value(call_on(&found, 9), "model"),
+        Some("gemini/gemini-1.5-pro")
+    );
+    let fallbacks = call_on(&found, 10);
+    assert_eq!(value(fallbacks, "model"), Some("o3-mini"));
+    assert_eq!(value(fallbacks, "fallbacks.model"), Some("gpt-4o-mini"));
+    // A missing model is a TypeError, not a default.
+    assert!(gaps_on(&found, 11).is_empty());
+    assert_eq!(
+        gaps_on(&found, 12),
+        vec!["unresolved_model/splat".to_string()]
+    );
+    assert_eq!(found.gaps.len(), 1, "{:?}", found.gaps);
+
+    // `model_alias_map` may map the model, and a fallback's, to another one.
+    let found = usages(
+        "import litellm\nlitellm.model_alias_map = {\"fast\": \"gpt-4o-mini\"}\nlitellm.completion(model=\"gpt-4o\", messages=[], fallbacks=[{\"model\": \"fast\"}])\n",
+    );
+    assert_eq!(value(call_on(&found, 3), "model"), Some("gpt-4o"));
+    assert_eq!(value(call_on(&found, 3), "fallbacks.model"), Some("fast"));
+    let alias = gaps(&found, GapKind::UnresolvedModel);
+    assert_eq!(alias.len(), 1, "{alias:?}");
+    assert_eq!(alias[0].reason, "dynamic_feature");
+    assert_eq!(alias[0].key, None);
+    assert!(alias[0].detail.contains("line 2"), "{}", alias[0].detail);
+
+    // A `model_list` (given, in a same-file dict or possibly in an opaque
+    // `**`) maps the model name to a deployment; its entries are not
+    // models the call sends.
+    let found = usages(
+        r#"
+import litellm
+CFG = {"model_list": [{"model_name": "gpt-4o", "litellm_params": {"model": "anthropic/claude-3-opus-20240229"}}]}
+litellm.completion(model="gpt-4o", messages=[], model_list=[{"model_name": "gpt-4o", "litellm_params": {"model": "anthropic/claude-3-opus-20240229"}}])
+litellm.completion(model="gpt-4o", messages=[], **CFG)
+litellm.completion(model="gpt-4o", messages=[], **options)
+litellm.completion(model="gpt-4o", messages=[])
+"#,
+    );
+    for line in [4, 5, 6, 7] {
+        let keys: Vec<&str> = call_on(&found, line)
+            .values
+            .iter()
+            .map(|v| v.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["model"], "{line}");
+    }
+    assert_eq!(
+        gaps_on(&found, 4),
+        vec!["unresolved_model/model_list".to_string()]
+    );
+    assert_eq!(
+        gaps_on(&found, 5),
+        vec!["unresolved_model/model_list".to_string()]
+    );
+    assert_eq!(
+        gaps_on(&found, 6),
+        vec!["unresolved_model/splat".to_string()]
+    );
+    assert!(gaps_on(&found, 7).is_empty());
+    assert!(
+        found.gaps.iter().all(|g| g.key.is_none()),
+        "{:?}",
+        found.gaps
+    );
+}
+
+#[test]
+fn bedrock_and_litellm_members_replaced_or_hooked_are_dynamic() {
+    for patch in [
+        "client.converse = fake",
+        "boto3.client = fake",
+        "client.meta.events.register(\"before-call.*\", hook)",
+        "boto3.Session().events.register(\"before-call.*\", hook)",
+    ] {
+        let source = format!(
+            "import boto3\nclient = boto3.client(\"bedrock-runtime\")\nclient.converse(modelId=\"amazon.nova-pro-v1:0\", messages=[])\n{patch}\n"
+        );
+        let found = usages(&source);
+        assert_eq!(
+            gaps_on(&found, 3),
+            vec!["ambiguous_client/dynamic_feature".to_string()],
+            "{patch}"
+        );
+        let detail = &gaps(&found, GapKind::AmbiguousClient)[0].detail;
+        assert!(detail.contains("line 4"), "{patch}: {detail}");
+    }
+    let found = usages(
+        "import litellm\nlitellm.completion(model=\"gpt-4o\", messages=[])\nlitellm.completion = traced(litellm.completion)\n",
+    );
+    assert_eq!(
+        gaps_on(&found, 2),
+        vec!["ambiguous_client/dynamic_feature".to_string()]
+    );
+
+    // A handler registered where this file cannot follow it counts by its
+    // botocore event name, and so does a default session set up from a
+    // botocore session; a `register` call that names no botocore event
+    // does not.
+    for (setup, hooked) in [
+        (
+            "boto3._get_default_session().events.register(\"before-parameter-build.bedrock-runtime.Converse\", hook)",
+            true,
+        ),
+        (
+            "boto3.Session()._session.register(\"provide-client-params.bedrock-runtime.Converse\", hook)",
+            true,
+        ),
+        (
+            "botocore.session.get_session().register(event_name=\"before-call.*\", handler=hook)",
+            true,
+        ),
+        ("boto3.setup_default_session(botocore_session=custom)", true),
+        ("boto3.setup_default_session(profile_name=\"dev\")", false),
+        ("atexit.register(cleanup)", false),
+        ("admin.site.register(Model)", false),
+        ("codecs.register(\"search\")", false),
+    ] {
+        let source = format!(
+            "import atexit\nimport boto3\nimport botocore.session\n{setup}\nclient = boto3.client(\"bedrock-runtime\")\nclient.converse(modelId=\"amazon.nova-pro-v1:0\", messages=[])\n"
+        );
+        let found = usages(&source);
+        let gaps = if hooked {
+            vec!["ambiguous_client/dynamic_feature".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(gaps_on(&found, 6), gaps, "{setup}");
+        assert_eq!(call_on(&found, 6).routing, Routing::Bedrock, "{setup}");
+    }
+}
+
+#[test]
+fn bedrock_and_litellm_files_pass_the_prefilter() {
+    use super::may_use_sdk;
+    for source in [
+        "import boto3\nclient = boto3.client(\"bedrock-runtime\")\n",
+        "def run(client):\n    return client.invoke_model(modelId=M, body=b)\n",
+        "from langchain_aws import ChatBedrock\n",
+        "from litellm import completion\n",
+        "import boto3\ndef ask(client):\n    return client.converse(modelId=M, messages=[])\n",
+        "import boto3\ndef ask(client):\n    return client.converse_stream(modelId=M, messages=[])\n",
+    ] {
+        assert!(may_use_sdk(source), "{source}");
+    }
+    // A Bedrock call on a client passed in is a gap where boto3 is imported.
+    let found = usages(
+        "import boto3\ndef ask(client):\n    return client.converse_stream(modelId=\"amazon.nova-pro-v1:0\", messages=[])\n",
+    );
+    assert_eq!(
+        gaps_on(&found, 3),
+        vec!["unknown_client_factory/parameter".to_string()]
+    );
+    // Bedrock's and LiteLLM's request names are not another SDK's.
+    let found = usages(
+        "import openai\nfrom openai import OpenAI\nclient = OpenAI()\nclient.converse(model=\"gpt-4o\")\nopenai.acompletion(model=\"gpt-4o\")\n",
+    );
+    assert!(found.calls.iter().all(|c| !c.request), "{:?}", found.calls);
+    // A file using boto3 for anything else is not parsed.
+    assert!(!may_use_sdk(
+        "import boto3\ns3 = boto3.client(\"s3\")\ns3.put_object(Bucket=\"b\", Key=\"k\", Body=b\"\")\n"
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Raw HTTP requests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn raw_http_posts_to_provider_apis_read_the_json_body() {
+    let found = usages(
+        r#"import json
+import requests
+import httpx as hx
+from requests import post
+
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+
+def ask(prompt):
+    data = {"model": "claude-3-haiku-20240307", "max_tokens": 200, "messages": []}
+    return requests.post("https://api.anthropic.com/v1/messages", headers=H, json=data)
+
+def ask_inline(prompt, key):
+    return requests.post(url="https://api.openai.com/v1/chat/completions", headers={"authorization": key}, json={"model": "gpt-3.5-turbo", "messages": []})
+
+def ask_httpx(prompt):
+    body = {"model": "gpt-4o", "input": prompt}
+    return hx.post("https://api.openai.com/v1/responses/", content=json.dumps(body))
+
+def ask_bare():
+    return post(OPENAI_URL, data=json.dumps({"model": "gpt-4-turbo", "messages": []}), timeout=5)
+"#,
+    );
+    assert!(found.imports.is_empty(), "{:?}", found.imports);
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+
+    let anthropic = call_on(&found, 10);
+    assert_eq!(anthropic.chain, "requests.post");
+    assert_eq!(anthropic.package, "requests");
+    assert_eq!(anthropic.sdk, Sdk::Anthropic);
+    assert_eq!(anthropic.routing, Routing::AnthropicDirect);
+    assert_eq!(anthropic.member, "messages.create");
+    assert!(anthropic.request);
+    assert_eq!(anthropic.receiver, Receiver::Module);
+    assert_eq!(anthropic.kwargs, ["headers", "json"]);
+    assert_eq!(value(anthropic, "model"), Some("claude-3-haiku-20240307"));
+    let captured = &anthropic.values[0];
+    assert_eq!(captured.origin, ValueOrigin::LocalConstant);
+    assert_eq!(captured.name.as_deref(), Some("data[\"model\"]"));
+    assert_eq!(captured.model_family, Some(Sdk::Anthropic));
+
+    let inline = call_on(&found, 13);
+    assert_eq!(inline.routing, Routing::OpenaiDirect);
+    assert_eq!(inline.member, "chat.completions.create");
+    assert_eq!(value(inline, "model"), Some("gpt-3.5-turbo"));
+    assert_eq!(inline.values[0].origin, ValueOrigin::Literal);
+    assert_eq!(inline.values.len(), 1, "{:?}", inline.values);
+
+    let responses = call_on(&found, 17);
+    assert_eq!(responses.package, "httpx");
+    assert_eq!(responses.chain, "hx.post");
+    assert_eq!(responses.member, "responses.create");
+    assert_eq!(value(responses, "model"), Some("gpt-4o"));
+
+    let bare = call_on(&found, 20);
+    assert_eq!(bare.receiver, Receiver::Symbol);
+    assert_eq!(bare.member, "chat.completions.create");
+    assert_eq!(value(bare, "model"), Some("gpt-4-turbo"));
+}
+
+#[test]
+fn raw_http_to_other_urls_is_not_recorded() {
+    for url in [
+        "\"https://api.openai.com/v1/models\"",
+        "\"https://openrouter.ai/api/v1/chat/completions\"",
+        "\"https://myco.openai.azure.com/openai/deployments/d/chat/completions\"",
+        "\"https://api.openai.com.evil.example/v1/chat/completions\"",
+        "\"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent\"",
+        "f\"{BASE}/v1/chat/completions\"",
+        "os.getenv(\"URL\", \"https://api.openai.com/v1/chat/completions\")",
+        "url",
+        "\"ftp://api.openai.com/v1/chat/completions\"",
+    ] {
+        let source = format!(
+            "import os\nimport requests\ndef ask(url):\n    return requests.post({url}, json={{\"model\": \"gpt-4o\"}})\n"
+        );
+        let found = usages(&source);
+        assert!(found.calls.is_empty(), "{url}: {:?}", found.calls);
+        assert!(found.gaps.is_empty(), "{url}: {:?}", found.gaps);
+    }
+    // A query string, a fragment, a port and a trailing `/` keep the path.
+    for url in [
+        "https://api.openai.com/v1/chat/completions?x=1",
+        "https://API.openai.com:443/v1/chat/completions/",
+        "http://api.openai.com/v1/chat/completions#top",
+    ] {
+        let source =
+            format!("import requests\nrequests.post(\"{url}\", json={{\"model\": \"gpt-4o\"}})\n");
+        let found = usages(&source);
+        assert_eq!(
+            call_on(&found, 2).member,
+            "chat.completions.create",
+            "{url}"
+        );
+    }
+}
+
+#[test]
+fn only_post_imported_from_an_http_library_is_followed() {
+    for source in [
+        // Not the library: a name assigned, a parameter, another module's
+        // `post`, another method.
+        "import requests\nrequests = Session()\nrequests.post(URL, json={\"model\": \"gpt-4o\"})\n",
+        "def ask(requests):\n    return requests.post(URL, json={\"model\": \"gpt-4o\"})\n",
+        "from mylib import post\npost(URL, json={\"model\": \"gpt-4o\"})\n",
+        "from requests import get as post\npost(URL, json={\"model\": \"gpt-4o\"})\n",
+        "import requests.adapters as requests\nrequests.post(URL, json={\"model\": \"gpt-4o\"})\n",
+        "import requests\nrequests.put(URL, json={\"model\": \"gpt-4o\"})\n",
+        "import requests\nrequests.Session().post(URL, json={\"model\": \"gpt-4o\"})\n",
+        "from requests import *\npost(URL, json={\"model\": \"gpt-4o\"})\n",
+    ] {
+        let source = format!("URL = \"https://api.openai.com/v1/chat/completions\"\n{source}");
+        let found = usages(&source);
+        assert!(found.calls.is_empty(), "{source}: {:?}", found.calls);
+    }
+    for source in [
+        "import requests.adapters\nrequests.post(URL, json={\"model\": \"gpt-4o\"})\n",
+        "from requests import post as send\nsend(URL, json={\"model\": \"gpt-4o\"})\n",
+        "def f():\n    import httpx\n    return httpx.post(URL, json={\"model\": \"gpt-4o\"})\n",
+    ] {
+        let source = format!("URL = \"https://api.openai.com/v1/chat/completions\"\n{source}");
+        let found = usages(&source);
+        assert_eq!(found.calls.len(), 1, "{source}");
+        assert_eq!(value(&found.calls[0], "model"), Some("gpt-4o"), "{source}");
+    }
+}
+
+#[test]
+fn raw_http_bodies_that_do_not_read_are_gaps() {
+    let found = usages(
+        r#"import json
+import requests
+URL = "https://api.openai.com/v1/chat/completions"
+MODELS = {"fast": "gpt-4o-mini", "slow": "gpt-4.1"}
+
+def from_param(body):
+    return requests.post(URL, json=body)
+
+def mutated():
+    data = {"model": "gpt-4o"}
+    data["model"] = pick()
+    return requests.post(URL, json=data)
+
+def overridable(extra):
+    return requests.post(URL, json={"model": "gpt-4o", **extra})
+
+def no_model():
+    return requests.post(URL, json={"messages": []})
+
+def string_body(payload):
+    return requests.post(URL, data=payload)
+
+def splat(**kw):
+    return requests.post(URL, json={"model": "gpt-4o"}, **kw)
+
+def looked_up(kind):
+    return requests.post(URL, json={"model": MODELS[kind]})
+
+def batch():
+    return requests.post("https://api.anthropic.com/v1/messages/batches", json={"requests": [{"custom_id": "a", "params": {"model": "claude-3-opus-20240229"}}]})
+
+def form():
+    return requests.post("https://api.openai.com/v1/audio/transcriptions", files=F, data={"model": "whisper-1"})
+"#,
+    );
+    assert_eq!(gaps_on(&found, 7), ["unresolved_model/request_body"]);
+    assert!(call_on(&found, 7).values.is_empty());
+    // A mutated dict is not read.
+    assert_eq!(gaps_on(&found, 12), ["unresolved_model/request_body"]);
+    assert!(call_on(&found, 12).values.is_empty());
+    assert_eq!(gaps_on(&found, 15), ["unresolved_model/splat"]);
+    let overridable = &gaps(&found, GapKind::UnresolvedModel)
+        .into_iter()
+        .find(|g| g.span.is_some_and(|s| s.line == 15))
+        .unwrap()
+        .values;
+    assert_eq!(overridable[0].value, "gpt-4o");
+    assert_eq!(gaps_on(&found, 18), ["unresolved_model/missing_model"]);
+    assert_eq!(gaps_on(&found, 21), ["unresolved_model/request_body"]);
+    // `**kw` may hold `data=`, which replaces a `json=` body.
+    assert_eq!(gaps_on(&found, 24), ["unresolved_model/splat"]);
+    assert_eq!(value(call_on(&found, 24), "model"), Some("gpt-4o"));
+    let splat = found
+        .gaps
+        .iter()
+        .find(|g| g.span.is_some_and(|s| s.line == 24))
+        .unwrap();
+    assert_eq!(splat.key, None);
+    // A model looked up with a run-time key lists the dict's values.
+    assert_eq!(gaps_on(&found, 27), ["unresolved_model/subscript"]);
+    let looked_up = found
+        .gaps
+        .iter()
+        .find(|g| g.span.is_some_and(|s| s.line == 27))
+        .unwrap();
+    let listed: Vec<&str> = looked_up.values.iter().map(|v| v.value.as_str()).collect();
+    assert_eq!(listed, ["gpt-4o-mini", "gpt-4.1"]);
+    // A Message Batch nests its models in its requests.
+    let batch = call_on(&found, 30);
+    assert_eq!(batch.member, "messages.batches.create");
+    assert!(gaps_on(&found, 30).is_empty());
+    assert_eq!(
+        value(batch, "requests.params.model"),
+        Some("claude-3-opus-20240229")
+    );
+    // Form data is not a JSON body.
+    assert_eq!(gaps_on(&found, 33), ["unresolved_model/request_body"]);
+    assert!(call_on(&found, 33).values.is_empty());
+}
+
+#[test]
+fn a_dict_passed_to_requests_post_stays_readable() {
+    // `requests.post(json=...)` only serializes the dict, so an SDK call
+    // that expands it later still reads it.
+    let found = usages(
+        r#"import requests
+from openai import OpenAI
+client = OpenAI()
+PARAMS = {"model": "gpt-4o", "messages": []}
+requests.post("https://api.openai.com/v1/chat/completions", json=PARAMS)
+client.chat.completions.create(**PARAMS)
+"#,
+    );
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+    assert_eq!(value(call_on(&found, 6), "model"), Some("gpt-4o"));
+    // Any other `post` may keep or change it.
+    let found = usages(
+        r#"import requests
+from openai import OpenAI
+client = OpenAI()
+session = make_session()
+PARAMS = {"model": "gpt-4o", "messages": []}
+session.post("https://api.openai.com/v1/chat/completions", json=PARAMS)
+client.chat.completions.create(**PARAMS)
+"#,
+    );
+    assert!(call_on(&found, 7).values.is_empty());
+    assert_eq!(gaps_on(&found, 7), ["unresolved_model/splat"]);
+}
+
+#[test]
+fn a_replaced_post_or_a_dynamic_file_leaves_the_route_unconfirmed() {
+    for (setup, reason) in [
+        ("requests.post = fake_post", "dynamic_feature"),
+        ("setattr(requests, \"post\", fake_post)", "dynamic_feature"),
+        ("del requests.post", "dynamic_feature"),
+        ("setattr(requests, name, fake)", "dynamic_feature"),
+        ("exec(code)", "dynamic_feature"),
+    ] {
+        let source = format!(
+            "import requests\n{setup}\nrequests.post(\"https://api.openai.com/v1/chat/completions\", json={{\"model\": \"gpt-4o\"}})\n"
+        );
+        let found = usages(&source);
+        assert_eq!(
+            gaps_on(&found, 3),
+            [format!("ambiguous_client/{reason}")],
+            "{setup}"
+        );
+        assert_eq!(call_on(&found, 3).routing, Routing::OpenaiDirect, "{setup}");
+    }
+}
+
+#[test]
+fn a_dict_given_to_a_replaced_post_is_not_read() {
+    // A replaced `post` may change the dict it is given, and so may any
+    // code in a file that can rebind anything.
+    for setup in [
+        "requests.post = fake",
+        "setattr(requests, \"post\", fake)",
+        "exec(code)",
+    ] {
+        let source = format!(
+            "import requests\nfrom openai import OpenAI\nclient = OpenAI()\nbody = {{\"model\": \"gpt-4o\", \"messages\": []}}\n{setup}\nrequests.post(\"https://api.openai.com/v1/chat/completions\", json=body)\nclient.chat.completions.create(**body)\n"
+        );
+        let found = usages(&source);
+        assert!(call_on(&found, 7).values.is_empty(), "{setup}");
+        assert!(
+            gaps_on(&found, 7).contains(&"unresolved_model/splat".to_string()),
+            "{setup}: {:?}",
+            gaps_on(&found, 7)
+        );
+        assert!(call_on(&found, 6).values.is_empty(), "{setup}");
+    }
+}
+
+#[test]
+fn a_query_or_fragment_before_the_path_ends_the_host() {
+    for url in [
+        "https://api.openai.com?x/v1/chat/completions",
+        "https://api.openai.com#/v1/embeddings",
+    ] {
+        let source =
+            format!("import requests\nrequests.post(\"{url}\", json={{\"model\": \"gpt-4o\"}})\n");
+        assert!(usages(&source).calls.is_empty(), "{url}");
+    }
+}
+
+#[test]
+fn a_def_that_rebinds_an_imported_name_replaces_it() {
+    let found = usages(
+        r#"from openai import OpenAI
+from httpx import post
+
+def OpenAI(*args, **kwargs):
+    return make()
+
+class post:
+    pass
+
+client = OpenAI()
+client.chat.completions.create(model="gpt-4o", messages=[])
+post("https://api.openai.com/v1/chat/completions", json={"model": "gpt-4o"})
+"#,
+    );
+    // The client may be the SDK's or the local function's.
+    assert_eq!(call_on(&found, 11).routing, Routing::Unknown);
+    assert_eq!(
+        gaps_on(&found, 11),
+        ["ambiguous_client/multiple_assignments"]
+    );
+    // `post` is the local class, not httpx's.
+    assert!(found.calls.iter().all(|c| c.package != "httpx"));
+}
+
+// ---------------------------------------------------------------------------
+// Calls through a wrapper in another file
+// ---------------------------------------------------------------------------
+
+fn parse(source: &str) -> tree_sitter::Tree {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_python::language())
+        .unwrap();
+    parser.parse(source, None).unwrap()
+}
+
+/// What one other file (`file`, imported as `module`) lists.
+struct OneModule {
+    module: &'static str,
+    file: &'static str,
+    params: Vec<crate::usages::ModelParam>,
+}
+
+impl crate::usages::WrapperLookup for OneModule {
+    fn model_params(
+        &self,
+        module: &str,
+        name: &str,
+    ) -> Option<(String, Vec<crate::usages::ModelParam>)> {
+        let params: Vec<_> = self
+            .params
+            .iter()
+            .filter(|p| module == self.module && p.function == name)
+            .cloned()
+            .collect();
+        (!params.is_empty()).then(|| (self.file.to_string(), params))
+    }
+}
+
+/// The model parameters `source` lists, read as `file`.
+fn model_params(source: &str, file: &str) -> Vec<crate::usages::ModelParam> {
+    super::extract(&parse(source), source, file).model_params
+}
+
+/// `caller` (as `run.py`) after `wrapper` (as `sampler.py`, imported as
+/// `module`) is scanned.
+fn through(wrapper: &str, module: &'static str, caller: &str) -> FileUsages {
+    let lookup = OneModule {
+        module,
+        file: "sampler.py",
+        params: model_params(wrapper, "sampler.py"),
+    };
+    super::extract_with(&parse(caller), caller, "run.py", Some(&lookup))
+}
+
+const SAMPLER: &str = r#"from openai import OpenAI
+
+class Sampler:
+    def __init__(self, *, effort=None, model: str = "o1-mini"):
+        self.client = OpenAI()
+        self.model = model
+        self.effort = effort
+
+    def __call__(self, messages):
+        return self.client.chat.completions.create(
+            model=self.model, messages=messages, reasoning_effort=self.effort
+        )
+
+client = OpenAI()
+
+def ask(prompt, model="gpt-4o-mini"):
+    return client.chat.completions.create(model=model, messages=[prompt])
+"#;
+
+#[test]
+fn a_class_or_function_whose_parameter_is_a_requests_model_lists_it() {
+    let params = model_params(SAMPLER, "sampler.py");
+    let listed: Vec<_> = params
+        .iter()
+        .map(|p| {
+            (
+                p.function.as_str(),
+                p.parameter.as_str(),
+                p.position,
+                p.keyword,
+                p.attribute.as_deref(),
+                p.key.as_str(),
+                p.line,
+                p.routing,
+                p.route_confirmed,
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (
+                "Sampler",
+                "model",
+                None,
+                true,
+                Some("model"),
+                "model",
+                10,
+                Routing::OpenaiDirect,
+                true
+            ),
+            (
+                "ask",
+                "model",
+                Some(1),
+                true,
+                None,
+                "model",
+                17,
+                Routing::OpenaiDirect,
+                true
+            ),
+        ]
+    );
+    assert_eq!(params[0].chain, "self.client.chat.completions.create");
+    assert_eq!(params[0].member, "chat.completions.create");
+    assert_eq!(params[0].package, "openai");
+    // The file's own report is unchanged: the default, with its gap.
+    let found = usages(SAMPLER);
+    assert_eq!(value(call_on(&found, 10), "model"), Some("o1-mini"));
+    assert_eq!(
+        gaps_on(&found, 10),
+        [
+            "unresolved_model/parameter_default",
+            "unresolved_model/subclass_override"
+        ]
+    );
+}
+
+#[test]
+fn a_call_from_another_file_binds_the_model_it_passes() {
+    let found = through(
+        SAMPLER,
+        ".sampler",
+        r#"from .sampler import Sampler, ask
+from .sampler import Sampler as S
+
+MODEL = "o1"
+
+def main(fast="o3-mini"):
+    models = {
+        "o1": Sampler(model="o1", effort="high"),
+        "const": Sampler(model=MODEL),
+        "alias": S(model="o1-preview"),
+        "fast": Sampler(model=fast),
+        "default": Sampler(),
+    }
+    ask("hi", "gpt-4o")
+    ask("hi", model="gpt-4.1")
+    ask("hi")
+    return models
+"#,
+    );
+    let o1 = call_on(&found, 8);
+    assert_eq!(o1.chain, "Sampler");
+    assert_eq!(o1.member, "Sampler");
+    assert!(!o1.request);
+    assert_eq!(o1.receiver, Receiver::Symbol);
+    assert_eq!(o1.sdk, Sdk::Openai);
+    assert_eq!(o1.package, "openai");
+    assert_eq!(o1.routing, Routing::OpenaiDirect);
+    assert_eq!(o1.kwargs, ["model", "effort"]);
+    assert_eq!(value(o1, "model"), Some("o1"));
+    assert_eq!(o1.values[0].origin, ValueOrigin::Literal);
+    assert!(!o1.values[0].positional);
+    let wrapper = o1.wrapper.as_ref().expect("a wrapper call");
+    assert_eq!(wrapper.file, "sampler.py");
+    assert_eq!(wrapper.function, "Sampler");
+    assert_eq!(wrapper.requests.len(), 1);
+    assert_eq!(wrapper.requests[0].parameter, "model");
+    assert_eq!(wrapper.requests[0].line, 10);
+    assert_eq!(
+        wrapper.requests[0].chain,
+        "self.client.chat.completions.create"
+    );
+    assert!(gaps_on(&found, 8).is_empty());
+
+    let constant = call_on(&found, 9);
+    assert_eq!(value(constant, "model"), Some("o1"));
+    assert_eq!(constant.values[0].origin, ValueOrigin::ModuleConstant);
+    assert_eq!(constant.values[0].name.as_deref(), Some("MODEL"));
+    assert!(gaps_on(&found, 9).is_empty());
+
+    let alias = call_on(&found, 10);
+    assert_eq!(alias.chain, "S");
+    assert_eq!(alias.member, "Sampler");
+    assert_eq!(value(alias, "model"), Some("o1-preview"));
+
+    // A public function's default: other modules may call it.
+    let fast = call_on(&found, 11);
+    assert_eq!(value(fast, "model"), Some("o3-mini"));
+    assert_eq!(fast.values[0].origin, ValueOrigin::ParameterDefault);
+    assert_eq!(gaps_on(&found, 11), ["unresolved_model/parameter_default"]);
+
+    // No model passed: the default applies, reported where it is defined.
+    assert!(found.calls.iter().all(|c| c.span.line != 12));
+
+    let positional = call_on(&found, 14);
+    assert_eq!(positional.member, "ask");
+    assert_eq!(value(positional, "model"), Some("gpt-4o"));
+    assert!(positional.values[0].positional);
+    let by_name = call_on(&found, 15);
+    assert_eq!(value(by_name, "model"), Some("gpt-4.1"));
+    assert!(!by_name.values[0].positional);
+    assert!(found.calls.iter().all(|c| c.span.line != 16));
+    assert!(found
+        .gaps
+        .iter()
+        .all(|g| g.kind != GapKind::AmbiguousClient));
+}
+
+#[test]
+fn a_parameter_is_not_listed_where_the_extractor_cannot_confirm_it() {
+    let head = "from openai import OpenAI\nimport litellm\nclient = OpenAI()\n";
+    let cases = [
+        // Decorated, defined twice, rebound, nested, a method, a lambda.
+        "@retry\ndef ask(model):\n    return client.chat.completions.create(model=model)\n",
+        "def ask(model):\n    return client.chat.completions.create(model=model)\ndef ask(model):\n    return 1\n",
+        "def ask(model):\n    return client.chat.completions.create(model=model)\nask = wrap(ask)\n",
+        "def outer():\n    def ask(model):\n        return client.chat.completions.create(model=model)\n    return ask\n",
+        "class Bot:\n    def ask(self, model):\n        return client.chat.completions.create(model=model)\n",
+        "ask = lambda model: client.chat.completions.create(model=model)\n",
+        // The parameter is changed before the request.
+        "def ask(model):\n    model = model or \"gpt-4o\"\n    return client.chat.completions.create(model=model)\n",
+        "def ask(model):\n    return client.chat.completions.create(model=model.lower())\n",
+        "def ask(model):\n    if model:\n        def model():\n            pass\n    return client.chat.completions.create(model=model)\n",
+        "def ask(model):\n    if model:\n        class model:\n            pass\n    return client.chat.completions.create(model=model)\n",
+        // The attribute is set twice, from something else, or again by a
+        // base class's constructor.
+        "class S:\n    def __init__(self, model):\n        self.model = model\n    def reset(self):\n        self.model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S:\n    def __init__(self, model):\n        self.model = model.strip()\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S:\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\nclass Mine(S):\n    def tune(self):\n        self.model = \"gpt-4o\"\n",
+        "class S(Base):\n    def __init__(self, model):\n        self.model = model\n        super().__init__()\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S(Base):\n    def __init__(self, model):\n        self.model = model\n        Base.__init__(self)\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        // The class may be built some other way.
+        "@dataclass\nclass S:\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S(metaclass=Meta):\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S(A, B):\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S:\n    def __new__(cls, model):\n        return object.__new__(cls)\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S:\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\nS.__init__ = other\n",
+        // A same-file base's `__new__`, decorator or class keyword.
+        "class One:\n    def __new__(cls, *a, **k):\n        return cls._it\nclass S(One):\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "@singleton\nclass One:\n    pass\nclass S(One):\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class One(metaclass=Meta):\n    pass\nclass S(One):\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        // The file may rewrite anything, or the request remaps its model.
+        "def ask(model):\n    return client.chat.completions.create(model=model)\nexec(code)\n",
+        "from settings import *\ndef ask(model):\n    return client.chat.completions.create(model=model)\n",
+        "litellm.model_alias_map = {}\ndef ask(model):\n    return litellm.completion(model=model, messages=[])\n",
+        // Passed through `**`: not a parameter this scan follows.
+        "def ask(**kw):\n    return client.chat.completions.create(**kw)\n",
+    ];
+    for case in cases {
+        let source = format!("{head}{case}");
+        assert_eq!(model_params(&source, "llm.py"), [], "{case}");
+    }
+    // A script is not imported.
+    let script =
+        format!("{head}def ask(model):\n    return client.chat.completions.create(model=model)\n");
+    assert_eq!(model_params(&script, "pkg/__main__.py"), []);
+    assert_eq!(model_params(&script, "llm.py").len(), 1);
+}
+
+#[test]
+fn a_wrapper_whose_requests_route_is_not_confirmed_is_routed_unknown() {
+    let wrapper = r#"import os
+from openai import OpenAI
+
+class Model:
+    def __init__(self, model):
+        self.model = model
+        if model == "deepseek-reasoner":
+            self.client = OpenAI(base_url="https://api.deepseek.com")
+        else:
+            self.client = OpenAI()
+
+    def generate(self, prompt):
+        return self.client.chat.completions.create(model=self.model, messages=[prompt])
+"#;
+    let params = model_params(wrapper, "sampler.py");
+    assert_eq!(params.len(), 1);
+    assert!(!params[0].route_confirmed);
+    let found = through(
+        wrapper,
+        "reasoners.lm.openai_model",
+        r#"from reasoners.lm.openai_model import Model
+
+def main(openai_model="o1"):
+    return Model(openai_model)
+"#,
+    );
+    let built = call_on(&found, 4);
+    assert_eq!(built.routing, Routing::Unknown);
+    assert_eq!(value(built, "model"), Some("o1"));
+    assert!(built.values[0].positional);
+    assert_eq!(
+        gaps_on(&found, 4),
+        [
+            "unresolved_model/parameter_default",
+            "ambiguous_client/wrapper_route"
+        ]
+    );
+}
+
+#[test]
+fn a_wrapper_whose_requests_disagree_on_the_route_is_routed_unknown() {
+    let wrapper = r#"from openai import AzureOpenAI, OpenAI
+
+client = OpenAI()
+azure = AzureOpenAI(azure_endpoint="https://example.openai.azure.com", api_version="2024-06-01")
+
+def ask(model, legacy=False):
+    if legacy:
+        return azure.chat.completions.create(model=model, messages=[])
+    return client.chat.completions.create(model=model, messages=[])
+"#;
+    let params = model_params(wrapper, "sampler.py");
+    let routes: Vec<_> = params
+        .iter()
+        .map(|p| (p.routing, p.route_confirmed))
+        .collect();
+    assert_eq!(
+        routes,
+        [(Routing::AzureOpenai, true), (Routing::OpenaiDirect, true)]
+    );
+    let found = through(
+        wrapper,
+        ".sampler",
+        "from .sampler import ask\nask(model=\"gpt-4o\")\n",
+    );
+    let call = call_on(&found, 2);
+    assert_eq!(value(call, "model"), Some("gpt-4o"));
+    assert_eq!(call.routing, Routing::Unknown);
+    assert_eq!(call.wrapper.as_ref().map(|w| w.requests.len()), Some(2));
+    assert_eq!(gaps_on(&found, 2), ["ambiguous_client/wrapper_route"]);
+}
+
+#[test]
+fn a_wrapper_call_keeps_the_gaps_of_what_it_passes() {
+    let found = through(
+        SAMPLER,
+        ".sampler",
+        r#"import os
+from .sampler import Sampler, ask
+
+def run(kw):
+    a = Sampler(model=os.environ["MODEL"])
+    b = Sampler(**kw)
+    c = ask("hi", *kw)
+    return a, b, c
+"#,
+    );
+    assert!(call_on(&found, 5).values.is_empty());
+    assert_eq!(gaps_on(&found, 5), ["unresolved_model/env_var"]);
+    assert_eq!(gaps_on(&found, 6), ["unresolved_model/splat"]);
+    assert_eq!(gaps_on(&found, 7), ["unresolved_model/splat"]);
+
+    // The instance's attribute written after it is built.
+    let found = through(
+        SAMPLER,
+        ".sampler",
+        "from .sampler import Sampler\ns = Sampler(model=\"o1\")\ns.model = \"gpt-4o\"\n",
+    );
+    assert_eq!(value(call_on(&found, 2), "model"), Some("o1"));
+    assert_eq!(gaps_on(&found, 2), ["unresolved_model/dynamic_feature"]);
+
+    // A file that may rebind anything: the callee too.
+    let found = through(
+        SAMPLER,
+        ".sampler",
+        "from .sampler import Sampler\nexec(code)\ns = Sampler(model=\"o1\")\n",
+    );
+    assert_eq!(value(call_on(&found, 3), "model"), Some("o1"));
+    assert_eq!(gaps_on(&found, 3), ["ambiguous_client/dynamic_feature"]);
+}
+
+#[test]
+fn a_wrapper_call_is_recorded_only_through_its_import_alone() {
+    let cases = [
+        "from .sampler import Sampler\nif flag:\n    Sampler = Other\nSampler(model=\"o1\")\n",
+        "from .sampler import Sampler\nfrom other import *\nSampler(model=\"o1\")\n",
+        "from .sampler import Sampler\ndef run(Sampler):\n    return Sampler(model=\"o1\")\n",
+        "from . import sampler\nsampler.Sampler(model=\"o1\")\n",
+        "import sampler\nsampler.Sampler(model=\"o1\")\n",
+        "from .other import Sampler\nSampler(model=\"o1\")\n",
+        "from .sampler import Other as Sampler\nSampler(model=\"o1\")\n",
+    ];
+    for case in cases {
+        let found = through(SAMPLER, ".sampler", case);
+        assert!(found.calls.is_empty(), "{case}: {:?}", found.calls);
+        assert!(found.gaps.is_empty(), "{case}: {:?}", found.gaps);
+    }
+    // An import inside the function that calls it.
+    let found = through(
+        SAMPLER,
+        ".sampler",
+        "def build():\n    from .sampler import Sampler\n    return Sampler(model=\"o1\")\n",
+    );
+    assert_eq!(value(call_on(&found, 3), "model"), Some("o1"));
+    assert_eq!(call_on(&found, 3).symbol.as_deref(), Some("build"));
+}
+
+#[test]
+fn a_function_wrapper_keeps_no_attribute_to_write() {
+    // `setattr(obj, name, v)` may write any attribute of anything: a
+    // class's model attribute, but a function keeps its model in none.
+    let caller = "from .sampler import Sampler, ask\nsetattr(obj, name, value)\nask(\"hi\", model=\"o1\")\nSampler(model=\"o1\")\n";
+    let found = through(SAMPLER, ".sampler", caller);
+    assert_eq!(value(call_on(&found, 3), "model"), Some("o1"));
+    let model_gaps = |line: u32| -> Vec<String> {
+        gaps_on(&found, line)
+            .into_iter()
+            .filter(|g| g.starts_with("unresolved_model/"))
+            .collect()
+    };
+    assert!(model_gaps(3).is_empty(), "{:?}", gaps_on(&found, 3));
+    assert_eq!(model_gaps(4), ["unresolved_model/dynamic_feature"]);
+}
+
+#[test]
+fn a_base_class_that_sets_the_attribute_too_keeps_it_unlisted() {
+    let source = "from openai import OpenAI\nclient = OpenAI()\nclass Base:\n    def with_model(self, model):\n        self.model = model\n        return self\nclass S(Base):\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n";
+    assert_eq!(model_params(source, "llm.py"), []);
+}
+
+#[test]
+fn a_parameter_another_request_sends_changed_is_not_listed() {
+    let head = "from openai import OpenAI\nimport requests\nclient = OpenAI()\nRENAMED = {\"gpt-3.5-turbo\": \"gpt-4o-mini\"}\n";
+    let cases = [
+        // Mapped in one branch, sent as passed in the other.
+        "def ask(prompt, model=\"gpt-4o-mini\"):\n    if model in RENAMED:\n        return client.chat.completions.create(model=RENAMED[model], messages=[prompt])\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        "def ask(model):\n    if model in RENAMED:\n        return client.chat.completions.create(model=RENAMED.get(model, model))\n    return client.chat.completions.create(model=model)\n",
+        // Through an assignment, a dict spread with `**`, a raw HTTP body.
+        "def ask(model):\n    if model in RENAMED:\n        m = RENAMED.get(model, model)\n        return client.chat.completions.create(model=m)\n    return client.chat.completions.create(model=model)\n",
+        "def ask(model):\n    if model in RENAMED:\n        params = {\"model\": RENAMED[model]}\n        return client.chat.completions.create(**params)\n    return client.chat.completions.create(model=model)\n",
+        "def ask(model):\n    if model in RENAMED:\n        return requests.post(\"https://api.openai.com/v1/chat/completions\", json={\"model\": RENAMED[model]})\n    return client.chat.completions.create(model=model)\n",
+        // Handed to a function of the file that sends a request.
+        "def _send(m):\n    return client.chat.completions.create(model=RENAMED.get(m, m))\ndef ask(model):\n    if model in RENAMED:\n        return _send(model)\n    return client.chat.completions.create(model=model)\n",
+        // A class: another method, an attribute set from it, a same-file
+        // base's method, a method it is handed to.
+        "class S:\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n    def legacy(self):\n        return client.chat.completions.create(model=RENAMED[self.model])\n",
+        "class S:\n    def __init__(self, model):\n        self.model = model\n        self.alias = RENAMED.get(model)\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n    def old(self):\n        return client.chat.completions.create(model=self.alias)\n",
+        "class Base:\n    def legacy(self):\n        return client.chat.completions.create(model=RENAMED[self.model])\nclass S(Base):\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S:\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        if self.model in RENAMED:\n            return self._send(self.model)\n        return client.chat.completions.create(model=self.model)\n    def _send(self, m):\n        return client.chat.completions.create(model=RENAMED[m])\n",
+    ];
+    for case in cases {
+        let source = format!("{head}{case}");
+        assert_eq!(model_params(&source, "llm.py"), [], "{case}");
+    }
+
+    // Read, but sent nowhere changed: a test, a price table, a helper that
+    // sends nothing, what the request returns.
+    let kept = [
+        "def ask(model):\n    if model.startswith(\"o1\"):\n        print(\"reasoning\")\n    return client.chat.completions.create(model=model)\n",
+        "PRICES = {}\ndef ask(model):\n    resp = client.chat.completions.create(model=model)\n    cost = PRICES[model] * resp.usage.total_tokens\n    return resp, cost\n",
+        "def log(m):\n    print(m)\ndef parse(r):\n    return r.choices[0]\ndef ask(model):\n    log(model)\n    resp = client.chat.completions.create(model=model)\n    return parse(resp)\n",
+        "class S:\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        resp = client.chat.completions.create(model=self.model)\n        return self._parse(resp)\n    def _parse(self, resp):\n        return client.chat.completions.create(model=self.model, messages=[resp])\n",
+    ];
+    for case in kept {
+        let source = format!("{head}{case}");
+        assert!(!model_params(&source, "llm.py").is_empty(), "{case}");
+    }
+}
+
+#[test]
+fn a_wrapper_request_of_a_package_this_file_cannot_check_is_routed_unknown() {
+    // What another scan exported for a package this one does not follow:
+    // the calling file's checks do not cover it, so the route is not
+    // confirmed.
+    let mut params = model_params(SAMPLER, "sampler.py");
+    params.retain(|p| p.function == "ask");
+    params[0].package = "agents".to_string();
+    let lookup = OneModule {
+        module: ".sampler",
+        file: "sampler.py",
+        params,
+    };
+    let caller = "from .sampler import ask
+ask(\"hi\", model=\"o1\")
+";
+    let found = super::extract_with(&parse(caller), caller, "run.py", Some(&lookup));
+    let call = call_on(&found, 2);
+    assert_eq!(value(call, "model"), Some("o1"));
+    assert_eq!(call.routing, Routing::Unknown);
+    assert_eq!(gaps_on(&found, 2), ["ambiguous_client/wrapper_route"]);
+}
+
+#[test]
+fn a_wrapper_call_keeps_what_the_calling_file_changes() {
+    // A LangChain chat model the wrapper builds and hands back, given
+    // another model or made configurable where it is called.
+    let make_llm = "from langchain_openai import ChatOpenAI\n\ndef make_llm(model=\"gpt-4o\"):\n    return ChatOpenAI(model=model, temperature=0)\n";
+    assert_eq!(model_params(make_llm, "llm.py").len(), 1);
+    for later in [
+        "llm.model_name = \"gpt-3.5-turbo\"",
+        "llm = llm.configurable_fields(model_name=ConfigurableField(id=\"m\"))",
+    ] {
+        let caller =
+            format!("from .llm import make_llm\nllm = make_llm(model=\"gpt-4o\")\n{later}\n");
+        let found = through(make_llm, ".llm", &caller);
+        assert_eq!(
+            value(call_on(&found, 2), "model"),
+            Some("gpt-4o"),
+            "{later}"
+        );
+        assert_eq!(
+            gaps_on(&found, 2),
+            ["unresolved_model/dynamic_feature"],
+            "{later}"
+        );
+    }
+
+    // The module-level API configured, or an endpoint variable set, in the
+    // calling file.
+    let ask = "import openai\n\ndef ask(model):\n    return openai.chat.completions.create(model=model, messages=[])\n";
+    assert!(model_params(ask, "llm.py")[0].route_confirmed);
+    let cases = [
+        (
+            "import openai\nfrom .llm import ask\nopenai.base_url = \"http://localhost:4000/v1/\"\nask(model=\"gpt-3.5-turbo\")\n",
+            "ambiguous_client/module_config",
+        ),
+        (
+            "import os\nfrom .llm import ask\nos.environ[\"OPENAI_BASE_URL\"] = \"http://proxy\"\nask(model=\"gpt-3.5-turbo\")\n",
+            "ambiguous_client/endpoint_env",
+        ),
+        (
+            "import os\nfrom .llm import ask\nos.environ[name] = value\nask(model=\"gpt-3.5-turbo\")\n",
+            "ambiguous_client/dynamic_feature",
+        ),
+    ];
+    for (caller, gap) in cases {
+        let found = through(ask, ".llm", caller);
+        let call = call_on(&found, 4);
+        assert_eq!(call.routing, Routing::Unknown, "{caller}");
+        assert_eq!(value(call, "model"), Some("gpt-3.5-turbo"), "{caller}");
+        assert_eq!(gaps_on(&found, 4), [gap], "{caller}");
+    }
+    // Configuring something else leaves the route alone.
+    let found = through(
+        ask,
+        ".llm",
+        "import openai\nfrom .llm import ask\nopenai.api_key = key\nask(model=\"gpt-3.5-turbo\")\n",
+    );
+    assert_eq!(call_on(&found, 4).routing, Routing::OpenaiDirect);
+    assert!(gaps_on(&found, 4).is_empty());
+
+    // LiteLLM's alias table mentioned in the calling file.
+    let litellm = "import litellm\n\ndef ask(model):\n    return litellm.completion(model=model, messages=[])\n";
+    let found = through(
+        litellm,
+        ".llm",
+        "import litellm\nfrom .llm import ask\nlitellm.model_alias_map = {\"gpt-3.5-turbo\": \"gpt-4o-mini\"}\nask(model=\"gpt-3.5-turbo\")\n",
+    );
+    let call = call_on(&found, 4);
+    assert_eq!(call.routing, Routing::Litellm);
+    assert_eq!(gaps_on(&found, 4), ["unresolved_model/dynamic_feature"]);
 }

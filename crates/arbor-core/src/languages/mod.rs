@@ -18,7 +18,7 @@ mod typescript;
 
 use crate::fallback_parser::is_fallback_supported_extension;
 use crate::node::CodeNode;
-use crate::usages::FileUsages;
+use crate::usages::{FileUsages, WrapperLookup};
 
 /// Trait for language-specific parsing logic.
 ///
@@ -54,6 +54,20 @@ pub trait LanguageParser: Send + Sync {
         _file_path: &str,
     ) -> Option<FileUsages> {
         None
+    }
+
+    /// [`Self::extract_usages`], also recording calls to the wrappers in
+    /// other files that `wrappers` resolves this file's imports to (see
+    /// [`crate::usages::SdkCall::wrapper`]). Languages that do not follow
+    /// wrappers extract as usual.
+    fn extract_usages_with(
+        &self,
+        tree: &tree_sitter::Tree,
+        source: &str,
+        file_path: &str,
+        _wrappers: &dyn WrapperLookup,
+    ) -> Option<FileUsages> {
+        self.extract_usages(tree, source, file_path)
     }
 
     /// The language name usage records carry, for a language that

@@ -23,7 +23,7 @@ pub fn run(path: &str, sdk: Option<&str>, json: bool) -> Result<()> {
             None => {
                 return fail(
                     json,
-                    format!("unknown sdk '{name}': use openai, anthropic or google (or gemini)"),
+                    format!("unknown sdk '{name}': use openai, anthropic, google (or gemini), aws (or bedrock) or litellm"),
                 )
             }
         },
@@ -126,7 +126,7 @@ fn print_report(report: &UsageReport) {
     );
 
     if report.usages.is_empty() {
-        println!("\nNo OpenAI, Anthropic or Gemini SDK calls found.");
+        println!("\nNo OpenAI, Anthropic, Gemini, Bedrock or LiteLLM calls found.");
     }
     for sdk in Sdk::ALL {
         let calls: Vec<&SdkCall> = report.usages.iter().filter(|c| c.sdk == sdk).collect();
@@ -279,8 +279,20 @@ fn print_call(call: &SdkCall) {
         .as_deref()
         .map(|s| format!("  in {}", clean(s)))
         .unwrap_or_default();
+    // A call through a wrapper in another file: where its requests are.
+    let through = call
+        .wrapper
+        .as_ref()
+        .map(|w| {
+            let mut lines: Vec<u32> = w.requests.iter().map(|r| r.line).collect();
+            lines.sort_unstable();
+            lines.dedup();
+            let lines: Vec<String> = lines.iter().map(u32::to_string).collect();
+            format!("  via {}:{}", clean(&w.file), lines.join(","))
+        })
+        .unwrap_or_default();
     println!(
-        "  {}  {}  {}{}{}",
+        "  {}  {}  {}{}{}{}",
         format!(
             "{}:{}:{}",
             clean(&call.file),
@@ -291,7 +303,8 @@ fn print_call(call: &SdkCall) {
         clean(&call.chain).cyan(),
         call.routing.as_str().yellow(),
         values.green(),
-        symbol.dimmed()
+        symbol.dimmed(),
+        through.dimmed()
     );
 }
 

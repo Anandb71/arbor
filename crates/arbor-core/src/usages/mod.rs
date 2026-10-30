@@ -60,10 +60,24 @@
 //! # Scope of this version
 //!
 //! Python only ([`python`]): `.py` files and extensionless scripts with a
-//! Python shebang. The TypeScript/ESM slice will implement
+//! Python shebang. LangChain's OpenAI, Anthropic and Bedrock chat models
+//! (`ChatOpenAI(model=...)`, `ChatBedrock(model_id=...)`) are recorded as a
+//! construction and a call that binds the model, like
+//! `genai.GenerativeModel(...)`. A `boto3` `bedrock-runtime` client's
+//! requests (`converse(modelId=...)`) route `bedrock` for any model, and
+//! `litellm.completion(model=...)` routes `litellm`. A raw HTTP request,
+//! `requests.post(...)` or `httpx.post(...)` to a listed `api.openai.com` or
+//! `api.anthropic.com` endpoint, is a direct request whose model is read from
+//! its JSON body. The TypeScript/ESM slice will implement
 //! [`crate::LanguageParser::extract_usages`] for its parsers and reuse these
 //! types. Resolution is per file: a client or model constant imported from
-//! another module is a gap, not a usage.
+//! another module is a gap, not a usage. The one exception is a call to a
+//! wrapper defined in another file of a repository scan: a module-level
+//! function or class whose parameter the extractor confirms is the model
+//! of a request in its own file ([`ModelParam`]). The scan's second pass
+//! records each call that passes it, in the calling file, as an
+//! [`SdkCall`] with a [`SdkCall::wrapper`]; the value's span stays in that
+//! file.
 
 pub mod python;
 
@@ -79,11 +93,23 @@ pub enum Sdk {
     Anthropic,
     /// `google.genai` and the legacy `google.generativeai`.
     Google,
+    /// The AWS SDK (`boto3`), followed only to its Amazon Bedrock runtime
+    /// client, and LangChain's Bedrock chat models built on it.
+    Aws,
+    /// LiteLLM (`litellm.completion`), which sends a request to whichever
+    /// provider its model string names.
+    Litellm,
 }
 
 impl Sdk {
     /// Every tracked provider, in display order.
-    pub const ALL: [Sdk; 3] = [Sdk::Openai, Sdk::Anthropic, Sdk::Google];
+    pub const ALL: [Sdk; 5] = [
+        Sdk::Openai,
+        Sdk::Anthropic,
+        Sdk::Google,
+        Sdk::Aws,
+        Sdk::Litellm,
+    ];
 
     /// The lowercase name used in JSON and on the command line.
     pub fn as_str(self) -> &'static str {
@@ -91,15 +117,20 @@ impl Sdk {
             Sdk::Openai => "openai",
             Sdk::Anthropic => "anthropic",
             Sdk::Google => "google",
+            Sdk::Aws => "aws",
+            Sdk::Litellm => "litellm",
         }
     }
 
-    /// Parses `openai`, `anthropic` or `google` (case-insensitive).
+    /// Parses `openai`, `anthropic`, `google`, `aws` or `litellm`
+    /// (case-insensitive; `gemini`, `bedrock` and `boto3` are accepted too).
     pub fn parse(name: &str) -> Option<Sdk> {
         match name.trim().to_ascii_lowercase().as_str() {
             "openai" => Some(Sdk::Openai),
             "anthropic" => Some(Sdk::Anthropic),
             "google" | "gemini" => Some(Sdk::Google),
+            "aws" | "bedrock" | "boto3" => Some(Sdk::Aws),
+            "litellm" => Some(Sdk::Litellm),
             _ => None,
         }
     }
@@ -117,16 +148,20 @@ impl std::fmt::Display for Sdk {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Routing {
-    /// `OpenAI()` / `AsyncOpenAI()` with no `base_url`, or the module-level API.
+    /// `OpenAI()` / `AsyncOpenAI()` with no `base_url`, the module-level API,
+    /// or LangChain's `ChatOpenAI` built the same way.
     OpenaiDirect,
-    /// `AzureOpenAI` / `AsyncAzureOpenAI`, or `openai.api_type = "azure"`.
+    /// `AzureOpenAI` / `AsyncAzureOpenAI`, `openai.api_type = "azure"`, or
+    /// LangChain's `AzureChatOpenAI`.
     AzureOpenai,
     /// A client given a `base_url` / `api_base` whose host is not the
     /// provider's own (OpenRouter, LiteLLM, a local server), or a
     /// module-level `openai.api_base` / `base_url` set that way. A `base_url`
-    /// of `api.openai.com` or `api.anthropic.com` is direct.
+    /// of `api.openai.com` or `api.anthropic.com` is direct. A Bedrock
+    /// client given an `endpoint_url` outside AWS is routed this way too.
     CustomBaseUrl,
-    /// `Anthropic()` / `AsyncAnthropic()` with no `base_url`.
+    /// `Anthropic()` / `AsyncAnthropic()` with no `base_url`, or LangChain's
+    /// `ChatAnthropic` built the same way.
     AnthropicDirect,
     /// `AnthropicBedrock` / `AsyncAnthropicBedrock`.
     AnthropicBedrock,
@@ -136,6 +171,12 @@ pub enum Routing {
     GoogleGenai,
     /// `google.generativeai` (the deprecated SDK).
     GoogleGenerativeaiLegacy,
+    /// Amazon Bedrock, for any model it serves: a `boto3` `bedrock-runtime`
+    /// client, or LangChain's `ChatBedrock` / `ChatBedrockConverse`.
+    Bedrock,
+    /// A call through LiteLLM (`litellm.completion(...)`), which picks the
+    /// provider and endpoint from the model string and its configuration.
+    Litellm,
     /// Not decided by this version: `**kwargs` passed to a direct
     /// constructor, a client typed only by annotation, a binding assigned
     /// more than one kind of client, a direct client given a `base_url`
@@ -163,6 +204,8 @@ impl Routing {
             Routing::AnthropicVertex => "anthropic_vertex",
             Routing::GoogleGenai => "google_genai",
             Routing::GoogleGenerativeaiLegacy => "google_generativeai_legacy",
+            Routing::Bedrock => "bedrock",
+            Routing::Litellm => "litellm",
             Routing::Unknown => "unknown",
         }
     }
@@ -202,7 +245,10 @@ pub enum BindingKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SdkImport {
     pub sdk: Sdk,
-    /// `openai`, `anthropic`, `google.genai` or `google.generativeai`.
+    /// `openai`, `anthropic`, `google.genai`, `google.generativeai`, `boto3`
+    /// or `litellm`, or the LangChain package a chat model comes from
+    /// (`langchain_openai`, `langchain_anthropic`, `langchain_aws`,
+    /// `langchain_community`, `langchain`).
     pub package: String,
     /// The module named in the statement (`openai.types.chat`).
     pub module: String,
@@ -336,7 +382,8 @@ impl ValueOrigin {
 /// A value captured for an allowlisted key ([`VALUE_KEYS`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapturedValue {
-    /// `model`, `engine`, `deployment_id` or `model_name`; for a key inside a
+    /// `model`, `engine`, `deployment_id` or `model_name` (and, on a Bedrock
+    /// call, `modelId` or `model_id`; see [`BEDROCK_VALUE_KEYS`]); for a key inside a
     /// dict literal argument, the path to it (`fallbacks.model` for
     /// `fallbacks=[{"model": ...}]`, `model` when the dict is positional or
     /// expanded with `**`). Every segment is an identifier-shaped key.
@@ -364,14 +411,20 @@ pub struct CapturedValue {
 /// A call whose member chain is rooted at a tracked binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SdkCall {
+    /// The provider: for a raw HTTP request, the one whose API host the
+    /// URL names.
     pub sdk: Sdk,
+    /// As in [`SdkImport::package`], or the HTTP library (`requests`,
+    /// `httpx`) a raw HTTP request is sent with.
     pub package: String,
     /// The callee as written, arguments elided
     /// (`self.client.chat.completions.create`).
     pub chain: String,
     /// The part after the tracked root (`chat.completions.create`), with the
     /// response wrappers `with_raw_response` / `with_streaming_response` and
-    /// client copies (`with_options(...)`, `copy(...)`) removed.
+    /// client copies (`with_options(...)`, `copy(...)`) removed. For a raw
+    /// HTTP request (`package` `requests` or `httpx`), the SDK method its
+    /// endpoint is (`chat.completions.create` for `/v1/chat/completions`).
     pub member: String,
     /// Whether the call sends a request to the provider: its last member is
     /// a request method (`create`, `stream`, `generate_content`,
@@ -402,6 +455,90 @@ pub struct SdkCall {
     pub spreads: Vec<Spread>,
     /// Values for allowlisted keys that resolved to string literals.
     pub values: Vec<CapturedValue>,
+    /// For a call to a function or class defined in another file of the
+    /// scan, whose parameter is the model of requests there
+    /// (`Sampler(model="o1")` after `from .sampler import Sampler`): that
+    /// function and those requests. The call's `sdk`, `package` and
+    /// `routing` are the requests' (`routing` is `unknown`, with an
+    /// `ambiguous_client` gap, when they differ or one is not confirmed),
+    /// `member` is the function's name, `request` is `false` (the requests
+    /// are recorded in that file) and `kwargs` are the call's own argument
+    /// names. Its values are what the call passes for the parameter, keyed
+    /// by the requests' model key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapper: Option<WrapperCall>,
+}
+
+/// The function or class a [`SdkCall::wrapper`] call reaches, in another
+/// file of the scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrapperCall {
+    /// The file that defines it, as the scan reports files.
+    pub file: String,
+    /// Its name there: a module-level function, or a class whose
+    /// `__init__` takes the parameter.
+    pub function: String,
+    /// The requests there whose model the call's argument is.
+    pub requests: Vec<WrapperRequest>,
+}
+
+/// One request a [`WrapperCall`]'s parameter reaches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrapperRequest {
+    /// The parameter of the function that is its model.
+    pub parameter: String,
+    /// The request as written there (`self.client.chat.completions.create`).
+    pub chain: String,
+    /// As in [`SdkCall::member`].
+    pub member: String,
+    pub line: u32,
+}
+
+/// A parameter of a module-level function or class that is the model of a
+/// request in the same file: what a call from another file passes for it
+/// is the model that request sends. The per-file extractor lists one only
+/// when it confirms the parameter reaches the request unchanged (see
+/// `docs/SDK_USAGES.md`, "Calls through a wrapper in another file"). The
+/// repository scan reads them for its second pass; they are not part of
+/// the JSON report.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModelParam {
+    /// The module-level name other files call: the function, or the class
+    /// whose `__init__` takes the parameter.
+    pub function: String,
+    pub parameter: String,
+    /// Its index among the positional arguments a call passes (`self`
+    /// excluded); `None` when it is keyword-only.
+    pub position: Option<u32>,
+    /// It may be passed by keyword (it is not positional-only).
+    pub keyword: bool,
+    /// For a class: the instance attribute `__init__` stores it in (`model`
+    /// for `self.model = model`), which a write on the instance replaces.
+    pub attribute: Option<String>,
+    /// The request's model key (`model`, `model_name`, `modelId`...).
+    pub key: String,
+    pub sdk: Sdk,
+    pub package: String,
+    pub chain: String,
+    pub member: String,
+    pub line: u32,
+    /// How the request reaches the SDK: through a client, or through the
+    /// module-level API (or a class or function imported from the SDK),
+    /// whose process-wide configuration a calling file may change.
+    pub receiver: Receiver,
+    pub routing: Routing,
+    /// The request's routing has no client gap.
+    pub route_confirmed: bool,
+}
+
+/// The functions and classes of other files that an import names, as the
+/// repository scan resolved them, for [`python::extract_with`].
+pub trait WrapperLookup {
+    /// The file that defines module-level `name` and the model parameters
+    /// it lists for it ([`FileUsages::model_params`]), when `module` (as an
+    /// import statement in this file writes it: `.sampler`,
+    /// `pkg.llm.client`) is another file of the scan.
+    fn model_params(&self, module: &str, name: &str) -> Option<(String, Vec<ModelParam>)>;
 }
 
 /// An expression spread into a call with `**`: names only, never values.
@@ -563,6 +700,11 @@ pub struct FileUsages {
     /// region may be missing. Set only for files that mention an SDK.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub syntax_errors: bool,
+    /// Parameters of this file's module-level functions and classes that
+    /// are the model of a request here, for calls from other files (see
+    /// [`ModelParam`]). Not serialized.
+    #[serde(skip)]
+    pub model_params: Vec<ModelParam>,
 }
 
 impl FileUsages {
@@ -620,8 +762,14 @@ pub fn is_python_shebang(head: &[u8]) -> bool {
 }
 
 /// Keys whose string value may be captured. Every other key is recorded by
-/// name only.
+/// name only, except [`BEDROCK_VALUE_KEYS`] on a Bedrock call.
 pub const VALUE_KEYS: &[&str] = &["model", "engine", "deployment_id", "model_name"];
+
+/// Keys whose value is also captured on a Bedrock call, and only there:
+/// `modelId` on a `boto3` `bedrock-runtime` request, `model_id` on
+/// LangChain's `ChatBedrock(...)`. Another SDK's `model_id` argument is not
+/// its model, so these are not [`VALUE_KEYS`].
+pub const BEDROCK_VALUE_KEYS: &[&str] = &["modelId", "model_id"];
 
 /// Name fragments that mark a credential: `api_key`, `auth_token`,
 /// `client_secret`, `PASSWD`, `db_pwd`, `CREDENTIALS`, `private_pem`...
@@ -860,6 +1008,10 @@ mod tests {
 
     #[test]
     fn value_keys_are_never_secret_shaped() {
+        for key in BEDROCK_VALUE_KEYS {
+            assert!(!is_secret_key(key), "{key} must not look like a secret");
+            assert!(!is_value_key(key), "{key} is read on Bedrock calls only");
+        }
         for key in VALUE_KEYS {
             assert!(!is_secret_key(key), "{key} must not look like a secret");
             assert!(is_value_key(key));
@@ -1009,6 +1161,8 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", sdk.as_str()));
         }
         assert_eq!(Sdk::parse("Gemini"), Some(Sdk::Google));
+        assert_eq!(Sdk::parse("Bedrock"), Some(Sdk::Aws));
+        assert_eq!(Sdk::parse("boto3"), Some(Sdk::Aws));
         assert_eq!(Sdk::parse("cohere"), None);
         for routing in [
             Routing::OpenaiDirect,
@@ -1019,6 +1173,8 @@ mod tests {
             Routing::AnthropicVertex,
             Routing::GoogleGenai,
             Routing::GoogleGenerativeaiLegacy,
+            Routing::Bedrock,
+            Routing::Litellm,
             Routing::Unknown,
         ] {
             let json = serde_json::to_string(&routing).unwrap();

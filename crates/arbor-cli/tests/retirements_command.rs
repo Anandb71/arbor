@@ -797,7 +797,7 @@ fn exit_codes_follow_the_window() {
     let output = arbor(clean.path(), &["retirements", ".", "--today", TODAY]);
     assert_eq!(output.status.code(), Some(0));
     assert!(stdout(&output).contains(
-        "No direct openai/anthropic/google SDK calls to retired or retiring models in 1 Python file. Calls through LangChain, LiteLLM or other wrappers are not checked yet."
+        "No direct openai/anthropic/google SDK calls to retired or retiring models in 1 Python file (LangChain's ChatOpenAI and ChatAnthropic, raw HTTP posts to their APIs, and models passed one hop to the project's own wrappers of them, included). Calls through LiteLLM count as routed; Bedrock's own model schedule, other wrapper libraries and wrappers the scan does not follow are not checked yet."
     ));
 }
 

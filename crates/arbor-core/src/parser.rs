@@ -8,7 +8,7 @@ use crate::error::{ParseError, Result};
 use crate::fallback_parser;
 use crate::languages::{get_parser, LanguageParser};
 use crate::node::CodeNode;
-use crate::usages::FileUsages;
+use crate::usages::{FileUsages, WrapperLookup};
 use std::fs;
 use std::path::Path;
 
@@ -129,6 +129,23 @@ pub fn parse_source_usages(
     }
     let tree = parse_tree(source, lang_parser)?;
     Ok(lang_parser.extract_usages(&tree, source, file_path))
+}
+
+/// [`parse_source_usages`] for a file the repository scan's second pass
+/// reads: calls to the wrappers in other files that `wrappers` resolves its
+/// imports to are recorded too, and the file is parsed even when it
+/// mentions no SDK (a call to a wrapper may be all it has).
+pub fn parse_source_usages_with(
+    source: &str,
+    file_path: &str,
+    lang_parser: &dyn LanguageParser,
+    wrappers: &dyn WrapperLookup,
+) -> Result<Option<FileUsages>> {
+    if lang_parser.usages_language().is_none() {
+        return Ok(None);
+    }
+    let tree = parse_tree(source, lang_parser)?;
+    Ok(lang_parser.extract_usages_with(&tree, source, file_path, wrappers))
 }
 
 /// SDK usages for a file on disk, with the path as written used in records.
