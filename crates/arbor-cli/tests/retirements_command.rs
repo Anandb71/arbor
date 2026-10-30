@@ -260,14 +260,107 @@ fn json_lists_retired_and_retiring_calls_from_a_fixed_date() {
         .starts_with("https://developers.openai.com/"));
 
     // Provenance travels with every report: one date per provider, and the
-    // oldest as the data date.
-    assert_eq!(report["data"]["as_of"], "2026-10-16");
+    // oldest as the data date. The 28 Oct 2026 refresh read every provider's
+    // pages that day.
+    assert_eq!(report["data"]["as_of"], "2026-10-28");
     let providers = report["data"]["providers"].as_array().unwrap();
     assert_eq!(providers[0]["provider"], "OpenAI");
-    assert_eq!(providers[0]["as_of"], "2026-10-18");
+    assert_eq!(providers[0]["as_of"], "2026-10-28");
     assert_eq!(providers[1]["provider"], "Anthropic");
-    assert_eq!(providers[1]["as_of"], "2026-10-16");
+    assert_eq!(providers[1]["as_of"], "2026-10-28");
+    let oldest = providers
+        .iter()
+        .map(|p| p["as_of"].as_str().unwrap())
+        .min()
+        .unwrap();
+    assert_eq!(report["data"]["as_of"], oldest);
     assert!(report["data"]["recipes"].as_array().unwrap().len() >= 6);
+}
+
+/// What the 28 Oct 2026 page reading changed in the report: the alias note
+/// names OpenAI's API reference, Haiku 4.5 is no longer said to accept the
+/// sampling parameters, and a gpt-3.5-turbo fine-tune gets no listed base.
+const PAGES_28_OCT: &str = r#"
+from anthropic import Anthropic
+from openai import OpenAI
+
+client = OpenAI()
+claude = Anthropic()
+
+
+def alias(q):
+    return client.chat.completions.create(model="gpt-4o", messages=[])
+
+
+def haiku(q):
+    return claude.messages.create(
+        model="claude-3-5-haiku-20241022", max_tokens=200, temperature=0.2, messages=[]
+    )
+
+
+def tuned(q):
+    return client.chat.completions.create(model="ft:gpt-3.5-turbo:acme::abc123", messages=[])
+"#;
+
+#[test]
+fn the_report_follows_the_28_october_page_reading() {
+    let dir = project(PAGES_28_OCT);
+    let (_, report) = run_json(dir.path(), &[]);
+
+    let alias = finding(&report, "gpt-4o");
+    let notes: Vec<&str> = alias["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap())
+        .collect();
+    assert!(
+        notes.iter().any(|n| n.contains(
+            "OpenAI's API reference lists it as deprecated with shutdown date 14 Jan 2027"
+        )),
+        "{notes:#?}"
+    );
+    assert!(
+        !notes.iter().any(|n| n.contains("does not list it")),
+        "{notes:#?}"
+    );
+
+    // Haiku 4.5 was a silent keep; under API version 2026-10-21 temperature
+    // returns 400 on every model, so the call now needs a person.
+    let haiku = finding(&report, "claude-3-5-haiku-20241022");
+    assert_eq!(haiku["replacement"], "claude-haiku-4-5-20251001");
+    assert_eq!(haiku["fix"], "manual");
+    let check = haiku["review"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["rule"] == "ANT-SAMPLING-HAIKU45")
+        .unwrap_or_else(|| panic!("{haiku:#}"));
+    assert_eq!(check["verified"], "unverified");
+    let message = check["message"].as_str().unwrap();
+    assert!(message.contains("2026-10-21"), "{message}");
+    assert!(!message.contains("accepts"), "{message}");
+
+    let tuned = finding(&report, "ft:gpt-3.5-turbo:acme::abc123");
+    assert_eq!(
+        tuned["replacement_text"],
+        "no fine-tunable replacement is listed"
+    );
+    assert!(tuned["review"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("OpenAI lists no replacement for fine-tunes of gpt-3.5-turbo"));
+
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    assert!(
+        text.contains("OpenAI describes gpt-6-luna as its \"most efficient model for focused, high-volume tasks\""),
+        "{text}"
+    );
+    assert!(!text.contains("flagship"), "{text}");
+    assert!(
+        !text.contains("accepts temperature, top_p and top_k"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -752,7 +845,7 @@ fn human_report_reads_plainly_and_offers_fix_prs_once() {
     assert!(text.contains("confirm the deployed value"));
     assert!(text.contains("Add --include-routed to list them."));
     assert!(text.contains(
-        "OpenAI as of 18 Oct 2026; Anthropic, Google and Google Cloud as of 16 Oct 2026"
+        "Retirement data from the providers' deprecation pages: OpenAI, Anthropic, Google and Google Cloud as of 28 Oct 2026."
     ));
     assert!(text.contains("Days are counted in UTC."));
     assert!(text.contains("Runs locally: no code leaves this machine."));
