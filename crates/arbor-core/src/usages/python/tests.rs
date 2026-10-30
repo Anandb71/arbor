@@ -517,6 +517,145 @@ class Bot:
 }
 
 #[test]
+fn a_typed_parameter_next_to_a_construction_is_another_value() {
+    // A typed parameter yielded to a construction next to it, so
+    // `client or OpenAI()` was `openai_direct` with no gap, although any
+    // caller may pass another client. It is now a value like the untyped
+    // parameter (`injected_or_default_client_is_ambiguous`).
+    let ambiguous = || vec!["ambiguous_client/multiple_assignments".to_string()];
+    let found = usages(
+        r#"from typing import Optional
+from openai import AzureOpenAI, OpenAI
+from mylib import make
+
+def ask(client: Optional[OpenAI] = None):
+    client = client or OpenAI()
+    return client.chat.completions.create(model="gpt-4o", messages=[])
+
+class Agent:
+    def __init__(self, client: Optional[OpenAI] = None):
+        self.client = client or OpenAI()
+
+    def run(self):
+        return self.client.chat.completions.create(model="gpt-4o", messages=[])
+
+def azure(client: Optional[AzureOpenAI] = None):
+    client = client or OpenAI()
+    return client.chat.completions.create(model="gpt-4o", messages=[])
+
+def factory(client: Optional[AzureOpenAI] = None):
+    client = client or make()
+    return client.chat.completions.create(model="gpt-4o", messages=[])
+
+def same(client: Optional[AzureOpenAI] = None):
+    client = client or AzureOpenAI()
+    return client.chat.completions.create(model="gpt-4o", messages=[])
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (7, Routing::Unknown, ambiguous()),
+            (14, Routing::Unknown, ambiguous()),
+            // A class that decides its route, next to a construction of
+            // another, or a factory's client, is still two values.
+            (18, Routing::Unknown, ambiguous()),
+            (22, Routing::Unknown, ambiguous()),
+            // A class that decides the construction's route agrees with it.
+            (26, Routing::AzureOpenai, vec![]),
+        ]
+    );
+}
+
+#[test]
+fn typed_clients_that_route_differently_are_a_gap_in_any_order() {
+    // Two typed clients took the first one's route: `azure` then `direct`
+    // was `azure_openai` with no gap, `direct` then `azure` the
+    // `annotation` gap. As in one union annotation, the route is decided
+    // only when every typed client decides it, and all the same way.
+    let annotation = || vec!["ambiguous_client/annotation".to_string()];
+    let found = usages(
+        r#"from openai import AsyncAzureOpenAI, AzureOpenAI, OpenAI
+
+def one(azure: AzureOpenAI, direct: OpenAI, flag):
+    if flag:
+        client = azure
+    else:
+        client = direct
+    return client.embeddings.create(model="text-embedding-3-small", input="x")
+
+def two(azure: AzureOpenAI, direct: OpenAI, flag):
+    if flag:
+        client = direct
+    else:
+        client = azure
+    return client.embeddings.create(model="text-embedding-3-small", input="x")
+
+def three(azure: AzureOpenAI, direct: OpenAI, flag):
+    client = azure if flag else direct
+    return client.embeddings.create(model="text-embedding-3-small", input="x")
+
+class Bot:
+    client: AzureOpenAI
+
+    def __init__(self, other: OpenAI):
+        self.client = other
+
+    def go(self):
+        return self.client.embeddings.create(model="text-embedding-3-small", input="x")
+
+def four(a: AzureOpenAI, b: AsyncAzureOpenAI, flag):
+    client = a if flag else b
+    return client.embeddings.create(model="text-embedding-3-small", input="x")
+
+class Declared:
+    client: AzureOpenAI | OpenAI
+
+    def __init__(self):
+        self.client = AzureOpenAI()
+
+    def go(self):
+        return self.client.embeddings.create(model="text-embedding-3-small", input="x")
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (8, Routing::Unknown, annotation()),
+            (15, Routing::Unknown, annotation()),
+            (19, Routing::Unknown, annotation()),
+            (28, Routing::Unknown, annotation()),
+            // Typed clients that all decide the same route.
+            (32, Routing::AzureOpenai, vec![]),
+            // A bare declaration still yields to the construction.
+            (41, Routing::AzureOpenai, vec![]),
+        ]
+    );
+    // Typed clients that route alike keep the reason one of them carries:
+    // here a field, which another module may set.
+    let field = usages(
+        r#"from pydantic import BaseModel
+from openai import AzureOpenAI
+
+class Svc(BaseModel):
+    client: AzureOpenAI
+
+    def go(self, other: AzureOpenAI, flag):
+        c = other if flag else self.client
+        return c.embeddings.create(model="text-embedding-3-small", input="x")
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&field),
+        vec![(
+            9,
+            Routing::Unknown,
+            vec!["ambiguous_client/dynamic_feature".to_string()]
+        )]
+    );
+}
+
+#[test]
 fn global_assignment_in_function_is_a_module_client() {
     let found = usages(
         r#"

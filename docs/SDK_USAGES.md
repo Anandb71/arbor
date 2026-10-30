@@ -150,8 +150,9 @@ always keeps its gap.
 ### Routes
 
 A call's routing is confirmed when its receiver reaches it through the
-value rules above (one kind of client per name), or through a parameter that
-every in-file caller of a private function passes. The receiver must be one of
+value rules above (one kind of client per name, where a parameter is one
+more value whatever its annotation), or through a parameter that every
+in-file caller of a private function passes. The receiver must be one of
 these:
 
 - **A client from a tracked constructor** (`OpenAI`, `AzureOpenAI`,
@@ -228,14 +229,35 @@ gets. That is an assumption of the report: a subclass in another module
 that replaces a public class's client is not seen.
 
 A client known only from a type annotation (`def ask(client: OpenAI)`,
-`client: OpenAI` in a class body), with no construction the file shows,
-routes by its class when the class alone decides the route
-(`AzureOpenAI`, `AnthropicBedrock`, `AnthropicVertex`). A direct class
-(`OpenAI`, `Anthropic`, `genai.Client`) may have been given a `base_url` or
-another endpoint, so its calls route `unknown` with an `annotation` gap. An
-annotation that names several classes (`AzureOpenAI | OpenAI`,
-`Union[AnthropicBedrock, Anthropic]`) decides the route only when every one
-of them does, and all the same way; otherwise its calls get the same gap.
+`client: OpenAI` in a class body) routes by its class when the class alone
+decides the route (`AzureOpenAI`, `AnthropicBedrock`, `AnthropicVertex`). A
+direct class (`OpenAI`, `Anthropic`, `genai.Client`) may have been given a
+`base_url` or another endpoint, so its calls route `unknown` with an
+`annotation` gap. An annotation that names several classes
+(`AzureOpenAI | OpenAI`, `Union[AnthropicBedrock, Anthropic]`) decides the
+route only when every one of them does, and all the same way; otherwise its
+calls get the same gap.
+
+When the name or attribute is given other values too:
+
+- A construction the file shows decides the route over a **bare
+  declaration** (`client: OpenAI` in a class body, with no value, and
+  `self.client = OpenAI()` in `__init__`).
+- A **typed value** (a parameter, or an annotated assignment with a value,
+  `self.client: OpenAI = make()`) is one more value. It agrees with a
+  construction only when its class decides that construction's route
+  (`AzureOpenAI` next to `AzureOpenAI(...)`); a direct class never does.
+  Otherwise the call gets a `multiple_assignments` gap, as with an untyped
+  parameter (`def ask(client: OpenAI | None = None): client = client or
+  OpenAI()`). So does a typed value next to a value that is not a client,
+  unless a declaration types the binding.
+- With no construction, the declarations and typed values decide the route
+  only when every one of them does, and all the same way, as in one
+  annotation; a declaration says more than the values next to it that are
+  not clients (`self.client = make_client()`). Otherwise the call gets the
+  `annotation` gap (`client = azure if flag else direct`, with
+  `azure: AzureOpenAI` and `direct: OpenAI`, in either order), or the gap
+  one of them already carries when they route alike.
 
 An OpenAI or Anthropic client's `base_url` routes by its host (a Gemini
 client's endpoint options are a gap, above). The URL itself is never

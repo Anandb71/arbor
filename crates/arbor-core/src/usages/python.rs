@@ -611,6 +611,10 @@ struct Client {
     ambiguous: bool,
     /// Known only from a type annotation, not from a construction.
     typed: bool,
+    /// Typed by a bare declaration (`client: OpenAI` in a class body), which
+    /// gives the binding a type but no value. Only [`combine`] reads it, and
+    /// what it returns never has it.
+    declared: bool,
     /// Why the routing may not hold at a call, reported there as an
     /// `ambiguous_client` gap.
     caveat: Option<ClientCaveat>,
@@ -5541,7 +5545,10 @@ impl<'t> Ctx<'t> {
             return val.clone();
         }
         if let Some(annotation) = assign.annotation {
-            if let Some(val) = self.typed(annotation, assign.scope) {
+            if let Some(mut val) = self.typed(annotation, assign.scope) {
+                if let (None, Val::Client { client, .. }) = (assign.value, &mut val) {
+                    client.declared = true;
+                }
                 return val;
             }
         }
@@ -5590,6 +5597,7 @@ impl<'t> Ctx<'t> {
                 site: None,
                 ambiguous: false,
                 typed: true,
+                declared: false,
                 caveat: (!decided).then_some(ClientCaveat::Annotation),
             },
             path: Vec::new(),
@@ -5930,6 +5938,7 @@ impl<'t> Ctx<'t> {
                     site: None,
                     ambiguous: true,
                     typed: false,
+                    declared: false,
                     caveat: None,
                 },
                 path: Vec::new(),
@@ -6083,6 +6092,7 @@ impl<'t> Ctx<'t> {
                 site,
                 ambiguous: false,
                 typed: false,
+                declared: false,
                 caveat,
             };
         }
@@ -6174,6 +6184,7 @@ impl<'t> Ctx<'t> {
             site,
             ambiguous: false,
             typed: false,
+            declared: false,
             caveat,
         }
     }
@@ -9906,10 +9917,16 @@ fn combine(vals: Vec<Val>) -> Val {
             .unwrap_or(Val::untracked(Origin::Unbound));
     }
     if real.len() == 1 {
-        return real
-            .into_iter()
-            .next()
-            .unwrap_or(Val::untracked(Origin::Other));
+        return match real.into_iter().next() {
+            // Read as the binding's value, a declaration is a typed value
+            // like any other.
+            Some(Val::Client { mut client, path }) => {
+                client.declared = false;
+                Val::Client { client, path }
+            }
+            Some(val) => val,
+            None => Val::untracked(Origin::Other),
+        };
     }
 
     let clients: Vec<&Client> = real
@@ -9919,20 +9936,25 @@ fn combine(vals: Vec<Val>) -> Val {
             _ => None,
         })
         .collect();
-    // A construction says more than an annotation; an annotation alone says
-    // more than an unknown factory next to it (`client: OpenAI` in the class
-    // body, `self.client = make_client()` in `__init__`).
+    // Whether a typed client's class alone decides its route.
+    let decides = |c: &Client| c.caveat.is_none() && !c.ambiguous;
+    // A construction says more than a bare declaration (`client: OpenAI` in
+    // the class body, `self.client = OpenAI()` in `__init__`). A typed value
+    // (a parameter, an annotated assignment from a factory) is one more
+    // value: it agrees with the constructions only when its class decides
+    // their route (`AzureOpenAI` next to `AzureOpenAI(...)`).
     let constructed: Vec<&Client> = clients.iter().copied().filter(|c| !c.typed).collect();
-    if constructed.is_empty() {
-        if let Some(typed) = clients.first() {
-            return Val::Client {
-                client: (*typed).clone(),
-                path: Vec::new(),
-            };
-        }
-    } else {
-        let first = constructed[0].clone();
-        let others = real.len() - clients.len();
+    if let Some(first) = constructed.first() {
+        let first = (*first).clone();
+        let disagree = clients
+            .iter()
+            .filter(|c| {
+                c.typed
+                    && !c.declared
+                    && !(decides(c) && c.pkg == first.pkg && c.routing == first.routing)
+            })
+            .count();
+        let others = real.len() - clients.len() + disagree;
         let same_routing = constructed.iter().all(|c| c.routing == first.routing);
         let same_pkg = constructed.iter().all(|c| c.pkg == first.pkg);
         let same_line = constructed.iter().all(|c| c.line == first.line);
@@ -9951,7 +9973,47 @@ fn combine(vals: Vec<Val>) -> Val {
                 site: if same_site { first.site } else { None },
                 ambiguous,
                 typed: false,
+                declared: false,
                 caveat: constructed.iter().find_map(|c| c.caveat.clone()),
+            },
+            path: Vec::new(),
+        };
+    }
+    // Typed clients alone. A declaration types every value of the binding,
+    // so it says more than an unknown factory next to it (`client: OpenAI`
+    // in the class body, `self.client = make_client()` in `__init__`). A
+    // typed value types only itself: next to another value it is
+    // ambiguous, as a construction is.
+    if let Some(first) = clients.first() {
+        let ambiguous = real.len() > clients.len() && !clients.iter().any(|c| c.declared);
+        // As in one annotation (see `Ctx::typed`), the route is decided only
+        // when every typed client decides it, and all the same way.
+        let alike = clients
+            .iter()
+            .all(|c| c.pkg == first.pkg && c.routing == first.routing);
+        let decided = !ambiguous && alike && clients.iter().all(|c| decides(c));
+        return Val::Client {
+            client: Client {
+                pkg: first.pkg,
+                routing: if decided {
+                    first.routing
+                } else {
+                    Routing::Unknown
+                },
+                line: None,
+                site: None,
+                ambiguous,
+                typed: !ambiguous,
+                declared: false,
+                // Clients that route alike keep the reason one of them
+                // carries (a field, say); ones that do not, the annotation's.
+                caveat: (!decided && !ambiguous).then(|| {
+                    clients
+                        .iter()
+                        .find_map(|c| c.caveat.clone())
+                        .filter(|_| alike)
+                        .unwrap_or(ClientCaveat::Annotation)
+                }),
             },
             path: Vec::new(),
         };
