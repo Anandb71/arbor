@@ -8186,6 +8186,7 @@ fn a_parameter_is_not_listed_where_the_extractor_cannot_confirm_it() {
         // base class's constructor.
         "class S:\n    def __init__(self, model):\n        self.model = model\n    def reset(self):\n        self.model = \"gpt-4o\"\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
         "class S:\n    def __init__(self, model):\n        self.model = model.strip()\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S:\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\nclass Mine(S):\n    def tune(self):\n        self.model = \"gpt-4o\"\n",
         "class S(Base):\n    def __init__(self, model):\n        self.model = model\n        super().__init__()\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
         "class S(Base):\n    def __init__(self, model):\n        self.model = model\n        Base.__init__(self)\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
         // The class may be built some other way.
@@ -8255,6 +8256,39 @@ def main(openai_model="o1"):
             "ambiguous_client/wrapper_route"
         ]
     );
+}
+
+#[test]
+fn a_wrapper_whose_requests_disagree_on_the_route_is_routed_unknown() {
+    let wrapper = r#"from openai import AzureOpenAI, OpenAI
+
+client = OpenAI()
+azure = AzureOpenAI(azure_endpoint="https://example.openai.azure.com", api_version="2024-06-01")
+
+def ask(model, legacy=False):
+    if legacy:
+        return azure.chat.completions.create(model=model, messages=[])
+    return client.chat.completions.create(model=model, messages=[])
+"#;
+    let params = model_params(wrapper, "sampler.py");
+    let routes: Vec<_> = params
+        .iter()
+        .map(|p| (p.routing, p.route_confirmed))
+        .collect();
+    assert_eq!(
+        routes,
+        [(Routing::AzureOpenai, true), (Routing::OpenaiDirect, true)]
+    );
+    let found = through(
+        wrapper,
+        ".sampler",
+        "from .sampler import ask\nask(model=\"gpt-4o\")\n",
+    );
+    let call = call_on(&found, 2);
+    assert_eq!(value(call, "model"), Some("gpt-4o"));
+    assert_eq!(call.routing, Routing::Unknown);
+    assert_eq!(call.wrapper.as_ref().map(|w| w.requests.len()), Some(2));
+    assert_eq!(gaps_on(&found, 2), ["ambiguous_client/wrapper_route"]);
 }
 
 #[test]
