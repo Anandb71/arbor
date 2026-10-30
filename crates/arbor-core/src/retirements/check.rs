@@ -4399,8 +4399,10 @@ def run():
         };
         let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-        // Responses API: the sampling rule is not verified there (no live
-        // call went to /v1/responses), so neither option can vouch for it.
+        // Responses API: no live call went to /v1/responses, but OpenAI's
+        // "Using GPT-6" guide documents the sampling rule there
+        // (G6-SAMPLING-RESPONSES, `docs` since the 28 Oct data, #297), so
+        // both options name temperature as a check.
         let responses = one(&[call(
             Sdk::Openai,
             Routing::OpenaiDirect,
@@ -4416,8 +4418,8 @@ def run():
         assert_eq!(
             flags(&responses),
             both(
-                ("reasoning_none", vec![], names(&["temperature"])),
-                ("model_default", vec![], names(&["temperature"])),
+                ("reasoning_none", names(&["temperature"]), vec![]),
+                ("model_default", names(&["temperature"]), vec![]),
             )
         );
 

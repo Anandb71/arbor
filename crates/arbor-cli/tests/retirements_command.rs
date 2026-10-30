@@ -1578,9 +1578,7 @@ fn arguments_that_need_reasoning_off_are_never_no_change() {
         "{text}"
     );
     assert!(
-        text.contains(
-            "check: Non-default temperature, top_p or top_k return 400 on claude-sonnet-5-5"
-        ),
+        text.contains("check: temperature, top_p or top_k return 400 on claude-sonnet-5-5"),
         "{text}"
     );
     // Only the call Arbor read in full, with nothing to change, says so.
@@ -1718,7 +1716,8 @@ fn wrapped_client_shapes_keep_their_arguments_checked() {
     assert!(names(&option(&plain, "model_default")["remove"]).is_empty());
 
     // The Responses API takes `reasoning={"effort": "none"}`; its sampling
-    // rule is a check (not verified live), and its tools need no change.
+    // rule is a check (documented, not live-checked), and its tools need no
+    // change.
     let respond = at("respond");
     let respond_decision = decision(&respond);
     let add = &option(&respond_decision, "reasoning_none")["add"];
@@ -1742,9 +1741,11 @@ fn wrapped_client_shapes_keep_their_arguments_checked() {
     assert_eq!(text.matches(unseen).count(), 1, "{text}");
     let unnamed = "let the model reason (could not check the arguments spread in with **)";
     assert_eq!(text.matches(unnamed).count(), 1, "{text}");
-    // The Responses API's temperature was never checked there.
+    // The Responses API's temperature: no live call checked it there, but
+    // OpenAI's "Using GPT-6" guide documents the rule (G6-SAMPLING-RESPONSES,
+    // `docs` since the 28 Oct data, #297), so each option names it.
     assert!(
-        text.contains("let the model reason (could not check temperature)"),
+        text.contains("let the model reason (check temperature)"),
         "{text}"
     );
     assert_eq!(
@@ -1816,10 +1817,12 @@ fn no_option_reads_no_change_next_to_a_check_line_that_says_otherwise() {
     let json = |names: &[&str]| serde_json::json!(names);
 
     // The Responses API: no live call checked temperature there, so the
-    // Chat Completions rule is not applied and neither option vouches for it.
+    // Chat Completions rule is not applied. OpenAI's "Using GPT-6" guide
+    // documents it (G6-SAMPLING-RESPONSES, `docs` since the 28 Oct data,
+    // #297), so both options name temperature as a check.
     for id in ["reasoning_none", "model_default"] {
-        assert_eq!(option("respond", id)["unverified"], json(&["temperature"]));
-        assert!(option("respond", id).get("check").is_none());
+        assert_eq!(option("respond", id)["check"], json(&["temperature"]));
+        assert!(option("respond", id).get("unverified").is_none());
     }
     // Claude: temperature returns 400 whichever way the thinking goes.
     for id in ["thinking_between_tools", "model_default"] {
@@ -1850,10 +1853,10 @@ fn no_option_reads_no_change_next_to_a_check_line_that_says_otherwise() {
 
     let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
     for line in [
-        "decide: keep reasoning off (add reasoning={\"effort\": \"none\"}; could not check temperature) or let the model reason (could not check temperature)",
-        "check: Whether gpt-6-luna accepts temperature, top_p or logprobs on the Responses API is not verified.",
+        "decide: keep reasoning off (add reasoning={\"effort\": \"none\"}; check temperature) or let the model reason (check temperature)",
+        "check: OpenAI's \"Using GPT-6\" guide says to remove temperature, top_p and top_logprobs on gpt-6-luna unless reasoning effort is \"none\"",
         "decide: think only between tools (add thinking={\"type\": \"between_tools\"}; check temperature) or let the model think (check temperature)",
-        "check: Non-default temperature, top_p or top_k return 400 on claude-sonnet-5-5",
+        "check: temperature, top_p or top_k return 400 on claude-sonnet-5-5",
         "decide: keep reasoning off (add reasoning_effort=\"none\"; check stop) or let the model reason (check stop)",
         "decide: keep reasoning off (add reasoning_effort=\"none\"; keep temperature) or let the model reason (remove temperature)",
         "decide: keep reasoning off (add reasoning_effort=\"none\"; could not check the arguments from **settings.llm_options) or let the model reason (could not check the arguments from **settings.llm_options)",
