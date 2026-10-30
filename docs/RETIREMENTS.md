@@ -83,8 +83,8 @@ LangChain takes its own arguments and builds the request, so only the checks abo
 model itself apply there: no *also change* or *decide* lines, and a check to review the
 parameters LangChain sends against the replacement by hand. A retired model there still
 fails the check. Other LangChain models and integrations, LiteLLM's own API, LlamaIndex
-and other wrappers are not checked yet, so a clean result says "No direct
-openai/anthropic/google SDK calls" and nothing more.
+and other wrappers are not checked yet, so a clean result names the direct SDK calls and
+these three chat models and nothing more.
 
 Fine-tuned models (`ft:<base>:...`) follow their base model's schedule. Arbor names a
 base model to retrain on only when the provider lists one that supports fine-tuning;

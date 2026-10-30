@@ -648,7 +648,7 @@ fn summary_lines(report: &RetirementReport, markdown: bool) -> Vec<String> {
     let mut lines = Vec::new();
     if s.affected_calls == 0 {
         lines.push(format!(
-            "No direct openai/anthropic/google SDK calls to retired or retiring models in {} Python file{} (LangChain's ChatOpenAI and ChatAnthropic included). Calls through LiteLLM or other wrappers are not checked yet.",
+            "No direct openai/anthropic/google SDK calls or LangChain chat models (ChatOpenAI, AzureChatOpenAI, ChatAnthropic) use retired or retiring models in {} Python file{}. Calls through LiteLLM or other wrappers are not checked yet.",
             s.files_scanned,
             if s.files_scanned == 1 { "" } else { "s" }
         ));
