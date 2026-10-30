@@ -642,15 +642,16 @@ fn under_root(root: &Path, path: &Path) -> Option<String> {
 }
 
 /// The second pass. When some project file lists model parameters
-/// ([`FileUsages::model_params`]), every other project file whose text
-/// names one of those functions or classes is read and analyzed again with
-/// its imports resolved, and its records replace the first pass's.
+/// ([`FileUsages::model_params`]), every other project file with an import
+/// statement that names one of those functions or classes (see
+/// [`imports_one`]) is read and analyzed again with its imports resolved,
+/// and its records replace the first pass's. An extensionless script may
+/// call a wrapper but is not a module others import.
 fn second_pass(root: &Path, outcomes: &mut [(Candidate, Outcome)], options: &UsageScanOptions) {
-    let project =
-        |c: &Candidate| c.vendored_root.is_none() && c.hidden_root.is_none() && !c.shebang;
+    let project = |c: &Candidate| c.vendored_root.is_none() && c.hidden_root.is_none();
     let mut modules = HashMap::new();
     for (candidate, outcome) in outcomes.iter_mut() {
-        if !project(candidate) {
+        if !project(candidate) || candidate.shebang {
             continue;
         }
         let Some(path) = under_root(root, &candidate.path) else {
@@ -679,13 +680,14 @@ fn second_pass(root: &Path, outcomes: &mut [(Candidate, Outcome)], options: &Usa
             }
             let from = under_root(root, &candidate.path)?;
             let source = read_source(candidate, options).ok()?;
-            let names_one = source
-                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                .any(|word| names.contains(word));
-            if !names_one {
+            if !imports_one(&source, &names) {
                 return None;
             }
-            let parser = detect_language(&candidate.path)?;
+            let parser = if candidate.shebang {
+                get_parser("py")
+            } else {
+                detect_language(&candidate.path)
+            }?;
             let lookup = ImportsOf {
                 index: &index,
                 from: &from,
@@ -700,6 +702,51 @@ fn second_pass(root: &Path, outcomes: &mut [(Candidate, Outcome)], options: &Usa
             *outcome = Outcome::Parsed(found);
         }
     }
+}
+
+/// Whether `source` may import one of `names`: some word of an import
+/// statement's text after `import` is one, read to the end of its line,
+/// through `\` continuations and a parenthesized list. A call through a
+/// wrapper is followed only through `from module import name`, so a file
+/// whose import statements name none is not read again. Text in strings and
+/// comments counts too, which only reads a file that need not be.
+fn imports_one(source: &str, names: &HashSet<String>) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(found) = source[from..].find("import") {
+        let at = from + found;
+        from = at + "import".len();
+        let before = source[..at].chars().next_back();
+        let after = source[from..].chars().next();
+        if before.is_some_and(word) || after.is_some_and(word) {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut end = source.len();
+        let mut last = ' ';
+        for (i, c) in source[from..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                '\n' | ';' if depth == 0 && last != '\\' => {
+                    end = from + i;
+                    break;
+                }
+                _ => {}
+            }
+            if c != '\r' {
+                last = c;
+            }
+        }
+        let statement = &source[from..end];
+        if statement
+            .split(|c: char| !word(c))
+            .any(|name| names.contains(name))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether an extensionless file starts with a Python shebang. Reads at most
@@ -997,6 +1044,12 @@ mod tests {
     fn a_call_to_a_wrapper_in_another_file_is_recorded_where_it_is() {
         let dir = tempdir().unwrap();
         write(dir.path(), "evals/sampler/o_sampler.py", SAMPLER);
+        // An extensionless script calls it too.
+        write(
+            dir.path(),
+            "bin/bench",
+            "#!/usr/bin/env python3\nfrom evals.sampler.o_sampler import Sampler\nSampler(model=\"o1-mini\")\n",
+        );
         // A relative import from the package, an absolute one from a
         // script in a subdirectory, and a file that names no SDK at all.
         write(
@@ -1019,6 +1072,12 @@ mod tests {
         assert_eq!(
             wrapper_calls(&report),
             [
+                (
+                    "bin/bench".to_string(),
+                    3,
+                    "Sampler".to_string(),
+                    Some("o1-mini".to_string())
+                ),
                 (
                     "evals/run.py".to_string(),
                     2,
@@ -1052,9 +1111,9 @@ mod tests {
         assert!(request.request);
         assert_eq!(request.values[0].value, "o1-mini");
         assert_eq!(report.summary.requests, 1);
-        assert_eq!(report.summary.calls, 3);
-        assert_eq!(report.summary.files_with_calls, 3);
-        assert_eq!(report.summary.calls_with_model, 3);
+        assert_eq!(report.summary.calls, 4);
+        assert_eq!(report.summary.files_with_calls, 4);
+        assert_eq!(report.summary.calls_with_model, 4);
 
         // Paths in records follow the display root, resolution does not.
         let options = UsageScanOptions {
@@ -1121,6 +1180,29 @@ mod tests {
         )
         .unwrap();
         assert!(report.usages.is_empty());
+    }
+
+    #[test]
+    fn only_a_file_whose_imports_name_a_wrapper_is_read_again() {
+        let names: HashSet<String> = ["Sampler", "ask"].iter().map(|n| n.to_string()).collect();
+        for source in [
+            "from .sampler import Sampler\n",
+            "from .sampler import Other as O, ask\n",
+            "from .sampler import (\n    Other,\n    Sampler,\n)\n",
+            "from .sampler import Other, \\\n    Sampler\n",
+            "import os; from .sampler import ask\n",
+        ] {
+            assert!(imports_one(source, &names), "{source}");
+        }
+        for source in [
+            "Sampler(model=\"o1\")\nask(\"hi\")\n",
+            "from .sampler import Other\nSampler = Other\n",
+            "from .sampler import Other\nask = 1\n",
+            "reimport(Sampler)\n",
+            "from .sampler import Samplers\n",
+        ] {
+            assert!(!imports_one(source, &names), "{source}");
+        }
     }
 
     #[test]
