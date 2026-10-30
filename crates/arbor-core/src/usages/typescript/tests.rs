@@ -2113,6 +2113,53 @@ new Bot().run(\"ask\");",
 }
 
 #[test]
+fn a_hash_private_method_is_out_of_reach_of_a_computed_member() {
+    // `this[kind]` reads a property by a string or symbol: never `#chat`.
+    for elsewhere in [
+        "dispatch(kind: string, m: string) { return (this as any)[kind](m); }",
+        "dispatch(m: string) { return (this as any)[m].call({ model: \"gpt-5.5\" }); }",
+        "dispatch(m: string) { const { [m]: f } = this as any; return f(\"gpt-5.5\"); }",
+    ] {
+        let (value, origin, gaps) = model_row(&format!(
+            "class Router {{
+  #chat(model = \"gpt-4o\") {{
+    return client.chat.completions.create({{ model, messages: [] }});
+  }}
+  route() {{ return this.#chat(); }}
+  {elsewhere}
+}}
+new Router().route();"
+        ));
+        assert_eq!(value.as_deref(), Some("gpt-4o"), "{elsewhere}");
+        assert_eq!(origin, Some(ValueOrigin::ParameterDefault), "{elsewhere}");
+        assert!(gaps.is_empty(), "{elsewhere}: {gaps:?}");
+        let (value, gaps) = model_of(&format!(
+            "class Bot {{
+  private model = \"gpt-4\";
+  #ask() {{ return client.chat.completions.create({{ model: this.model, messages: [] }}); }}
+  run() {{ return this.#ask(); }}
+  {elsewhere}
+}}
+new Bot().run();"
+        ));
+        assert_eq!(value.as_deref(), Some("gpt-4"), "{elsewhere}");
+        assert!(gaps.is_empty(), "{elsewhere}: {gaps:?}");
+    }
+    // A `private` method is a plain property at run time: it is reached.
+    let (_, _, gaps) = model_row(
+        "class Router {
+  private chat(model = \"gpt-4o\") {
+    return client.chat.completions.create({ model, messages: [] });
+  }
+  route() { return this.chat(); }
+  dispatch(kind: string, m: string) { return (this as any)[kind](m); }
+}
+new Router().route();",
+    );
+    assert_eq!(gaps, vec!["unresolved_model/unseen_callers"]);
+}
+
+#[test]
 fn a_member_in_parentheses_or_a_type_assertion_is_used_as_written() {
     // Parentheses keep the reference, and `!`, `as`, `satisfies` and `<T>`
     // compile to nothing: the chain inside is called, bound or written.

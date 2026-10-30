@@ -5476,14 +5476,15 @@ impl<'t> Ctx<'t> {
     /// another object as `this`: its name is read without being called
     /// (`setTimeout(bot.ask)`, `{ ask: bot.ask }`, `const { ask } = bot`),
     /// it is called through `call`, `apply` or `bind`, or the file does
-    /// either under a name known only at run time (`this[m].call(other)`).
+    /// either under a name known only at run time (`this[m].call(other)`),
+    /// which never reaches a `#name`.
     fn this_rebound(&self, scope: usize) -> bool {
         self.scopes[scope]
             .method
             .and_then(|func| self.funcs[func].method)
             .is_some_and(|m| {
                 !m.ctor
-                    && (self.method_refs_wild
+                    && ((self.method_refs_wild && !m.name.starts_with('#'))
                         || (!m.name.is_empty() && self.method_refs.contains(m.name)))
             })
     }
@@ -7168,9 +7169,11 @@ impl<'t> Ctx<'t> {
                 .cloned()
                 .unwrap_or_default();
             if method.private {
+                // A key known only at run time never reaches a `#name`.
+                let by_key = !method.name.starts_with('#')
+                    && (self.method_refs_wild || self.method_calls_wild);
                 let complete = !self.method_refs.contains(method.name)
-                    && !self.method_refs_wild
-                    && !self.method_calls_wild
+                    && !by_key
                     && sites.len() <= MAX_CALLERS_READ
                     && class.decorated.is_none();
                 return Callers {
