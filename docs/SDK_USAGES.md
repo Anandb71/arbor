@@ -618,8 +618,9 @@ These are reported with no gap (`model`, and the other keys in `VALUE_KEYS`):
    `bind`), it keeps an `attribute` gap. A method reached under a name known
    only at run time and called through `call`, `apply` or `bind`
    (`this[m].call(other)`), or a computed key in an object pattern (`const {
-   [m]: f } = this`), may be any method: then every method's reads of `this`
-   keep the gap. Reads by class name are confirmed.
+   [m]: f } = this`), may be any method but a `#name`, which no computed key
+   reaches: then every other method's reads of `this` keep the gap. Reads by
+   class name are confirmed.
 6. **A parameter default, when every call of the function is in this file**
    and none passes another value. The calls are all seen for:
    - a function declaration, or a `const` bound to an arrow function or
@@ -634,8 +635,9 @@ These are reported with no gap (`model`, and the other keys in `VALUE_KEYS`):
      object pattern, as in `const { ask } = this`): every call of its name in
      the file is listed. A method called under a name known only at run time
      (`this[kind](...)`, `r[name](...)`, `this[m].call(...)`) may be any
-     method, as with Python's `getattr(self, kind)(...)`: then no private
-     method's calls are all seen;
+     method, as with Python's `getattr(self, kind)(...)`: then no `private`
+     method's calls are all seen. A `#private` method's are, since no
+     computed key reaches a `#name`;
    - the constructor of a class that is not exported, is only constructed by
      name (`new Bot(...)`, or a class expression's own name), has no
      same-file subclass, no `new this()` and no `.constructor` used as a
