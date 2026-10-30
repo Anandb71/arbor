@@ -668,11 +668,11 @@ enum ClientCaveat {
     /// `api_base` or `api_type`, or a `**` expansion that may hold one
     /// (`what`), which routes it whatever the module's settings are.
     CallRouting { what: &'static str },
-    /// A client known only from a type annotation that names a direct class
-    /// (`def ask(client: OpenAI)`; also `Anthropic`, `genai.Client`) or
-    /// classes that route differently (`AzureOpenAI | OpenAI`): how it was
-    /// built, and so whether it was given a `base_url` or another endpoint,
-    /// is not seen.
+    /// A client known only from a type annotation that does not decide its
+    /// route: one that names a direct class (`def ask(client: OpenAI)`; also
+    /// `Anthropic`, `genai.Client`), whose `base_url` or other endpoint is
+    /// not seen, or classes that route differently, in one annotation
+    /// (`AzureOpenAI | OpenAI`) or across a binding's typed values.
     Annotation,
 }
 
@@ -7394,7 +7394,7 @@ impl<'t> Ctx<'t> {
                 ClientCaveat::Annotation => (
                     "annotation",
                     format!(
-                        "the client behind `{chain}` is known only by its type annotation, so whether it was given a `base_url` or another endpoint is not seen"
+                        "the client behind `{chain}` is known only by its type annotation, which does not decide its route"
                     ),
                 ),
             };
