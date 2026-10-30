@@ -814,14 +814,20 @@ fn value_keys(pkg: Pkg, receiver: Receiver) -> ValueKeys {
             ValueKeys::Only(&["model_id", "modelId"])
         }
         Pkg::LangchainAws => ValueKeys::Only(&["model_id", "model"]),
+        // `completion(model, ...)` takes no `engine` or `model_name`; a
+        // `deployment_id` replaces the model (see the `reassigned` gap).
+        Pkg::Litellm => ValueKeys::Only(&["model", "deployment_id"]),
         _ => ValueKeys::DEFAULT,
     }
 }
 
 /// The two names a LangChain chat model of `pkg` takes its model under:
-/// its field, then the field's alias.
-fn langchain_model_names(pkg: Pkg) -> [&'static str; 2] {
+/// its field, then the field's alias. On a call on a built Bedrock model
+/// (`receiver` is a client) they are the call's two spellings, which
+/// langchain-aws folds into one `modelId`.
+fn langchain_model_names(pkg: Pkg, receiver: Receiver) -> [&'static str; 2] {
     match pkg {
+        Pkg::LangchainAws if receiver == Receiver::Client => ["model_id", "modelId"],
         Pkg::LangchainAws => ["model_id", "model"],
         _ => ["model", "model_name"],
     }
@@ -7310,9 +7316,11 @@ impl<'t> Ctx<'t> {
             .map(|n| self.text(n));
             let hooked: &[Pkg] = match name {
                 Some("register" | "register_first" | "register_last") => {
+                    // The event name may be a same-file constant.
                     let event = keyword_value(call, |n| self.text(n), |k| k == "event_name")
                         .or(self.arguments(call).first_positional)
-                        .and_then(|n| self.literal(n).ok());
+                        .and_then(|n| self.resolve_value(n, scope, 0).ok())
+                        .map(|resolved| resolved.value);
                     if event.is_some_and(|e| EVENTS.iter().any(|p| e.starts_with(p))) {
                         &BEDROCK
                     } else {
@@ -7802,6 +7810,9 @@ impl<'t> Ctx<'t> {
         // same-file dict.
         let mut model_list =
             target.pkg == Pkg::Litellm && args.kwargs.iter().any(|k| k == "model_list");
+        // A LiteLLM call given a `deployment_id`, which replaces its `model`.
+        let mut deployment =
+            target.pkg == Pkg::Litellm && args.kwargs.iter().any(|k| k == "deployment_id");
         let mut expanded: Vec<usize> = Vec::new();
         // The model keys the expanded same-file dicts give.
         let mut expanded_keys: HashSet<&'static str> = HashSet::new();
@@ -7821,7 +7832,7 @@ impl<'t> Ctx<'t> {
                     continue;
                 }
                 keyed = true;
-                if let Some(known) = langchain_model_names(target.pkg)
+                if let Some(known) = langchain_model_names(target.pkg, target.receiver)
                     .into_iter()
                     .find(|k| *k == key.as_str())
                 {
@@ -7857,6 +7868,9 @@ impl<'t> Ctx<'t> {
             }
             if target.pkg == Pkg::Litellm && expansion.summary.last.contains_key("model_list") {
                 model_list = true;
+            }
+            if target.pkg == Pkg::Litellm && expansion.summary.last.contains_key("deployment_id") {
+                deployment = true;
             }
             if target.pkg != Pkg::Boto3 {
                 let list = self.dict_nested(&expansion);
@@ -7942,7 +7956,7 @@ impl<'t> Ctx<'t> {
         // Bedrock). Given both, which one it keeps is not confirmed; given
         // one, an opaque `**` expansion may hold the other, which (unlike a
         // second `model=` in an SDK call) is no `TypeError`.
-        let [field, alias] = langchain_model_names(target.pkg);
+        let [field, alias] = langchain_model_names(target.pkg, target.receiver);
         let given = |key: &str| args.kwargs.iter().any(|k| k == key) || expanded_keys.contains(key);
         let names = (given(field), given(alias));
         // The key a gap about the model as a whole holds: the name the call
@@ -8045,6 +8059,7 @@ impl<'t> Ctx<'t> {
             let mut remapped = Vec::new();
             if let Some(feature) = self.litellm_aliases {
                 remapped.push((
+                    None,
                     "dynamic_feature",
                     format!(
                         "{} may map the models `{chain}` names to other ones",
@@ -8054,6 +8069,7 @@ impl<'t> Ctx<'t> {
             }
             if model_list {
                 remapped.push((
+                    None,
                     "model_list",
                     format!("`{chain}` is given a `model_list`, which maps the model names it is given to the deployments LiteLLM calls"),
                 ));
@@ -8062,11 +8078,21 @@ impl<'t> Ctx<'t> {
             // says it.
             if opaque_splat && !values.is_empty() {
                 remapped.push((
+                    None,
                     "splat",
                     format!("`{chain}` is given a `**` expansion that may hold a `model_list`, which maps the model names it is given to the deployments LiteLLM calls"),
                 ));
             }
-            for (reason, detail) in remapped {
+            // `completion` sends the `deployment_id` in place of the
+            // `model` (and to Azure): the deployment is the value sent.
+            if deployment {
+                remapped.push((
+                    Some("model"),
+                    "reassigned",
+                    format!("`model` for `{chain}` is replaced by the `deployment_id` it is given, which LiteLLM sends to Azure instead"),
+                ));
+            }
+            for (key, reason, detail) in remapped {
                 self.out.gaps.push(UsageGap {
                     kind: GapKind::UnresolvedModel,
                     sdk: Some(sdk),
@@ -8074,7 +8100,7 @@ impl<'t> Ctx<'t> {
                     span: Some(span),
                     symbol: symbol.clone(),
                     chain: Some(chain.clone()),
-                    key: None,
+                    key: key.map(str::to_string),
                     reason: reason.to_string(),
                     detail,
                     values: Vec::new(),

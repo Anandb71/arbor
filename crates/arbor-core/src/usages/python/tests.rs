@@ -7100,6 +7100,27 @@ chosen.converse(modelId="amazon.titan-text-lite-v1", messages=[])
     assert_eq!(unknown[1].values[0].key, "modelId");
     assert_eq!(unknown[1].values[0].value, "amazon.titan-text-lite-v1");
 
+    // A session given its own botocore session, or a `**` expansion, is
+    // not followed: calls on its clients are Bedrock-shaped gaps.
+    let found = usages(
+        r#"
+import boto3
+custom = boto3.Session(botocore_session=bs)
+custom.client("bedrock-runtime").converse(modelId="amazon.nova-pro-v1:0", messages=[])
+spread = boto3.Session(**cfg)
+spread.client("bedrock-runtime").converse(modelId="amazon.nova-pro-v1:0", messages=[])
+"#,
+    );
+    assert!(found.clients.is_empty(), "{:?}", found.clients);
+    assert!(found.calls.is_empty(), "{:?}", found.calls);
+    for line in [4, 6] {
+        assert_eq!(
+            gaps_on(&found, line),
+            vec!["unknown_client_factory/sdk_call_result".to_string()],
+            "{line}"
+        );
+    }
+
     // Without a boto3 import, `converse` is not taken for Bedrock's.
     let found = usages(
         "from chatkit import bot\nimport openai\n\ndef run(agent):\n    agent.converse(modelId=\"x\")\n",
@@ -7404,6 +7425,31 @@ llm.invoke("hi", model="amazon.nova-lite-v1:0")
     assert!(call_on(&found, 13).values.is_empty());
     assert!(gaps_on(&found, 13).is_empty());
 
+    // A call's two spellings are folded into one `modelId`, the later one
+    // winning: given both, or one next to an opaque `**`, the call's model
+    // is not confirmed.
+    let found = usages(
+        r#"
+from langchain_aws import ChatBedrockConverse
+llm = ChatBedrockConverse(model_id="amazon.nova-pro-v1:0")
+llm.invoke("hi", model_id="amazon.nova-lite-v1:0", modelId="amazon.nova-micro-v1:0")
+llm.invoke("hi", modelId="amazon.nova-lite-v1:0", **options)
+"#,
+    );
+    assert_eq!(
+        gaps_on(&found, 4),
+        vec!["unresolved_model/reassigned".to_string()]
+    );
+    assert_eq!(
+        gaps_on(&found, 5),
+        vec!["unresolved_model/splat".to_string()]
+    );
+    let splat = gaps(&found, GapKind::UnresolvedModel)
+        .into_iter()
+        .find(|g| g.span.unwrap().line == 5)
+        .unwrap();
+    assert_eq!(splat.key.as_deref(), Some("modelId"));
+
     // Its requests read `model_id` when they are sent.
     let found = usages(
         "from langchain_aws import ChatBedrock\nllm = ChatBedrock(model_id=\"amazon.nova-pro-v1:0\")\nllm.model_id = pick()\n",
@@ -7524,6 +7570,39 @@ litellm.completion(model="gpt-4o", messages=[])
         "{:?}",
         found.gaps
     );
+
+    // `deployment_id`, by keyword or in a same-file dict, replaces the
+    // model (and sends it to Azure); `engine` and `model_name` are no
+    // parameters of `completion`.
+    let found = usages(
+        r#"
+import litellm
+AZURE = {"deployment_id": "chat-prod"}
+litellm.completion(model="gpt-3.5-turbo", deployment_id="chat-prod", messages=[])
+litellm.completion(model="gpt-3.5-turbo", messages=[], **AZURE)
+litellm.completion(model="gpt-4o", engine="x", model_name="y", messages=[])
+"#,
+    );
+    let keyed = call_on(&found, 4);
+    assert_eq!(value(keyed, "model"), Some("gpt-3.5-turbo"));
+    assert_eq!(value(keyed, "deployment_id"), Some("chat-prod"));
+    for line in [4, 5] {
+        let replaced: Vec<&UsageGap> = found
+            .gaps
+            .iter()
+            .filter(|g| g.span.is_some_and(|s| s.line == line))
+            .collect();
+        assert_eq!(replaced.len(), 1, "{line}: {replaced:?}");
+        assert_eq!(replaced[0].reason, "reassigned");
+        assert_eq!(replaced[0].key.as_deref(), Some("model"));
+    }
+    let keys: Vec<&str> = call_on(&found, 6)
+        .values
+        .iter()
+        .map(|v| v.key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["model"]);
+    assert!(gaps_on(&found, 6).is_empty());
 }
 
 #[test]
@@ -7576,6 +7655,11 @@ fn bedrock_and_litellm_members_replaced_or_hooked_are_dynamic() {
         ("atexit.register(cleanup)", false),
         ("admin.site.register(Model)", false),
         ("codecs.register(\"search\")", false),
+        // An event name held in a same-file constant.
+        (
+            "EVENT = \"before-call.bedrock-runtime.Converse\"; boto3.Session()._session.register(EVENT, hook)",
+            true,
+        ),
     ] {
         let source = format!(
             "import atexit\nimport boto3\nimport botocore.session\n{setup}\nclient = boto3.client(\"bedrock-runtime\")\nclient.converse(modelId=\"amazon.nova-pro-v1:0\", messages=[])\n"

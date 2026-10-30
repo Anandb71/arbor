@@ -923,6 +923,15 @@ fn call_routing(
         Routing::Unknown if call.sdk == Sdk::Google => (RoutingClass::Unknown, google()),
         Routing::Unknown => (RoutingClass::Unknown, Schedule::Guess),
     };
+    // A Bedrock client's call, or a LangChain Bedrock model's, sends a
+    // Bedrock model ID however it is routed (`unknown` for an unresolved
+    // endpoint, `custom_base_url` for a gateway in front of Bedrock): no
+    // other provider's schedule describes it.
+    let schedule = if call.sdk == Sdk::Aws {
+        Schedule::Unlisted
+    } else {
+        schedule
+    };
     let gap = at_call.iter().find(|g| gaps::holds_routing(g));
     CallRouting {
         class: if gap.is_some() || kind == CallKind::RequestParam {
@@ -3639,6 +3648,28 @@ first_party = brt.converse(modelId="claude-3-5-sonnet-20240620", messages=[])
         assert_eq!(prefixed.provider, Table::GeminiApi);
         assert_eq!(prefixed.status, State::AutoRouted);
         assert!(at("first_party = ").is_none(), "{:#?}", report.routed);
+        // However the Bedrock client is routed: a gateway in front of it
+        // (`custom_base_url`) or an endpoint the file cannot read
+        // (`unknown`).
+        let source = r#"import os
+import boto3
+gateway = boto3.client("bedrock-runtime", endpoint_url="http://localhost:4000")
+gateway.converse(modelId="claude-3-5-sonnet-20240620", messages=[])
+env = boto3.client("bedrock-runtime", endpoint_url=os.environ["BEDROCK_URL"])
+env.converse(modelId="claude-3-5-sonnet-20240620", messages=[])
+"#;
+        let report = check_source(source, &opts);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        assert!(report.routed.is_empty(), "{:#?}", report.routed);
+        // A LiteLLM `deployment_id` replaces the model: a retired `model`
+        // next to one is confirm-first, and does not fail the check.
+        let source = "import litellm\nlitellm.completion(model=\"gpt-3.5-turbo-0613\", deployment_id=\"chat-prod\", messages=[])\n";
+        let report = check_source(source, &opts);
+        assert_eq!(report.routed.len(), 1, "{:#?}", report.routed);
+        assert_eq!(report.routed[0].status, State::Retired);
+        assert_eq!(report.routed[0].confidence, Confidence::ConfirmFirst);
+        assert!(!report.routed[0].fails);
+        assert_eq!(report.exit_code, 0);
         // The same on a client passed in, which the scan cannot resolve.
         let source = "import boto3
 def ask(brt):
