@@ -7921,11 +7921,14 @@ impl<'t> Ctx<'t> {
             Pkg::LangchainAws => "model_id",
             _ => "model",
         };
-        // A call on a built LangChain Bedrock model may be given its model
-        // through `**` too.
-        let bedrock_model_call =
-            target.pkg == Pkg::LangchainAws && target.receiver == Receiver::Client;
-        if !keyed && opaque_splat && (request || model_bearing || bedrock_model_call) {
+        // A call on a built LangChain chat model (`invoke`, `bind`, `batch`,
+        // `stream`...) sends its kwargs over the model's own parameters, so
+        // a `model` there replaces the field.
+        let on_chat_model = target.pkg.is_langchain() && target.receiver == Receiver::Client;
+        // On a Bedrock one, through the Converse API (see the `conditional`
+        // gap below).
+        let bedrock_model_call = on_chat_model && target.pkg == Pkg::LangchainAws;
+        if !keyed && opaque_splat && (request || model_bearing || on_chat_model) {
             let unresolved = Unresolved::new("splat", "**kwargs".to_string());
             self.unresolved_gap(&site, model_key, &unresolved, None);
         } else if !keyed && model_bearing && default_model && !args.list_splat {

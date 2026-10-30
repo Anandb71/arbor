@@ -287,14 +287,15 @@ completion models (`langchain_openai.OpenAI`, `BedrockLLM`),
     models fail to build without one, so neither is it there.
 
   The classes are pydantic models that take keyword arguments only, so a
-  positional argument is not read. A built model's requests read its model
-  field when they are sent, so a write of either of its names (`model` or
-  `model_name`; `model_id` or `model`) on any object other than `self` or a
-  same-file class (`llm.model_name = ...`, `settings.model = ...`), or of an
-  attribute with a run-time name, gives the LangChain chat model values in
-  the file a `dynamic_feature` gap. So does making the model configurable at
-  run time (`configurable_fields(model_name=...)`,
-  `configurable_alternatives(...)`).
+  positional argument is not read. A built model's requests send its model
+  field, read when they are sent, unless the call passes its own (`model`;
+  `model_id` or `modelId` on a Bedrock model; see the calls below). So a
+  write of either of its names (`model` or `model_name`; `model_id` or
+  `model`) on any object other than `self` or a same-file class
+  (`llm.model_name = ...`, `settings.model = ...`), or of an attribute with
+  a run-time name, gives the LangChain chat model values in the file a
+  `dynamic_feature` gap. So does making the model configurable at run time
+  (`configurable_fields(model_name=...)`, `configurable_alternatives(...)`).
 - **The route.** A chat model routes like the SDK client it builds, under the
   client rules in [Routes](#routes). Its endpoint is `base_url` or LangChain's
   own name for it (`openai_api_base`, `anthropic_api_url`), routed by host.
@@ -323,6 +324,11 @@ completion models (`langchain_openai.OpenAI`, `BedrockLLM`),
   `llm.with_structured_output(...)`) are recorded with its routing, as calls on
   a client are. What such a call returns, including a copy
   (`llm.copy(update=...)`, which may change any field), is not followed.
+  LangChain sends a call's keyword arguments over the model's own parameters,
+  so a call may pass its own `model` (`llm.invoke(q, model=...)`,
+  `llm.bind(model=...)`), which is sent in place of the field: a literal is
+  read under the value rules above, a parameter is a gap, and a `**` expansion
+  the file cannot read is a `splat` gap on `model`, as for an SDK request.
   LangChain's run options (`config`, `configurable`, `metadata`, `tags`,
   `callbacks`, `run_name`) and a call's positional input never reach the
   provider's request, so a `model` key inside them is not read.

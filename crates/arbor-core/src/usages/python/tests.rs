@@ -7622,3 +7622,55 @@ fn bedrock_and_litellm_files_pass_the_prefilter() {
         "import boto3\ns3 = boto3.client(\"s3\")\ns3.put_object(Bucket=\"b\", Key=\"k\", Body=b\"\")\n"
     ));
 }
+
+#[test]
+fn langchain_calls_on_a_chat_model_may_pass_their_own_model() {
+    // LangChain sends a call's kwargs over the model's own parameters, so
+    // a `**` expansion the file cannot read may hold the model it sends.
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+llm = ChatOpenAI(model="gpt-4.1")
+claude = ChatAnthropic(model="claude-sonnet-5-5")
+OPTS = {"stop": ["\n"]}
+
+def ask(q, **kwargs):
+    return llm.invoke(q, **kwargs)
+
+def tools(params):
+    return claude.bind(**params)
+
+async def later(qs, **opts):
+    await llm.abatch(qs, **opts)
+
+llm.batch(["a"], **OPTS)
+llm.invoke("hi", model="gpt-3.5-turbo-0301")
+"#,
+    );
+    for line in [10, 13, 16] {
+        let splat: Vec<&UsageGap> = found
+            .gaps
+            .iter()
+            .filter(|g| g.span.unwrap().line == line)
+            .collect();
+        assert_eq!(splat.len(), 1, "line {line}: {:?}", found.gaps);
+        assert_eq!(splat[0].kind, GapKind::UnresolvedModel);
+        assert_eq!(splat[0].reason, "splat");
+        assert_eq!(splat[0].key.as_deref(), Some("model"));
+    }
+    // A same-file dict with no model in it hides nothing.
+    assert!(gaps_on(&found, 18).is_empty(), "{:?}", found.gaps);
+    assert_eq!(
+        value(call_on(&found, 19), "model"),
+        Some("gpt-3.5-turbo-0301")
+    );
+    // The constructors keep their own values, with no gap.
+    assert_eq!(value(call_on(&found, 5), "model"), Some("gpt-4.1"));
+    assert_eq!(
+        value(call_on(&found, 6), "model"),
+        Some("claude-sonnet-5-5")
+    );
+    assert!(gaps_on(&found, 5).is_empty() && gaps_on(&found, 6).is_empty());
+}
