@@ -774,6 +774,19 @@ const LITELLM_REQUESTS: &[&str] = &["completion", "acompletion"];
 /// with none runs its parent's).
 const DEFAULT_MODEL_CLASSES: &[&str] = &["Agent", "ClaudeAgentOptions", "ClaudeCodeOptions"];
 
+/// The Claude Code CLI's model variables: the model a session given none
+/// runs, what each alias resolves to, and the model of subagents.
+const CLAUDE_CODE_MODEL_ENV: &[&str] = &[
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+];
+
 /// What the Claude Code CLI reads its provider or endpoint from: the
 /// provider switches (Bedrock, Vertex AI, Foundry...) and the endpoint
 /// overrides. The SDK runs the CLI with the process environment, and the
@@ -833,6 +846,41 @@ const REEXPORTS: &[(&str, &[Pkg])] = &[
         ],
     ),
 ];
+
+/// The modules of the OpenAI Agents SDK that define or re-export each of its
+/// tracked classes. A class imported from any other `agents` module (a
+/// repository's own `agents.models`) is not the SDK's.
+const AGENTS_MODULES: &[(&str, &[&str])] = &[
+    (
+        "agents",
+        &[
+            "Agent",
+            "RunConfig",
+            "OpenAIResponsesModel",
+            "OpenAIChatCompletionsModel",
+        ],
+    ),
+    ("agents.agent", &["Agent"]),
+    ("agents.run", &["RunConfig"]),
+    ("agents.run_config", &["RunConfig"]),
+    ("agents.models.openai_responses", &["OpenAIResponsesModel"]),
+    (
+        "agents.models.openai_chatcompletions",
+        &["OpenAIChatCompletionsModel"],
+    ),
+    ("agents.extensions.models.litellm_model", &["LitellmModel"]),
+];
+
+/// Whether the Agents SDK's `module` defines or re-exports `class` (see
+/// [`AGENTS_MODULES`]).
+fn agents_exports(module: &str, class: &str) -> bool {
+    AGENTS_MODULES.iter().any(|(listed, classes)| {
+        let mut parts = module.split('.').map(str::trim);
+        classes.contains(&class)
+            && listed.split('.').all(|want| parts.next() == Some(want))
+            && parts.next().is_none()
+    })
+}
 
 /// The packages of the [`REEXPORTS`] module `module` is, or is a submodule
 /// of. Only as many segments as the listed module has are read.
@@ -2341,6 +2389,9 @@ struct Ctx<'t> {
     /// `OpenAIChatCompletionsModel`, `LitellmModel`) built in this file, by
     /// call id: only these route an agent or run they are given.
     agents_model_sites: HashSet<usize>,
+    /// The Agents SDK `RunConfig`s built in this file, by call id, and
+    /// whether each is given a model.
+    agents_run_configs: HashMap<usize, bool>,
     /// The objects of every `env` or `settings` attribute in the file
     /// (`options.env[...] = ...`), which may be Claude Code options' (see
     /// [`Ctx::note_options_rerouted`]).
@@ -2559,6 +2610,7 @@ impl<'t> Ctx<'t> {
             constructions: HashMap::new(),
             constructing: HashSet::new(),
             agents_model_sites: HashSet::new(),
+            agents_run_configs: HashMap::new(),
             options_env_objects: Vec::new(),
             options_rerouted: HashMap::new(),
             options_rerouted_any: None,
@@ -5181,8 +5233,12 @@ impl<'t> Ctx<'t> {
 
             // `from langchain_community.chat_models import ChatOpenAI`,
             // `from agents import Agent`: the class decides its package.
-            let reexport =
-                reexports.and_then(|pkgs| pkgs.iter().find_map(|pkg| client_class(*pkg, &name)));
+            let reexport = reexports
+                .and_then(|pkgs| pkgs.iter().find_map(|pkg| client_class(*pkg, &name)))
+                .filter(|class| {
+                    !matches!(class.pkg, Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm)
+                        || agents_exports(written, class.name)
+                });
             if let Some(class) = reexport {
                 let binding = Binding {
                     local: &local,
@@ -7006,6 +7062,14 @@ impl<'t> Ctx<'t> {
         if matches!(class.family, Family::AgentsModel | Family::Litellm) {
             self.agents_model_sites.insert(call.id());
         }
+        if class.pkg == Pkg::OpenaiAgents && class.name == "RunConfig" {
+            let given = self.arguments(call);
+            let model = given.kwargs.iter().any(|k| k == "model")
+                || given.positional > 0
+                || given.list_splat
+                || given.splat;
+            self.agents_run_configs.insert(call.id(), model);
+        }
         let scope = self.call_scope.get(&call.id()).copied().unwrap_or(0);
         let args = self.arguments(call);
         // Clients routed by their endpoint argument: a direct client's
@@ -7228,27 +7292,57 @@ impl<'t> Ctx<'t> {
                 return Some("`env=`");
             }
         }
-        keyword_value(call, text, |k| k == "settings")
+        if keyword_value(call, text, |k| k == "settings")
             .is_some_and(|settings| settings.kind() != "none")
-            .then_some("`settings=`")
+        {
+            return Some("`settings=`");
+        }
+        // `extra_args={"settings": ...}` is the CLI's `--settings`.
+        let extra = keyword_value(call, text, |k| k == "extra_args")?;
+        let names_no_settings = match extra.kind() {
+            "none" => true,
+            "dictionary" => dict_entries(extra, |n| self.literal(n).ok(), text)
+                .iter()
+                .all(|entry| entry.as_ref().is_some_and(|(k, _)| k != "settings")),
+            _ => false,
+        };
+        (!names_no_settings).then_some("`extra_args=`")
     }
 
     /// Whether Claude Code options' `extra_args=` may hold a model flag:
     /// anything but `None` or a dict literal whose keys are all strings,
     /// none of them `model` or `fallback-model`, with no `**` in it.
     fn extra_args_may_set_model(&self, call: Node<'t>) -> bool {
+        self.option_may_name(
+            call,
+            "extra_args",
+            &["model", "fallback-model", "fallback_model"],
+        )
+    }
+
+    /// Whether Claude Code options' `env=` may set one of the CLI's model
+    /// variables ([`CLAUDE_CODE_MODEL_ENV`]), which pick the model for an
+    /// alias, a subagent or a session given none.
+    fn env_may_set_model(&self, call: Node<'t>) -> bool {
+        self.option_may_name(call, "env", CLAUDE_CODE_MODEL_ENV)
+    }
+
+    /// Whether the dict a call gives as `option=` may hold one of `keys`:
+    /// anything but `None` or a dict literal whose keys are all strings,
+    /// none of them listed, with no `**` in it.
+    fn option_may_name(&self, call: Node<'t>, option: &str, keys: &[&str]) -> bool {
         let text = |n: Node<'t>| self.text(n);
-        let Some(extra) = keyword_value(call, text, |k| k == "extra_args") else {
+        let Some(given) = keyword_value(call, text, |k| k == option) else {
             return false;
         };
-        match extra.kind() {
+        match given.kind() {
             "none" => false,
-            "dictionary" => !dict_entries(extra, |n| self.literal(n).ok(), text)
+            "dictionary" => !dict_entries(given, |n| self.literal(n).ok(), text)
                 .iter()
                 .all(|entry| {
-                    entry.as_ref().is_some_and(|(k, _)| {
-                        !matches!(k.as_str(), "model" | "fallback-model" | "fallback_model")
-                    })
+                    entry
+                        .as_ref()
+                        .is_some_and(|(k, _)| !keys.contains(&k.as_str()))
                 }),
             _ => true,
         }
@@ -7471,13 +7565,14 @@ impl<'t> Ctx<'t> {
     fn positional_model(
         &self,
         call: Node<'t>,
+        scope: usize,
         target: &CallTarget,
         member: &str,
         args: &Args<'t>,
     ) -> Option<(&'static str, Node<'t>)> {
         let first = args.first_positional?;
         if target.pkg.is_agentscope() && target.receiver != Receiver::Client {
-            if !self.builds_credential(first) {
+            if !self.builds_credential(first, scope) {
                 return Some(("model_name", first));
             }
             let (positional, _) = call_arguments(call, |n| self.text(n));
@@ -7491,29 +7586,49 @@ impl<'t> Ctx<'t> {
 
     /// The credential an AgentScope 2 model is given: `credential=`, or a
     /// first positional argument that builds one (`OpenAICredential(...)`).
-    fn agentscope_credential(&self, call: Node<'t>) -> Option<Node<'t>> {
+    fn agentscope_credential(&self, call: Node<'t>, scope: usize) -> Option<Node<'t>> {
         let text = |n: Node<'t>| self.text(n);
         keyword_value(call, text, |k| k == "credential").or_else(|| {
             let (positional, _) = call_arguments(call, text);
             positional
                 .first()
                 .copied()
-                .filter(|first| self.builds_credential(*first))
+                .filter(|first| self.builds_credential(*first, scope))
         })
     }
 
-    /// Whether `expr` calls a class named like AgentScope's credentials
-    /// (`OpenAICredential(...)`, `agentscope.credential.AnthropicCredential(...)`).
-    fn builds_credential(&self, expr: Node<'t>) -> bool {
-        expr.kind() == "call"
-            && expr
-                .child_by_field_name("function")
-                .and_then(|f| match f.kind() {
-                    "identifier" => Some(f),
-                    "attribute" => f.child_by_field_name("attribute"),
-                    _ => None,
-                })
-                .is_some_and(|name| self.text(name).ends_with("Credential"))
+    /// Whether `expr` builds one of AgentScope's credentials: a call of a
+    /// class named like them (`OpenAICredential(...)`) that an `agentscope`
+    /// import binds (`from agentscope.credential import OpenAICredential`,
+    /// `agentscope.credential.OpenAICredential`). Another library's
+    /// (`DefaultAzureCredential()`) is not one.
+    fn builds_credential(&self, expr: Node<'t>, scope: usize) -> bool {
+        if expr.kind() != "call" {
+            return false;
+        }
+        let Some(function) = expr.child_by_field_name("function") else {
+            return false;
+        };
+        let name = match function.kind() {
+            "identifier" => Some(function),
+            "attribute" => function.child_by_field_name("attribute"),
+            _ => None,
+        };
+        if !name.is_some_and(|n| self.text(n).ends_with("Credential")) {
+            return false;
+        }
+        // The name the chain starts from.
+        let mut root = function;
+        while root.kind() == "attribute" {
+            match root.child_by_field_name("object") {
+                Some(object) => root = object,
+                None => return false,
+            }
+        }
+        root.kind() == "identifier"
+            && self
+                .import_target(root, scope)
+                .is_some_and(|target| &*target == "agentscope" || target.starts_with("agentscope."))
     }
 
     /// Where an AgentScope model sends its requests: the provider's own API
@@ -7544,7 +7659,7 @@ impl<'t> Ctx<'t> {
         if args.splat {
             return option("a `**` expansion");
         }
-        let credential = self.agentscope_credential(call);
+        let credential = self.agentscope_credential(call, scope);
         // AgentScope 2 takes its credential first, which a name may hold
         // (`OpenAIChatModel(cred, model=...)`): a first positional argument
         // that is not a model name AgentScope 1 would take may be one.
@@ -7589,7 +7704,7 @@ impl<'t> Ctx<'t> {
         // client arguments (AgentScope 1).
         let mut endpoint: Option<Node<'t>> = None;
         if let Some(credential) = credential {
-            if !self.builds_credential(credential) {
+            if !self.builds_credential(credential, scope) {
                 return option("`credential=`");
             }
             let given = self.arguments(credential);
@@ -8206,8 +8321,14 @@ impl<'t> Ctx<'t> {
                         .import_target(function, scope)
                         .is_some_and(|target| target.ends_with(".set_default_openai_client")));
             let args = self.arguments(call);
+            // A run, by that name or through its import under another.
+            let run = named("RunConfig")
+                || (function.kind() == "identifier"
+                    && self.imported_class(function, scope).is_some_and(|class| {
+                        class.pkg == Pkg::OpenaiAgents && class.name == "RunConfig"
+                    }));
             let provider = args.kwargs.iter().any(|k| k == "model_provider")
-                || (named("RunConfig") && (args.positional > 1 || args.list_splat || args.splat));
+                || (run && (args.positional > 1 || args.list_splat || args.splat));
             if sets_client || provider {
                 self.agents_provider = Some(Self::feature(
                     "the Agents SDK's client or model provider set",
@@ -8244,11 +8365,21 @@ impl<'t> Ctx<'t> {
         if !claude {
             return;
         }
+        // `setattr(o, "env", ...)`, `o.__setattr__("env", ...)`,
+        // `o.__dict__["env"] = ...` and `vars(o)["env"] = ...` are attribute
+        // writes too.
+        let written: Vec<(Node<'t>, usize)> = self
+            .config_assigns
+            .iter()
+            .filter(|assign| matches!(assign.attr, "env" | "settings"))
+            .map(|assign| (assign.object, assign.scope))
+            .collect();
         let objects: Vec<(Node<'t>, usize)> = self
             .options_env_objects
             .iter()
             .chain(self.wild_attr_objects.iter())
             .copied()
+            .chain(written)
             .collect();
         for (object, scope) in objects {
             match self.eval(object, scope, 0) {
@@ -8288,9 +8419,14 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    /// A `RunConfig` given a model (by keyword, by position or through an
-    /// expansion), which every agent it runs uses instead of its own. Only
-    /// in a file that imports one of the Agents SDK's tracked classes.
+    /// What may give the file's agents and model objects another model
+    /// for a run, which replaces theirs: a `RunConfig` given a model (by
+    /// keyword, by position or through an expansion); a `run_config=`
+    /// that is not `None` or a same-file `RunConfig` given none (a
+    /// parameter, `run_config=config` from elsewhere); and a `**` expansion
+    /// given to `Runner.run`, `run_sync` or `run_streamed`, which may hold
+    /// one. Only in a file that imports one of the Agents SDK's tracked
+    /// classes.
     fn note_agents_run_model(&mut self) {
         if !self.imports_agents() {
             return;
@@ -8308,13 +8444,59 @@ impl<'t> Ctx<'t> {
                 || args.positional > 0
                 || args.list_splat
                 || args.splat;
-            if is_run && given {
-                self.agents_run_model = Some(Self::feature(
-                    "a `RunConfig` that gives every agent it runs its model",
-                    call,
-                ));
+            let what = if is_run && given {
+                Some("a `RunConfig` that gives every agent it runs its model")
+            } else if self.runs_agents(function, scope) && args.splat {
+                Some("a run given a `**` expansion, which may hold its `run_config`")
+            } else {
+                let config = keyword_value(call, |n| self.text(n), |k| k == "run_config");
+                match config {
+                    Some(config) if !self.run_config_without_model(config, scope) => {
+                        Some("a run given a `run_config` this file does not show to be built without a model")
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(what) = what {
+                self.agents_run_model = Some(Self::feature(what, call));
                 return;
             }
+        }
+    }
+
+    /// Whether `function` is `Runner.run`, `Runner.run_sync` or
+    /// `Runner.run_streamed`, with `Runner` the Agents SDK's (by its
+    /// import) or so named.
+    fn runs_agents(&self, function: Node<'t>, scope: usize) -> bool {
+        if function.kind() != "attribute" {
+            return false;
+        }
+        let runs = function
+            .child_by_field_name("attribute")
+            .is_some_and(|attr| matches!(self.text(attr), "run" | "run_sync" | "run_streamed"));
+        let runner = function
+            .child_by_field_name("object")
+            .is_some_and(|object| {
+                object.kind() == "identifier"
+                    && (self.text(object) == "Runner"
+                        || self.import_target(object, scope).is_some_and(|target| {
+                            target.starts_with("agents.") && target.ends_with(".Runner")
+                        }))
+            });
+        runs && runner
+    }
+
+    /// Whether a `run_config=` argument gives the run no model: `None`, or
+    /// a same-file `RunConfig` built with none.
+    fn run_config_without_model(&mut self, config: Node<'t>, scope: usize) -> bool {
+        if config.kind() == "none" {
+            return true;
+        }
+        match self.eval(config, scope, 0) {
+            Val::Client { client, path } if path.is_empty() && !client.ambiguous => client
+                .site
+                .is_some_and(|site| self.agents_run_configs.get(&site) == Some(&false)),
+            _ => false,
         }
     }
 
@@ -8497,18 +8679,23 @@ impl<'t> Ctx<'t> {
         // Claude Code options whose `env` or `settings` the file uses after
         // they are built (`options.env["CLAUDE_CODE_USE_BEDROCK"] = "1"`)
         // may run the CLI on another provider.
-        if matches!(client.pkg, Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk)
-            && client.caveat.is_none()
-            && !client.ambiguous
-        {
-            let feature = client
-                .site
-                .and_then(|site| self.options_rerouted.get(&site).copied())
-                .or(self.options_rerouted_any);
-            if let Some(feature) = feature {
-                client.routing = Routing::Unknown;
-                client.caveat = Some(ClientCaveat::OptionsRerouted(feature));
+        // A `base_url` written anywhere does not change the CLI, so the
+        // client rules below do not apply to them; a write with a run-time
+        // name on the options is this gap.
+        if matches!(client.pkg, Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk) {
+            if client.caveat.is_none() && !client.ambiguous {
+                let feature = client
+                    .site
+                    .and_then(|site| self.options_rerouted.get(&site).copied())
+                    .or(self.options_rerouted_any);
+                if let Some(feature) = feature {
+                    client.routing = Routing::Unknown;
+                    client.caveat = Some(ClientCaveat::OptionsRerouted(feature));
+                } else if let Some(feature) = self.sdk_patched.get(&client.pkg) {
+                    client.caveat = Some(ClientCaveat::Dynamic(*feature));
+                }
             }
+            return client;
         }
         // A legacy Gemini model object: `configure(client_options=...)`
         // routes every one of them.
@@ -8853,6 +9040,32 @@ impl<'t> Ctx<'t> {
             }
         }
         target
+    }
+
+    /// The tracked class a name is bound to when every definition of it
+    /// that reaches `node` is an import of that class, read from imports
+    /// alone (nothing is evaluated).
+    fn imported_class(&self, node: Node<'t>, scope: usize) -> Option<ClientClass> {
+        let (key, at) = self.locate(self.text(node), scope, node.start_byte());
+        let imports = self.imports.get(&key)?;
+        let defs = match self.reaching(&key, at) {
+            Reach::All => self.all_defs(&key),
+            Reach::Subset(defs) => defs,
+        };
+        let mut found: Option<ClientClass> = None;
+        for def in defs {
+            let DefRef::Import(i) = def else {
+                return None;
+            };
+            let Val::Class(class) = imports.get(i)?.val else {
+                return None;
+            };
+            match found {
+                Some(seen) if seen != class => return None,
+                _ => found = Some(class),
+            }
+        }
+        found
     }
 
     /// The HTTP library ([`HTTP_LIBRARIES`]) whose `post` function
@@ -9243,7 +9456,8 @@ impl<'t> Ctx<'t> {
         // `GenerativeModel("gemini-pro")`, `genai.embed_content("models/...", text)`:
         // the model is positional.
         if !keyed {
-            if let Some((key, first)) = self.positional_model(call, &target, &member, &args) {
+            if let Some((key, first)) = self.positional_model(call, scope, &target, &member, &args)
+            {
                 keyed = true;
                 let result = self.resolve_value(first, scope, 0);
                 let site = Site {
@@ -9270,7 +9484,13 @@ impl<'t> Ctx<'t> {
             // call sends (a `model_list` gap below covers it).
             let deployments =
                 target.pkg == Pkg::Litellm && keyword.as_deref() == Some("model_list");
-            if (target.pkg.is_langchain() && run_option) || target.pkg == Pkg::Boto3 || deployments
+            // An agent framework's other arguments configure a run or the
+            // CLI (`trace_metadata`, `model_settings`, `extra_args`): a
+            // `model` key in them is not the model a request sends.
+            if (target.pkg.is_langchain() && run_option)
+                || target.pkg == Pkg::Boto3
+                || deployments
+                || target.pkg.is_agent_framework()
             {
                 continue;
             }
@@ -9356,7 +9576,7 @@ impl<'t> Ctx<'t> {
                 model_list = true;
             }
             extra_args_expanded |= expansion.summary.last.contains_key("extra_args");
-            if target.pkg != Pkg::Boto3 {
+            if target.pkg != Pkg::Boto3 && !target.pkg.is_agent_framework() {
                 let list = self.dict_nested(&expansion);
                 let deployments =
                     |path: &str| target.pkg == Pkg::Litellm && path.starts_with("model_list.");
@@ -9510,7 +9730,9 @@ impl<'t> Ctx<'t> {
                     .iter()
                     .find_map(|attr| self.outside_attr_writes.get(attr).copied())
             });
-            let run = (target.pkg == Pkg::OpenaiAgents && member == "Agent")
+            // A run's model replaces an agent's and a model object's.
+            let run = (matches!(target.pkg, Pkg::OpenaiAgents | Pkg::OpenaiAgentsLitellm)
+                && member != "RunConfig")
                 .then_some(self.agents_run_model)
                 .flatten();
             let changed =
@@ -9547,6 +9769,43 @@ impl<'t> Ctx<'t> {
         // expansion that holds them, or one this file cannot read.
         let options = matches!(target.pkg, Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk)
             && member != "AgentDefinition";
+        // Its environment may also set the CLI's model variables: given as
+        // `env=`, or written in the file.
+        let model_env = (matches!(target.pkg, Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk))
+            .then(|| {
+                CLAUDE_CODE_MODEL_ENV
+                    .iter()
+                    .find(|var| self.env_writes.contains(**var))
+                    .map(|var| format!("this file sets `{var}`"))
+                    .or_else(|| {
+                        self.env_wild.map(|feature| {
+                            format!("this file may set one ({})", feature.describe())
+                        })
+                    })
+                    .or_else(|| {
+                        (options && self.env_may_set_model(call))
+                            .then(|| "it is given an `env=` that may set one".to_string())
+                    })
+            })
+            .flatten();
+        if let Some(why) = model_env {
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::UnresolvedModel,
+                sdk: Some(sdk),
+                file: self.file.clone(),
+                span: Some(span),
+                symbol: symbol.clone(),
+                chain: Some(chain.clone()),
+                key: None,
+                reason: "env_var".to_string(),
+                detail: format!(
+                    "the Claude Code CLI behind `{chain}` reads which model an alias, a subagent or a session with none runs from its model variables, and {why}, so which model it uses is not confirmed"
+                ),
+                values: Vec::new(),
+                values_complete: false,
+                args: None,
+            });
+        }
         if options && (self.extra_args_may_set_model(call) || extra_args_expanded || opaque_splat) {
             self.out.gaps.push(UsageGap {
                 kind: GapKind::UnresolvedModel,

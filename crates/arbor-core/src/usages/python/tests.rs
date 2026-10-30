@@ -8254,11 +8254,17 @@ expanded_flags = ClaudeAgentOptions(model="claude-opus-4-1", **FLAGS)
     );
     for line in 4..=8 {
         assert_eq!(call_on(&found, line).routing, Routing::Unknown, "{line}");
-        assert_eq!(
-            gaps_on(&found, line),
-            ["ambiguous_client/endpoint_option"],
-            "{line}"
-        );
+        // An `env=` this file cannot read whole may also set the CLI's
+        // model variables.
+        let expected: &[&str] = if line == 6 || line == 7 {
+            &[
+                "unresolved_model/env_var",
+                "ambiguous_client/endpoint_option",
+            ]
+        } else {
+            &["ambiguous_client/endpoint_option"]
+        };
+        assert_eq!(gaps_on(&found, line), expected, "{line}");
     }
     // A `**` expansion may also hold `extra_args` (below).
     assert_eq!(call_on(&found, 9).routing, Routing::Unknown);
@@ -8488,11 +8494,12 @@ setattr(options, name, value)
 ",
     );
     assert_eq!(call_on(&found, 2).routing, Routing::Unknown);
+    // The options' own gap, not a `base_url` one: the CLI has none.
     assert_eq!(
         gaps_on(&found, 2),
         [
             "unresolved_model/dynamic_feature",
-            "ambiguous_client/base_url_assigned"
+            "ambiguous_client/dynamic_feature"
         ]
     );
     // `self.env` in a same-file class is not options'.
@@ -8554,4 +8561,197 @@ v1_env = OpenAIChatModel(os.getenv("AGENT_MODEL"))
     assert_eq!(call_on(&found, 8).routing, Routing::OpenaiDirect);
     assert_eq!(call_on(&found, 9).routing, Routing::OpenaiDirect);
     assert_eq!(gaps_on(&found, 9), ["unresolved_model/env_var"]);
+}
+
+#[test]
+fn nested_model_keys_in_a_frameworks_arguments_are_not_read() {
+    // Trace metadata, model settings and CLI flags are no model a request
+    // sends.
+    let found = usages(
+        r#"from agents import Agent, RunConfig
+from claude_agent_sdk import ClaudeAgentOptions
+
+run = RunConfig(trace_metadata={"model": "gpt-4o"})
+agent = Agent(name="a", model="gpt-4.1", model_settings={"model": "o3-mini"})
+options = ClaudeAgentOptions(model="claude-sonnet-4-5", extra_args={"model": "claude-3-opus-20240229"})
+"#,
+    );
+    assert!(call_on(&found, 4).values.is_empty());
+    let agent = call_on(&found, 5);
+    assert_eq!(agent.values.len(), 1);
+    assert_eq!(value(agent, "model"), Some("gpt-4.1"));
+    let options = call_on(&found, 6);
+    assert_eq!(options.values.len(), 1);
+    // The flag still leaves the model unconfirmed.
+    assert_eq!(gaps_on(&found, 6), ["unresolved_model/reassigned"]);
+
+    // Nor through a same-file dict expanded with `**`.
+    let found = usages(
+        r#"from agents import Agent
+
+META = {"model": "o1"}
+SETTINGS = {"name": "a", "model": "gpt-4.1", "model_settings": META, "handoff_description": {"model": "x"}}
+agent = Agent(**SETTINGS)
+"#,
+    );
+    let agent = call_on(&found, 5);
+    assert!(
+        agent.values.iter().all(|v| v.key == "model"),
+        "{:?}",
+        agent.values
+    );
+}
+
+#[test]
+fn claude_options_rewritten_through_setattr_or_their_dict_are_gaps() {
+    for change in [
+        "setattr(options, \"env\", {\"CLAUDE_CODE_USE_BEDROCK\": \"1\"})",
+        "options.__setattr__(\"settings\", \"settings.json\")",
+        "options.__dict__[\"env\"] = {\"CLAUDE_CODE_USE_BEDROCK\": \"1\"}",
+        "vars(options)[\"env\"] = {}",
+    ] {
+        let source = format!(
+            "from claude_agent_sdk import ClaudeAgentOptions\noptions = ClaudeAgentOptions(model=\"claude-sonnet-4-5-20250929\")\n{change}\n"
+        );
+        let found = usages(&source);
+        assert_eq!(call_on(&found, 2).routing, Routing::Unknown, "{change}");
+        assert!(
+            gaps_on(&found, 2).contains(&"ambiguous_client/dynamic_feature".to_string()),
+            "{change}: {:?}",
+            found.gaps
+        );
+    }
+    // A write of another attribute is not one.
+    let found = usages(
+        "from claude_agent_sdk import ClaudeAgentOptions\noptions = ClaudeAgentOptions(model=\"claude-sonnet-4-5-20250929\")\nsetattr(options, \"max_turns\", 3)\n",
+    );
+    assert_eq!(call_on(&found, 2).routing, Routing::AnthropicDirect);
+}
+
+#[test]
+fn a_model_a_run_may_be_given_leaves_agents_and_model_objects_unconfirmed() {
+    for run in [
+        "async def ask(q, run_config=None):\n    return await Runner.run(agent, q, run_config=run_config)\n",
+        "async def ask(q, **kwargs):\n    return await Runner.run(agent, q, **kwargs)\n",
+        "def ask(q):\n    return Runner.run_sync(agent, q, run_config=CONFIG)\n",
+    ] {
+        let source = format!(
+            "from agents import Agent, Runner, OpenAIChatCompletionsModel\nfrom openai import AsyncOpenAI\nagent = Agent(name=\"a\", model=\"gpt-4o\")\nmodel = OpenAIChatCompletionsModel(\"gpt-4o\", AsyncOpenAI())\n{run}"
+        );
+        let found = usages(&source);
+        for line in [3, 4] {
+            assert!(
+                gaps_on(&found, line).contains(&"unresolved_model/dynamic_feature".to_string()),
+                "{run} line {line}: {:?}",
+                found.gaps
+            );
+        }
+    }
+    // A run given none, or a same-file `RunConfig` with no model, keeps the
+    // agent's; a `RunConfig` never gets the gap itself.
+    for run in [
+        "Runner.run_sync(agent, \"hi\")",
+        "Runner.run_sync(agent, \"hi\", run_config=None)",
+        "Runner.run_sync(agent, \"hi\", run_config=RunConfig(workflow_name=\"w\"))",
+        "Runner.run_sync(agent, \"hi\", run_config=config)",
+    ] {
+        let source = format!(
+            "from agents import Agent, Runner, RunConfig\nagent = Agent(name=\"a\", model=\"gpt-4o\")\nconfig = RunConfig(workflow_name=\"w\")\n{run}\n"
+        );
+        let found = usages(&source);
+        assert!(gaps_on(&found, 2).is_empty(), "{run}: {:?}", found.gaps);
+        assert!(gaps_on(&found, 3).is_empty(), "{run}: {:?}", found.gaps);
+    }
+}
+
+#[test]
+fn only_the_agents_sdks_own_modules_are_followed() {
+    let found = usages(
+        r#"from agents.agent import Agent
+from agents.run import RunConfig
+from agents.run_config import RunConfig as Config
+from agents.models.openai_responses import OpenAIResponsesModel
+from agents.tools import Agent as ToolAgent
+from agents.models import OpenAIChatCompletionsModel
+
+Agent(name="a", model="gpt-4o")
+RunConfig(model="gpt-4o")
+Config(model="gpt-4o")
+OpenAIResponsesModel("gpt-4o", client)
+ToolAgent(name="b", model="gpt-4o")
+OpenAIChatCompletionsModel("gpt-4o", client)
+"#,
+    );
+    let lines: Vec<u32> = found.calls.iter().map(|c| c.span.line).collect();
+    assert_eq!(lines, vec![8, 9, 10, 11]);
+    assert!(found
+        .imports
+        .iter()
+        .all(|i| i.local != "ToolAgent" && i.local != "OpenAIChatCompletionsModel"));
+}
+
+#[test]
+fn an_aliased_run_given_a_provider_is_a_gap() {
+    let found = usages(
+        "from agents import Agent, RunConfig as Config\nagent = Agent(name=\"a\", model=\"gpt-4o\")\nconfig = Config(None, provider)\n",
+    );
+    assert_eq!(call_on(&found, 2).routing, Routing::Unknown);
+    assert!(gaps_on(&found, 2).contains(&"ambiguous_client/given_client".to_string()));
+}
+
+#[test]
+fn claude_options_may_get_settings_or_model_variables_elsewhere() {
+    let found = usages(
+        r#"import os
+from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions
+
+flags = ClaudeAgentOptions(model="claude-sonnet-4-5-20250929", extra_args={"settings": "team.json"})
+aliases = ClaudeAgentOptions(model="sonnet", env={"ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-5-20250929"})
+plain = ClaudeAgentOptions(model="sonnet", env={"ANTHROPIC_API_KEY": key})
+"#,
+    );
+    assert_eq!(call_on(&found, 4).routing, Routing::Unknown);
+    assert!(gaps_on(&found, 4).contains(&"ambiguous_client/endpoint_option".to_string()));
+    assert_eq!(gaps_on(&found, 5), ["unresolved_model/env_var"]);
+    assert!(gaps_on(&found, 6).is_empty());
+
+    // Set in the file, a model variable reaches agent definitions too.
+    let found = usages(
+        r#"import os
+from claude_agent_sdk import AgentDefinition
+
+os.environ["CLAUDE_CODE_SUBAGENT_MODEL"] = "claude-opus-4-1"
+reviewer = AgentDefinition(description="r", prompt="p", model="opus")
+"#,
+    );
+    assert!(gaps_on(&found, 5).contains(&"unresolved_model/env_var".to_string()));
+}
+
+#[test]
+fn another_librarys_credential_is_not_agentscopes() {
+    let found = usages(
+        r#"from agentscope.model import OpenAIChatModel
+from azure.identity import DefaultAzureCredential
+
+keyword = OpenAIChatModel(credential=DefaultAzureCredential(), model="gpt-4o")
+positional = OpenAIChatModel(DefaultAzureCredential(), "gpt-4o")
+
+
+class OpenAICredential:
+    pass
+
+
+local = OpenAIChatModel(OpenAICredential(), "gpt-4o")
+"#,
+    );
+    for line in [4, 5, 12] {
+        assert_eq!(call_on(&found, line).routing, Routing::Unknown, "{line}");
+        assert!(
+            gaps_on(&found, line).contains(&"ambiguous_client/endpoint_option".to_string()),
+            "{line}: {:?}",
+            found.gaps
+        );
+    }
+    // Read as AgentScope 1's model name, which a call does not resolve to.
+    assert!(call_on(&found, 5).values.is_empty());
 }
