@@ -30,8 +30,10 @@
 //! clean report never claims more than was read.
 //!
 //! Only SDK calls that send a request, bind a model for later requests
-//! (`genai.GenerativeModel(...)`) or set a model in a request parameter
-//! object (a tool config) are checked. Response and type objects built in
+//! (`genai.GenerativeModel(...)`, a LangChain chat model) or set a model in
+//! a request parameter object (a tool config) are checked. A LangChain chat
+//! model takes LangChain's arguments, so only the rules about its model
+//! apply there, and the finding says to check its parameters by hand. Response and type objects built in
 //! code (`ChatCompletion(...)`, `Message(...)`, `.model_validate(...)`) send
 //! nothing; they are counted in [`Summary::response_objects`] and skipped.
 
@@ -662,7 +664,14 @@ pub fn check(input: ScanInput<'_>, data: &Retirements, options: &CheckOptions) -
                     class: RoutingClass::Unknown,
                     routing: "unresolved_client".to_string(),
                     sdk: gap.sdk,
-                    schedule: Schedule::Guess,
+                    // A Bedrock-shaped call (`.converse(...)` where the file
+                    // imports boto3) is looked up no more than a Bedrock
+                    // client's own.
+                    schedule: if gap.sdk == Some(Sdk::Aws) {
+                        Schedule::Unlisted
+                    } else {
+                        Schedule::Guess
+                    },
                     base_url: None,
                     gap: None,
                 },
@@ -857,6 +866,10 @@ enum Schedule {
     /// Routed or unknown: a router prefix names the schedule, else the
     /// model ID's shape, else the SDK's own provider.
     Guess,
+    /// A route whose provider keeps a schedule the data does not hold
+    /// (Amazon Bedrock): nothing is looked up, so no other provider's dates
+    /// are applied to its model IDs.
+    Unlisted,
 }
 
 /// The routing [`crate::usages`] decided. A `base_url` is already routed by
@@ -896,15 +909,28 @@ fn call_routing(
         Routing::GoogleGenerativeaiLegacy => {
             (RoutingClass::Direct, Schedule::One(Table::GeminiApi))
         }
+        // LiteLLM picks the provider from the model string.
         Routing::AzureOpenai
         | Routing::CustomBaseUrl
         | Routing::AnthropicBedrock
-        | Routing::AnthropicVertex => (RoutingClass::Routed, Schedule::Guess),
+        | Routing::AnthropicVertex
+        | Routing::Litellm => (RoutingClass::Routed, Schedule::Guess),
+        // AWS keeps Bedrock's schedule, which the data does not hold.
+        Routing::Bedrock => (RoutingClass::Routed, Schedule::Unlisted),
         // The usage scan leaves a client built with `vertexai=True` or a
         // run-time value unrouted (an `endpoint_option` gap); the schedule
         // still follows what its constructor says.
         Routing::Unknown if call.sdk == Sdk::Google => (RoutingClass::Unknown, google()),
         Routing::Unknown => (RoutingClass::Unknown, Schedule::Guess),
+    };
+    // A Bedrock client's call, or a LangChain Bedrock model's, sends a
+    // Bedrock model ID however it is routed (`unknown` for an unresolved
+    // endpoint, `custom_base_url` for a gateway in front of Bedrock): no
+    // other provider's schedule describes it.
+    let schedule = if call.sdk == Sdk::Aws {
+        Schedule::Unlisted
+    } else {
+        schedule
     };
     let gap = at_call.iter().find(|g| gaps::holds_routing(g));
     CallRouting {
@@ -938,11 +964,14 @@ fn vertexai_of(call: &SdkCall, clients: &[ClientConstruction]) -> Option<VertexA
     })
 }
 
-fn sdk_table(sdk: Sdk) -> Table {
+/// The schedule of the provider whose SDK this is, if it is a provider's
+/// own: the AWS SDK and LiteLLM call many providers' models.
+fn sdk_table(sdk: Sdk) -> Option<Table> {
     match sdk {
-        Sdk::Openai => Table::Openai,
-        Sdk::Anthropic => Table::Anthropic,
-        Sdk::Google => Table::GeminiApi,
+        Sdk::Openai => Some(Table::Openai),
+        Sdk::Anthropic => Some(Table::Anthropic),
+        Sdk::Google => Some(Table::GeminiApi),
+        Sdk::Aws | Sdk::Litellm => None,
     }
 }
 
@@ -1159,6 +1188,7 @@ fn resolve<'d>(
             hit.schedule_unconfirmed = true;
             return Some((hit, RoutingClass::Unknown));
         }
+        Schedule::Unlisted => return None,
         Schedule::Guess => {}
     }
     // Routed or unknown: a router prefix names the schedule, else the model
@@ -1170,9 +1200,20 @@ fn resolve<'d>(
             return Some((hit, RoutingClass::Routed));
         }
     }
+    // LiteLLM sends a Gemini model named with no provider prefix to Vertex
+    // AI (`get_llm_provider`); only `gemini/<model>`, above, reaches the
+    // Gemini API.
+    if routing.sdk == Some(Sdk::Litellm) && model_family(value) == Some(Sdk::Google) {
+        let mut hit = lookup(data, Table::Vertex, value)?;
+        hit.notes.push(
+            "LiteLLM sends a Gemini model named with no provider prefix to Vertex AI, so this is Google Cloud's (Vertex AI) schedule; `gemini/<model>` would reach the Gemini API instead."
+                .to_string(),
+        );
+        return Some((hit, RoutingClass::Routed));
+    }
     let table = model_family(value)
-        .map(sdk_table)
-        .or(routing.sdk.map(sdk_table))?;
+        .and_then(sdk_table)
+        .or(routing.sdk.and_then(sdk_table))?;
     let hit = match lookup(data, table, value) {
         Some(hit) => hit,
         // A Google client whose endpoint is not known may be on Vertex AI,
@@ -1184,7 +1225,7 @@ fn resolve<'d>(
     };
     let table = hit.table;
     // An SDK sending another provider's model is talking to a proxy.
-    let crosses = routing.sdk.is_some_and(|sdk| sdk_table(sdk) != table)
+    let crosses = routing.sdk.is_some_and(|sdk| sdk_table(sdk) != Some(table))
         && !(routing.sdk == Some(Sdk::Google) && table == Table::Vertex);
     let class = if crosses {
         RoutingClass::Routed
@@ -1473,6 +1514,14 @@ fn finding_for(
     // or an object of its own: the call's argument names and endpoint say
     // nothing about it, so only the rules about the model itself apply.
     let nested = value.key.rsplit_once('.').map(|(container, _)| container);
+    // A LangChain chat model takes LangChain's arguments, not the
+    // provider's, and builds the request itself: the same holds, and for
+    // LiteLLM and Amazon Bedrock too.
+    let wrapper = match site {
+        Site::Call(call, _) => wrapper_of(call),
+        Site::Gap(_) => None,
+    };
+    let model_only = nested.is_some() || wrapper.is_some();
     let mut outcome = Outcome::default();
     if call_kind != CallKind::RequestParam {
         if let Some((rule_set, target, source_model, source_family)) = source {
@@ -1480,17 +1529,13 @@ fn finding_for(
                 target,
                 source_model,
                 source_family,
-                endpoint: if nested.is_some() { None } else { endpoint },
+                endpoint: if model_only { None } else { endpoint },
                 routing: &routing.routing,
-                kwargs: if nested.is_some() {
-                    &[]
-                } else {
-                    kwargs.as_slice()
-                },
+                kwargs: if model_only { &[] } else { kwargs.as_slice() },
             };
             let rules = data
                 .rules(rule_set)
-                .filter(|rule| nested.is_none() || about_the_model(rule));
+                .filter(|rule| !model_only || about_the_model(rule));
             outcome = apply_rules(rules, &context);
         }
     }
@@ -1559,6 +1604,20 @@ fn finding_for(
             rule: None,
             message: format!(
                 "The model is set in {container}, nested in this call's arguments: Arbor checked only the model there, not the parameters set next to it, so check those{against} by hand."
+            ),
+            because: Vec::new(),
+            verified: None,
+        });
+    }
+    if let Some(through) = wrapper {
+        let against = live
+            .as_deref()
+            .map(|m| format!(" against {m}"))
+            .unwrap_or_default();
+        reasons.push(ReviewItem {
+            rule: None,
+            message: format!(
+                "The call goes through {through}, which takes its own arguments and builds the request: Arbor checked only the model, not the parameters sent with it, so check those{against} by hand."
             ),
             because: Vec::new(),
             verified: None,
@@ -1658,10 +1717,24 @@ fn finding_for(
     })
 }
 
+/// What a call that is not the provider's own SDK goes through, as people
+/// say it: a LangChain chat model built or called (`LangChain
+/// (langchain_openai)`), LiteLLM, or Amazon Bedrock through boto3.
+fn wrapper_of(call: &SdkCall) -> Option<String> {
+    let package = call.package.as_str();
+    match package {
+        "langchain" => Some(format!("LangChain ({package})")),
+        _ if package.starts_with("langchain_") => Some(format!("LangChain ({package})")),
+        "litellm" => Some("LiteLLM".to_string()),
+        "boto3" => Some("Amazon Bedrock (boto3)".to_string()),
+        _ => None,
+    }
+}
+
 /// A rule about the model itself rather than the request that sends it: a
 /// check or a note with no endpoint and no argument condition. Only these
 /// apply to a model nested in a call's arguments, whose own request the
-/// call's argument names do not describe.
+/// call's argument names do not describe, and to a LangChain chat model.
 fn about_the_model(rule: &ParamRule) -> bool {
     matches!(rule.effect, RuleEffect::Review | RuleEffect::Note)
         && rule.endpoints.is_empty()
@@ -3485,6 +3558,238 @@ def tool_model(tools):
         let call = at("client.chat.completions.create(", "model");
         assert!(change(&call, "max_tokens").is_some(), "{call:#?}");
         assert_eq!(call.decisions.len(), 1);
+    }
+
+    #[test]
+    fn bedrock_and_litellm_calls_are_routed_and_checked_only_for_the_model() {
+        let source = r#"import boto3
+import litellm
+from langchain_aws import ChatBedrock
+
+bedrock = boto3.client("bedrock-runtime")
+nova = bedrock.converse(modelId="amazon.nova-pro-v1:0", messages=[])
+claude = bedrock.converse(modelId="anthropic.claude-3-5-sonnet-20240620-v1:0", messages=[])
+llm = ChatBedrock(model_id="us.anthropic.claude-3-5-sonnet-20241022-v2:0")
+old = litellm.completion(model="gpt-3.5-turbo", messages=[], max_tokens=256)
+routed = litellm.completion(model="anthropic/claude-3-5-sonnet-20241022", messages=[])
+"#;
+        // Routed calls are counted, and listed only on request.
+        let report = check_source(source, &options("2026-10-27"));
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        assert!(report.routed.is_empty());
+        assert_eq!(report.summary.routed_calls, 2);
+        assert_eq!(report.exit_code, 0);
+
+        let mut opts = options("2026-10-27");
+        opts.include_routed = true;
+        let report = check_source(source, &opts);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        // Bedrock keeps its own schedule, which the data does not hold, so
+        // its model IDs match nothing; LiteLLM's are looked up by their
+        // router prefix or their shape.
+        let mut lines: Vec<u32> = report.routed.iter().map(|f| f.line).collect();
+        lines.sort();
+        assert_eq!(
+            lines,
+            vec![line_of(source, "old = "), line_of(source, "routed = ")]
+        );
+        let at = |needle: &str| {
+            let line = line_of(source, needle);
+            report.routed.iter().find(|f| f.line == line).unwrap()
+        };
+        for finding in &report.routed {
+            assert_eq!(finding.routing, "litellm");
+            assert_eq!(finding.routing_class, RoutingClass::Routed);
+            assert_eq!(finding.call_kind, CallKind::Request);
+            assert!(finding.changes.is_empty(), "{:#?}", finding.changes);
+            assert!(finding.decisions.is_empty(), "{:#?}", finding.decisions);
+            assert_eq!(finding.fix, FixKind::Manual);
+            assert!(
+                finding
+                    .review
+                    .iter()
+                    .any(|r| r.message.contains("goes through LiteLLM")),
+                "{:#?}",
+                finding.review
+            );
+        }
+        assert_eq!(at("old = ").status, State::Retired);
+        assert!(at("old = ").fails);
+        assert_eq!(at("routed = ").match_kind, MatchKind::RouterPrefix);
+        assert_eq!(report.exit_code, 1);
+
+        // LiteLLM sends a bare Gemini model to Vertex AI, and only
+        // `gemini/...` to the Gemini API; a Bedrock route looks nothing up,
+        // even a first-party ID Bedrock would reject.
+        let source = r#"import boto3
+import litellm
+
+bare = litellm.completion(model="gemini-3.7-flash", messages=[])
+prefixed = litellm.completion(model="gemini/gemini-3.7-flash", messages=[])
+brt = boto3.client("bedrock-runtime")
+first_party = brt.converse(modelId="claude-3-5-sonnet-20240620", messages=[])
+"#;
+        let report = check_source(source, &opts);
+        let at = |needle: &str| {
+            let line = line_of(source, needle);
+            report.routed.iter().find(|f| f.line == line)
+        };
+        let bare = at("bare = ").expect("a finding on Vertex AI's schedule");
+        assert_eq!(bare.provider, Table::Vertex);
+        assert_eq!(bare.status, State::Retiring);
+        assert!(
+            bare.notes
+                .iter()
+                .any(|n| n.contains("LiteLLM sends a Gemini model")),
+            "{:#?}",
+            bare.notes
+        );
+        let prefixed = at("prefixed = ").expect("a finding on the Gemini API's schedule");
+        assert_eq!(prefixed.provider, Table::GeminiApi);
+        assert_eq!(prefixed.status, State::AutoRouted);
+        assert!(at("first_party = ").is_none(), "{:#?}", report.routed);
+        // However the Bedrock client is routed: a gateway in front of it
+        // (`custom_base_url`) or an endpoint the file cannot read
+        // (`unknown`).
+        let source = r#"import os
+import boto3
+gateway = boto3.client("bedrock-runtime", endpoint_url="http://localhost:4000")
+gateway.converse(modelId="claude-3-5-sonnet-20240620", messages=[])
+env = boto3.client("bedrock-runtime", endpoint_url=os.environ["BEDROCK_URL"])
+env.converse(modelId="claude-3-5-sonnet-20240620", messages=[])
+"#;
+        let report = check_source(source, &opts);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        assert!(report.routed.is_empty(), "{:#?}", report.routed);
+        // A LiteLLM `deployment_id` replaces the model: a retired `model`
+        // next to one is confirm-first, and does not fail the check.
+        let source = "import litellm\nlitellm.completion(model=\"gpt-3.5-turbo-0613\", deployment_id=\"chat-prod\", messages=[])\n";
+        let report = check_source(source, &opts);
+        assert_eq!(report.routed.len(), 1, "{:#?}", report.routed);
+        assert_eq!(report.routed[0].status, State::Retired);
+        assert_eq!(report.routed[0].confidence, Confidence::ConfirmFirst);
+        assert!(!report.routed[0].fails);
+        assert_eq!(report.exit_code, 0);
+        // The same on a client passed in, which the scan cannot resolve.
+        let source = "import boto3
+def ask(brt):
+    return brt.converse(modelId=\"claude-3-5-sonnet-20240620\", messages=[])
+";
+        let report = check_source(source, &opts);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
+        assert!(report.routed.is_empty(), "{:#?}", report.routed);
+
+        // LiteLLM may map a model, a fallback's included, to another one:
+        // through `model_alias_map` or a `model_list`. Both are confirm
+        // first, and a retired one does not fail the check.
+        for remap in [
+            "litellm.model_alias_map = {\"gpt-3.5-turbo-0613\": \"anthropic/claude-3-opus-20240229\"}\n",
+            "",
+        ] {
+            let list = if remap.is_empty() {
+                ", model_list=DEPLOYMENTS"
+            } else {
+                ""
+            };
+            let source = format!(
+                "import litellm\n{remap}litellm.completion(model=\"gpt-3.5-turbo-0613\", messages=[], fallbacks=[{{\"model\": \"gpt-3.5-turbo-0613\"}}]{list})\n"
+            );
+            let report = check_source(&source, &opts);
+            let keys: Vec<&str> = report.routed.iter().map(|f| f.key.as_str()).collect();
+            assert_eq!(keys.len(), 2, "{remap}{list}: {:#?}", report.routed);
+            assert!(keys.contains(&"fallbacks.model"), "{keys:?}");
+            for finding in &report.routed {
+                assert_eq!(finding.status, State::Retired);
+                assert_eq!(finding.confidence, Confidence::ConfirmFirst);
+                assert!(!finding.fails, "{finding:#?}");
+            }
+            assert_eq!(report.exit_code, 0, "{remap}{list}");
+        }
+    }
+
+    #[test]
+    fn langchain_chat_models_get_only_the_rules_about_the_model() {
+        // `ChatOpenAI(max_tokens=...)` is LangChain's argument, which it
+        // maps to the request itself: the SDK's argument changes and
+        // reasoning choices are not the call's to make.
+        let source = r#"from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+from openai import OpenAI
+
+client = OpenAI()
+llm = ChatOpenAI(model="gpt-4o", max_tokens=256, temperature=0)
+claude = ChatAnthropic(model="claude-3-5-sonnet-20241022", temperature=0.2)
+old = ChatOpenAI(model_name="gpt-3.5-turbo")
+plain = client.chat.completions.create(model="gpt-4o", messages=[], max_tokens=256, temperature=0)
+"#;
+        let report = check_source(source, &options("2026-10-27"));
+        let at = |needle: &str| -> Finding {
+            let line = line_of(source, needle);
+            let found: Vec<&Finding> = report.findings.iter().filter(|f| f.line == line).collect();
+            assert_eq!(found.len(), 1, "{needle}: {:#?}", report.findings);
+            found[0].clone()
+        };
+        let data = bundled().unwrap();
+        for (needle, package) in [
+            ("llm = ", "langchain_openai"),
+            ("claude = ", "langchain_anthropic"),
+        ] {
+            let finding = at(needle);
+            assert_eq!(finding.call_kind, CallKind::ModelBinding, "{needle}");
+            assert_eq!(finding.confidence, Confidence::Confirmed, "{needle}");
+            assert_eq!(finding.routing_class, RoutingClass::Direct, "{needle}");
+            assert!(finding.changes.is_empty(), "{:#?}", finding.changes);
+            assert!(finding.decisions.is_empty(), "{:#?}", finding.decisions);
+            assert_eq!(finding.fix, FixKind::Manual, "{needle}");
+            let check = finding
+                .review
+                .iter()
+                .find(|r| r.message.contains("goes through LangChain"))
+                .expect("a check naming LangChain");
+            assert!(check.message.contains(package), "{}", check.message);
+            assert!(
+                check.message.contains(&format!(
+                    "check those against {} by hand",
+                    finding.live_replacement.as_deref().unwrap()
+                )),
+                "{}",
+                check.message
+            );
+            for item in &finding.review {
+                if let Some(id) = &item.rule {
+                    let rule = data.data.rules.iter().find(|r| &r.id == id).unwrap();
+                    assert!(about_the_model(rule), "{id} is about the request");
+                }
+            }
+        }
+        // A retired model still fails the check through LangChain.
+        let old = at("old = ");
+        assert_eq!(old.status, State::Retired);
+        assert!(old.fails);
+        assert_eq!(report.exit_code, 1);
+        // The same model at an SDK request keeps its argument rules.
+        let plain = at("plain = ");
+        assert!(change(&plain, "max_tokens").is_some(), "{plain:#?}");
+        assert_eq!(plain.decisions.len(), 1);
+        assert!(plain
+            .review
+            .iter()
+            .all(|r| !r.message.contains("LangChain")));
+
+        // A model the file may rewrite after the chat model is built is
+        // listed once, as confirm-first, under the name the call passes.
+        let source = "from langchain_openai import ChatOpenAI
+llm = ChatOpenAI(model_name=\"gpt-4o\")
+args.model = pick()
+";
+        let report = check_source(source, &options("2026-10-27"));
+        assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
+        assert_eq!(report.findings[0].confidence, Confidence::ConfirmFirst);
+        assert_eq!(
+            report.findings[0].gap_reason.as_deref(),
+            Some("dynamic_feature")
+        );
+        assert!(report.unreadable.is_empty(), "{:#?}", report.unreadable);
     }
 
     #[test]

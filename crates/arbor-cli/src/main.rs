@@ -362,7 +362,7 @@ enum Commands {
         #[arg(default_value = ".")]
         path: String,
 
-        /// Only this provider's SDK: openai, anthropic or google (alias: gemini)
+        /// Only this provider's SDK: openai, anthropic, google (alias: gemini), aws (alias: bedrock; boto3 and LangChain's Bedrock models) or litellm
         #[arg(long)]
         sdk: Option<String>,
 
@@ -401,7 +401,7 @@ enum Commands {
         #[arg(long, value_name = "DAYS", value_parser = clap::value_parser!(i64).range(0..=36500))]
         fail_within: Option<i64>,
 
-        /// List calls that go through Azure, another host in base_url or another cloud (the provider's dates may not apply) and let them fail the check
+        /// List calls that go through Azure, another host in base_url, another cloud or LiteLLM (the provider's dates may not apply) and let them fail the check
         #[arg(long)]
         include_routed: bool,
 

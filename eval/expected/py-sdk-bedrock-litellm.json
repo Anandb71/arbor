@@ -1,0 +1,53 @@
+{
+  "corpus_version": 1,
+  "suite": "usages",
+  "language": "python",
+  "covers": [
+    "boto3 bedrock-runtime clients: converse, invoke_model and converse_stream route bedrock for any model, with modelId from a module constant, a same-file dict expanded with ** and a literal",
+    "a bedrock-runtime client given an endpoint_url outside AWS is custom_base_url; a boto3 client for another service (s3) and its calls are not tracked",
+    "a modelId read from the environment is an env_var gap",
+    "a Bedrock client built from a boto3.Session and passed to a public helper: in_file_callers on the route, the caller's model listed with the parameter gap",
+    "LangChain's ChatBedrock (model_id=) and ChatBedrockConverse (model=) as clients and model-bearing calls; invoke on the built model keeps its routing; BedrockEmbeddings is not tracked",
+    "litellm.completion / acompletion route litellm, by keyword and by position; litellm.token_counter and a module setting are not calls"
+  ],
+  "usages_expected": [
+    {"at": "app/bedrock_runtime.py:15", "chain": "runtime.converse", "routing": "bedrock", "values": {"modelId": "us.anthropic.claude-sonnet-4-5-20250929-v1:0"}},
+    {"at": "app/bedrock_runtime.py:23", "chain": "runtime.invoke_model", "routing": "bedrock", "values": {"modelId": "amazon.nova-pro-v1:0"}},
+    {"at": "app/bedrock_runtime.py:27", "chain": "gateway.converse_stream", "routing": "custom_base_url", "values": {"modelId": "meta.llama3-70b-instruct-v1:0"}},
+    {"at": "app/bedrock_runtime.py:31", "chain": "runtime.converse", "routing": "bedrock"},
+
+    {"at": "app/session_client.py:9", "chain": "client.converse", "routing": "bedrock"},
+
+    {"at": "app/chat_bedrock.py:4", "chain": "ChatBedrock", "routing": "bedrock", "values": {"model_id": "us.anthropic.claude-3-5-sonnet-20241022-v2:0"}},
+    {"at": "app/chat_bedrock.py:5", "chain": "ChatBedrockConverse", "routing": "bedrock", "values": {"model": "amazon.nova-lite-v1:0"}},
+    {"at": "app/chat_bedrock.py:10", "chain": "chat.invoke", "routing": "bedrock"},
+    {"at": "app/chat_bedrock.py:14", "chain": "converse.invoke", "routing": "bedrock"},
+
+    {"at": "app/litellm_calls.py:11", "chain": "completion", "routing": "litellm", "values": {"model": "gpt-4o-mini"}},
+    {"at": "app/litellm_calls.py:15", "chain": "litellm.acompletion", "routing": "litellm", "values": {"model": "anthropic/claude-3-5-haiku-20241022"}}
+  ],
+  "clients_expected": [
+    {"at": "app/bedrock_runtime.py:9", "constructor": "boto3.client", "binding": "runtime", "routing": "bedrock"},
+    {"at": "app/bedrock_runtime.py:10", "constructor": "boto3.client", "binding": "gateway", "routing": "custom_base_url"},
+    {"at": "app/session_client.py:5", "constructor": "boto3.client", "binding": "bedrock", "routing": "bedrock"},
+    {"at": "app/chat_bedrock.py:4", "constructor": "langchain_aws.ChatBedrock", "binding": "chat", "routing": "bedrock"},
+    {"at": "app/chat_bedrock.py:5", "constructor": "langchain_aws.ChatBedrockConverse", "binding": "converse", "routing": "bedrock"}
+  ],
+  "gaps_expected": [
+    {"at": "app/bedrock_runtime.py:31", "kind": "unresolved_model", "reason": "env_var"},
+    {"at": "app/session_client.py:9", "kind": "unresolved_model", "reason": "parameter"},
+    {"at": "app/session_client.py:9", "kind": "ambiguous_client", "reason": "in_file_callers"}
+  ],
+  "skipped_expected": {"vendored_files": 0, "vendored_calls": 0, "hidden_files": 0, "hidden_calls": 0},
+  "forbidden_in_output": [
+    "bedrock-proxy.internal.example.com",
+    "put_object",
+    "transcripts",
+    "amazon.titan-embed-text-v2:0",
+    "embed_documents",
+    "token_counter"
+  ],
+  "known_missing": [],
+  "known_extra": [],
+  "notes": "Synthetic. Truth is what each line does at run time, except where a policy turns it into a gap. boto3 is followed only to clients built for the service \"bedrock-runtime\" (here as a literal, also through boto3.Session(...).client), and a Bedrock request's model is its modelId, for any model Bedrock serves, so every such call routes bedrock. gateway is given an endpoint_url outside AWS, so it and its converse_stream are custom_base_url (the URL itself is never output). The s3 client storage and its put_object are not tracked. bedrock_runtime.py:31 reads modelId from the environment: no value, an env_var gap. session_client.py passes its client and model to a public function, so the route keeps an in_file_callers gap and the model is a parameter gap listing what the one in-file caller passes. ChatBedrock and ChatBedrockConverse are LangChain chat models on Bedrock: each constructor is a client and a call record with its model (model_id= or model=), and invoke on the built model keeps its routing. BedrockEmbeddings and its embed_documents are not tracked. LiteLLM is followed only through completion and acompletion: litellm_calls.py:15 passes the model by position, through a module constant; litellm.drop_params is a setting, not a patch, and litellm.token_counter is not a request."
+}
