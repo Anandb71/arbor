@@ -156,7 +156,7 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     (
         GapKind::AmbiguousClient,
         "annotation",
-        "the client is a parameter known only by its type annotation, so its options are not seen",
+        "the client is known only by its type annotation, so its options are not seen",
     ),
     (GapKind::AmbiguousClient, "endpoint_env", "this file sets the SDK's endpoint variable"),
     (GapKind::AmbiguousClient, "base_url_env", "the base_url or baseURL is read from the environment"),
@@ -170,6 +170,16 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
         GapKind::AmbiguousClient,
         "module_config",
         "another module may route the module-level API to Azure",
+    ),
+    (
+        GapKind::AmbiguousClient,
+        "module_routing",
+        "a module-level routing setting is not one Arbor can decide",
+    ),
+    (
+        GapKind::AmbiguousClient,
+        "call_routing",
+        "the call passes its own api_base or api_type, or an expansion that may hold one",
     ),
     (
         GapKind::AmbiguousClient,
