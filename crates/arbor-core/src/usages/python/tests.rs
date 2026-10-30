@@ -8254,17 +8254,13 @@ expanded_flags = ClaudeAgentOptions(model="claude-opus-4-1", **FLAGS)
     );
     for line in 4..=8 {
         assert_eq!(call_on(&found, line).routing, Routing::Unknown, "{line}");
-        // An `env=` this file cannot read whole may also set the CLI's
-        // model variables.
-        let expected: &[&str] = if line == 6 || line == 7 {
-            &[
-                "unresolved_model/env_var",
-                "ambiguous_client/endpoint_option",
-            ]
-        } else {
-            &["ambiguous_client/endpoint_option"]
-        };
-        assert_eq!(gaps_on(&found, line), expected, "{line}");
+        // An `env=` this file cannot read whole may set the CLI's model
+        // variables, but a full model ID given as `--model` wins over them.
+        assert_eq!(
+            gaps_on(&found, line),
+            ["ambiguous_client/endpoint_option"],
+            "{line}"
+        );
     }
     // A `**` expansion may also hold `extra_args` (below).
     assert_eq!(call_on(&found, 9).routing, Routing::Unknown);
@@ -8754,4 +8750,130 @@ local = OpenAIChatModel(OpenAICredential(), "gpt-4o")
     }
     // Read as AgentScope 1's model name, which a call does not resolve to.
     assert!(call_on(&found, 5).values.is_empty());
+}
+
+#[test]
+fn agentscope_sends_a_model_nested_in_its_request_arguments() {
+    let found = usages(
+        r#"from agentscope.model import OpenAIChatModel, AnthropicChatModel
+
+v1 = OpenAIChatModel(model_name="gpt-4o", generate_kwargs={"model": "gpt-3.5-turbo-0301"})
+v2 = OpenAIChatModel(credential=OpenAICredential(api_key=key), model="gpt-4.1", extra_body={"model": "gpt-4o-mini"})
+claude = AnthropicChatModel(model_name="claude-sonnet-5-5", generate_kwargs={"model": "claude-3-opus-20240229"})
+sampling = OpenAIChatModel(model_name="gpt-4o", generate_kwargs={"temperature": 0.2})
+opaque = OpenAIChatModel(model_name="gpt-4o", generate_kwargs=settings)
+SETTINGS = {"model_name": "gpt-4o", "generate_kwargs": {"model": "o1"}}
+expanded = OpenAIChatModel(**SETTINGS)
+"#,
+    );
+    // The nested model is the one AgentScope sends.
+    assert_eq!(
+        value(call_on(&found, 3), "generate_kwargs.model"),
+        Some("gpt-3.5-turbo-0301")
+    );
+    assert_eq!(gaps_on(&found, 3), ["unresolved_model/reassigned"]);
+    let over = found
+        .gaps
+        .iter()
+        .find(|g| g.span.is_some_and(|s| s.line == 3))
+        .unwrap();
+    assert_eq!(over.key.as_deref(), Some("model_name"));
+    assert_eq!(
+        value(call_on(&found, 4), "extra_body.model"),
+        Some("gpt-4o-mini")
+    );
+    assert!(gaps_on(&found, 4).contains(&"unresolved_model/reassigned".to_string()));
+    assert_eq!(
+        value(call_on(&found, 5), "generate_kwargs.model"),
+        Some("claude-3-opus-20240229")
+    );
+    assert_eq!(gaps_on(&found, 5), ["unresolved_model/reassigned"]);
+    // Sampling arguments only: the model it is built with is the one sent.
+    assert!(gaps_on(&found, 6).is_empty());
+    assert_eq!(gaps_on(&found, 7), ["unresolved_model/reassigned"]);
+    assert_eq!(
+        value(call_on(&found, 9), "generate_kwargs.model"),
+        Some("o1")
+    );
+    assert!(gaps_on(&found, 9).contains(&"unresolved_model/reassigned".to_string()));
+}
+
+#[test]
+fn a_runner_named_any_way_given_an_expansion_leaves_agents_unconfirmed() {
+    for run in [
+        "import agents\nasync def ask(q, **kw):\n    return await agents.Runner.run(agent, q, **kw)\n",
+        "runner = Runner\nasync def ask(q, **kw):\n    return await runner.run(agent, q, **kw)\n",
+        "class Bot:\n    def ask(self, q, **kw):\n        return self.runner.run_sync(agent, q, **kw)\n",
+    ] {
+        let source = format!(
+            "from agents import Agent, Runner\nagent = Agent(name=\"a\", model=\"gpt-4o\")\n{run}"
+        );
+        let found = usages(&source);
+        assert!(
+            gaps_on(&found, 2).contains(&"unresolved_model/dynamic_feature".to_string()),
+            "{run}: {:?}",
+            found.gaps
+        );
+    }
+}
+
+#[test]
+fn the_clis_model_variables_change_only_aliases_and_subagents() {
+    let found = usages(
+        r#"from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions
+
+full = ClaudeAgentOptions(model="claude-3-opus-20240229", env={"CLAUDE_CODE_SUBAGENT_MODEL": "claude-sonnet-4-5-20250929"})
+team = ClaudeAgentOptions(
+    model="claude-sonnet-4-5-20250929",
+    env={"ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-3-5-sonnet-20240620"},
+    agents={"reviewer": AgentDefinition(description="r", prompt="p", model="sonnet")},
+)
+CFG = {"env": {"ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-3-5-sonnet-20240620"}}
+expanded = ClaudeAgentOptions(model="sonnet", **CFG)
+configured = ClaudeAgentOptions(model="opus", settings='{"env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "x"}}')
+later = ClaudeAgentOptions(model="haiku")
+later.env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = "claude-3-haiku-20240307"
+"#,
+    );
+    // A full model ID: the variables cannot change it.
+    assert!(gaps_on(&found, 3).is_empty(), "{:?}", found.gaps);
+    assert!(!gaps_on(&found, 4).contains(&"unresolved_model/env_var".to_string()));
+    // The subagent's alias resolves through its options' environment.
+    let subagent = found
+        .gaps
+        .iter()
+        .find(|g| g.span.is_some_and(|s| s.line == 7) && g.reason == "env_var")
+        .expect("the definition's alias is unconfirmed");
+    assert_eq!(subagent.key.as_deref(), Some("model"));
+    for line in [10, 11, 12] {
+        assert!(
+            gaps_on(&found, line).contains(&"unresolved_model/env_var".to_string()),
+            "{line}: {:?}",
+            gaps_on(&found, line)
+        );
+    }
+}
+
+#[test]
+fn claude_options_given_flags_after_they_are_built_are_gaps() {
+    for change in [
+        "options.extra_args[\"settings\"] = \"bedrock.json\"",
+        "options.extra_args = {\"model\": \"claude-3-opus-20240229\"}",
+        "setattr(options, \"extra_args\", flags)",
+    ] {
+        let source = format!(
+            "from claude_agent_sdk import ClaudeAgentOptions\noptions = ClaudeAgentOptions(model=\"claude-sonnet-4-5-20250929\", extra_args={{}})\n{change}\n"
+        );
+        let found = usages(&source);
+        assert_eq!(call_on(&found, 2).routing, Routing::Unknown, "{change}");
+        let gaps = gaps_on(&found, 2);
+        assert!(
+            gaps.contains(&"ambiguous_client/dynamic_feature".to_string()),
+            "{change}: {gaps:?}"
+        );
+        assert!(
+            gaps.contains(&"unresolved_model/reassigned".to_string()),
+            "{change}: {gaps:?}"
+        );
+    }
 }

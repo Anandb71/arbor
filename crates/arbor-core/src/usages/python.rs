@@ -1068,6 +1068,36 @@ fn value_keys(pkg: Pkg, receiver: Receiver) -> ValueKeys {
     }
 }
 
+/// Whether a call of `pkg` reads no model keys nested in its other
+/// arguments: the OpenAI Agents SDK's and the Claude Agent SDK's configure a
+/// run or the CLI (`trace_metadata`, `model_settings`, `extra_args`), so a
+/// `model` in them is not the model a request sends. An AgentScope model's
+/// are read: it sends `generate_kwargs` (AgentScope 1) and `extra_body`
+/// (AgentScope 2) in its request, over its own model.
+fn reads_no_nested_models(pkg: Pkg) -> bool {
+    pkg.is_agent_framework() && !pkg.is_agentscope()
+}
+
+/// The aliases the Claude Code CLI resolves to a model through its model
+/// variables, compared without case.
+const CLAUDE_CODE_ALIASES: &[&str] = &[
+    "default",
+    "best",
+    "fable",
+    "opus",
+    "sonnet",
+    "haiku",
+    "sonnet[1m]",
+    "opus[1m]",
+    "opusplan",
+];
+
+fn is_claude_alias(value: &str) -> bool {
+    CLAUDE_CODE_ALIASES
+        .iter()
+        .any(|alias| alias.eq_ignore_ascii_case(value))
+}
+
 /// The attributes that hold the model of what an agent framework's class of
 /// `pkg` builds, which a write after it is built changes.
 fn framework_model_fields(pkg: Pkg) -> &'static [&'static str] {
@@ -2395,12 +2425,17 @@ struct Ctx<'t> {
     /// The objects of every `env` or `settings` attribute in the file
     /// (`options.env[...] = ...`), which may be Claude Code options' (see
     /// [`Ctx::note_options_rerouted`]).
-    options_env_objects: Vec<(Node<'t>, usize)>,
+    options_env_objects: Vec<(Node<'t>, usize, &'t str)>,
     /// Claude Code options whose `env` or `settings` the file uses after
     /// they are built, by construction call id, and whether an object this
     /// file cannot identify may be such options.
     options_rerouted: HashMap<usize, Feature>,
     options_rerouted_any: Option<Feature>,
+    /// Claude Code options given CLI flags (`extra_args`) after they are
+    /// built, by construction call id, and whether an object this file
+    /// cannot identify may be such options.
+    options_flags: HashMap<usize, Feature>,
+    options_flags_any: Option<Feature>,
     name_memo: HashMap<Key, Memo<Val>>,
     attr_memo: HashMap<Key, Memo<Val>>,
     /// The same for `self.x` / `cls.x`, read with subclasses and outside
@@ -2614,6 +2649,8 @@ impl<'t> Ctx<'t> {
             options_env_objects: Vec::new(),
             options_rerouted: HashMap::new(),
             options_rerouted_any: None,
+            options_flags: HashMap::new(),
+            options_flags_any: None,
             name_memo: HashMap::new(),
             attr_memo: HashMap::new(),
             dyn_attr_memo: HashMap::new(),
@@ -7411,6 +7448,23 @@ impl<'t> Ctx<'t> {
     /// their `agents=` dict (`ClaudeAgentOptions(agents={"r":
     /// AgentDefinition(...)})`), as built.
     fn enclosing_options(&mut self, call: Node<'t>) -> Option<Client> {
+        let options = self.enclosing_options_call(call)?;
+        let function = options.child_by_field_name("function")?;
+        let scope = self.call_scope.get(&options.id()).copied().unwrap_or(0);
+        match self.eval(function, scope, 0) {
+            Val::Class(class)
+                if class.family == Family::ClaudeCode && class.name != "AgentDefinition" =>
+            {
+                Some(self.construction(options, class))
+            }
+            _ => None,
+        }
+    }
+
+    /// The call an agent definition is built inside, by its `agents=` dict
+    /// (`ClaudeAgentOptions(agents={"r": AgentDefinition(...)})`), whatever
+    /// that call is.
+    fn enclosing_options_call(&self, call: Node<'t>) -> Option<Node<'t>> {
         let pair = self.parents.get(&call.id()).copied()?;
         if pair.kind() != "pair"
             || pair.child_by_field_name("value").map(|v| v.id()) != Some(call.id())
@@ -7426,21 +7480,48 @@ impl<'t> Ctx<'t> {
         {
             return None;
         }
-        let options = keyword
+        keyword
             .parent()
             .filter(|list| list.kind() == "argument_list")?
             .parent()
-            .filter(|c| c.kind() == "call")?;
-        let function = options.child_by_field_name("function")?;
-        let scope = self.call_scope.get(&options.id()).copied().unwrap_or(0);
-        match self.eval(function, scope, 0) {
-            Val::Class(class)
-                if class.family == Family::ClaudeCode && class.name != "AgentDefinition" =>
-            {
-                Some(self.construction(options, class))
-            }
-            _ => None,
+            .filter(|c| c.kind() == "call")
+    }
+
+    /// Why the Claude Code CLI's model variables ([`CLAUDE_CODE_MODEL_ENV`])
+    /// may be set for the options built by `options` (`None` for an agent
+    /// definition built outside any), if they may: the file sets one or
+    /// writes the environment with a run-time name, or the options' `env=`
+    /// may name one, a `**` expansion, `settings=` or `extra_args` may set
+    /// one, or the file changes their environment after they are built.
+    fn claude_model_vars(&self, options: Option<Node<'t>>) -> Option<String> {
+        if let Some(var) = CLAUDE_CODE_MODEL_ENV
+            .iter()
+            .find(|var| self.env_writes.contains(**var))
+        {
+            return Some(format!("this file sets `{var}`"));
         }
+        if let Some(feature) = self.env_wild {
+            return Some(format!("this file may set them ({})", feature.describe()));
+        }
+        let call = options?;
+        let text = |n: Node<'t>| self.text(n);
+        let why = if self.env_may_set_model(call) {
+            "its options' `env=` may set one"
+        } else if self.arguments(call).splat {
+            "its options are given a `**` expansion, which may hold an `env`"
+        } else if keyword_value(call, text, |k| k == "settings").is_some_and(|v| v.kind() != "none")
+        {
+            "its options' `settings=` may set one"
+        } else if self.option_may_name(call, "extra_args", &["settings"]) {
+            "its options' `extra_args` may give the CLI settings that set one"
+        } else if self.options_rerouted.contains_key(&call.id())
+            || self.options_rerouted_any.is_some()
+        {
+            "the file may change its options' environment after they are built"
+        } else {
+            return None;
+        };
+        Some(why.to_string())
     }
 
     /// Where an Agents SDK class sends its requests, when that is not its
@@ -8342,11 +8423,15 @@ impl<'t> Ctx<'t> {
     /// An attribute named `env` or `settings`, of any object: Claude Code
     /// options hold the CLI's environment and settings there.
     fn note_options_env(&mut self, node: Node<'t>, scope: usize) {
-        let named = node
-            .child_by_field_name("attribute")
-            .is_some_and(|attr| matches!(self.text(attr), "env" | "settings"));
-        if let (true, Some(object)) = (named, node.child_by_field_name("object")) {
-            self.options_env_objects.push((object, scope));
+        let Some(attr) = node.child_by_field_name("attribute") else {
+            return;
+        };
+        let attr = self.text(attr);
+        if let (true, Some(object)) = (
+            matches!(attr, "env" | "settings" | "extra_args"),
+            node.child_by_field_name("object"),
+        ) {
+            self.options_env_objects.push((object, scope, attr));
         }
     }
 
@@ -8368,35 +8453,48 @@ impl<'t> Ctx<'t> {
         // `setattr(o, "env", ...)`, `o.__setattr__("env", ...)`,
         // `o.__dict__["env"] = ...` and `vars(o)["env"] = ...` are attribute
         // writes too.
-        let written: Vec<(Node<'t>, usize)> = self
+        let written: Vec<(Node<'t>, usize, &'t str)> = self
             .config_assigns
             .iter()
-            .filter(|assign| matches!(assign.attr, "env" | "settings"))
-            .map(|assign| (assign.object, assign.scope))
+            .filter(|assign| matches!(assign.attr, "env" | "settings" | "extra_args"))
+            .map(|assign| (assign.object, assign.scope, assign.attr))
             .collect();
-        let objects: Vec<(Node<'t>, usize)> = self
+        // A write with a run-time name may be any of them.
+        let wild: Vec<(Node<'t>, usize, &'t str)> = self
+            .wild_attr_objects
+            .iter()
+            .map(|(object, scope)| (*object, *scope, "env"))
+            .collect();
+        let objects: Vec<(Node<'t>, usize, &'t str)> = self
             .options_env_objects
             .iter()
-            .chain(self.wild_attr_objects.iter())
             .copied()
+            .chain(wild)
             .chain(written)
             .collect();
-        for (object, scope) in objects {
+        for (object, scope, attr) in objects {
+            let flags = attr == "extra_args";
             match self.eval(object, scope, 0) {
                 Val::Client { client, path }
                     if path.is_empty()
                         && matches!(client.pkg, Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk) =>
                 {
                     let feature = Self::feature(
-                        "the options' `env` or `settings` used after they are built",
+                        "the options' `env`, `settings` or `extra_args` used after they are built",
                         object,
                     );
                     match client.site {
                         Some(site) => {
                             self.options_rerouted.entry(site).or_insert(feature);
+                            if flags {
+                                self.options_flags.entry(site).or_insert(feature);
+                            }
                         }
                         None => {
                             self.options_rerouted_any.get_or_insert(feature);
+                            if flags {
+                                self.options_flags_any.get_or_insert(feature);
+                            }
                         }
                     }
                 }
@@ -8410,10 +8508,14 @@ impl<'t> Ctx<'t> {
                     && (matches!(self.text(object), "self" | "cls")
                         || self.class_receiver(object, scope).is_some()) => {}
                 _ => {
-                    self.options_rerouted_any.get_or_insert(Self::feature(
-                        "an `env` or `settings` attribute of an object this file cannot identify, which may be Claude Code options",
+                    let feature = Self::feature(
+                        "an `env`, `settings` or `extra_args` attribute of an object this file cannot identify, which may be Claude Code options",
                         object,
-                    ));
+                    );
+                    self.options_rerouted_any.get_or_insert(feature);
+                    if flags {
+                        self.options_flags_any.get_or_insert(feature);
+                    }
                 }
             }
         }
@@ -8464,9 +8566,11 @@ impl<'t> Ctx<'t> {
         }
     }
 
-    /// Whether `function` is `Runner.run`, `Runner.run_sync` or
-    /// `Runner.run_streamed`, with `Runner` the Agents SDK's (by its
-    /// import) or so named.
+    /// Whether `function` may be the Agents SDK's `Runner.run`,
+    /// `Runner.run_sync` or `Runner.run_streamed`: its receiver is named
+    /// like a runner (`Runner`, `agents.Runner`, `runner = Runner`,
+    /// `self.runner`) or is the SDK's `Runner` imported under another
+    /// name.
     fn runs_agents(&self, function: Node<'t>, scope: usize) -> bool {
         if function.kind() != "attribute" {
             return false;
@@ -8477,9 +8581,14 @@ impl<'t> Ctx<'t> {
         let runner = function
             .child_by_field_name("object")
             .is_some_and(|object| {
-                object.kind() == "identifier"
-                    && (self.text(object) == "Runner"
-                        || self.import_target(object, scope).is_some_and(|target| {
+                let last = match object.kind() {
+                    "identifier" => Some(object),
+                    "attribute" => object.child_by_field_name("attribute"),
+                    _ => None,
+                };
+                last.is_some_and(|name| self.text(name).eq_ignore_ascii_case("runner"))
+                    || (object.kind() == "identifier"
+                        && self.import_target(object, scope).is_some_and(|target| {
                             target.starts_with("agents.") && target.ends_with(".Runner")
                         }))
             });
@@ -9490,7 +9599,7 @@ impl<'t> Ctx<'t> {
             if (target.pkg.is_langchain() && run_option)
                 || target.pkg == Pkg::Boto3
                 || deployments
-                || target.pkg.is_agent_framework()
+                || reads_no_nested_models(target.pkg)
             {
                 continue;
             }
@@ -9519,6 +9628,9 @@ impl<'t> Ctx<'t> {
         // Claude Code options given `extra_args` in an expanded same-file
         // dict (by keyword, see below).
         let mut extra_args_expanded = false;
+        // An AgentScope model given `generate_kwargs` or `extra_body` in an
+        // expanded same-file dict.
+        let mut overrides_expanded = false;
         let mut expanded: Vec<usize> = Vec::new();
         // The model keys the expanded same-file dicts give.
         let mut expanded_keys: HashSet<&'static str> = HashSet::new();
@@ -9576,7 +9688,9 @@ impl<'t> Ctx<'t> {
                 model_list = true;
             }
             extra_args_expanded |= expansion.summary.last.contains_key("extra_args");
-            if target.pkg != Pkg::Boto3 && !target.pkg.is_agent_framework() {
+            overrides_expanded |= expansion.summary.last.contains_key("generate_kwargs")
+                || expansion.summary.last.contains_key("extra_body");
+            if target.pkg != Pkg::Boto3 && !reads_no_nested_models(target.pkg) {
                 let list = self.dict_nested(&expansion);
                 let deployments =
                     |path: &str| target.pkg == Pkg::Litellm && path.starts_with("model_list.");
@@ -9769,42 +9883,108 @@ impl<'t> Ctx<'t> {
         // expansion that holds them, or one this file cannot read.
         let options = matches!(target.pkg, Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk)
             && member != "AgentDefinition";
-        // Its environment may also set the CLI's model variables: given as
-        // `env=`, or written in the file.
-        let model_env = (matches!(target.pkg, Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk))
-            .then(|| {
-                CLAUDE_CODE_MODEL_ENV
+        // The CLI's model variables pick the model an alias resolves to and
+        // a subagent's model; a full model ID given as `--model` wins over
+        // them. So an alias the options are given, and any model of an
+        // agent definition, is not confirmed where they may be set: in the
+        // file, or in the environment of the options a definition runs in.
+        if matches!(target.pkg, Pkg::ClaudeAgentSdk | Pkg::ClaudeCodeSdk) {
+            let definition = member == "AgentDefinition";
+            let options_call = if definition {
+                self.enclosing_options_call(call)
+            } else {
+                Some(call)
+            };
+            if let Some(why) = self.claude_model_vars(options_call) {
+                let mut keys: Vec<String> = values
                     .iter()
-                    .find(|var| self.env_writes.contains(**var))
-                    .map(|var| format!("this file sets `{var}`"))
-                    .or_else(|| {
-                        self.env_wild.map(|feature| {
-                            format!("this file may set one ({})", feature.describe())
-                        })
-                    })
-                    .or_else(|| {
-                        (options && self.env_may_set_model(call))
-                            .then(|| "it is given an `env=` that may set one".to_string())
-                    })
-            })
-            .flatten();
-        if let Some(why) = model_env {
-            self.out.gaps.push(UsageGap {
-                kind: GapKind::UnresolvedModel,
-                sdk: Some(sdk),
-                file: self.file.clone(),
-                span: Some(span),
-                symbol: symbol.clone(),
-                chain: Some(chain.clone()),
-                key: None,
-                reason: "env_var".to_string(),
-                detail: format!(
-                    "the Claude Code CLI behind `{chain}` reads which model an alias, a subagent or a session with none runs from its model variables, and {why}, so which model it uses is not confirmed"
-                ),
-                values: Vec::new(),
-                values_complete: false,
-                args: None,
-            });
+                    .filter(|v| !v.key.contains('.') && (definition || is_claude_alias(&v.value)))
+                    .map(|v| v.key.clone())
+                    .collect();
+                keys.dedup();
+                for key in keys {
+                    self.out.gaps.push(UsageGap {
+                        kind: GapKind::UnresolvedModel,
+                        sdk: Some(sdk),
+                        file: self.file.clone(),
+                        span: Some(span),
+                        symbol: symbol.clone(),
+                        chain: Some(chain.clone()),
+                        detail: format!(
+                            "the Claude Code CLI may pick the `{key}` of `{chain}` through its model variables (an alias's model, a subagent's model), and {why}, so which model it uses is not confirmed"
+                        ),
+                        key: Some(key),
+                        reason: "env_var".to_string(),
+                        values: Vec::new(),
+                        values_complete: false,
+                        args: None,
+                    });
+                }
+            }
+        }
+        // Options given CLI flags after they are built may get another
+        // model.
+        if options {
+            let flags = self
+                .options_flags
+                .get(&call.id())
+                .copied()
+                .or(self.options_flags_any);
+            if let Some(feature) = flags {
+                self.out.gaps.push(UsageGap {
+                    kind: GapKind::UnresolvedModel,
+                    sdk: Some(sdk),
+                    file: self.file.clone(),
+                    span: Some(span),
+                    symbol: symbol.clone(),
+                    chain: Some(chain.clone()),
+                    key: None,
+                    reason: "reassigned".to_string(),
+                    detail: format!(
+                        "`{chain}` may be given other CLI flags after it is built ({}), which may pass another model",
+                        feature.describe()
+                    ),
+                    values: Vec::new(),
+                    values_complete: false,
+                    args: None,
+                });
+            }
+        }
+        // AgentScope sends `generate_kwargs` (AgentScope 1) or `extra_body`
+        // (AgentScope 2) in its request over its own model: one that may
+        // hold a `model` leaves the model it is built with unconfirmed. The
+        // nested value, read above, is the one sent.
+        if target.pkg.is_agentscope() {
+            let given = ["generate_kwargs", "extra_body"]
+                .into_iter()
+                .find(|option| self.option_may_name(call, option, &["model"]))
+                .or((overrides_expanded || opaque_splat).then_some("a `**` expansion"));
+            if let Some(option) = given {
+                let mut keys: Vec<String> = values
+                    .iter()
+                    .filter(|v| v.key == "model" || v.key == "model_name")
+                    .map(|v| v.key.clone())
+                    .collect();
+                keys.dedup();
+                for key in keys {
+                    self.out.gaps.push(UsageGap {
+                        kind: GapKind::UnresolvedModel,
+                        sdk: Some(sdk),
+                        file: self.file.clone(),
+                        span: Some(span),
+                        symbol: symbol.clone(),
+                        chain: Some(chain.clone()),
+                        detail: format!(
+                            "`{chain}` is given `{option}`, whose `model` AgentScope sends in its request instead of the `{key}` it is built with, so which model it uses is not confirmed"
+                        ),
+                        key: Some(key),
+                        reason: "reassigned".to_string(),
+                        values: Vec::new(),
+                        values_complete: false,
+                        args: None,
+                    });
+                }
+            }
         }
         if options && (self.extra_args_may_set_model(call) || extra_args_expanded || opaque_splat) {
             self.out.gaps.push(UsageGap {
