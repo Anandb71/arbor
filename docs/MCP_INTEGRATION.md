@@ -210,7 +210,7 @@ Examples:
 
 All tools return a standard envelope:
 ```json
-{ "ok": true, "tool": "...", "arbor_version": "3.1.0", "data": {...}, "meta": { "node_count": N, "suggested_next_tool": "...", "suggested_next_args": {...} } }
+{ "ok": true, "tool": "...", "arbor_version": "3.1.1", "data": {...}, "meta": { "node_count": N, "suggested_next_tool": "...", "suggested_next_args": {...} } }
 ```
 Errors return `{ "ok": false, "error": "..." }`.
 
