@@ -1628,8 +1628,17 @@ struct Ctx<'t> {
     member_writes: Vec<MemberWrite<'t>>,
     /// Calls by member name (`x.ask(...)`), for private methods' callers.
     method_calls: HashMap<&'t str, Vec<(Node<'t>, usize)>>,
-    /// Member names read without being called (`x.ask` passed or stored).
+    /// Member names read without being called (`x.ask` passed or stored,
+    /// or a key of an object pattern: `const { ask } = bot`).
     method_refs: HashSet<&'t str>,
+    /// A method may be called under a name known only at run time
+    /// (`this[kind](...)`, as Python's `getattr(self, kind)(...)`): no
+    /// method's calls are all seen.
+    method_calls_wild: bool,
+    /// A method may be read under a name known only at run time and run
+    /// with another `this` (`this[m].call(other)`, `const { [m]: f } =
+    /// this`): as if every method name were in `method_refs`.
+    method_refs_wild: bool,
     /// SDK imports found in the walk: the binding, written specifier, the
     /// imported name and its span, recorded once names are bound.
     pending_imports: Vec<(usize, String, Option<String>, Node<'t>)>,
@@ -1773,6 +1782,8 @@ impl<'t> Ctx<'t> {
             member_writes: Vec::new(),
             method_calls: HashMap::new(),
             method_refs: HashSet::new(),
+            method_calls_wild: false,
+            method_refs_wild: false,
             pending_imports: Vec::new(),
             outside_writes: HashMap::new(),
             outside_wild: None,
@@ -2276,6 +2287,7 @@ impl<'t> Ctx<'t> {
                     exported,
                 )),
                 "shorthand_property_identifier_pattern" => {
+                    self.pattern_key(node);
                     let mut path = path;
                     path.push(Step::Key(self.text(node)));
                     declared.push(self.declare(
@@ -2296,6 +2308,9 @@ impl<'t> Ctx<'t> {
                         match child.kind() {
                             "pair_pattern" => {
                                 let key = child.child_by_field_name("key");
+                                if let Some(key) = key {
+                                    self.pattern_key(key);
+                                }
                                 let step = key.map_or(Step::Other, |k| self.key_step(k));
                                 if let Some(key) =
                                     key.filter(|k| k.kind() == "computed_property_name")
@@ -2381,20 +2396,46 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// A key of an object pattern reads that member without calling it
+    /// (`const { ask } = this` is `this.ask` read): the method may then be
+    /// called from anywhere, with any `this`. A computed key that is not a
+    /// literal may read any member.
+    fn pattern_key(&mut self, key: Node<'t>) {
+        let name = match key.kind() {
+            "shorthand_property_identifier_pattern" => Some(self.text(key)),
+            "computed_property_name" => key.named_child(0).and_then(|k| static_key(k, self.src)),
+            _ => match self.key_step(key) {
+                Step::Key(name) => Some(name),
+                _ => None,
+            },
+        };
+        match name {
+            Some(name) => {
+                self.method_refs.insert(name);
+            }
+            None => self.method_refs_wild = true,
+        }
+    }
+
     /// Records the writes of an assignment pattern's targets
     /// (`[a, b] = ...`, `({ x: this.y } = ...)`).
     fn pattern_targets(&mut self, pattern: Node<'t>, f: &Frame<'t>, stack: &mut Vec<Frame<'t>>) {
         let mut work = vec![pattern];
         while let Some(node) = work.pop() {
             match node.kind() {
-                "identifier" | "shorthand_property_identifier_pattern" => self.add_ref(
-                    f.scope,
-                    node,
-                    RefKind::Write(Write {
-                        value: None,
-                        scope: f.scope,
-                    }),
-                ),
+                "identifier" | "shorthand_property_identifier_pattern" => {
+                    if node.kind() == "shorthand_property_identifier_pattern" {
+                        self.pattern_key(node);
+                    }
+                    self.add_ref(
+                        f.scope,
+                        node,
+                        RefKind::Write(Write {
+                            value: None,
+                            scope: f.scope,
+                        }),
+                    )
+                }
                 "member_expression" | "subscript_expression" | "non_null_expression" => {
                     let mut target = self.child(f, node, f.scope, None);
                     target.parent = Some(pattern);
@@ -2407,6 +2448,7 @@ impl<'t> Ctx<'t> {
                 }
                 "pair_pattern" => {
                     if let Some(key) = node.child_by_field_name("key") {
+                        self.pattern_key(key);
                         if key.kind() == "computed_property_name" {
                             stack.push(self.child(f, key, f.scope, None));
                         }
@@ -3721,9 +3763,20 @@ impl<'t> Ctx<'t> {
             _ => {}
         }
         // `x.ask.call(other)`, `.apply(...)`, `.bind(...)`: `ask` runs with
-        // another `this`.
-        if let [.., Step::Key(method), Step::Key("call" | "apply" | "bind")] = path.as_ref() {
-            self.method_refs.insert(method);
+        // another `this`. Under a key known only at run time
+        // (`this[m].call(other)`), any method may; called directly
+        // (`this[kind](...)`), any method may be called.
+        match path.as_ref() {
+            [.., Step::Key(method), Step::Key("call" | "apply" | "bind")] => {
+                self.method_refs.insert(method);
+            }
+            [.., Step::Other, Step::Key("call" | "apply" | "bind")] => {
+                self.method_refs_wild = true;
+            }
+            [.., Step::Other] if matches!(does, ChainUse::Call) => {
+                self.method_calls_wild = true;
+            }
+            _ => {}
         }
         if let Some(Step::Key(last)) = path.last() {
             match does {
@@ -5310,13 +5363,18 @@ impl<'t> Ctx<'t> {
 
     /// Whether the method whose `this` the code in `scope` sees may run with
     /// another object as `this`: its name is read without being called
-    /// (`setTimeout(bot.ask)`, `{ ask: bot.ask }`) or it is called through
-    /// `call`, `apply` or `bind`.
+    /// (`setTimeout(bot.ask)`, `{ ask: bot.ask }`, `const { ask } = bot`),
+    /// it is called through `call`, `apply` or `bind`, or the file does
+    /// either under a name known only at run time (`this[m].call(other)`).
     fn this_rebound(&self, scope: usize) -> bool {
         self.scopes[scope]
             .method
             .and_then(|func| self.funcs[func].method)
-            .is_some_and(|m| !m.ctor && !m.name.is_empty() && self.method_refs.contains(m.name))
+            .is_some_and(|m| {
+                !m.ctor
+                    && (self.method_refs_wild
+                        || (!m.name.is_empty() && self.method_refs.contains(m.name)))
+            })
     }
 
     /// What a class property holds: the one or more writes of it, combined.
@@ -6945,6 +7003,8 @@ impl<'t> Ctx<'t> {
                 .unwrap_or_default();
             if method.private {
                 let complete = !self.method_refs.contains(method.name)
+                    && !self.method_refs_wild
+                    && !self.method_calls_wild
                     && sites.len() <= MAX_CALLERS_READ
                     && class.decorated.is_none();
                 return Callers {

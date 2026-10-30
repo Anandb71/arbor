@@ -1999,6 +1999,120 @@ setTimeout(b.ask);",
 }
 
 #[test]
+fn a_method_called_through_a_computed_member_has_unseen_callers() {
+    // Python's `getattr(self, kind)(model)`: the method is picked at run
+    // time, so no private method's calls are all seen.
+    let router = |route: &str, after: &str| {
+        format!(
+            "class Router {{
+  private chat(model = \"gpt-4o\") {{
+    return client.chat.completions.create({{ model, messages: [] }});
+  }}
+  route(kind: \"chat\", model: string) {{ {route} }}
+}}
+{after}"
+        )
+    };
+    for (route, after) in [
+        (
+            "return this[kind](model);",
+            "new Router().route(\"chat\", \"gpt-5.5\");",
+        ),
+        (
+            "return this[kind]?.(model);",
+            "new Router().route(\"chat\", \"gpt-5.5\");",
+        ),
+        // Read from `this` without a call, as `this.chat` would be.
+        (
+            "const { chat } = this; return chat(model);",
+            "new Router().route(\"chat\", \"gpt-5.5\");",
+        ),
+        (
+            "const { chat: run = () => null } = this; return run(model);",
+            "new Router().route(\"chat\", \"gpt-5.5\");",
+        ),
+        // On an instance.
+        (
+            "return null;",
+            "const r = new Router();
+const name = process.argv[2] as \"chat\";
+r[name](\"gpt-5.5\");",
+        ),
+        (
+            "return null;",
+            "const { chat } = new Router() as any;
+chat(\"gpt-5.5\");",
+        ),
+        (
+            "return null;",
+            "let chat: any;
+({ chat } = new Router() as any);
+chat(\"gpt-5.5\");",
+        ),
+    ] {
+        let body = router(route, after);
+        let (value, origin, gaps) = model_row(&body);
+        assert_eq!(value.as_deref(), Some("gpt-4o"), "{body}");
+        assert_eq!(origin, Some(ValueOrigin::ParameterDefault), "{body}");
+        assert_eq!(gaps, vec!["unresolved_model/unseen_callers"], "{body}");
+    }
+    // A key known in the file is a call by name: its value is listed.
+    let (value, _, gaps) = model_row(&router(
+        "return this[\"chat\"](model);",
+        "new Router().route(\"chat\", \"gpt-5.5\");",
+    ));
+    assert_eq!(value.as_deref(), Some("gpt-4o"));
+    assert_eq!(gaps, vec!["unresolved_model/parameter_overridden"]);
+    // No call through a computed member: every call is seen.
+    let (value, _, gaps) = model_row(&router(
+        "return this.chat();",
+        "const MODELS: Record<string, string> = { chat: \"gpt-4o\" };
+console.log(MODELS[process.argv[2]]);
+new Router().route(\"chat\", \"gpt-5.5\");",
+    ));
+    assert_eq!(value.as_deref(), Some("gpt-4o"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
+fn a_method_run_through_a_computed_member_with_another_this_reads_another_object() {
+    for run in [
+        "return this[m].call({ model: \"gpt-5.5\" });",
+        "return this[m].apply({ model: \"gpt-5.5\" }, []);",
+        "return this[m].bind({ model: \"gpt-5.5\" })();",
+        "const { ask } = this; return ask.call({ model: \"gpt-5.5\" });",
+        "const { [m]: f } = this; return f.call({ model: \"gpt-5.5\" });",
+    ] {
+        let body = format!(
+            "class Bot {{
+  private model = \"gpt-4\";
+  ask() {{ return client.chat.completions.create({{ model: this.model, messages: [] }}); }}
+  run(m: \"ask\") {{ {run} }}
+}}
+new Bot().run(\"ask\");"
+        );
+        let (value, gaps) = model_of(&body);
+        assert_eq!(value.as_deref(), Some("gpt-4"), "{run}");
+        assert!(
+            gaps.iter().any(|g| g == "unresolved_model/attribute"),
+            "{run}: {gaps:?}"
+        );
+    }
+    // Called through a computed member with its own `this`, the class
+    // property is still the one read.
+    let (value, gaps) = model_of(
+        "class Bot {
+  private model = \"gpt-4\";
+  ask() { return client.chat.completions.create({ model: this.model, messages: [] }); }
+  run(m: \"ask\") { return this[m](); }
+}
+new Bot().run(\"ask\");",
+    );
+    assert_eq!(value.as_deref(), Some("gpt-4"));
+    assert!(gaps.is_empty(), "{gaps:?}");
+}
+
+#[test]
 fn an_enum_member_names_the_members_before_outer_names() {
     let (value, gaps) = model_of(
         "const Fast = \"gpt-4\";
