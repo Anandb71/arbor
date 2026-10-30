@@ -21,10 +21,10 @@
 //! `--include-routed`.
 
 use arbor_core::retirements::{
-    bundled, check, routing_gap_text, source_argument, value_gap_text, BaseUrl, CallKind, Change,
-    ChangeKind, CheckOptions, Confidence, Date, DateKind, Decision, Finding, MatchKind,
-    OptionStatus, RetirementReport, RoutingClass, ScanInput, State, Syntax, FINE_TUNING,
-    REPORT_VERSION,
+    bundled, check, routing_gap_text, source_argument, spread_list, value_gap_text, BaseUrl,
+    CallKind, Change, ChangeKind, CheckOptions, Confidence, Date, DateKind, Decision, Finding,
+    MatchKind, OptionStatus, RetirementReport, RoutingClass, ScanInput, State, Summary, Syntax,
+    UncheckedArgs, FINE_TUNING, REPORT_VERSION,
 };
 use arbor_core::usages::{is_unsafe_char, ValueOrigin};
 use arbor_watcher::usages::{scan_usages, UsageScanOptions};
@@ -32,10 +32,11 @@ use colored::Colorize;
 use std::io::Write;
 use std::path::Path;
 
-/// Where the closing line of the human report points people who want the
-/// fix PRs opened for them. The only place this URL is written. The
-/// `utm_source` tag lets the page credit a fix-PR signup to the CLI; the
-/// link carries nothing about the scanned code or the run.
+/// Where the closing lines of the human report point people who want help
+/// with the fixes. The only place this URL is written. The `utm_source` tag
+/// lets the page credit a signup to the CLI. As written here the link
+/// carries nothing about the scanned code or the run; [`review_url`] adds
+/// counts and one date to it, never anything else.
 pub const FIX_PRS_URL: &str = "https://getarbor.dev/retirements?utm_source=arbor-cli";
 
 /// Data older than this gets a reminder to update Arbor.
@@ -171,6 +172,68 @@ fn build_report(args: &Args) -> Result<RetirementReport, String> {
 /// or annotations, and not with `--quiet` or in CI.
 fn show_offer(quiet: bool) -> bool {
     !quiet && !in_ci()
+}
+
+/// The readiness-review link, only when the report lists at least one call
+/// to a retired or retiring model:
+/// `FIX_PRS_URL&review=1&calls=4&retired=1&next=2027-01-14`.
+///
+/// It is built from the summary's counts and the next shutdown date alone,
+/// so it cannot carry a repository name, path, file name, code or model
+/// string. `calls` is every listed call (the summary's first number),
+/// `retired` those already retired, and `next` the soonest shutdown date
+/// among the retiring ones, left out when none is retiring. Routed calls
+/// are not counted (the provider's dates may not apply to them). Nothing
+/// is sent: the person decides whether to open the link.
+fn review_url(summary: &Summary) -> Option<String> {
+    if summary.retired + summary.retiring == 0 {
+        return None;
+    }
+    let mut url = format!(
+        "{FIX_PRS_URL}&review=1&calls={}&retired={}",
+        summary.affected_calls, summary.retired
+    );
+    if let Some(next) = &summary.next_shutdown {
+        url.push_str(&format!("&next={}", next.date.iso()));
+    }
+    Some(url)
+}
+
+/// The closing lines of the human report: the readiness-review offer with
+/// its link when a call uses a retired or retiring model, the fix-PR offer
+/// for any other listed or routed call, and nothing for a clean report.
+fn offer_lines(s: &Summary, routed: bool) -> Vec<String> {
+    if let Some(url) = review_url(s) {
+        let these = if s.affected_calls == 1 {
+            "this call"
+        } else {
+            "these calls"
+        };
+        let ask = match &s.next_shutdown {
+            Some(next) => format!("Want {these} ready before {}?", next.date.human()),
+            None => format!("Want {these} fixed?"),
+        };
+        let carries = if s.next_shutdown.is_some() {
+            "how many calls are listed, how many are already retired and the next shutdown date"
+        } else {
+            "how many calls are listed and how many are already retired"
+        };
+        return vec![
+            format!(
+                "{ask} Ask for a paid readiness review: we write the fix pull requests with you and list every call we find but can't check."
+            ),
+            url,
+            format!(
+                "Arbor has sent nothing. From this run, opening the link shares only {carries}: no code, paths, file names or model names. Your email reaches Arbor only if you submit the form there."
+            ),
+        ];
+    }
+    if s.affected_calls > 0 || routed {
+        return vec![format!(
+            "Want Arbor to open these fixes as pull requests for you? {FIX_PRS_URL}"
+        )];
+    }
+    Vec::new()
 }
 
 fn in_ci() -> bool {
@@ -375,6 +438,25 @@ fn describe_decision(decision: &Decision, syntax: Syntax, code: bool) -> String 
             if !removed.is_empty() {
                 edits.push(format!("remove {}", removed.join(", ")));
             }
+            // Arguments a check line flags whichever way the choice goes.
+            if !option.check.is_empty() {
+                edits.push(format!("check {}", option.check.join(", ")));
+            }
+            if !option.unverified.is_empty() {
+                edits.push(format!("could not check {}", option.unverified.join(", ")));
+            }
+            // When Arbor could not read every argument, no option's edits are
+            // complete: an unseen `max_tokens` or `stop` returns 400 with
+            // reasoning off too, and an unseen `temperature` must go when
+            // the model reasons. Like a check line, it holds either way.
+            if let Some(unchecked) = decision.unchecked_args {
+                edits.push(unchecked_clause(
+                    unchecked,
+                    &decision.unread_spreads,
+                    syntax,
+                    code,
+                ));
+            }
             if edits.is_empty() {
                 edits.push("no change".to_string());
             }
@@ -382,6 +464,36 @@ fn describe_decision(decision: &Decision, syntax: Syntax, code: bool) -> String 
         })
         .collect::<Vec<_>>()
         .join(" or ")
+}
+
+/// `could not check the arguments from **PARAMS`: said in place of "no
+/// change" when Arbor could not read every argument the call sends.
+/// `spreads` names the `**` expressions it could not read; the TypeScript
+/// scan records none.
+fn unchecked_clause(
+    unchecked: UncheckedArgs,
+    spreads: &[String],
+    syntax: Syntax,
+    code: bool,
+) -> String {
+    match unchecked {
+        UncheckedArgs::Splat if syntax == Syntax::JavaScript => {
+            "could not check the properties not written at the call".to_string()
+        }
+        UncheckedArgs::Splat if spreads.is_empty() => format!(
+            "could not check the arguments spread in with {}",
+            tick("**", code)
+        ),
+        UncheckedArgs::Splat => format!(
+            "could not check the arguments from {}",
+            spread_list(spreads, code)
+        ),
+        UncheckedArgs::ExtraBody => format!(
+            "could not check the arguments in {}",
+            tick("extra_body", code)
+        ),
+        UncheckedArgs::NotRecorded => "could not check this call's arguments".to_string(),
+    }
 }
 
 /// What to keep in mind about how the value was found and where the call
@@ -873,8 +985,14 @@ fn print_human(report: &RetirementReport, quiet: bool, offer: bool) {
     if !quiet {
         println!("{}", data_line(report).dimmed());
     }
-    if offer && (report.summary.affected_calls > 0 || !report.routed.is_empty()) {
-        println!("\nWant Arbor to open these fixes as pull requests for you? {FIX_PRS_URL}");
+    if offer {
+        let routed = !report.routed.is_empty();
+        for (i, line) in offer_lines(&report.summary, routed).into_iter().enumerate() {
+            if i == 0 {
+                println!();
+            }
+            println!("{line}");
+        }
     }
 }
 
@@ -1144,7 +1262,7 @@ fn annotations(report: &RetirementReport, limit: usize) -> String {
             "::notice title={}::{}\n",
             escape_property("Arbor retirements"),
             escape_data(&format!(
-                "{} more {} to retired or retiring models {} not annotated (at most {limit} warnings per step); the full report lists every call.",
+                "{} more {} to retired or retiring models {} not annotated (at most {limit} warnings per step); the full report lists them all.",
                 more,
                 verb(more, "call", "calls"),
                 verb(more, "is", "are")
@@ -1201,7 +1319,7 @@ mod tests {
     #[test]
     fn the_offer_url_is_one_constant() {
         let needle = ["https://getarbor.dev", "/retirements"].concat();
-        // The page credits a fix-PR signup to the CLI by this tag.
+        // The page credits a signup to the CLI by this tag.
         assert_eq!(FIX_PRS_URL, format!("{needle}?utm_source=arbor-cli"));
         let source = include_str!("retirements.rs");
         assert_eq!(
@@ -1209,6 +1327,160 @@ mod tests {
             1,
             "the URL is written once"
         );
+        // The review link is that constant plus counts.
+        let url = review_url(&summary(2, 1, 1, Some("2027-01-14"))).unwrap();
+        assert!(url.starts_with(&format!("{FIX_PRS_URL}&")), "{url}");
+    }
+
+    use arbor_core::retirements::{NextShutdown, Table};
+
+    /// A summary with `calls` listed, `retired` and `retiring` of them, and
+    /// the next shutdown date among the retiring ones.
+    fn summary(calls: usize, retired: usize, retiring: usize, next: Option<&str>) -> Summary {
+        Summary {
+            affected_calls: calls,
+            affected_files: 1,
+            retired,
+            retiring,
+            other: calls - retired - retiring,
+            next_shutdown: next.map(|d| NextShutdown {
+                date: Date::parse(d).unwrap(),
+                days_left: 88,
+                provider: Table::Openai,
+                calls: retiring,
+            }),
+            ..Summary::default()
+        }
+    }
+
+    /// The query of `url` as `(key, value)` pairs.
+    fn query(url: &str) -> Vec<(&str, &str)> {
+        let (_, query) = url.split_once('?').unwrap();
+        query
+            .split('&')
+            .map(|pair| pair.split_once('=').unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn the_review_link_carries_the_counts_and_the_next_date() {
+        let url = review_url(&summary(4, 1, 3, Some("2027-01-14"))).unwrap();
+        assert_eq!(
+            query(&url),
+            [
+                ("utm_source", "arbor-cli"),
+                ("review", "1"),
+                ("calls", "4"),
+                ("retired", "1"),
+                ("next", "2027-01-14"),
+            ]
+        );
+        // Every listed call counts, including one only to keep an eye on.
+        let url = review_url(&summary(5, 0, 2, Some("2026-11-30"))).unwrap();
+        assert!(url.ends_with("&calls=5&retired=0&next=2026-11-30"), "{url}");
+    }
+
+    #[test]
+    fn the_review_link_has_no_date_when_nothing_is_retiring() {
+        let url = review_url(&summary(2, 2, 0, None)).unwrap();
+        assert!(url.ends_with("&review=1&calls=2&retired=2"), "{url}");
+        assert!(!url.contains("next="), "{url}");
+    }
+
+    #[test]
+    fn no_retired_or_retiring_call_means_no_review_link() {
+        // A clean report.
+        assert_eq!(review_url(&Summary::default()), None);
+        // Only calls to keep an eye on (unconfirmed, deprecated, auto-routed),
+        // and routed calls, which the summary does not list.
+        let mut s = summary(3, 0, 0, None);
+        s.routed_calls = 2;
+        assert_eq!(review_url(&s), None);
+    }
+
+    #[test]
+    fn the_review_link_carries_only_counts_and_a_date() {
+        // The summary is all the builder sees, so nothing about the code can
+        // reach the link; check its shape anyway: five known keys, values
+        // that are digits or an ISO date, and no character a path, file name
+        // or model string would need.
+        for s in [
+            summary(1, 1, 0, None),
+            summary(4, 1, 3, Some("2027-01-14")),
+            summary(129, 44, 85, Some("2026-11-30")),
+        ] {
+            let url = review_url(&s).unwrap();
+            let rest = url.strip_prefix(FIX_PRS_URL).unwrap();
+            assert!(
+                rest.chars()
+                    .all(|c| c.is_ascii_digit() || "&=-".contains(c) || c.is_ascii_lowercase()),
+                "{url}"
+            );
+            for (key, value) in query(&url) {
+                match key {
+                    "utm_source" => assert_eq!(value, "arbor-cli"),
+                    "review" => assert_eq!(value, "1"),
+                    "calls" | "retired" => {
+                        assert!(value.chars().all(|c| c.is_ascii_digit()), "{url}")
+                    }
+                    "next" => assert_eq!(Date::parse(value).map(Date::iso).as_deref(), Some(value)),
+                    other => panic!("unexpected key {other} in {url}"),
+                }
+            }
+            for leak in ["gpt", "claude", "gemini", "openai", ".py", "/app", "\\"] {
+                assert!(!rest.contains(leak), "{leak} in {url}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_offer_follows_the_findings() {
+        // A retiring call: the review offer, its link, and what the link
+        // shares, with nothing sent until the person opens it.
+        let lines = offer_lines(&summary(4, 1, 3, Some("2027-01-14")), false);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].starts_with(
+            "Want these calls ready before 14 Jan 2027? Ask for a paid readiness review:"
+        ));
+        // The review is a paid service people deliver: it lists the calls
+        // they find but can't check, not every call the tool missed.
+        assert!(lines[0].ends_with(
+            "we write the fix pull requests with you and list every call we find but can't check."
+        ));
+        assert_eq!(
+            Some(lines[1].clone()),
+            review_url(&summary(4, 1, 3, Some("2027-01-14")))
+        );
+        assert!(
+            lines[2].starts_with("Arbor has sent nothing."),
+            "{}",
+            lines[2]
+        );
+        assert!(
+            lines[2].contains("the next shutdown date: no code, paths, file names or model names.")
+        );
+        assert!(lines[2].contains("only if you submit the form"));
+
+        // Only retired calls: no date to be ready by, and none in the link.
+        let lines = offer_lines(&summary(2, 2, 0, None), false);
+        assert!(lines[0].starts_with("Want these calls fixed?"), "{lines:?}");
+        assert!(!lines[2].contains("date"), "{}", lines[2]);
+        let lines = offer_lines(&summary(1, 1, 0, None), false);
+        assert!(lines[0].starts_with("Want this call fixed?"), "{lines:?}");
+
+        // Calls only to keep an eye on, or only routed ones: the fix-PR
+        // line as before, with the link that carries nothing.
+        for (s, routed) in [(summary(3, 0, 0, None), false), (Summary::default(), true)] {
+            assert_eq!(
+                offer_lines(&s, routed),
+                [format!(
+                    "Want Arbor to open these fixes as pull requests for you? {FIX_PRS_URL}"
+                )]
+            );
+        }
+
+        // Nothing found: no offer at all.
+        assert!(offer_lines(&Summary::default(), false).is_empty());
     }
 
     #[test]

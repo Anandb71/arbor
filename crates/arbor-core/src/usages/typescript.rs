@@ -63,8 +63,9 @@
 
 use super::{
     is_capturable_value, is_credential_value, is_identifier_key, is_secret_key, is_value_key,
-    model_family, BindingKind, CapturedValue, ClientConstruction, ClientScope, FileUsages, GapKind,
-    Receiver, Routing, Sdk, SdkCall, SdkImport, Span, UsageGap, ValueOrigin, VertexAi,
+    model_family, BindingKind, CallArgs, CapturedValue, ClientConstruction, ClientScope,
+    FileUsages, GapKind, Receiver, Routing, Sdk, SdkCall, SdkImport, Span, UsageGap, ValueOrigin,
+    VertexAi,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -6341,6 +6342,14 @@ struct Options<'t> {
 }
 
 impl<'t> Options<'t> {
+    /// Some property it sends may not be written at the call: a spread, a
+    /// computed key, a prototype, or an object passed by name. The
+    /// retirement check then never reads its property names as every
+    /// argument the call sends ([`SdkCall::splat`]).
+    fn unwritten(&self) -> bool {
+        self.spread || self.opaque || self.read.proto
+    }
+
     /// What sets `key`, with the name of the object it came from.
     fn find(&self, key: &str) -> Found<'t> {
         let mut found = self.read.find(key);
@@ -8075,6 +8084,7 @@ impl<'t> Ctx<'t> {
             detail,
             values: Vec::new(),
             values_complete: false,
+            args: None,
         });
     }
 
@@ -8145,6 +8155,7 @@ impl<'t> Ctx<'t> {
                         ),
                         values: Vec::new(),
                         values_complete: false,
+                        args: None,
                     });
                     return;
                 }
@@ -8477,9 +8488,12 @@ impl<'t> Ctx<'t> {
             file: self.file.clone(),
             span,
             symbol,
+            splat: options.unwritten() || spread_args,
             kwargs: options.keys,
             positional,
-            splat: options.spread || spread_args,
+            // The extractor does not record what each spread holds:
+            // `splat` alone says that some arguments are unread.
+            spreads: Vec::new(),
             values,
         });
     }
@@ -8616,6 +8630,7 @@ impl<'t> Ctx<'t> {
             detail,
             values: Vec::new(),
             values_complete: false,
+            args: None,
         });
     }
 
@@ -8854,6 +8869,7 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         }
     }
@@ -8967,6 +8983,7 @@ impl<'t> Ctx<'t> {
             detail,
             values_complete: complete && !values.is_empty(),
             values,
+            args: None,
         });
     }
 
@@ -9116,6 +9133,13 @@ impl<'t> Ctx<'t> {
             detail,
             values,
             values_complete: false,
+            // The arguments are known even when the client is not: the
+            // retirement check applies its argument rules to them.
+            args: Some(CallArgs {
+                splat: options.unwritten() || self.has_spread_argument(call),
+                kwargs: options.keys,
+                spreads: Vec::new(),
+            }),
         });
     }
 
@@ -9151,6 +9175,7 @@ impl<'t> Ctx<'t> {
             ),
             values: Vec::new(),
             values_complete: false,
+            args: None,
         });
     }
 
@@ -9321,6 +9346,7 @@ impl<'t> Ctx<'t> {
                     ),
                     values: Vec::new(),
                     values_complete: false,
+                    args: None,
                 });
             }
             self.out.gaps.extend(added);

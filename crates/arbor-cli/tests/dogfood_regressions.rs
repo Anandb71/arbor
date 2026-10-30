@@ -55,6 +55,15 @@ fn write(dir: &Path, path: &str, content: &str) {
     fs::write(full, content).unwrap();
 }
 
+/// A temp folder that is its own project (an empty `.arbor/`), so Arbor never
+/// walks up from it to a marker in a parent folder, such as `~/.arbor` when
+/// the temp folder is under the home folder (#273).
+fn project() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join(".arbor")).unwrap();
+    temp
+}
+
 #[test]
 fn a_branch_switch_never_answers_from_the_other_branch() {
     let temp = tempfile::tempdir().unwrap();
@@ -98,7 +107,7 @@ fn a_branch_switch_never_answers_from_the_other_branch() {
 
 #[test]
 fn an_upgrade_rebuilds_a_graph_the_old_version_saved() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = project();
     let dir = temp.path();
     let lib = "pub fn helper() -> u32 {\n    1\n}\n\npub fn other() -> u32 {\n    2\n}\n";
     write(dir, "src/lib.rs", lib);
@@ -137,7 +146,7 @@ fn an_upgrade_rebuilds_a_graph_the_old_version_saved() {
 }
 
 fn mixed_project() -> tempfile::TempDir {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = project();
     let dir = temp.path();
     write(dir, "src/jobs.rs", "pub fn enqueue() -> u32 {\n    1\n}\n");
     write(
@@ -212,4 +221,56 @@ fn an_empty_answer_says_what_it_cannot_see() {
             .is_some_and(|n| n.contains("Not proof")),
         "{none}"
     );
+}
+
+/// `arbor index --changed-only` rebuilds the files the change didn't touch
+/// from the saved graph. Their imports are not graph vertices, so they have
+/// to be saved beside it: otherwise every call an import binds in an
+/// untouched file loses its edge after an incremental index.
+#[test]
+fn an_incremental_index_keeps_the_imports_of_unchanged_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    git(dir, &["init", "-q"]);
+    git(dir, &["config", "user.email", "arbor-tests@example.com"]);
+    git(dir, &["config", "user.name", "Arbor Tests"]);
+    write(dir, "app/__init__.py", "");
+    write(
+        dir,
+        "app/money.py",
+        "def to_cents(x):\n    return x * 100\n",
+    );
+    write(
+        dir,
+        "app/orders.py",
+        "from app.money import to_cents\n\n\ndef total(x):\n    return to_cents(x)\n",
+    );
+    write(dir, "app/other.py", "def unrelated():\n    return 1\n");
+    write(
+        dir,
+        "web/format.ts",
+        "export function formatPrice(x: number): string {\n  return String(x);\n}\n",
+    );
+    write(
+        dir,
+        "web/cart.ts",
+        "import { formatPrice } from \"./format\";\n\nexport function render(): string {\n  return formatPrice(1);\n}\n",
+    );
+    write(dir, ".gitignore", ".arbor/\n");
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-qm", "base"]);
+    assert!(arbor(dir, &["index", "."]).status.success());
+
+    write(dir, "app/other.py", "def unrelated():\n    return 2\n");
+    let incremental = arbor(dir, &["index", ".", "--changed-only"]);
+    assert!(
+        incremental.status.success(),
+        "{}",
+        String::from_utf8_lossy(&incremental.stderr)
+    );
+
+    let python = json(dir, &["callers", "to_cents", ".", "--json"]);
+    assert_eq!(names(&python["callers"]), vec!["total"]);
+    let typescript = json(dir, &["callers", "formatPrice", ".", "--json"]);
+    assert_eq!(names(&typescript["callers"]), vec!["render"]);
 }

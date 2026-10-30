@@ -10,7 +10,20 @@ with each call's routing and model values. A consumer (a codemod, a reviewer) sh
 - **Anything else carries a gap.** The gap's `reason` says why, and the call
   needs a person to confirm it first. A gap may still list the value the code
   names (a parameter default, an environment fallback, a class attribute that
-  something else may overwrite), so it can be proposed for review.
+  something else may overwrite), so it can be proposed for review. A call
+  whose client is not resolved (`unknown_client_factory`) also lists its
+  argument names in `args` (names only, never values, and `splat` when some
+  come from `**`), so its arguments can be checked like a resolved call's.
+- **A `**` expression is listed in `spreads`**, on a call and in a gap's
+  `args`: its `name` as written (`PARAMS`, `kwargs`, `self.options`; omitted
+  for a dict written inline, a conditional, or a credential-shaped name), the
+  argument names it sends (`keys`) when it is a dict literal in the same file,
+  and `complete` when those are all of them (no `**` or computed key inside,
+  every key recorded, and the dict is never changed or passed on later in that
+  file; a change made to it from another module is not seen). Names only,
+  never values: a secret-sounding name such as `max_tokens` is listed, a key
+  that is not an identifier or is shaped like a credential is not, and the
+  dict is then not `complete`.
 
 Python is too dynamic to resolve every shape soundly. Rather than adding a
 special case for each one, the extractor resolves a small grammar exactly, and
