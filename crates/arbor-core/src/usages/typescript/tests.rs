@@ -2985,6 +2985,27 @@ fn a_global_fetch_written_in_the_file_is_a_custom_fetch() {
         assert_eq!(c.routing, Routing::Unknown, "{source}");
         assert_eq!(gaps_at(&found, c), vec!["ambiguous_client/endpoint_option"]);
     }
+    // openai v3 sends through axios: its route stays, while a v4 client in
+    // the same file is re-routed.
+    let found = usages(
+        "import OpenAI, { Configuration, OpenAIApi } from \"openai\";
+global.fetch = require(\"node-fetch\");
+const legacy = new OpenAIApi(new Configuration({ apiKey: key }));
+const client = new OpenAI();
+legacy.createChatCompletion({ model: \"gpt-4o\", messages: [] });
+client.chat.completions.create({ model: \"gpt-4o\", messages: [] });",
+    );
+    let v3 = call(&found, "legacy.createChatCompletion");
+    assert_eq!(v3.routing, Routing::OpenaiDirect);
+    assert!(gaps_at(&found, v3).is_empty(), "{:?}", found.gaps);
+    assert_eq!(routing_of(&found, "legacy"), Routing::OpenaiDirect);
+    let v4 = call(&found, "client.chat.completions.create");
+    assert_eq!(v4.routing, Routing::Unknown);
+    assert_eq!(
+        gaps_at(&found, v4),
+        vec!["ambiguous_client/endpoint_option"]
+    );
+    assert_eq!(routing_of(&found, "client"), Routing::Unknown);
     // Read, or written on an object literal of the file: nothing replaced.
     for other in [
         "const original = globalThis.fetch;",

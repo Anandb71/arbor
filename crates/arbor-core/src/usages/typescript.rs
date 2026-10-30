@@ -586,7 +586,7 @@ const CLASSES: &[ClientClass] = &[
     class(Pkg::Openai, "OpenAI", Family::OpenaiDirect),
     class(Pkg::Openai, "AzureOpenAI", Family::Azure),
     class(Pkg::Openai, "BedrockOpenAI", Family::Platform),
-    class(Pkg::Openai, "OpenAIApi", Family::OpenaiV3),
+    class(Pkg::Openai, V3_API, Family::OpenaiV3),
     class(Pkg::Anthropic, "Anthropic", Family::AnthropicDirect),
     class(Pkg::AnthropicBedrock, "AnthropicBedrock", Family::Bedrock),
     class(
@@ -618,6 +618,8 @@ fn client_class(pkg: Pkg, name: &str) -> Option<ClientClass> {
 
 /// openai v3's `Configuration`: `new OpenAIApi(new Configuration({ basePath }))`.
 const V3_CONFIGURATION: &str = "Configuration";
+/// openai v3's client, which sends its requests through axios.
+const V3_API: &str = "OpenAIApi";
 
 impl ClientClass {
     /// Routing from the constructor, its option names and what its
@@ -675,10 +677,11 @@ fn base_url_key(family: Family) -> Option<&'static str> {
     }
 }
 
-/// Routes to a provider's own API, whose requests the SDK sends through the
-/// global `fetch` unless the client is given its own.
-fn through_global_fetch(routing: Routing) -> bool {
-    matches!(
+/// Whether a client sends its requests to a provider's own API through the
+/// global `fetch`, as every SDK does unless the client is given its own:
+/// not openai v3's `OpenAIApi` (`v3`), which sends through axios.
+fn through_global_fetch(routing: Routing, v3: bool) -> bool {
+    !v3 && matches!(
         routing,
         Routing::OpenaiDirect
             | Routing::AnthropicDirect
@@ -8556,7 +8559,9 @@ impl<'t> Ctx<'t> {
                 option: "`setDefaultBaseUrls`, which this file calls",
             });
         }
-        if self.global_fetch && through_global_fetch(client.routing) {
+        if self.global_fetch
+            && through_global_fetch(client.routing, client.family == Family::OpenaiV3)
+        {
             client.routing = Routing::Unknown;
             client.caveat.get_or_insert(ClientCaveat::EndpointOption {
                 option: "the global `fetch`, which this file may replace",
@@ -9523,13 +9528,15 @@ impl<'t> Ctx<'t> {
         // A client built from a mocked or replaced SDK is not the SDK's,
         // `setDefaultBaseUrls` re-routes every Gemini client, and a replaced
         // global `fetch` every direct one.
+        let v3 = format!("{}.{V3_API}", Pkg::Openai.package());
         for client in &mut self.out.clients {
             if self
                 .sdk_patched
                 .keys()
                 .any(|pkg| pkg.package() == client.package)
                 || (self.genai_base_urls.is_some() && client.package == Pkg::GoogleGenai.package())
-                || (self.global_fetch && through_global_fetch(client.routing))
+                || (self.global_fetch
+                    && through_global_fetch(client.routing, client.constructor == v3))
             {
                 client.routing = Routing::Unknown;
             }
