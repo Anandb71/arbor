@@ -335,7 +335,9 @@ completion models (`langchain_openai.OpenAI`, `BedrockLLM`),
   On a Bedrock model, the Converse API sends a `model_id=` (or `modelId=`)
   given to the call instead of the model's own
   (`llm.invoke(q, model_id=...)`), so it is read there, and a `**` expansion
-  the file cannot read is a `splat` gap on `model_id`. `ChatBedrock` sends it
+  the file cannot read is a `splat` gap on `model_id`. langchain-aws folds
+  both spellings into one `modelId`, the later winning, so a call given both,
+  or one next to such a `**`, keeps a `reassigned` or `splat` gap. `ChatBedrock` sends it
   only when it runs on the Converse API (`beta_use_converse_api`), so there
   the value keeps a `conditional` gap; `ChatBedrockConverse` always does.
 
@@ -409,9 +411,11 @@ session given `botocore_session` or a `**` expansion are not followed.
 **LiteLLM.** `litellm.completion(...)` and `litellm.acompletion(...)`,
 however they are imported (`from litellm import completion`,
 `litellm.main.completion`). The model is `model`, by keyword or as the first
-positional argument, read under the value rules; a `fallbacks=[{"model":
-...}]` entry is a nested value, while plain-string fallbacks
-(`fallbacks=["gpt-4o-mini"]`) and `litellm.model_fallbacks` are not read.
+positional argument, read under the value rules, and so is a
+`deployment_id`; `completion` takes no `engine` or `model_name`, so those are
+not read. A `fallbacks=[{"model": ...}]` entry is a nested value, while
+plain-string fallbacks (`fallbacks=["gpt-4o-mini"]`) and
+`litellm.model_fallbacks` are not read.
 No other LiteLLM function is followed
 (`embedding`, `text_completion`, `responses`, `Router`, `token_counter`,
 `supports_function_calling`...). A missing model is a `TypeError`, so it is
@@ -428,17 +432,24 @@ not a gap.
   model, and these gaps hold no key, so they cover every model value of the
   call, nested fallbacks included:
   - `litellm.model_alias_map` maps it process-wide: a file that mentions it
-    anywhere gives every LiteLLM call a `dynamic_feature` gap;
+    anywhere gives each LiteLLM call in that file a `dynamic_feature` gap;
   - a `model_list` passed to the call, by keyword or in a same-file dict
     expanded with `**`, maps it to a deployment: a `model_list` gap, and the
     list's entries are not read as models;
   - a `**` expansion the file cannot read may hold a `model_list`: a
     `splat` gap.
 
-`arbor retirements` lists both only with `--include-routed`. AWS keeps
-Bedrock's model schedule, which the bundled data does not hold, so nothing is
-looked up for a call routed `bedrock`, whatever its model ID. A LiteLLM model
-is looked up on the schedule its router prefix names (`openai/`,
+  A `deployment_id`, by keyword or in a same-file dict expanded with `**`,
+  replaces the `model` (`completion` sets `model = deployment_id` and sends it
+  to Azure): the `model` keeps a `reassigned` gap, and the deployment is the
+  value sent.
+
+`arbor retirements` does not check Bedrock calls: AWS keeps Bedrock's model
+schedule, which the bundled data does not hold, so nothing is looked up for a
+`boto3` Bedrock call or a LangChain Bedrock model's, whatever its routing
+(`bedrock`, `custom_base_url` for a gateway, `unknown`) and its model ID, and
+none is listed or counted. LiteLLM calls are routed: counted, and listed with
+`--include-routed`. A LiteLLM model is looked up on the schedule its router prefix names (`openai/`,
 `anthropic/`, `gemini/`, `vertex_ai/`), else by its shape, except that a
 Gemini model with no prefix (`gemini-2.5-flash`) is looked up on Vertex AI's
 schedule, where LiteLLM sends it; only `gemini/<model>` reaches the Gemini
@@ -578,9 +589,10 @@ The report assumes the rest. In particular:
 - Where a Bedrock client sends its requests may also come from the AWS
   configuration: an `endpoint_url` in `~/.aws/config`, under whichever
   profile the environment or the file selects (`AWS_PROFILE`,
-  `boto3.Session(profile_name=...)`). A LiteLLM call's may come from
-  settings another module makes (`litellm.api_base`,
-  `litellm.model_alias_map`). Neither is seen.
+  `boto3.Session(profile_name=...)`). Where a LiteLLM call sends its
+  requests may come from settings another module makes (`litellm.api_base`),
+  and another module may remap its model (`litellm.model_alias_map`). None
+  of these is seen.
 - A LangChain chat model's field names and aliases are those of the current
   `langchain-openai`, `langchain-anthropic` and `langchain-aws`; which LangChain version the
   project runs is not known. The deprecated classes are read the same way.

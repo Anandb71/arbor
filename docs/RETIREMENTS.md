@@ -84,17 +84,19 @@ model itself apply there: no *also change* or *decide* lines, and a check to rev
 parameters LangChain sends against the replacement by hand. A retired model there still
 fails the check.
 
-Calls through LiteLLM (`litellm.completion`, `acompletion`) and on Amazon Bedrock (a
-`boto3` `bedrock-runtime` client, LangChain's `ChatBedrock` and `ChatBedrockConverse`) are
-routed: they are counted, and `--include-routed` lists them
+Calls through LiteLLM (`litellm.completion`, `acompletion`) are routed: they are
+counted, and `--include-routed` lists them
 ([SDK_USAGES.md](SDK_USAGES.md#amazon-bedrock-and-litellm)). A LiteLLM model is looked up
 on the schedule its router prefix names (`anthropic/claude-3-5-sonnet-20241022` on
 Anthropic's), else by its shape (`gpt-4o` on OpenAI's), with only the checks about the
 model, since LiteLLM takes OpenAI-style arguments and translates them for each provider.
 A Gemini model with no prefix (`gemini-2.5-flash`) is looked up on Google Cloud's (Vertex
 AI) schedule, where LiteLLM sends it; `gemini/gemini-2.5-flash` reaches the Gemini API.
-AWS keeps Bedrock's model schedule, which the data does not hold, so nothing is looked up
-for a Bedrock call, whatever its model ID (`anthropic.claude-3-5-sonnet-20240620-v1:0`). Other LangChain models and
+Calls on Amazon Bedrock (a `boto3` `bedrock-runtime` client, LangChain's `ChatBedrock` and
+`ChatBedrockConverse`) are not checked: AWS keeps Bedrock's model schedule, which the data
+does not hold, so nothing is looked up for them, whatever their routing or model ID
+(`anthropic.claude-3-5-sonnet-20240620-v1:0`), and they are neither listed nor counted.
+`arbor usages` lists them. Other LangChain models and
 integrations, LlamaIndex and other wrappers are not checked yet, so a clean result says
 "No direct openai/anthropic/google SDK calls" and nothing more.
 
@@ -186,8 +188,9 @@ it too. The check runs on the runner and sends nothing anywhere.
   pages leave out, such as the four OpenAI aliases above.
 - **Direct SDK calls and LangChain chat models.** It reads the `openai`, `anthropic`,
   `google-genai` and `google-generativeai` SDKs, and LangChain's `ChatOpenAI`,
-  `AzureChatOpenAI` and `ChatAnthropic`. Calls through LiteLLM and on Amazon Bedrock are
-  routed (`--include-routed`), and Bedrock's own schedule is not in the data. Other
+  `AzureChatOpenAI` and `ChatAnthropic`. Calls through LiteLLM are routed
+  (`--include-routed`); calls on Amazon Bedrock are not checked, since Bedrock's own
+  schedule is not in the data. Other
   framework wrappers (LangChain's other integrations, LlamaIndex) are not checked yet. Model IDs in `.env`, YAML, JSON or notebooks are not read.
 - **Values it can see.** A model passed in from an environment variable, a function
   argument or another module is counted under "Not checked"; `arbor usages` lists those
