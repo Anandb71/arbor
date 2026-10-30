@@ -399,6 +399,7 @@ pub fn extract_with(
     cx.index_definitions();
     cx.settle_dict_escapes();
     cx.analyze();
+    cx.settle_model_params();
     let mut found = cx.finish();
     found.syntax_errors = tree.root_node().has_error();
     found
@@ -2274,6 +2275,17 @@ struct Ctx<'t> {
     /// Wrappers in other files, by the import target that names them
     /// (`.sampler.Sampler`), from [`Ctx::resolve_wrappers`].
     wrappers: HashMap<Rc<str>, Rc<Wrapper>>,
+    /// What gap-worthy calls may send a model in, other than a parameter
+    /// read unchanged (see [`Ctx::note_model_read`]), for
+    /// [`Ctx::changed_elsewhere`].
+    model_reads: Vec<Node<'t>>,
+    /// The gap-worthy calls recorded, and calls through a wrapper in
+    /// another file: what may send a request.
+    sending: Vec<Node<'t>>,
+    /// Model parameters found, with the function each is a parameter of,
+    /// until [`Ctx::settle_model_params`] keeps the ones no request sends
+    /// changed.
+    param_exports: Vec<(ModelParam, usize)>,
     out: FileUsages,
 }
 
@@ -2392,6 +2404,9 @@ impl<'t> Ctx<'t> {
             import_cut: None,
             base_inits: None,
             wrappers: HashMap::new(),
+            model_reads: Vec::new(),
+            sending: Vec::new(),
+            param_exports: Vec::new(),
             out: FileUsages::new(file, "python"),
         }
     }
@@ -8036,6 +8051,11 @@ impl<'t> Ctx<'t> {
         // The call's own arguments: none of them is a model value.
         let args = self.arguments_with(call, ValueKeys::Only(&[]));
         let (positional, keywords) = call_arguments(call, |n| self.text(n));
+        self.sending.push(call);
+        for arg in positional.iter().chain(keywords.iter().map(|(_, v)| v)) {
+            self.note_model_read(*arg);
+        }
+        self.model_reads.extend(splat_arguments(call));
         let by_keyword = |name: &str| {
             keywords
                 .iter()
@@ -8494,10 +8514,254 @@ impl<'t> Ctx<'t> {
                 routing: request.routing,
                 route_confirmed,
             };
-            if !self.out.model_params.contains(&param) {
+            self.param_exports.push((param, source.func));
+        }
+    }
+
+    /// Keeps, for [`Ctx::changed_elsewhere`], what `arg` may send a model
+    /// in: in a dict, list or tuple literal, the values under a model key
+    /// (or a key that is not a string) and its `**` entries, and any other
+    /// expression whole.
+    fn note_model_read(&mut self, arg: Node<'t>) {
+        let mut stack = vec![arg];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "dictionary" | "list" | "tuple" | "set" => stack.extend(named_children(node)),
+                "pair" => {
+                    let (Some(key), Some(value)) = (
+                        node.child_by_field_name("key"),
+                        node.child_by_field_name("value"),
+                    ) else {
+                        continue;
+                    };
+                    let other_key = self.literal(key).is_ok_and(|k| {
+                        !is_value_key(&k) && !BEDROCK_VALUE_KEYS.contains(&k.as_str())
+                    });
+                    if other_key {
+                        stack.push(value);
+                    } else {
+                        self.model_reads.push(value);
+                    }
+                }
+                _ if node.id() == arg.id() => self.model_reads.push(node),
+                "dictionary_splat" => self.model_reads.push(node),
+                _ => {}
+            }
+        }
+    }
+
+    /// Keeps the model parameters [`Ctx::note_model_params`] found that no
+    /// request of their function or class sends changed (see
+    /// [`Ctx::changed_elsewhere`]), each once.
+    fn settle_model_params(&mut self) {
+        let exports = std::mem::take(&mut self.param_exports);
+        let mut changed: HashMap<(usize, String, Option<String>), bool> = HashMap::new();
+        let mut kept = HashSet::new();
+        for (param, func) in exports {
+            let key = (func, param.parameter.clone(), param.attribute.clone());
+            let held = match changed.get(&key) {
+                Some(held) => *held,
+                None => {
+                    let held =
+                        self.changed_elsewhere(func, &param.parameter, param.attribute.as_deref());
+                    changed.insert(key, held);
+                    held
+                }
+            };
+            if !held && kept.insert(param.clone()) {
                 self.out.model_params.push(param);
             }
         }
+    }
+
+    /// Whether the model parameter `param` of `func` (or, for a class, the
+    /// attribute `attr` its `__init__` stores it in) may reach a request
+    /// changed on some path, so that a call passing a value may send
+    /// another one: `RENAMED[model]` in one branch and `model` in the
+    /// other. The code that can see it is the function, or the class and
+    /// its same-file bases (their methods run on its instances). There, a
+    /// value computed from it, through any chain of assignments, that a
+    /// gap-worthy call or a wrapper call sends where a model may be (see
+    /// [`Ctx::note_model_read`]), or that is passed to a function, class or
+    /// method of this file that sends a request, holds it. What a request
+    /// returns is not counted as computed from its model.
+    fn changed_elsewhere(&self, func: usize, param: &str, attr: Option<&str>) -> bool {
+        let Some(root) = self.root else {
+            return true;
+        };
+        let own = (self.scopes[func].start, self.scopes[func].end);
+        let mut regions = Vec::new();
+        if attr.is_some() {
+            let mut class = self.scopes[func].parent;
+            while let Some(c) = class {
+                let range = (self.scopes[c].start, self.scopes[c].end);
+                if regions.contains(&range) || regions.len() > MAX_SCOPE_DEPTH as usize {
+                    break;
+                }
+                regions.push(range);
+                class = self.class_shape(c).base;
+            }
+        } else {
+            regions.push(own);
+        }
+        let within = |node: Node<'t>, (start, end): (usize, usize)| {
+            start <= node.start_byte() && node.end_byte() <= end
+        };
+        let seen = |node: Node<'t>| regions.iter().any(|r| within(node, *r));
+        let sent: HashSet<usize> = self.sending.iter().map(|c| c.id()).collect();
+
+        // The assignments (target, value) and the calls there.
+        let mut binds: Vec<(Node<'t>, Node<'t>)> = Vec::new();
+        let mut calls: Vec<Node<'t>> = Vec::new();
+        for &(start, end) in &regions {
+            let Some(top) = root.descendant_for_byte_range(start, end) else {
+                continue;
+            };
+            let mut stack = vec![top];
+            while let Some(node) = stack.pop() {
+                let bind = match node.kind() {
+                    "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => (
+                        node.child_by_field_name("left"),
+                        node.child_by_field_name("right"),
+                    ),
+                    "named_expression" => (
+                        node.child_by_field_name("name"),
+                        node.child_by_field_name("value"),
+                    ),
+                    "as_pattern" => (node.child_by_field_name("alias"), node.named_child(0)),
+                    "call" => {
+                        calls.push(node);
+                        (None, None)
+                    }
+                    _ => (None, None),
+                };
+                if let (Some(target), Some(value)) = bind {
+                    binds.push((target, value));
+                }
+                stack.extend(named_children(node));
+            }
+        }
+
+        let mut taint = Taint {
+            param,
+            own,
+            names: HashSet::new(),
+            attrs: attr.into_iter().collect(),
+        };
+        loop {
+            let mut grew = false;
+            for &(target, value) in &binds {
+                if self.reads(value, &taint, &sent) {
+                    grew |= self.taint_target(target, &mut taint);
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+
+        if self
+            .model_reads
+            .iter()
+            .any(|&node| seen(node) && self.reads(node, &taint, &sent))
+        {
+            return true;
+        }
+        // Handed to code of this file that sends a request.
+        let sends = |name: &str| {
+            self.scopes.iter().any(|scope| {
+                matches!(scope.kind, ScopeKind::Function | ScopeKind::Class)
+                    && scope.name == name
+                    && self
+                        .sending
+                        .iter()
+                        .any(|call| within(*call, (scope.start, scope.end)))
+            })
+        };
+        calls.iter().any(|&call| {
+            let Some(function) = call.child_by_field_name("function") else {
+                return false;
+            };
+            let name = match function.kind() {
+                "identifier" => Some(self.text(function)),
+                "attribute" => function
+                    .child_by_field_name("object")
+                    .filter(|object| match object.kind() {
+                        "identifier" => matches!(self.text(*object), "self" | "cls"),
+                        "call" => object
+                            .child_by_field_name("function")
+                            .is_some_and(|f| self.text(f) == "super"),
+                        _ => false,
+                    })
+                    .and_then(|_| function.child_by_field_name("attribute"))
+                    .map(|a| self.text(a)),
+                _ => None,
+            };
+            name.is_some_and(sends)
+                && call
+                    .child_by_field_name("arguments")
+                    .is_some_and(|args| self.reads(args, &taint, &sent))
+        })
+    }
+
+    /// Whether `node` reads a name or attribute `taint` holds: the
+    /// parameter itself in its own function, a name assigned from it, or
+    /// an attribute (of anything) assigned from it. A request's result
+    /// (`sent`) is not read into.
+    fn reads(&self, node: Node<'t>, taint: &Taint<'_>, sent: &HashSet<usize>) -> bool {
+        let mut stack = vec![node];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "identifier" => {
+                    let field = node.parent().is_some_and(|parent| {
+                        let named = |field: &str| parent.child_by_field_name(field) == Some(node);
+                        (parent.kind() == "attribute" && named("attribute"))
+                            || (parent.kind() == "keyword_argument" && named("name"))
+                    });
+                    if field {
+                        continue;
+                    }
+                    let name = self.text(node);
+                    let in_own = taint.own.0 <= node.start_byte() && node.end_byte() <= taint.own.1;
+                    if taint.names.contains(name) || (name == taint.param && in_own) {
+                        return true;
+                    }
+                }
+                "attribute" => {
+                    let attr = node.child_by_field_name("attribute");
+                    if attr.is_some_and(|a| taint.attrs.contains(self.text(a))) {
+                        return true;
+                    }
+                }
+                "call" if sent.contains(&node.id()) => continue,
+                _ => {}
+            }
+            stack.extend(named_children(node));
+        }
+        false
+    }
+
+    /// Adds the names and attributes an assignment `target` binds to
+    /// `taint`; `true` when one is new.
+    fn taint_target<'a>(&self, target: Node<'t>, taint: &mut Taint<'a>) -> bool
+    where
+        't: 'a,
+    {
+        let mut grew = false;
+        let mut stack = vec![target];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "identifier" => grew |= taint.names.insert(self.text(node)),
+                "attribute" => {
+                    if let Some(attr) = node.child_by_field_name("attribute") {
+                        grew |= taint.attrs.insert(self.text(attr));
+                    }
+                }
+                "subscript" => stack.extend(node.child_by_field_name("value")),
+                _ => stack.extend(named_children(node)),
+            }
+        }
+        grew
     }
 
     /// Asks `lookup` about every name this file imports with `from module
@@ -8590,6 +8854,7 @@ impl<'t> Ctx<'t> {
             match argument_for(call, position, keyword, |n| self.text(n)) {
                 ArgFor::Found(expr) => {
                     passed = true;
+                    self.model_reads.push(expr);
                     let by_name = keyword.is_some_and(|k| args.kwargs.iter().any(|a| a == k));
                     let result = self.resolve_value(expr, scope, 0);
                     self.take_value(&site, &param.key, !by_name, result, &mut values);
@@ -8606,6 +8871,8 @@ impl<'t> Ctx<'t> {
             self.out.gaps.truncate(gaps_before);
             return;
         }
+        self.sending.push(call);
+        self.model_reads.extend(splat_arguments(call));
 
         // The packages of the requests (`langchain_community` names two).
         let pkgs: Vec<Pkg> = ALL_PKGS
@@ -8907,12 +9174,23 @@ impl<'t> Ctx<'t> {
             } else {
                 None
             };
+            if gap_worthy && source.is_none() {
+                self.model_reads.push(*expr);
+            }
             let result = self.resolve_value(*expr, scope, 0);
             let own_gaps = self.out.gaps.len();
             self.take_value(&site, key, false, result, &mut values);
             if let Some(source) = source {
                 from_params.push((key.clone(), source, own_gaps..self.out.gaps.len()));
             }
+        }
+
+        if gap_worthy {
+            self.sending.push(call);
+            for (_, literal) in &args.literal_args {
+                self.note_model_read(*literal);
+            }
+            self.model_reads.extend(splat_arguments(call));
         }
 
         // `GenerativeModel("gemini-pro")`, `genai.embed_content("models/...", text)`:
@@ -8923,6 +9201,7 @@ impl<'t> Ctx<'t> {
                 args.first_positional,
             ) {
                 keyed = true;
+                self.model_reads.push(first);
                 let result = self.resolve_value(first, scope, 0);
                 let site = Site {
                     gap_worthy: true,
@@ -11393,6 +11672,17 @@ struct ParamSource {
     attribute: Option<String>,
 }
 
+/// What holds a value computed from a model parameter (see
+/// [`Ctx::changed_elsewhere`]).
+struct Taint<'a> {
+    /// The parameter, read under its name in its own function (`own`).
+    param: &'a str,
+    own: (usize, usize),
+    /// Names and attributes assigned such a value where it can be seen.
+    names: HashSet<&'a str>,
+    attrs: HashSet<&'a str>,
+}
+
 /// The request a [`ModelParam`] is the model of.
 struct ParamRequest<'a> {
     sdk: Sdk,
@@ -11896,6 +12186,19 @@ fn children(node: Node<'_>) -> Vec<Node<'_>> {
 
 /// Every named child, in order, in time linear in their number
 /// (`Node::named_child(i)` walks from the first child on every call).
+/// The `*` and `**` arguments of a call.
+fn splat_arguments(call: Node<'_>) -> Vec<Node<'_>> {
+    call.child_by_field_name("arguments")
+        .filter(|a| a.kind() == "argument_list")
+        .map(|a| {
+            named_children(a)
+                .into_iter()
+                .filter(|n| matches!(n.kind(), "list_splat" | "dictionary_splat"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).collect()

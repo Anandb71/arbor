@@ -8342,6 +8342,45 @@ fn a_base_class_that_sets_the_attribute_too_keeps_it_unlisted() {
 }
 
 #[test]
+fn a_parameter_another_request_sends_changed_is_not_listed() {
+    let head = "from openai import OpenAI\nimport requests\nclient = OpenAI()\nRENAMED = {\"gpt-3.5-turbo\": \"gpt-4o-mini\"}\n";
+    let cases = [
+        // Mapped in one branch, sent as passed in the other.
+        "def ask(prompt, model=\"gpt-4o-mini\"):\n    if model in RENAMED:\n        return client.chat.completions.create(model=RENAMED[model], messages=[prompt])\n    return client.chat.completions.create(model=model, messages=[prompt])\n",
+        "def ask(model):\n    if model in RENAMED:\n        return client.chat.completions.create(model=RENAMED.get(model, model))\n    return client.chat.completions.create(model=model)\n",
+        // Through an assignment, a dict spread with `**`, a raw HTTP body.
+        "def ask(model):\n    if model in RENAMED:\n        m = RENAMED.get(model, model)\n        return client.chat.completions.create(model=m)\n    return client.chat.completions.create(model=model)\n",
+        "def ask(model):\n    if model in RENAMED:\n        params = {\"model\": RENAMED[model]}\n        return client.chat.completions.create(**params)\n    return client.chat.completions.create(model=model)\n",
+        "def ask(model):\n    if model in RENAMED:\n        return requests.post(\"https://api.openai.com/v1/chat/completions\", json={\"model\": RENAMED[model]})\n    return client.chat.completions.create(model=model)\n",
+        // Handed to a function of the file that sends a request.
+        "def _send(m):\n    return client.chat.completions.create(model=RENAMED.get(m, m))\ndef ask(model):\n    if model in RENAMED:\n        return _send(model)\n    return client.chat.completions.create(model=model)\n",
+        // A class: another method, an attribute set from it, a same-file
+        // base's method, a method it is handed to.
+        "class S:\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n    def legacy(self):\n        return client.chat.completions.create(model=RENAMED[self.model])\n",
+        "class S:\n    def __init__(self, model):\n        self.model = model\n        self.alias = RENAMED.get(model)\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n    def old(self):\n        return client.chat.completions.create(model=self.alias)\n",
+        "class Base:\n    def legacy(self):\n        return client.chat.completions.create(model=RENAMED[self.model])\nclass S(Base):\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class S:\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        if self.model in RENAMED:\n            return self._send(self.model)\n        return client.chat.completions.create(model=self.model)\n    def _send(self, m):\n        return client.chat.completions.create(model=RENAMED[m])\n",
+    ];
+    for case in cases {
+        let source = format!("{head}{case}");
+        assert_eq!(model_params(&source, "llm.py"), [], "{case}");
+    }
+
+    // Read, but sent nowhere changed: a test, a price table, a helper that
+    // sends nothing, what the request returns.
+    let kept = [
+        "def ask(model):\n    if model.startswith(\"o1\"):\n        print(\"reasoning\")\n    return client.chat.completions.create(model=model)\n",
+        "PRICES = {}\ndef ask(model):\n    resp = client.chat.completions.create(model=model)\n    cost = PRICES[model] * resp.usage.total_tokens\n    return resp, cost\n",
+        "def log(m):\n    print(m)\ndef parse(r):\n    return r.choices[0]\ndef ask(model):\n    log(model)\n    resp = client.chat.completions.create(model=model)\n    return parse(resp)\n",
+        "class S:\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        resp = client.chat.completions.create(model=self.model)\n        return self._parse(resp)\n    def _parse(self, resp):\n        return client.chat.completions.create(model=self.model, messages=[resp])\n",
+    ];
+    for case in kept {
+        let source = format!("{head}{case}");
+        assert!(!model_params(&source, "llm.py").is_empty(), "{case}");
+    }
+}
+
+#[test]
 fn a_wrapper_call_keeps_what_the_calling_file_changes() {
     // A LangChain chat model the wrapper builds and hands back, given
     // another model or made configurable where it is called.

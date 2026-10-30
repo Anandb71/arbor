@@ -501,7 +501,7 @@ pub struct WrapperRequest {
 /// `docs/SDK_USAGES.md`, "Calls through a wrapper in another file"). The
 /// repository scan reads them for its second pass; they are not part of
 /// the JSON report.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModelParam {
     /// The module-level name other files call: the function, or the class
     /// whose `__init__` takes the parameter.
