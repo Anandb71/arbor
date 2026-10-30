@@ -201,6 +201,11 @@ pub fn scan_usages(root: &Path, options: &UsageScanOptions) -> std::io::Result<U
         walk(root, options.follow_symlinks, prefix.as_deref())
     };
 
+    // `agents` is the OpenAI Agents SDK's module, and also a common name for
+    // a repository's own: with one in the tree, `from agents import Agent`
+    // may load it instead.
+    let local_agents = local_agents_module(&candidates, root, prefix.as_deref());
+
     let outcomes: Vec<(Candidate, Outcome)> = candidates
         .into_par_iter()
         .map(|candidate| {
@@ -240,6 +245,9 @@ pub fn scan_usages(root: &Path, options: &UsageScanOptions) -> std::io::Result<U
                 continue;
             }
         };
+        if let Some(local) = &local_agents {
+            found.shadow_agents_sdk(local);
+        }
         if let Some(sdk) = options.sdk {
             found.retain_sdk(sdk);
         }
@@ -313,6 +321,35 @@ pub fn scan_usages(root: &Path, options: &UsageScanOptions) -> std::io::Result<U
 
     summarize(&mut report);
     Ok(report)
+}
+
+/// The first module of the scanned tree named like the OpenAI Agents SDK's
+/// `agents`, as a display path: an `agents.py`, or a directory `agents`
+/// holding a Python file (a package or a namespace package, `src/agents/`).
+/// Vendored and hidden directories do not count: the SDK itself is
+/// installed under a virtual environment's `site-packages`.
+fn local_agents_module(
+    candidates: &[Candidate],
+    root: &Path,
+    prefix: Option<&str>,
+) -> Option<String> {
+    candidates
+        .iter()
+        .filter(|c| {
+            c.vendored_root.is_none()
+                && c.hidden_root.is_none()
+                && c.path.extension().is_some_and(|e| e == "py")
+        })
+        .find_map(|c| {
+            let relative = slash_path(c.path.strip_prefix(root).unwrap_or(&c.path));
+            let segments: Vec<&str> = relative.split('/').collect();
+            let (file, dirs) = segments.split_last()?;
+            if *file == "agents.py" {
+                return Some(c.relative.clone());
+            }
+            let at = dirs.iter().position(|dir| *dir == "agents")?;
+            Some(under(prefix, &format!("{}/", segments[..=at].join("/"))))
+        })
 }
 
 /// The display prefix, normalised: forward slashes, no trailing slash, and
@@ -562,6 +599,59 @@ mod tests {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn a_repositorys_own_agents_module_leaves_the_agents_sdk_unconfirmed() {
+        const AGENT: &str = "from agents import Agent\nbot = Agent(name=\"a\", model=\"gpt-4o\")\n";
+        // Without one, the call is the SDK's.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "app.py", AGENT);
+        write(
+            dir.path(),
+            ".venv/lib/site-packages/agents/__init__.py",
+            "x = 1\n",
+        );
+        let report = scan_usages(dir.path(), &UsageScanOptions::default()).unwrap();
+        assert_eq!(report.usages[0].routing, Routing::OpenaiDirect);
+        assert!(report.gaps.is_empty(), "{:?}", report.gaps);
+
+        for local in ["agents/__init__.py", "src/agents/tools.py", "agents.py"] {
+            let dir = tempdir().unwrap();
+            write(dir.path(), "app.py", AGENT);
+            write(dir.path(), local, "class Agent:\n    pass\n");
+            let report = scan_usages(dir.path(), &UsageScanOptions::default()).unwrap();
+            let call = &report.usages[0];
+            assert_eq!(call.routing, Routing::Unknown, "{local}");
+            assert_eq!(report.clients[0].routing, Routing::Unknown, "{local}");
+            let mut reasons: Vec<String> = report
+                .gaps
+                .iter()
+                .map(|g| format!("{}/{}", g.kind.as_str(), g.reason))
+                .collect();
+            reasons.sort();
+            assert_eq!(
+                reasons,
+                [
+                    "ambiguous_client/local_module",
+                    "unresolved_model/local_module"
+                ],
+                "{local}"
+            );
+            let shown = if local == "agents.py" {
+                "agents.py".to_string()
+            } else {
+                format!("{}/", local.rsplit_once('/').unwrap().0)
+            };
+            assert!(
+                report
+                    .gaps
+                    .iter()
+                    .all(|g| g.detail.contains(&format!("`{shown}`"))),
+                "{:?}",
+                report.gaps
+            );
+        }
     }
 
     #[test]

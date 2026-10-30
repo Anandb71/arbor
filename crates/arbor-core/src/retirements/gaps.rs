@@ -126,6 +126,11 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     ),
     (
         GapKind::UnresolvedModel,
+        "local_module",
+        "the repository has its own module named like the SDK, which the import may load instead",
+    ),
+    (
+        GapKind::UnresolvedModel,
         "truncated",
         "the call passes more model values than the scan reads, so not all are listed",
     ),
@@ -173,6 +178,11 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
         GapKind::AmbiguousClient,
         "given_client",
         "the requests go through an SDK client or model provider the chat model, agent or model object is given",
+    ),
+    (
+        GapKind::AmbiguousClient,
+        "local_module",
+        "the repository has its own module named like the SDK, which the import may load instead",
     ),
     (
         GapKind::AmbiguousClient,

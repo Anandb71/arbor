@@ -647,6 +647,53 @@ impl FileUsages {
         self.calls.retain(|c| c.sdk == sdk);
         self.gaps.retain(|g| g.sdk.is_none_or(|s| s == sdk));
     }
+
+    /// The scanned tree has a module of its own named like the OpenAI
+    /// Agents SDK's `agents` (`local`, its path), which `from agents import
+    /// ...` may load instead. Every record of the SDK in this file is then
+    /// unconfirmed: each construction and call routes `unknown`, and each
+    /// call gets a `local_module` gap on its routing and, when it has values,
+    /// one on its model.
+    pub fn shadow_agents_sdk(&mut self, local: &str) {
+        let agents = |package: &str| package == "agents";
+        for client in self.clients.iter_mut().filter(|c| agents(&c.package)) {
+            client.routing = Routing::Unknown;
+        }
+        let mut gaps = Vec::new();
+        for call in self.calls.iter_mut().filter(|c| agents(&c.package)) {
+            call.routing = Routing::Unknown;
+            let gap = |kind: GapKind, detail: String| UsageGap {
+                kind,
+                sdk: Some(call.sdk),
+                file: call.file.clone(),
+                span: Some(call.span),
+                symbol: call.symbol.clone(),
+                chain: Some(call.chain.clone()),
+                key: None,
+                reason: "local_module".to_string(),
+                detail,
+                values: Vec::new(),
+                values_complete: false,
+                args: None,
+            };
+            let chain = &call.chain;
+            gaps.push(gap(
+                GapKind::AmbiguousClient,
+                format!(
+                    "this repository has its own `agents` module (`{local}`), which `from agents import ...` may load instead of the OpenAI Agents SDK, so where `{chain}` sends its requests is not confirmed"
+                ),
+            ));
+            if !call.values.is_empty() {
+                gaps.push(gap(
+                    GapKind::UnresolvedModel,
+                    format!(
+                        "this repository has its own `agents` module (`{local}`), which `from agents import ...` may load instead of the OpenAI Agents SDK, so `{chain}` may not be the SDK's and its model is not confirmed"
+                    ),
+                ));
+            }
+        }
+        self.gaps.extend(gaps);
+    }
 }
 
 /// Languages that have a usage extractor.
