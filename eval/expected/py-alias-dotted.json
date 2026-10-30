@@ -1,0 +1,22 @@
+{
+  "corpus_version": 1,
+  "language": "python",
+  "covers": ["import alias resolution", "from pkg.mod import Y as Z", "from .mod import Y as Z"],
+  "symbols": [
+    "shop/orders.py::total_cents",
+    "legacy/invoices.py::invoice_cents",
+    "billing/money.py::money_to_minor_units",
+    "legacy/money.py::money_to_minor_units"
+  ],
+  "edges_expected": [
+    ["shop/orders.py::total_cents", "billing/money.py::money_to_minor_units"],
+    ["legacy/invoices.py::invoice_cents", "legacy/money.py::money_to_minor_units"]
+  ],
+  "edges_forbidden": [
+    ["shop/orders.py::total_cents", "legacy/money.py::money_to_minor_units"],
+    ["legacy/invoices.py::invoice_cents", "billing/money.py::money_to_minor_units"]
+  ],
+  "known_missing": [],
+  "known_extra": [],
+  "notes": "billing/money.py and legacy/money.py both define money_to_minor_units. shop/orders.py aliases it from the dotted module billing.money; legacy/invoices.py aliases it from the relative module .money, its own package's sibling. Each alias call must reach only the module its import names."
+}
