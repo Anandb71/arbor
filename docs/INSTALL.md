@@ -109,6 +109,12 @@ Downloads the matching release binary on install:
 npx @anandb71/arbor-cli
 ```
 
+npm 12 skips install scripts unless its `allow-scripts` setting names the package. When the install script did not run, the first `arbor` run downloads the release archive for your platform from the GitHub Release matching the package version, checks it against that release's `SHA256SUMS`, and installs the binary next to the wrapper (or, when that folder is not writable, under your user cache folder). Progress goes to stderr, so `--json` output is unaffected. A failed download exits 2 and prints the reason and the manual steps.
+
+- Behind a proxy: Node.js 22.21+ and 24.5+ use `HTTPS_PROXY`/`NO_PROXY`, or npm's `https-proxy`/`noproxy` settings. For a proxy that inspects HTTPS, set `NODE_EXTRA_CA_CERTS` to its CA certificate.
+- Mirror: set `ARBOR_NPM_DOWNLOAD_BASE` to a folder (https) holding the release archives and `SHA256SUMS`.
+- Cache folder: `ARBOR_NPM_CACHE_DIR` overrides the fallback folder.
+
 ## Homebrew
 
 A formula is kept at [`packaging/homebrew/arbor.rb`](../packaging/homebrew/arbor.rb), but no tap is published yet, so `brew install` cannot find it. On macOS and Linux use the install script above.

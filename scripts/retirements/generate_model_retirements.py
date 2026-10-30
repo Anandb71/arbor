@@ -118,13 +118,31 @@ RULES = {
     "OAI-REASONING-DEFAULT": {"message": "{target} runs at medium reasoning effort by default, so it can reason; the model it replaces answered without a reasoning step."},
     "OAI-SAMPLING": {"message": "temperature, top_p and logprobs are accepted on {target} at reasoning_effort \"none\"; at its default effort a non-default temperature returns 400."},
     "OAI-SAMPLING-RESPONSES": {"message": "Whether {target} accepts temperature, top_p or logprobs on the Responses API is not verified."},
-    "OAI-SAMPLING-REASONING-SOURCE": {"message": "temperature, top_p and logprobs work on {target} only at reasoning_effort \"none\", which would turn off this reasoning model's reasoning."},
+    # 28 Oct audit (RECIPE-DRIFT §7): the live check sent top_p and logprobs only at "none",
+    # and only on Chat Completions; the recipe's evidence says no GPT-5.6 page states the rule.
+    "OAI-SAMPLING-REASONING-SOURCE": {
+        "message": "On {target}, a non-default temperature returned 400 at the default reasoning effort and worked at reasoning_effort \"none\", which would turn off this reasoning model's reasoning (live check, 18 Oct 2026); top_p and logprobs were tested only at \"none\".",
+        "otherwise_verified": "unverified",
+        "why": "the recipe cites no page for it (its evidence: no GPT-5.6 page states the rule; the GPT-5.4 guide states it for older models), so nothing backs it where the live calls did not reach, such as the Responses API",
+    },
     "OAI-MAX-TOKENS": {
-        "message": "max_tokens is rejected on {target}: use max_completion_tokens (same value).",
+        # 28 Oct audit (RECIPE-DRIFT item 15): the API reference says "deprecated"; only
+        # gpt-5.6-terra was called live.
+        "message": "max_tokens is deprecated in favour of max_completion_tokens (OpenAI's API reference) and returned 400 on gpt-5.6-terra (live check, 18 Oct 2026; gpt-5.6-sol and gpt-5.6-luna not tested): use max_completion_tokens (same value).",
         "choice_note": "If {target} reasons, max_completion_tokens also bounds its reasoning tokens, so a small limit can be used up before any visible text.",
     },
-    "OAI-STOP": {"message": "stop is not supported on {target} (400)."},
-    "OAI-LOGIT-BIAS": {"message": "logit_bias is not supported on {target} (400)."},
+    # 28 Oct audit (RECIPE-DRIFT item 16 and §7): no page says stop or logit_bias fails on
+    # any GPT-5.6 model; the only evidence is one live call on gpt-5.6-terra at "none".
+    "OAI-STOP": {
+        "message": "stop returned 400 on gpt-5.6-terra at reasoning_effort \"none\" (live check, 18 Oct 2026); it was not tested on gpt-5.6-sol, gpt-5.6-luna or at the default effort. OpenAI's API reference names only o3 and o4-mini as not supporting stop.",
+        "otherwise_verified": "unverified",
+        "why": "the cited API reference says stop is unsupported on o3 and o4-mini only, so no page backs the rule where the live call did not reach",
+    },
+    "OAI-LOGIT-BIAS": {
+        "message": "logit_bias returned 400 on gpt-5.6-terra at reasoning_effort \"none\" (live check, 18 Oct 2026); it was not tested on gpt-5.6-sol, gpt-5.6-luna or at the default effort.",
+        "otherwise_verified": "unverified",
+        "why": "no page says logit_bias is unsupported on any GPT-5.6 model, so nothing backs the rule where the live call did not reach",
+    },
     "OAI-PENALTIES-N-SEED": {
         "message": "presence_penalty, frequency_penalty, n and seed are accepted on gpt-5.6-terra at reasoning_effort \"none\".",
         "else_message": "presence_penalty, frequency_penalty, n and seed were verified on gpt-5.6-terra only, not on {target}.",
@@ -145,7 +163,9 @@ RULES = {
     "G6-LEGACY-FUNCTIONS": {"message": "Legacy functions/function_call work on {target} at reasoning_effort \"none\"; without it they were not tested."},
     "G6-REASONING-DEFAULT": {"message": "{target} runs at medium reasoning effort by default, so it can reason; the model it replaces answered without a reasoning step."},
     "G6-SAMPLING": {"message": "temperature, top_p and logprobs are accepted on {target} at reasoning_effort \"none\"; at its default effort a non-default temperature returns 400."},
-    "G6-SAMPLING-RESPONSES": {"message": "Whether {target} accepts temperature, top_p or logprobs on the Responses API is not verified."},
+    # 28 Oct audit (RECIPE-DRIFT item 18, decision F4): the "Using GPT-6" guide states the
+    # rule for the Responses API too; still no Responses call was made.
+    "G6-SAMPLING-RESPONSES": {"message": "OpenAI's \"Using GPT-6\" guide says to remove temperature, top_p and top_logprobs on {target} unless reasoning effort is \"none\", and on the Responses API to drop message.output_text.logprobs from include. Arbor has not tested this on the Responses API."},
     "G6-MAX-TOKENS": {
         "message": "max_tokens is rejected on {target}: use max_completion_tokens (same value).",
         "choice_note": "If {target} reasons, max_completion_tokens also bounds its reasoning tokens, so a small limit can be used up before any visible text.",
@@ -158,11 +178,15 @@ RULES = {
     "G6-LEGACY-COMPLETIONS-ENDPOINT": {"message": "{target} does not support the legacy Completions endpoint: move the call to Chat Completions or Responses."},
     "G6-ASSISTANTS": {"message": "The Assistants API is shut down and {target} does not support it."},
     "G6-REGISTRIES": {"skip": "needs to follow the model string beyond the call (tokenizers, pricing tables)"},
-    "G6-TIER-CHANGE": {"message": "{target} is OpenAI's most efficient tier; GPT-4o and GPT-4.1 were flagship models, so answer quality may change."},
+    # 28 Oct audit (RECIPE-DRIFT item 19): OpenAI's own words; no page calls GPT-4.1 a flagship.
+    "G6-TIER-CHANGE": {"message": "OpenAI describes {target} as its \"most efficient model for focused, high-volume tasks\", so answer quality may change compared with the model it replaces."},
     # -- Anthropic --
-    "ANT-SAMPLING": {"message": "Non-default temperature, top_p or top_k return 400 on {target}; removing them is the documented fix and changes behaviour."},
+    # 28 Oct audit (RECIPE-DRIFT items 23 and 28, decision F3): API version 2026-10-21
+    # removes the three parameters on every model; the SDK majors that send it are named
+    # on Anthropic's migration page.
+    "ANT-SAMPLING": {"message": "temperature, top_p or top_k return 400 on {target}: at any value under API version 2026-10-21 (sent by anthropic Python >= 2.0.0 and @anthropic-ai/sdk >= 1.0.0), and at a non-default value under 2023-06-01. Removing them is the documented fix and changes behaviour."},
     "ANT-SAMPLING-HAIKU45": [
-        {"message": "{target} accepts temperature, top_p and top_k."},
+        {"message": "{target} is not documented as rejecting temperature, top_p or top_k on API version 2023-06-01; on 2026-10-21 (sent by anthropic Python >= 2.0.0 and @anthropic-ai/sdk >= 1.0.0) they return 400 on every model."},
         {
             "suffix": "both",
             "effect": "review",
@@ -455,6 +479,30 @@ def live_models(item: dict) -> list:
     return [str(m) for m in as_list(models)]
 
 
+def otherwise_verified(rule: dict, item: dict) -> str:
+    """The label a live rule carries where its live check did not reach: `docs` when the
+    recipe cites a page for it, unless RULES says the cited page does not cover the
+    rule there (it then needs a `why`)."""
+    override = item.get("otherwise_verified")
+    if override is None:
+        return "docs" if docs_backed(rule) else "unverified"
+    if override != "unverified":
+        raise GenerationError(f"{rule['id']}: otherwise_verified can only be lowered to unverified")
+    return override
+
+
+def live_dates_cited(rule: dict, message: str) -> None:
+    """A message that names its live check ("live check, 18 Oct 2026") must name the
+    recipe's live_result date, so a newer check cannot leave an old date in the text."""
+    for cited in re.findall(r"live check, (\d{1,2} [A-Z][a-z]{2} \d{4})", message):
+        live = rule.get("live_result") or {}
+        date = iso(live.get("date")) if isinstance(live, dict) else None
+        if date is None or human_date(date) != cited:
+            raise GenerationError(
+                f"{rule['id']}: the message cites a live check of {cited}, but the recipe's live_result date is {date!r}"
+            )
+
+
 def docs_backed(item: dict) -> bool:
     """Whether the recipe cites a page for the rule, so it stands on the docs where the
     live check did not reach."""
@@ -513,9 +561,20 @@ def openai_dated(recipe: dict) -> tuple[list, list]:
         if (value.get("basis") == "models_api" or "404" in outcome) and not checked:
             raise GenerationError(f"{model}: a live finding without a live_result date")
         if value.get("basis") == "models_api":
+            # The deprecations page has no row for the bare aliases (they appear there only as
+            # recommended replacements in older rows); the Chat Completions API reference
+            # dates each one, and the recipe quotes it (28 Oct audit, RECIPE-DRIFT items 10-13).
+            reference = f'"{model}" Deprecated. Announced shutdown date: {date}'
+            quotes = [str(q.get("quote", "")) for q in value.get("evidence_quotes") or [] if isinstance(q, dict)]
+            if not any(reference in quote for quote in quotes):
+                raise GenerationError(
+                    f"{model}: an alias dated by the models API needs the API reference quote {reference!r}"
+                )
             notes.append(
-                f"{model} is an alias: OpenAI's deprecations page does not list it, but its models API "
-                f"gives it shutdown date {human_date(date)} (checked {human_date(checked)})."
+                f"{model} is an alias: OpenAI's deprecations page gives it no shutdown date (its "
+                f"{human_date(date)} rows name only dated snapshots), but OpenAI's API reference lists it "
+                f"as deprecated with shutdown date {human_date(date)}, and its models API gave that date "
+                f"on {human_date(checked)}."
             )
         elif value.get("kind") == "listed_variant" and "404" in outcome:
             status = "shut_down"
@@ -933,6 +992,7 @@ def translate_rule(rule: dict, rule_set: str) -> tuple[list, list]:
             raise GenerationError(f"{rid}: condition {sorted(unknown)} is not visible from keyword names; give a translation with a reason")
         if overrides and not item.get("why"):
             raise GenerationError(f"{rid}: overrides {sorted(overrides)} need a reason")
+        live_dates_cited(rule, item["message"])
         effect = item.get("effect") or ACTION_EFFECTS.get(action)
         if effect is None:
             raise GenerationError(f"{rid}: action {action!r} needs an explicit effect")
@@ -975,7 +1035,7 @@ def translate_rule(rule: dict, rule_set: str) -> tuple[list, list]:
             # A live result vouches for the models it called, on the API it called.
             "live_models": live_models(rule) if live else [],
             "live_endpoints": list(LIVE_ENDPOINTS) if live else [],
-            "otherwise_verified": ("docs" if docs_backed(rule) else "unverified") if live else None,
+            "otherwise_verified": otherwise_verified(rule, item) if live else None,
             "source_url": rule.get("source_url"),
         }
         if effect == "add" and "add" not in item:
@@ -1001,6 +1061,8 @@ def translate_rule(rule: dict, rule_set: str) -> tuple[list, list]:
         if rule.get("see_choice"):
             engine["see_choice"] = rule["see_choice"]
             engine["choice_note"] = item.get("choice_note")
+        if "otherwise_verified" in item and not live:
+            raise GenerationError(f"{rid}: otherwise_verified in RULES on a rule without a live result")
         for key in ("endpoints", "targets", "any_kwargs", "all_kwargs", "lacks_kwargs", "add"):
             if key in item:
                 engine[key] = copy.deepcopy(item[key])

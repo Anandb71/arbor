@@ -235,3 +235,68 @@ jobs:
           arbor init .
           arbor index .
           arbor query "helper" . | grep -q helper
+
+  # The npm wrapper with its install script skipped, as npm 12 does by
+  # default (#281): bin/arbor.js must download, verify and run the binary on
+  # first run. npm 10 and 11 skip it with --ignore-scripts; npm 12 skips it
+  # on its own.
+  npm-first-run:
+    name: npm first run (${{ matrix.os }}, npm ${{ matrix.npm }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        npm: ['10', '11', '12']
+        include:
+          - npm: '10'
+            node: '20'
+            install: npm install --ignore-scripts
+          - npm: '11'
+            node: '24'
+            install: npm install --ignore-scripts
+          - npm: '12'
+            node: '24'
+            install: npx --yes npm@12 install
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Test the wrapper against a local release
+        run: node --test packaging/npm/test/download.test.js
+
+      - name: Install the packed wrapper and run it against the GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./packaging/npm/package.json').version")
+          if ! curl -fsSLI "https://github.com/Anandb71/arbor/releases/download/v${VERSION}/SHA256SUMS" >/dev/null; then
+            echo "::notice::v${VERSION} is not released yet, so there is nothing to download; skipping."
+            exit 0
+          fi
+          TGZ="$RUNNER_TEMP/$(cd packaging/npm && npm pack --silent --pack-destination "$RUNNER_TEMP")"
+          mkdir -p "$RUNNER_TEMP/npm-first-run" && cd "$RUNNER_TEMP/npm-first-run"
+          npm init -y >/dev/null
+          ${{ matrix.install }} "$TGZ"
+          BIN=node_modules/@anandb71/arbor-cli/bin
+          if [ -e "$BIN/arbor" ] || [ -e "$BIN/arbor.exe" ]; then
+            echo "::error::the install script ran, so this job does not test the first-run download"
+            exit 1
+          fi
+          npx --no-install arbor --version 2>first-run.err | tee first-run.out
+          cat first-run.err
+          grep -q "arbor ${VERSION}" first-run.out
+          grep -q "against SHA256SUMS" first-run.err
+          npx --no-install arbor --version >second-run.out 2>second-run.err
+          grep -q "arbor ${VERSION}" second-run.out
+          if grep -q downloading second-run.err; then
+            echo "::error::the second run downloaded again"
+            exit 1
+          fi

@@ -120,7 +120,7 @@ Key features:
 
 ### `.arbor/` Directory
 
-Local cache created by `arbor init`/`arbor setup`. Contains `config.json` with default settings, `graph.bin` (bincode-serialized graph with centrality scores), and `graph.json` (JSON snapshot). Treated as workspace root marker alongside `.git`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`.
+Local cache created by `arbor init`/`arbor setup`. Contains `config.json` with default settings, `graph.bin` (bincode-serialized graph with centrality scores), and `graph.json` (JSON snapshot). Treated as workspace root marker alongside `.git`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`. Commands use the nearest folder with a marker at or above where they run, but the walk stops at the home folder: a folder under home never resolves to home or to anything above it, and Arbor run in home never looks above it (`find_workspace_root` in `crates/arbor-cli/src/commands.rs`). `~/.arbor` holds the global config and, on Windows, the installed binary, so it must not make the whole home folder one project (#273).
 
 ## CLI Command Reference
 
