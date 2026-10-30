@@ -1393,7 +1393,12 @@ fn finding_for(
     confidence: Confidence,
 ) -> Option<Finding> {
     let (hit, class) = match site {
-        Site::Call(call, _) if call.package == "agents" => {
+        // Only an agent's or a run's model name goes through the SDK's
+        // model provider; a model object sends its string as it is.
+        Site::Call(call, _)
+            if call.package == "agents"
+                && matches!(call.member.as_str(), "Agent" | "RunConfig") =>
+        {
             let (sent, through_litellm) = agents_model_sent(&value.value);
             let litellm = CallRouting {
                 sdk: Some(Sdk::Litellm),
@@ -3852,6 +3857,15 @@ routed = Agent(name="b", model="litellm/anthropic/claude-3-5-sonnet-20240620")
             .expect("a litellm/ name is looked up by the provider prefix after it");
         assert_eq!(routed.routing, "litellm");
         assert_eq!(routed.routing_class, RoutingClass::Routed);
+
+        // A model object sends its string unchanged, prefix included.
+        let source = r#"from agents import OpenAIChatCompletionsModel
+from openai import AsyncOpenAI
+
+kept = OpenAIChatCompletionsModel("openai/o3-mini", AsyncOpenAI())
+"#;
+        let report = check_source(source, &opts);
+        assert!(report.findings.is_empty(), "{:#?}", report.findings);
     }
 
     #[test]
