@@ -8428,9 +8428,9 @@ impl<'t> Ctx<'t> {
     /// The module-level name other files call to pass a parameter of
     /// `func`: a function, or the class whose `__init__` it is, defined
     /// once at module level, undecorated (a class also with no class
-    /// keyword, second base or `__new__`), and bound by nothing else, in a
-    /// module other files may import (not a script) that no dynamic
-    /// feature may rewrite.
+    /// keyword, second base or `__new__`, nor a same-file base with one or
+    /// with a decorator), and bound by nothing else, in a module other
+    /// files may import (not a script) that no dynamic feature may rewrite.
     fn exported_callee(&self, func: usize) -> Option<String> {
         if self.script
             || self.file_dynamic.is_some()
@@ -8468,22 +8468,37 @@ impl<'t> Ctx<'t> {
             // A `def` in a class body is also an assignment of its name
             // there (see [`Ctx::bind_definitions`]): `__init__` is bound
             // once when that is its only one.
-            let method = |m: &str| (named, m.to_string());
-            let bindings = |m: &str| {
-                let key = method(m);
+            let bindings = |class: usize, m: &str| {
+                let key = (class, m.to_string());
                 self.functions.get(&key).map_or(0, Vec::len)
                     + self.assigns.get(&key).map_or(0, Vec::len)
                     + self.attr_assigns.get(&key).map_or(0, Vec::len)
                     + usize::from(self.imports.contains_key(&key))
                     + usize::from(self.other_imports.contains_key(&key))
             };
+            // Its same-file bases: their `__new__` builds its instances too,
+            // and their decorators and class keywords apply to it.
+            let mut bases = Vec::new();
+            let mut base = self.class_shape(named).base;
+            while let Some(b) = base.filter(|b| !bases.contains(b) && *b != named) {
+                bases.push(b);
+                base = self.class_shape(b).base;
+            }
             functions == 0
                 && classes == 1
                 && !def.decorated
                 && def.class_feature.is_none()
-                && self.functions.get(&method("__init__")).map_or(0, Vec::len) == 1
-                && bindings("__init__") == 2
-                && bindings("__new__") == 0
+                && self
+                    .functions
+                    .get(&(named, "__init__".to_string()))
+                    .map_or(0, Vec::len)
+                    == 1
+                && bindings(named, "__init__") == 2
+                && bindings(named, "__new__") == 0
+                && bases.iter().all(|&b| {
+                    let base = &self.scopes[b];
+                    !base.decorated && base.class_feature.is_none() && bindings(b, "__new__") == 0
+                })
         };
         let rebound = self.assigns.contains_key(&key)
             || self.imports.contains_key(&key)

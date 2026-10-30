@@ -8194,6 +8194,10 @@ fn a_parameter_is_not_listed_where_the_extractor_cannot_confirm_it() {
         "class S(A, B):\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
         "class S:\n    def __new__(cls, model):\n        return object.__new__(cls)\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
         "class S:\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\nS.__init__ = other\n",
+        // A same-file base's `__new__`, decorator or class keyword.
+        "class One:\n    def __new__(cls, *a, **k):\n        return cls._it\nclass S(One):\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "@singleton\nclass One:\n    pass\nclass S(One):\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
+        "class One(metaclass=Meta):\n    pass\nclass S(One):\n    def __init__(self, model):\n        self.model = model\n    def go(self):\n        return client.chat.completions.create(model=self.model)\n",
         // The file may rewrite anything, or the request remaps its model.
         "def ask(model):\n    return client.chat.completions.create(model=model)\nexec(code)\n",
         "from settings import *\ndef ask(model):\n    return client.chat.completions.create(model=model)\n",
