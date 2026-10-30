@@ -2113,6 +2113,90 @@ new Bot().run(\"ask\");",
 }
 
 #[test]
+fn a_member_in_parentheses_or_a_type_assertion_is_used_as_written() {
+    // Parentheses keep the reference, and `!`, `as`, `satisfies` and `<T>`
+    // compile to nothing: the chain inside is called, bound or written.
+    for route in [
+        "return this[kind]!(model);",
+        "return (this[kind])(model);",
+        "return (this[kind] as any)(model);",
+        "return (<any>this[kind])(model);",
+        "return (this[kind] satisfies any)(model);",
+        "return ((this[kind] as any)!)?.(model);",
+        "return (this[kind] as any).call(this, model);",
+        "return (this[kind] as any)[\"apply\"](this, [model]);",
+    ] {
+        let body = format!(
+            "class Router {{
+  private chat(model = \"gpt-4o\") {{
+    return client.chat.completions.create({{ model, messages: [] }});
+  }}
+  route(kind: \"chat\", model: string) {{ {route} }}
+}}
+new Router().route(\"chat\", \"gpt-5.5\");"
+        );
+        let (value, origin, gaps) = model_row(&body);
+        assert_eq!(value.as_deref(), Some("gpt-4o"), "{route}");
+        assert_eq!(origin, Some(ValueOrigin::ParameterDefault), "{route}");
+        assert_eq!(gaps, vec!["unresolved_model/unseen_callers"], "{route}");
+    }
+    for run in [
+        "return (this[m] as any).call({ model: \"gpt-5.5\" });",
+        "return (this[m])!.bind({ model: \"gpt-5.5\" })();",
+    ] {
+        let (value, gaps) = model_of(&format!(
+            "class Bot {{
+  private model = \"gpt-4\";
+  ask() {{ return client.chat.completions.create({{ model: this.model, messages: [] }}); }}
+  run(m: \"ask\") {{ {run} }}
+}}
+new Bot().run(\"ask\");"
+        ));
+        assert_eq!(value.as_deref(), Some("gpt-4"), "{run}");
+        assert!(
+            gaps.iter().any(|g| g == "unresolved_model/attribute"),
+            "{run}: {gaps:?}"
+        );
+    }
+    // A class property written through a wrapper is written.
+    for write in [
+        "(this.model as any) = \"gpt-5.5\";",
+        "this.model! = \"gpt-5.5\";",
+    ] {
+        let (_, gaps) = model_of(&format!(
+            "class Bot {{
+  private model = \"gpt-4\";
+  ask() {{ return client.chat.completions.create({{ model: this.model, messages: [] }}); }}
+  swap() {{ {write} }}
+}}
+new Bot().ask();"
+        ));
+        assert_eq!(gaps, vec!["unresolved_model/reassigned"], "{write}");
+    }
+    // A method with a known name called through a wrapper is a call: what
+    // it is passed is listed.
+    let (default, _, gaps) = model_row(
+        "class Router {
+  private chat(model = \"gpt-4o\") {
+    return client.chat.completions.create({ model, messages: [] });
+  }
+  route() { return (this.chat as any)(\"gpt-5.5\"); }
+}
+new Router().route();",
+    );
+    assert_eq!(default.as_deref(), Some("gpt-4o"));
+    assert_eq!(gaps, vec!["unresolved_model/parameter_overridden"]);
+    // An SDK request called through a wrapper is a request, not a method
+    // stored as a value.
+    let found = usages(&format!(
+        "{CLIENT}(client.chat.completions.create as any)({{ model: \"gpt-4o\", messages: [] }});"
+    ));
+    let c = call(&found, "client.chat.completions.create");
+    assert_eq!(value(c, "model"), Some("gpt-4o"));
+    assert!(found.gaps.is_empty(), "{:?}", found.gaps);
+}
+
+#[test]
 fn an_enum_member_names_the_members_before_outer_names() {
     let (value, gaps) = model_of(
         "const Fast = \"gpt-4\";

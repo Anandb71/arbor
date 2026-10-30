@@ -1604,6 +1604,29 @@ struct Frame<'t> {
     owner: Option<usize>,
     /// The class whose body this node is a member of.
     class: Option<usize>,
+    /// Inside wrappers that keep its value (`(x)`, `x!`, `x as T`, `x
+    /// satisfies T`, `<T>x`): where the outermost one's value goes.
+    wrapped: Option<Context<'t>>,
+}
+
+/// Where a node's value goes: its parent, the field it is in there, and
+/// the parent's parent.
+#[derive(Debug, Clone, Copy)]
+struct Context<'t> {
+    parent: Option<Node<'t>>,
+    field: Option<&'static str>,
+    grand: Option<Node<'t>>,
+}
+
+impl<'t> Frame<'t> {
+    /// Where this node's value goes, past the wrappers around it.
+    fn context(&self) -> Context<'t> {
+        self.wrapped.unwrap_or(Context {
+            parent: self.parent,
+            field: self.field,
+            grand: self.grand,
+        })
+    }
 }
 
 struct Ctx<'t> {
@@ -1974,6 +1997,7 @@ impl<'t> Ctx<'t> {
             decorated: false,
             owner: None,
             class: None,
+            wrapped: None,
         }];
         while let Some(frame) = stack.pop() {
             self.visit(frame, &mut stack);
@@ -2014,6 +2038,9 @@ impl<'t> Ctx<'t> {
             decorated: false,
             owner: f.owner,
             class: None,
+            // One step per frame: a wrapper's own context, already past
+            // the wrappers around it.
+            wrapped: keeps_value(f.node.kind()).then(|| f.context()),
         }
     }
 
@@ -3669,15 +3696,18 @@ impl<'t> Ctx<'t> {
 
     /// What the top of a member chain at `f` does.
     fn chain_use(&self, f: &Frame<'t>) -> ChainUse<'t> {
-        let Some(parent) = f.parent else {
+        // `(x.a as any)(...)`, `x.a! = v`: a wrapper keeps the chain's value,
+        // so its use is the wrapper's.
+        let context = f.context();
+        let Some(parent) = context.parent else {
             return ChainUse::Read;
         };
         let write = |value| ChainUse::Write {
             value,
             scope: f.scope,
         };
-        let grand = f.grand.map(|g| g.kind());
-        match (parent.kind(), f.field) {
+        let grand = context.grand.map(|g| g.kind());
+        match (parent.kind(), context.field) {
             ("assignment_expression", Some("left")) => write(parent.child_by_field_name("right")),
             ("augmented_assignment_expression", Some("left"))
             | ("update_expression", _)
@@ -3685,10 +3715,11 @@ impl<'t> Ctx<'t> {
             ("unary_expression", _) if is_delete(parent) => write(None),
             ("call_expression", Some("function")) => ChainUse::Call,
             ("arguments", _) if matches!(grand, Some("call_expression" | "new_expression")) => {
-                f.grand.map_or(ChainUse::Read, ChainUse::Arg)
+                context.grand.map_or(ChainUse::Read, ChainUse::Arg)
             }
             ("spread_element", _) if matches!(grand, Some("object" | "array")) => ChainUse::Spread(
-                f.grand
+                context
+                    .grand
                     .and_then(|g| self.literal_calls.get(&g.id()).copied()),
             ),
             ("assignment_pattern" | "object_assignment_pattern", Some("left"))
@@ -3707,6 +3738,9 @@ impl<'t> Ctx<'t> {
         let mut links: Vec<Step<'t>> = Vec::new();
         let mut current = top;
         let mut innermost = top;
+        // The last member or subscript link: past any `!` below it, the next
+        // node down is its object.
+        let mut object_of = top;
         loop {
             match current.kind() {
                 "member_expression" => {
@@ -3732,6 +3766,9 @@ impl<'t> Ctx<'t> {
                 "non_null_expression" => {}
                 _ => break,
             }
+            if current.kind() != "non_null_expression" {
+                object_of = current;
+            }
             innermost = current;
             let next = match current.kind() {
                 "non_null_expression" => current.named_child(0),
@@ -3748,9 +3785,10 @@ impl<'t> Ctx<'t> {
         let line = self.line(top);
         // `this.constructor` or `x.constructor` used as a value may build an
         // instance without naming its class.
+        let context = f.context();
         if path.last() == Some(&Step::Key("constructor"))
             && !matches!(does, ChainUse::Write { .. })
-            && f.parent.map(|p| p.kind()) != Some("binary_expression")
+            && context.parent.map(|p| p.kind()) != Some("binary_expression")
         {
             let feature = Feature {
                 what: "an instance built through its `constructor` property",
@@ -3779,14 +3817,28 @@ impl<'t> Ctx<'t> {
             "this" | "meta_property" => {}
             _ if root.id() != top.id() => {
                 let link = self.child(f, innermost, f.scope, None);
-                stack.push(self.child(&link, root, f.scope, Some("object")));
+                let mut object = self.child(&link, root, f.scope, Some("object"));
+                // `(this[m])!.call(...)`: the root is the object of the link
+                // above the `!`.
+                if innermost.kind() == "non_null_expression" {
+                    object.wrapped = Some(Context {
+                        parent: Some(object_of),
+                        field: Some("object"),
+                        grand: None,
+                    });
+                }
+                stack.push(object);
             }
             _ => {}
         }
         // `x.ask.call(other)`, `.apply(...)`, `.bind(...)`: `ask` runs with
         // another `this`. Under a key known only at run time
-        // (`this[m].call(other)`), any method may; called directly
-        // (`this[kind](...)`), any method may be called.
+        // (`this[m].call(other)`, `(this[m] as any).call(other)`), any
+        // method may; called directly (`this[kind](...)`), any method may
+        // be called.
+        let rebound = f.wrapped.is_some()
+            && context.field == Some("object")
+            && context.parent.is_some_and(|p| self.rebinds(p));
         match path.as_ref() {
             [.., Step::Key(method), Step::Key("call" | "apply" | "bind")] => {
                 self.method_refs.insert(method);
@@ -3794,6 +3846,7 @@ impl<'t> Ctx<'t> {
             [.., Step::Other, Step::Key("call" | "apply" | "bind")] => {
                 self.method_refs_wild = true;
             }
+            [.., Step::Other] if rebound => self.method_refs_wild = true,
             [.., Step::Other] if matches!(does, ChainUse::Call) => {
                 self.method_calls_wild = true;
             }
@@ -3802,7 +3855,7 @@ impl<'t> Ctx<'t> {
         if let Some(Step::Key(last)) = path.last() {
             match does {
                 ChainUse::Call => {
-                    if let Some(call) = f.parent {
+                    if let Some(call) = context.parent {
                         let sites = self.method_calls.entry(last).or_default();
                         if sites.len() <= MAX_CALLERS_READ {
                             sites.push((call, f.scope));
@@ -3834,6 +3887,18 @@ impl<'t> Ctx<'t> {
                 line,
             });
         }
+    }
+
+    /// Whether `member` reads `call`, `apply` or `bind` off its object.
+    fn rebinds(&self, member: Node<'t>) -> bool {
+        let key = match member.kind() {
+            "member_expression" => member.child_by_field_name("property").map(|p| self.text(p)),
+            "subscript_expression" => member
+                .child_by_field_name("index")
+                .and_then(|i| static_key(i, self.src)),
+            _ => None,
+        };
+        matches!(key, Some("call" | "apply" | "bind"))
     }
 
     /// `new this()` or `new this.constructor()`: an instance built without
@@ -3978,6 +4043,19 @@ fn has_token(node: Node<'_>, token: &str) -> bool {
 /// Whether `node` has a child in field `field`.
 fn has_field(node: Node<'_>, field: &str) -> bool {
     node.child_by_field_name(field).is_some()
+}
+
+/// Expressions whose value is the one inside them: parentheses, and
+/// TypeScript's assertions, which compile to nothing.
+fn keeps_value(kind: &str) -> bool {
+    matches!(
+        kind,
+        "parenthesized_expression"
+            | "non_null_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "type_assertion"
+    )
 }
 
 /// `expr` without the parentheses around it.
