@@ -244,11 +244,12 @@ project's own, as in `AzureOpenAI | Gateway`) are not read.
 
 When the name or attribute is given other values too:
 
-- A construction the file shows decides the route over a **bare
-  declaration** (`client: OpenAI` in a class body, with no value, and
+- A construction the file shows decides the route over a **declaration**
+  (`client: OpenAI` in a class body with no value, or with `None` or
+  another literal as in `client: Optional[OpenAI] = None`, and
   `self.client = OpenAI()` in `__init__`).
-- A **typed value** (a parameter, or an annotated assignment with a value,
-  `self.client: OpenAI = make()`) is one more value. It agrees with a
+- A **typed value** (a parameter, or an annotated assignment with any other
+  value, `self.client: OpenAI = make()`) is one more value. It agrees with a
   construction only when its class decides that construction's route
   (`AzureOpenAI` next to `AzureOpenAI(...)`); a direct class never does.
   Otherwise the call gets a `multiple_assignments` gap, as with an untyped

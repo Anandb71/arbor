@@ -611,8 +611,9 @@ struct Client {
     ambiguous: bool,
     /// Known only from a type annotation, not from a construction.
     typed: bool,
-    /// Typed by a bare declaration (`client: OpenAI` in a class body), which
-    /// gives the binding a type but no value. Only [`combine`] reads it, and
+    /// Typed by a declaration, which gives the binding a type but no client:
+    /// bare (`client: OpenAI` in a class body) or with a placeholder
+    /// (`client: Optional[OpenAI] = None`). Only [`combine`] reads it, and
     /// what it returns never has it.
     declared: bool,
     /// Why the routing may not hold at a call, reported there as an
@@ -5546,7 +5547,11 @@ impl<'t> Ctx<'t> {
         }
         if let Some(annotation) = assign.annotation {
             if let Some(mut val) = self.typed(annotation, assign.scope) {
-                if let (None, Val::Client { client, .. }) = (assign.value, &mut val) {
+                // `client: Optional[OpenAI] = None` declares the binding as
+                // much as a bare `client: OpenAI` does: the placeholder is
+                // not a client, as it is not one unannotated.
+                let declared = matches!(value, None | Some(Val::Untracked(Origin::Placeholder)));
+                if let (true, Val::Client { client, .. }) = (declared, &mut val) {
                     client.declared = true;
                 }
                 return val;

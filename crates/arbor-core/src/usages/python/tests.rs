@@ -568,6 +568,80 @@ def same(client: Optional[AzureOpenAI] = None):
 }
 
 #[test]
+fn a_typed_declaration_set_to_none_yields_to_a_construction() {
+    // `client: Optional[OpenAI] = None` and then `OpenAI()` is the lazy
+    // client of ordinary code. The `None` is a placeholder, as it is with no
+    // annotation, so the annotation declares the binding like a bare
+    // `client: OpenAI` and the construction decides the route.
+    let found = usages(
+        r#"from typing import Optional
+from openai import AzureOpenAI, OpenAI
+from mylib import make
+
+class Eager:
+    client: Optional[OpenAI] = None
+
+    def __init__(self):
+        self.client = OpenAI()
+
+    def ask(self):
+        return self.client.chat.completions.create(model="gpt-4o", messages=[])
+
+class Lazy:
+    _client: OpenAI | None = None
+
+    def ask(self):
+        if self._client is None:
+            self._client = OpenAI()
+        return self._client.chat.completions.create(model="gpt-4o", messages=[])
+
+_client: Optional[OpenAI] = None
+
+def get():
+    global _client
+    if _client is None:
+        _client = OpenAI()
+    return _client.chat.completions.create(model="gpt-4o", messages=[])
+
+class Other:
+    client: Optional[AzureOpenAI] = None
+
+    def __init__(self):
+        self.client = OpenAI()
+
+    def ask(self):
+        return self.client.chat.completions.create(model="gpt-4o", messages=[])
+
+class Made:
+    client: Optional[OpenAI] = None
+
+    def __init__(self):
+        self.client = make()
+
+    def ask(self):
+        return self.client.chat.completions.create(model="gpt-4o", messages=[])
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (12, Routing::OpenaiDirect, vec![]),
+            (20, Routing::OpenaiDirect, vec![]),
+            (28, Routing::OpenaiDirect, vec![]),
+            // The construction decides over another declared class.
+            (37, Routing::OpenaiDirect, vec![]),
+            // Next to a factory's client the declaration types the binding,
+            // and a direct class does not decide its route.
+            (
+                46,
+                Routing::Unknown,
+                vec!["ambiguous_client/annotation".to_string()]
+            ),
+        ]
+    );
+}
+
+#[test]
 fn typed_clients_that_route_differently_are_a_gap_in_any_order() {
     // Two typed clients took the first one's route: `azure` then `direct`
     // was `azure_openai` with no gap, `direct` then `azure` the
