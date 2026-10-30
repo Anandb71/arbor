@@ -625,7 +625,8 @@ file as a call that binds the model, like `ChatOpenAI(...)`. The call record
 
 - `request: false`, `chain` as written, `member` the function's name and
   `receiver` `symbol`;
-- `kwargs` the call's own argument names;
+- `kwargs` the call's own argument names, and `spreads` its own `**`
+  expressions;
 - `sdk`, `package` and `routing` those of the requests it reaches;
 - `wrapper`: the defining file, the function's name, and each request there
   (`parameter`, `chain`, `member`, `line`).
