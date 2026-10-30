@@ -540,9 +540,12 @@ recorded like a LangChain chat model, as a construction and a call
 (`request: false`) that binds the model, read under the value rules above.
 Nothing called on what they build is recorded (`agent.clone(...)`,
 `agent.as_tool(...)`): those objects configure a run, they are not clients.
-Their other arguments configure a run or the CLI (`trace_metadata`,
-`model_settings`, `extra_args`), so a `model` key nested in them, written at
-the call or in a dict expanded with `**`, is not read as a model.
+The OpenAI Agents SDK's and the Claude Agent SDK's other arguments configure
+a run or the CLI (`trace_metadata`, `model_settings`, `extra_args`), so a
+`model` key nested in them, written at the call or in a dict expanded with
+`**`, is not read as a model. AgentScope's are read: it sends
+`generate_kwargs` (AgentScope 1) and `extra_body` (AgentScope 2) in its
+request over its own model (below).
 
 | Framework | Classes | Imported from | Model |
 |---|---|---|---|
@@ -558,11 +561,14 @@ classes from a module of the SDK that defines or re-exports it (the table):
 `import agents`, a wildcard import, any other name (`from agents import
 get_sql_agent`), another `agents` module (`from agents.tools import Agent`)
 and a relative import are not followed. When the scanned tree has an `agents`
-module of its own (an `agents.py`, or a directory `agents` holding Python
-files, outside vendored and hidden directories), `from agents import Agent`
-may load it instead: every Agents SDK record then routes `unknown`, and each
-call gets a `local_module` gap on its routing and, when it has values, on its
-model. A single file scanned alone cannot show this. AgentScope is
+module of its own (an `agents.py`, a directory `agents` holding Python
+files, or a link named `agents` or `agents.py`, outside vendored, hidden and
+ignored directories), or the scan is of a directory inside an `agents`
+package (an `agents` directory with an `__init__.py`, the scan root or one of
+its parents), `from agents import Agent` may load it instead: every Agents
+SDK record then routes `unknown`, and each call gets a `local_module` gap on
+its routing and, when it has values, on its model. A single file scanned
+alone shows only the package it is inside. AgentScope is
 followed only through `from agentscope.model... import`; its models for
 other providers (`DashScopeChatModel`, `OllamaChatModel`...) and its 0.x
 model configurations are not. The Claude Agent SDK's modules are followed
@@ -608,8 +614,10 @@ the file may give a run one:
   name, or through an expansion);
 - a `run_config=` given anywhere that is not `None` or a same-file
   `RunConfig` built without a model (a parameter, one from another module);
-- a `**` expansion given to `Runner.run`, `Runner.run_sync` or
-  `Runner.run_streamed`, which may hold a `run_config`.
+- a `**` expansion given to `run`, `run_sync` or `run_streamed` on a
+  receiver named like a runner (`Runner`, `agents.Runner`, `runner = Runner`,
+  `self.runner`) or the SDK's `Runner` imported under another name, which may
+  hold a `run_config`.
 
 So do they in a file that writes `model` on another object (`agent.model =
 ...`). A run configured in another module is not seen. `Agent.clone(model=
@@ -646,7 +654,10 @@ another provider or endpoint, so:
   no such setting;
 - options whose `extra_args` give the CLI `--settings` (`extra_args=
   {"settings": ...}`, or `extra_args` the file cannot read whole) route
-  `unknown` with an `endpoint_option` gap.
+  `unknown` with an `endpoint_option` gap. `extra_args` used after the
+  options are built (`options.extra_args["settings"] = ...`, `setattr(options,
+  "extra_args", ...)`) count as their environment above, and also give their
+  values a `reassigned` gap: the flags may pass another model.
 
 An agent definition runs where its options do: built inside the options'
 `agents=` dict (`ClaudeAgentOptions(agents={"r": AgentDefinition(...)})`),
@@ -660,11 +671,15 @@ covers every value of the call. The CLI's model variables
 (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`,
 `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`,
 `ANTHROPIC_DEFAULT_FABLE_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`,
-`CLAUDE_CODE_SUBAGENT_MODEL`) pick the model for an alias, a subagent or a
-session given none: options given an `env=` that names one (or one the file
-cannot read whole), and every options object and agent definition in a file
-that sets one (or writes the environment with a run-time name), keep an
-`env_var` gap with no key. `query(...)`,
+`CLAUDE_CODE_SUBAGENT_MODEL`) pick what an alias resolves to, a subagent's
+model and the model of a session given none; a full model ID given as
+`--model` wins over them. Where they may be set (the file sets one or writes
+the environment with a run-time name; the options' `env=` may name one, a
+`**` expansion, `settings=` or `extra_args` may set one, or the file changes
+their environment after they are built), an alias the options are given
+(`"sonnet"`, `"opus"`, `"default"`...) and every model of an agent definition
+built inside them keep an `env_var` gap on their key; options given a full
+model ID do not. `query(...)`,
 `ClaudeSDKClient` and its `set_model(...)` are not read.
 
 **AgentScope.** Each model builds its provider's SDK client: OpenAI's for
@@ -683,8 +698,13 @@ for Gemini, anything but the API key), any other `client_type`, and a `**`
 expansion given to the model route `unknown` with an `endpoint_option` gap.
 So does a first positional argument that is neither a credential built in
 place (`OpenAICredential(...)`) nor a model name AgentScope 1 would take,
-such as a name holding a credential (`OpenAIChatModel(cred, model=...)`). A
-credential counts only when an `agentscope` import binds its class
+such as a name holding a credential (`OpenAIChatModel(cred, model=...)`).
+AgentScope sends `generate_kwargs` (AgentScope 1) and `extra_body`
+(AgentScope 2) in its request over its own model: the model nested in them
+is read, and one that may hold a `model` (a dict literal naming one, one the
+file cannot read whole, or a `**` expansion that may hold them) gives the
+model the class is built with a `reassigned` gap. A credential counts only
+when an `agentscope` import binds its class
 (`from agentscope.credential import OpenAICredential`): another library's
 (`DefaultAzureCredential()`) is a credential this scan cannot read.
 
