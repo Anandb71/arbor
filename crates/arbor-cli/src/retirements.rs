@@ -648,7 +648,7 @@ fn summary_lines(report: &RetirementReport, markdown: bool) -> Vec<String> {
     let mut lines = Vec::new();
     if s.affected_calls == 0 {
         lines.push(format!(
-            "No direct openai/anthropic/google SDK calls to retired or retiring models in {} Python file{} (LangChain's ChatOpenAI and ChatAnthropic, raw HTTP posts to their APIs and the models given to the OpenAI Agents SDK, the Claude Agent SDK and AgentScope included). Calls through LiteLLM count as routed; Bedrock's own model schedule and other wrappers are not checked yet.",
+            "No direct openai/anthropic/google SDK calls to retired or retiring models found in {} Python file{}. Arbor also reads LangChain's ChatOpenAI and ChatAnthropic, raw HTTP posts to their APIs and the agent-framework classes listed in docs/SDK_USAGES.md, where it can resolve them. Calls through LiteLLM count as routed; Bedrock's own model schedule and other wrappers are not checked yet.",
             s.files_scanned,
             if s.files_scanned == 1 { "" } else { "s" }
         ));

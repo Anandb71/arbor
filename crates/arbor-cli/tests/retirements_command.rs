@@ -797,7 +797,7 @@ fn exit_codes_follow_the_window() {
     let output = arbor(clean.path(), &["retirements", ".", "--today", TODAY]);
     assert_eq!(output.status.code(), Some(0));
     assert!(stdout(&output).contains(
-        "No direct openai/anthropic/google SDK calls to retired or retiring models in 1 Python file (LangChain's ChatOpenAI and ChatAnthropic, raw HTTP posts to their APIs and the models given to the OpenAI Agents SDK, the Claude Agent SDK and AgentScope included). Calls through LiteLLM count as routed; Bedrock's own model schedule and other wrappers are not checked yet."
+        "No direct openai/anthropic/google SDK calls to retired or retiring models found in 1 Python file. Arbor also reads LangChain's ChatOpenAI and ChatAnthropic, raw HTTP posts to their APIs and the agent-framework classes listed in docs/SDK_USAGES.md, where it can resolve them. Calls through LiteLLM count as routed; Bedrock's own model schedule and other wrappers are not checked yet."
     ));
 }
 

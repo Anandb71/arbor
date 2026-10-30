@@ -111,9 +111,10 @@ Anthropic and Gemini models. `Agent(name="triage", model="gpt-4o")` is a direct 
 OpenAI's schedule, `ClaudeAgentOptions(model=...)` on Anthropic's, unless the scan
 leaves the route unconfirmed (a model the Agents SDK routes by a prefix or a model
 object, Claude Code options whose `env=` may pick another provider). The Agents SDK
-strips `openai/` and `litellm/` from a model name before it sends it, so the name is
-looked up without them (`litellm/anthropic/claude-3-5-sonnet-20240620` on Anthropic's
-schedule, as a call routed through LiteLLM). The framework
+strips `openai/` and `litellm/` from the model name an agent or a run is given before
+it sends it, so that name is looked up without them
+(`litellm/anthropic/claude-3-5-sonnet-20240620` on Anthropic's schedule, as a call
+routed through LiteLLM); a model object sends its string as it is. The framework
 takes its own arguments and builds the request, so only the checks about the model
 apply, with a check to review the parameters it sends by hand. A Claude Code alias
 (`"sonnet"`) names no dated model, so it is not listed. An agent or Claude Code options

@@ -540,26 +540,34 @@ recorded like a LangChain chat model, as a construction and a call
 (`request: false`) that binds the model, read under the value rules above.
 Nothing called on what they build is recorded (`agent.clone(...)`,
 `agent.as_tool(...)`): those objects configure a run, they are not clients.
+Their other arguments configure a run or the CLI (`trace_metadata`,
+`model_settings`, `extra_args`), so a `model` key nested in them, written at
+the call or in a dict expanded with `**`, is not read as a model.
 
 | Framework | Classes | Imported from | Model |
 |---|---|---|---|
-| OpenAI Agents SDK (`openai-agents`) | `Agent`, `RunConfig` | `agents` and its submodules | `model`; a run's first positional argument |
-| | `OpenAIResponsesModel`, `OpenAIChatCompletionsModel` | the same | `model` or the first positional argument |
+| OpenAI Agents SDK (`openai-agents`) | `Agent`, `RunConfig` | `agents`; `agents.agent`, `agents.run`, `agents.run_config` | `model`; a run's first positional argument |
+| | `OpenAIResponsesModel`, `OpenAIChatCompletionsModel` | `agents`; `agents.models.openai_responses`, `agents.models.openai_chatcompletions` | `model` or the first positional argument |
 | | `LitellmModel` | `agents.extensions.models.litellm_model` | the same |
 | Claude Agent SDK, Claude Code SDK | `ClaudeAgentOptions`, `AgentDefinition`; `ClaudeCodeOptions` | `claude_agent_sdk`; `claude_code_sdk` | `model`, `fallback_model` |
 | AgentScope | `OpenAIChatModel`, `OpenAIResponseModel`, `AnthropicChatModel`, `GeminiChatModel` | `agentscope.model` | `model_name` (AgentScope 1, also its first positional argument) or `model` (AgentScope 2, also after a credential passed by position) |
 
 `agents` is also a common name for a repository's own package, so the OpenAI
-Agents SDK is followed only through `from agents... import` of one of these
-classes: `import agents`, a wildcard import, any other name (`from agents
-import get_sql_agent`) and a relative import are not followed. AgentScope is
+Agents SDK is followed only through `from <module> import` of one of these
+classes from a module of the SDK that defines or re-exports it (the table):
+`import agents`, a wildcard import, any other name (`from agents import
+get_sql_agent`), another `agents` module (`from agents.tools import Agent`)
+and a relative import are not followed. When the scanned tree has an `agents`
+module of its own (an `agents.py`, or a directory `agents` holding Python
+files, outside vendored and hidden directories), `from agents import Agent`
+may load it instead: every Agents SDK record then routes `unknown`, and each
+call gets a `local_module` gap on its routing and, when it has values, on its
+model. A single file scanned alone cannot show this. AgentScope is
 followed only through `from agentscope.model... import`; its models for
 other providers (`DashScopeChatModel`, `OllamaChatModel`...) and its 0.x
 model configurations are not. The Claude Agent SDK's modules are followed
 like an SDK's (`import claude_agent_sdk as sdk` too). A name that is not on
-this list reports nothing. A repository's own `agents` package is therefore
-read as the SDK only where a file imports one of these class names from it
-(`from agents import Agent`).
+this list reports nothing.
 
 **OpenAI Agents SDK.** The SDK sends a model name through its model
 provider, which picks the provider from the name's prefix. So the route
@@ -591,12 +599,21 @@ also imported under another name) or passes a `model_provider` anywhere
 `given_client` gap. An agent given no model runs the SDK's default model,
 which depends on the SDK version (`gpt-4.1` from 0.3 to 0.6) and on
 `OPENAI_DEFAULT_MODEL`: a `missing_model` gap. A run given none keeps its
-agents' models, and a model object needs one, so neither is a gap. A
-`RunConfig` given a model (by keyword, by position or through an expansion)
-replaces the model of every agent it runs, so in a file that builds one,
-every agent's values keep a `dynamic_feature` gap; so they do in a file that
-writes `model` on another object (`agent.model = ...`). `Agent.clone(model=
-...)` and `Runner.run(...)` are not read.
+agents' models, and a model object needs one, so neither is a gap. A run's
+model replaces that of every agent and model object it runs, so the values
+of every agent and model object in a file keep a `dynamic_feature` gap where
+the file may give a run one:
+
+- a `RunConfig` given a model (by keyword, by position, also under another
+  name, or through an expansion);
+- a `run_config=` given anywhere that is not `None` or a same-file
+  `RunConfig` built without a model (a parameter, one from another module);
+- a `**` expansion given to `Runner.run`, `Runner.run_sync` or
+  `Runner.run_streamed`, which may hold a `run_config`.
+
+So do they in a file that writes `model` on another object (`agent.model =
+...`). A run configured in another module is not seen. `Agent.clone(model=
+...)` is not read.
 
 **Claude Agent SDK.** The SDK runs the Claude Code CLI with the options'
 `model` and `fallback_model`. An alias (`"sonnet"`, `"opus"`, an agent
@@ -622,7 +639,14 @@ another provider or endpoint, so:
   `options.settings = ...`), or writes with a run-time name, route `unknown`
   with a `dynamic_feature` gap, and so does every Claude Code options object
   in a file that uses `env` or `settings` on an object it cannot identify
-  (other than `self`, `cls` or a same-file class).
+  (other than `self`, `cls` or a same-file class). The attribute's name may
+  be written as a string too (`setattr(options, "env", ...)`,
+  `options.__setattr__("env", ...)`, `options.__dict__["env"]`,
+  `vars(options)["env"]`). A write of `base_url` is not one: the CLI has
+  no such setting;
+- options whose `extra_args` give the CLI `--settings` (`extra_args=
+  {"settings": ...}`, or `extra_args` the file cannot read whole) route
+  `unknown` with an `endpoint_option` gap.
 
 An agent definition runs where its options do: built inside the options'
 `agents=` dict (`ClaudeAgentOptions(agents={"r": AgentDefinition(...)})`),
@@ -632,8 +656,16 @@ with an `options_route` gap.
 The options' `extra_args` become CLI flags and may pass another model: unless
 they are `None` or a dict literal that names no model flag, they, or a `**`
 expansion that may hold them, are a `reassigned` gap with no key, which
-covers every value of the call. `query(...)`, `ClaudeSDKClient` and its
-`set_model(...)` are not read.
+covers every value of the call. The CLI's model variables
+(`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`,
+`ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`,
+`ANTHROPIC_DEFAULT_FABLE_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`,
+`CLAUDE_CODE_SUBAGENT_MODEL`) pick the model for an alias, a subagent or a
+session given none: options given an `env=` that names one (or one the file
+cannot read whole), and every options object and agent definition in a file
+that sets one (or writes the environment with a run-time name), keep an
+`env_var` gap with no key. `query(...)`,
+`ClaudeSDKClient` and its `set_model(...)` are not read.
 
 **AgentScope.** Each model builds its provider's SDK client: OpenAI's for
 `OpenAIChatModel` and `OpenAIResponseModel`, Anthropic's for
@@ -651,7 +683,10 @@ for Gemini, anything but the API key), any other `client_type`, and a `**`
 expansion given to the model route `unknown` with an `endpoint_option` gap.
 So does a first positional argument that is neither a credential built in
 place (`OpenAICredential(...)`) nor a model name AgentScope 1 would take,
-such as a name holding a credential (`OpenAIChatModel(cred, model=...)`).
+such as a name holding a credential (`OpenAIChatModel(cred, model=...)`). A
+credential counts only when an `agentscope` import binds its class
+(`from agentscope.credential import OpenAICredential`): another library's
+(`DefaultAzureCredential()`) is a credential this scan cannot read.
 
 `arbor retirements` checks only the model of these calls: each framework
 takes its own arguments and builds the request, so the SDK's argument rules
@@ -791,8 +826,11 @@ The report assumes the rest. In particular:
   agent given none runs may come from `OPENAI_DEFAULT_MODEL`, and Claude
   Code options given none from `ANTHROPIC_MODEL`.
 - Claude Code's settings files (`.claude/settings.json` and the user's),
-  which the Claude Agent SDK loads unless `setting_sources` says otherwise,
-  may set the CLI's `env`, and so its provider. They are not read.
+  may set the CLI's `env`, and so its provider. claude-agent-sdk 0.2 loads
+  every source when `setting_sources` is `None` (its default, which matches
+  the CLI's), and only the sources it names otherwise (`[]` loads none);
+  earlier versions loaded them only when named. They are not read, whichever
+  sources are loaded.
 - The OpenAI Agents SDK's default client or model provider set in another
   module (`set_default_openai_client(...)` at start-up), and a `RunConfig`
   with a model built in another module, are not seen: an agent's model name
