@@ -844,6 +844,23 @@ mod data_tests {
             assert_eq!(entry.date.as_deref(), Some("2027-01-14"));
             assert_eq!(entry.replacement.as_deref(), Some("gpt-6-luna"));
         }
+        // OpenAI's deprecations page lists these bare IDs in its own 11 Dec
+        // rows (read 28 Oct 2026), so they cite the page, not the models API.
+        for (alias, replacement) in [
+            ("gpt-5", "gpt-5.6-sol"),
+            ("gpt-5-mini", "gpt-5.6-terra"),
+            ("gpt-5-nano", "gpt-5.6-luna"),
+            ("gpt-5-pro", "gpt-5.6-sol"),
+            ("o3", "gpt-5.6-sol"),
+            ("o3-pro", "gpt-5.6-sol"),
+        ] {
+            let entry = r.entry(Table::Openai, alias).expect(alias);
+            assert_eq!(entry.status, EntryStatus::Retiring, "{alias}");
+            assert_eq!(entry.date.as_deref(), Some("2026-12-11"), "{alias}");
+            assert_eq!(entry.replacement.as_deref(), Some(replacement), "{alias}");
+            assert_eq!(entry.recipe, "openai-2026-10-23", "{alias}");
+            assert!(entry.notes.is_empty(), "{alias}: {:?}", entry.notes);
+        }
         let sonnet = r
             .entry(Table::Anthropic, "claude-3-5-sonnet-20241022")
             .unwrap();
@@ -871,6 +888,104 @@ mod data_tests {
             max_tokens.see_choice.as_deref(),
             Some("G6-REASONING-DEFAULT")
         );
+    }
+
+    #[test]
+    fn ids_the_page_added_after_23_october_follow_their_rows() {
+        // Between 23 and 26 Oct 2026 OpenAI's deprecations page started listing
+        // bare IDs and dated snapshots together in its rows, which added these
+        // 15 IDs (7 bare, 8 snapshots). Each value is its row's date and
+        // replacement cell as read on 28 Oct 2026. No recipe has argument rules
+        // for them, so they are report-only with no rule set.
+        const PRO: Option<&str> = Some("gpt-5.6-sol (reasoning.mode: pro)");
+        const IMAGE: Option<&str> = Some("gpt-image-2.5-sunburst or gpt-image-2.5-flare");
+        const TRANSCRIBE: Option<&str> = Some("gpt-live-transcribe or gpt-transcribe");
+        let r = data();
+        for (model, date, replacement, text) in [
+            ("gpt-5", "2026-12-11", Some("gpt-5.6-sol"), None),
+            ("gpt-5-mini", "2026-12-11", Some("gpt-5.6-terra"), None),
+            ("gpt-5-nano", "2026-12-11", Some("gpt-5.6-luna"), None),
+            ("gpt-5-pro", "2026-12-11", Some("gpt-5.6-sol"), PRO),
+            ("o3", "2026-12-11", Some("gpt-5.6-sol"), None),
+            ("o3-pro", "2026-12-11", Some("gpt-5.6-sol"), PRO),
+            ("gpt-image-1.5-2025-12-16", "2026-12-01", None, IMAGE),
+            (
+                "gpt-4o-mini-tts",
+                "2027-01-06",
+                Some("gpt-realtime-2.1-mini"),
+                None,
+            ),
+            (
+                "gpt-realtime-2025-08-28",
+                "2027-01-20",
+                Some("gpt-realtime-2.1"),
+                None,
+            ),
+            (
+                "gpt-audio-2025-08-28",
+                "2027-01-20",
+                Some("gpt-audio-1.5"),
+                None,
+            ),
+            (
+                "gpt-realtime-mini-2025-12-15",
+                "2027-01-20",
+                Some("gpt-realtime-2.1-mini"),
+                None,
+            ),
+            (
+                "gpt-audio-mini-2025-12-15",
+                "2027-01-20",
+                Some("gpt-audio-1.5"),
+                None,
+            ),
+            (
+                "gpt-4o-mini-transcribe-2025-12-15",
+                "2027-02-26",
+                None,
+                TRANSCRIBE,
+            ),
+            ("gpt-5.1-2025-11-13", "2027-04-01", Some("gpt-6-sol"), None),
+            (
+                "gpt-5.4-nano-2026-03-17",
+                "2027-04-01",
+                Some("gpt-6-luna"),
+                None,
+            ),
+        ] {
+            let entry = r.entry(Table::Openai, model).expect(model);
+            assert_eq!(entry.status, EntryStatus::Retiring, "{model}");
+            assert_eq!(entry.date.as_deref(), Some(date), "{model}");
+            assert_eq!(entry.replacement.as_deref(), replacement, "{model}");
+            assert_eq!(entry.replacement_text.as_deref(), text, "{model}");
+            assert_eq!(entry.action, Action::ReportOnly, "{model}");
+            assert_eq!(entry.rule_set, None, "{model}");
+            assert_eq!(entry.recipe, "openai-2026-10-23", "{model}");
+            assert!(entry.notes.is_empty(), "{model}: {:?}", entry.notes);
+        }
+        // The five snapshots the 14 Jan rows list keep their rewrite and rules.
+        for snapshot in [
+            "gpt-4o-2024-08-06",
+            "gpt-4o-2024-11-20",
+            "gpt-4o-mini-2024-07-18",
+            "gpt-4.1-2025-04-14",
+            "gpt-4.1-mini-2025-04-14",
+        ] {
+            let entry = r.entry(Table::Openai, snapshot).expect(snapshot);
+            assert_eq!(entry.date.as_deref(), Some("2027-01-14"), "{snapshot}");
+            assert_eq!(
+                entry.replacement.as_deref(),
+                Some("gpt-6-luna"),
+                "{snapshot}"
+            );
+            assert_eq!(entry.action, Action::Rewrite, "{snapshot}");
+            assert_eq!(
+                entry.rule_set.as_deref(),
+                Some("openai-2027-01-14"),
+                "{snapshot}"
+            );
+            assert_eq!(entry.kind.as_deref(), Some("snapshot"), "{snapshot}");
+        }
     }
 
     #[test]

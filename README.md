@@ -238,7 +238,7 @@ claude mcp add --transport stdio --scope project arbor -- arbor bridge
 
 ## Find code that calls retiring AI models
 
-OpenAI shuts down `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` on 14 January 2027, and Anthropic and Google retire models on their own dates. `arbor retirements` lists the direct `openai`, `anthropic` and Google SDK calls that use a retired or retiring model. For each one it shows the replacement the provider lists, the arguments that have to change with it, and the choices your repo makes first (such as whether gpt-6-luna should reason). Calls through LangChain, LiteLLM or other wrappers are not checked yet.
+OpenAI's deprecations page lists five dated GPT-4o, GPT-4o mini, GPT-4.1 and GPT-4.1 mini snapshots, such as `gpt-4o-2024-08-06`, for shutdown on 14 January 2027, and its models API gave the bare `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` the same date when checked on 18 October 2026. Anthropic and Google retire models on their own dates. `arbor retirements` lists the direct `openai`, `anthropic` and Google SDK calls that use a retired or retiring model. For each one it shows the replacement the provider lists, the arguments that have to change with it, and the choices your repo makes first (such as whether gpt-6-luna should reason). Calls through LangChain, LiteLLM or other wrappers are not checked yet.
 
 ```bash
 npx @anandb71/arbor-cli retirements .

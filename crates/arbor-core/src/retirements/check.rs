@@ -3525,6 +3525,92 @@ def known(model):
     }
 
     #[test]
+    fn bare_gpt_5_and_o3_shut_down_with_their_snapshots_on_11_december() {
+        // OpenAI's deprecations page lists each 11 Dec row as the bare ID and
+        // its snapshot (`gpt-5` | `gpt-5-2025-08-07`) since late October 2026;
+        // Arbor 3.1.0 had only the snapshots, so `model="gpt-5"` and
+        // `model="o3"` were not listed at all.
+        let source = r#"from openai import OpenAI
+
+client = OpenAI()
+
+
+def run(question):
+    messages = [{"role": "user", "content": question}]
+    client.chat.completions.create(model="gpt-5-2025-08-07", messages=messages)
+    client.chat.completions.create(model="gpt-5", messages=messages)
+    client.chat.completions.create(model="o3", messages=messages)
+    client.chat.completions.create(model="gpt-5-mini", messages=messages)
+    client.chat.completions.create(model="gpt-5-nano", messages=messages)
+    client.chat.completions.create(model="gpt-5-pro", messages=messages)
+    client.chat.completions.create(model="o3-pro", messages=messages)
+    client.chat.completions.create(model="o1-preview", messages=messages)
+"#;
+        let report = check_source(source, &options("2026-10-28"));
+        let at = |model: &str| -> Finding {
+            let line = line_of(source, &format!("model=\"{model}\""));
+            let found: Vec<&Finding> = report.findings.iter().filter(|f| f.line == line).collect();
+            assert_eq!(found.len(), 1, "{model}: {:#?}", report.findings);
+            found[0].clone()
+        };
+        for (model, replacement, text) in [
+            ("gpt-5-2025-08-07", "gpt-5.6-sol", None),
+            ("gpt-5", "gpt-5.6-sol", None),
+            ("o3", "gpt-5.6-sol", None),
+            ("gpt-5-mini", "gpt-5.6-terra", None),
+            ("gpt-5-nano", "gpt-5.6-luna", None),
+            (
+                "gpt-5-pro",
+                "gpt-5.6-sol",
+                Some("gpt-5.6-sol (reasoning.mode: pro)"),
+            ),
+            (
+                "o3-pro",
+                "gpt-5.6-sol",
+                Some("gpt-5.6-sol (reasoning.mode: pro)"),
+            ),
+        ] {
+            let finding = at(model);
+            assert_eq!(finding.matched, model, "matched exactly, never by prefix");
+            assert_eq!(finding.match_kind, MatchKind::Exact, "{model}");
+            assert_eq!(finding.provider, Table::Openai, "{model}");
+            assert_eq!(finding.status, State::Retiring, "{model}");
+            assert_eq!(finding.date.unwrap().iso(), "2026-12-11", "{model}");
+            assert_eq!(finding.days_left, Some(44), "{model}");
+            assert_eq!(finding.replacement.as_deref(), Some(replacement), "{model}");
+            assert_eq!(finding.replacement_text.as_deref(), text, "{model}");
+            assert_eq!(finding.confidence, Confidence::Confirmed, "{model}");
+            // The page is the source: these rows carry no models API note.
+            assert_eq!(
+                finding.source_url.as_deref(),
+                Some("https://developers.openai.com/api/docs/deprecations"),
+                "{model}"
+            );
+            assert!(finding.notes.is_empty(), "{model}: {:?}", finding.notes);
+            // No recipe has rules for GPT-5.6 targets of these rows yet: the
+            // date and replacement only, and a manual check, never a change.
+            assert!(finding.changes.is_empty(), "{model}");
+            assert!(finding.decisions.is_empty(), "{model}");
+            assert_eq!(finding.fix, FixKind::Manual, "{model}");
+            assert!(
+                finding.review.iter().any(|r| r.message
+                    == format!("The parameters {replacement} needs have not been checked yet.")),
+                "{model}: {:#?}",
+                finding.review
+            );
+        }
+        // o1-preview (shut down 28 Jul 2025) lists o3, which now has a date
+        // too, so the chain goes on to gpt-5.6-sol.
+        let preview = at("o1-preview");
+        assert_eq!(preview.status, State::Retired);
+        assert_eq!(preview.replacement.as_deref(), Some("o3"));
+        assert_eq!(preview.live_replacement.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(preview.replacement_chain[0].model, "o3");
+        assert_eq!(preview.replacement_chain[0].status, Some(State::Retiring));
+        assert_eq!(report.findings.len(), 8, "{:#?}", report.findings);
+    }
+
+    #[test]
     fn matching_is_exact() {
         for not_listed in [
             "GPT-4O",
