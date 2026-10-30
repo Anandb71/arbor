@@ -574,12 +574,26 @@ nowhere (`def with_model(self, model): self.model = model`). A base class in
 another file is not read: like any write in another module, its methods may
 set the attribute unseen.
 
+Nor may the parameter reach a request changed. Where it can be read (the
+function, or the class and its same-file bases, whose methods its instances
+run), nothing computed from it may be sent as a model by another request or a
+call through another wrapper: not `RENAMED[model]` in one branch beside
+`model` in the other, not `DEPRECATED[self.model]` beside `self.model`, not
+through a variable, a dict spread with `**` or a raw HTTP body built from it.
+Nor may it be handed to a function, class or method of the file that sends a
+request (`_send(model)`), which may change it. Otherwise a call that passes a
+value the code maps would read as sending it. A read that sends nothing
+changed keeps it listed: a test (`model.startswith("o1")`), a price lookup,
+logging, or what the request returns. A helper in another module is not read,
+as for any value.
+
 The function or class must meet all of these:
 
 - defined once at module level and bound by nothing else;
 - no decorator, on it or on its `__init__`;
 - for a class, no class keyword (`metaclass=...`), at most one base, no
-  `__new__`, and nothing that rebinds `__init__`;
+  `__new__`, nothing that rebinds `__init__`, and no same-file base with a
+  `__new__`, a decorator or a class keyword;
 - not in a script (an extensionless file or `__main__.py`), which nothing
   imports;
 - not in a file with a dynamic feature of the whole file (`exec`,
@@ -588,7 +602,10 @@ The function or class must meet all of these:
 - for a class, an attribute that no dynamic feature of the class may change.
 
 Only a keyword argument at the request counts. A model passed there by
-position or inside a `**` dict is not followed.
+position or inside a `**` dict is not followed. Only the requests of the
+packages this page covers are followed (the OpenAI, Anthropic and Google SDKs,
+LangChain's chat models, Bedrock and LiteLLM), since the calling file's checks
+below are written for them.
 
 The request may carry gaps from reading the parameter itself: its default
 (`parameter_default`, `parameter_overridden`, `unseen_callers`), what in-file
@@ -617,7 +634,9 @@ When two modules could be meant, the import is not followed, nor is a path
 above the scan root or a file in a vendored or hidden directory. A package's
 `__init__.py` that re-exports the name (`from .sampler import Sampler`) is not
 followed to where the name is defined. A scan of a single file has no other
-files to resolve against.
+files to resolve against. The scan reads a file again for this only when one
+of its import statements names such a function or class; an extensionless
+script may be a caller, though nothing imports it.
 
 **The record.** A call that passes the parameter is recorded in the calling
 file as a call that binds the model, like `ChatOpenAI(...)`. The call record
@@ -643,9 +662,9 @@ A call that leaves the parameter out is not recorded: its default is
 reported, with its gap, where it is defined. The value's span is in the
 calling file, so a codemod edits the literal there.
 
-The route is the requests' when the wrapper's file confirms it and they all
-agree. Otherwise it is `unknown`, with an `ambiguous_client` gap whose reason
-is `wrapper_route`. What the calling file does to the whole process can
+The route is the requests' when the wrapper's file confirms it, they all
+agree, and the calling file's scan knows their package. Otherwise it is
+`unknown`, with an `ambiguous_client` gap whose reason is `wrapper_route`. What the calling file does to the whole process can
 change it too, and then the route is `unknown` with a gap:
 
 - `endpoint_env`: the file sets an endpoint variable the requests' SDK reads

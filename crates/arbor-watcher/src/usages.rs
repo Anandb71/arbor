@@ -21,9 +21,10 @@
 //! A directory scan makes a second pass for calls through a wrapper in
 //! another file: a module-level function or class whose parameter the
 //! extractor confirms is the model of a request in its own file
-//! ([`ModelParam`]). Each project file that names one is read again with
-//! its imports resolved to the scanned files (see [`ModuleIndex::resolve`]),
-//! and a call that passes the parameter is recorded in that file.
+//! ([`ModelParam`]). Each project file whose import statements name one (an
+//! extensionless script included) is read again with its imports resolved
+//! to the scanned files (see [`ModuleIndex::resolve`]), and a call that
+//! passes the parameter is recorded in that file.
 
 use crate::indexer::IgnoreMatcher;
 use arbor_core::languages::get_parser;
