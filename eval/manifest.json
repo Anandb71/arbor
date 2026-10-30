@@ -102,6 +102,18 @@
       "language": "python",
       "suite": "usages",
       "covers": "the third review of #276: nonlocal, match, except and wildcard-import bindings, globals() writes, constructor calls against __init__ defaults, subclasses and outside writes against self attributes, functions used as values, constructors chosen at run time, dict aliases through chains and attributes, candidate values with no credential, a clipped import path"
+    },
+    {
+      "name": "ts-sdk-usages",
+      "language": "typescript",
+      "suite": "usages",
+      "covers": "TypeScript/JavaScript SDK usage extraction: ESM, CommonJS and openai v3 imports, class-held clients, routing (baseURL, Azure, Bedrock, Vertex, Gemini vertexai), constants, object literals, parameter defaults against their callers, env fallbacks, cross-file and dynamic gaps, a mocked SDK, vendored and hidden directories, secrets"
+    },
+    {
+      "name": "ts-sdk-real-slice",
+      "language": "typescript",
+      "suite": "usages",
+      "covers": "real SDK example code from openai-node (Apache-2.0), anthropic-sdk-typescript (MIT), js-genai (Apache-2.0) and the archived generative-ai-js (Apache-2.0)"
     }
   ]
 }

@@ -313,9 +313,15 @@ pub enum UncheckedArgs {
 
 impl UncheckedArgs {
     /// What a person has to check, for the report. `spreads` names the `**`
-    /// expressions Arbor could not read (`PARAMS`), for `Splat`.
-    pub fn message(self, spreads: &[String]) -> String {
+    /// expressions Arbor could not read (`PARAMS`), for `Splat`. The
+    /// TypeScript scan records no spreads: in its files `Splat` means some
+    /// property of the options object is not written at the call.
+    pub fn message(self, spreads: &[String], syntax: Syntax) -> String {
         match self {
+            UncheckedArgs::Splat if syntax == Syntax::JavaScript => {
+                "Some properties of the options object are not written at the call (a spread, a computed key or an object passed by name), so Arbor could not check them all."
+                    .to_string()
+            }
             UncheckedArgs::Splat if spreads.is_empty() => {
                 "Some arguments are spread into the call with `**`, so Arbor could not check them all."
                     .to_string()
@@ -1480,6 +1486,7 @@ fn finding_for(
                 target,
                 source_model,
                 source_family,
+                syntax: Syntax::of_file(&file),
                 endpoint: if nested.is_some() { None } else { endpoint },
                 routing: &routing.routing,
                 kwargs: if nested.is_some() {
@@ -1520,7 +1527,7 @@ fn finding_for(
     let mut reasons = model_reasons(
         &hit,
         status,
-        unchecked.map(|u| u.message(&unread_spreads)),
+        unchecked.map(|u| u.message(&unread_spreads, Syntax::of_file(&file))),
         source.is_some(),
         chained,
     );
@@ -1708,36 +1715,55 @@ fn endpoint_name(endpoint: &str) -> &str {
 fn endpoint_of(chain: &str, member: &str) -> Option<&'static str> {
     let text = if member.contains('.') { member } else { chain };
     let has = |needle: &str| text.contains(needle);
-    let endpoint =
-        if has("fine_tuning.") || has("fine_tunes.") || has("FineTuningJob.") || has("FineTune.") {
-            FINE_TUNING
-        } else if has("chat.completions") || has("ChatCompletion") {
-            "chat.completions"
-        } else if has("responses.") {
-            "responses"
-        } else if has("assistants.") || has("threads.") {
-            "assistants"
-        } else if has("completions.") || has("Completion.") {
-            "completions_legacy"
-        } else if has("messages.") {
-            "messages"
-        } else if has("generate_content")
-            || has("GenerativeModel")
-            || has("chats.")
-            || has("send_message")
-        {
-            "generate_content"
-        } else if has("interactions.") {
-            "interactions"
-        } else if has("embeddings.") || has("embed_content") || has("Embedding.") {
-            "embeddings"
-        } else if has("images.") || has("generate_images") {
-            "images"
-        } else if has("audio.") {
-            "audio"
-        } else {
-            return None;
-        };
+    // Python's snake_case and the JavaScript SDKs' camelCase names
+    // (`fineTuning.jobs.create`, `models.generateContent`), and openai v3's
+    // `OpenAIApi` methods (`createChatCompletion`).
+    let endpoint = if has("fine_tuning.")
+        || has("fineTuning.")
+        || has("fine_tunes.")
+        || has("FineTuningJob.")
+        || has("FineTune.")
+        || has("createFineTune")
+    {
+        FINE_TUNING
+    } else if has("chat.completions") || has("ChatCompletion") {
+        "chat.completions"
+    } else if has("responses.") {
+        "responses"
+    } else if has("assistants.") || has("threads.") {
+        "assistants"
+    } else if has("completions.") || has("Completion.") || has("createCompletion") {
+        "completions_legacy"
+    } else if has("messages.") {
+        "messages"
+    } else if has("generate_content")
+        || has("generateContent")
+        || has("GenerativeModel")
+        || has("chats.")
+        || has("send_message")
+        || has("sendMessage")
+    {
+        "generate_content"
+    } else if has("interactions.") {
+        "interactions"
+    } else if has("embeddings.")
+        || has("embed_content")
+        || has("embedContent")
+        || has("Embedding.")
+        || has("createEmbedding")
+    {
+        "embeddings"
+    } else if has("images.")
+        || has("generate_images")
+        || has("generateImages")
+        || has("createImage")
+    {
+        "images"
+    } else if has("audio.") || has("createTranscription") || has("createTranslation") {
+        "audio"
+    } else {
+        return None;
+    };
     Some(endpoint)
 }
 
@@ -1824,6 +1850,8 @@ struct RuleContext<'a> {
     endpoint: Option<&'static str>,
     routing: &'a str,
     kwargs: &'a [String],
+    /// How the call's arguments are written, for values named in messages.
+    syntax: Syntax,
 }
 
 impl RuleContext<'_> {
@@ -2152,7 +2180,7 @@ fn add_choice(rule: &ParamRule, context: &RuleContext<'_>, out: &mut Outcome) {
                 "{} This call already sets {}; check that it is {}.",
                 context.message(&rule.message),
                 add.name,
-                python_literal(&add.value)
+                source_literal(&add.value, context.syntax)
             ),
             because,
             verified: Some(context.verified(rule)),
@@ -2279,7 +2307,7 @@ fn apply_adds(
                 "This call already sets {}; on {} it must be {}.",
                 spec.name,
                 context.target,
-                python_literal(&spec.value)
+                source_literal(&spec.value, context.syntax)
             ),
             because: because.to_vec(),
             verified: Some(context.verified(rule)),
@@ -2350,6 +2378,79 @@ fn is_effort_none(param: &str, value: Option<&serde_json::Value>) -> bool {
             map.get("effort").and_then(|v| v.as_str()) == Some("none")
         }
         _ => false,
+    }
+}
+
+/// The language a call's arguments are written in, from its file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Syntax {
+    /// Keyword arguments: `reasoning_effort="none"`, `None`, `True`.
+    Python,
+    /// An options object: `reasoning_effort: "none"`, `null`, `true`.
+    JavaScript,
+}
+
+impl Syntax {
+    /// JavaScript for `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.mts`
+    /// and `.cts` files; Python for the rest.
+    pub fn of_file(file: &str) -> Self {
+        let extension = std::path::Path::new(file)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default();
+        let javascript = ["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"]
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(extension));
+        if javascript {
+            Syntax::JavaScript
+        } else {
+            Syntax::Python
+        }
+    }
+}
+
+/// A JSON value as the call's language writes it: [`python_literal`] for
+/// Python; for JavaScript the JSON text itself, which is a valid literal
+/// there (`"none"`, `{"type": "between_tools"}`, `null`).
+pub fn source_literal(value: &serde_json::Value, syntax: Syntax) -> String {
+    match syntax {
+        Syntax::Python => python_literal(value),
+        Syntax::JavaScript => javascript_literal(value),
+    }
+}
+
+/// An argument as the call's language passes it: `name=value` (a keyword
+/// argument) or `name: value` (a property of the options object).
+pub fn source_argument(name: &str, value: &serde_json::Value, syntax: Syntax) -> String {
+    match syntax {
+        Syntax::Python => format!("{name}={}", python_literal(value)),
+        Syntax::JavaScript => format!("{name}: {}", javascript_literal(value)),
+    }
+}
+
+/// A JSON value as a JavaScript literal, spaced like [`python_literal`].
+fn javascript_literal(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Array(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(javascript_literal)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        serde_json::Value::Object(map) => format!(
+            "{{{}}}",
+            map.iter()
+                .map(|(k, v)| format!(
+                    "{}: {}",
+                    serde_json::Value::String(k.clone()),
+                    javascript_literal(v)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        other => other.to_string(),
     }
 }
 
@@ -3946,6 +4047,206 @@ def run(question):
         check(input, bundled().unwrap(), opts)
     }
 
+    /// The usage scan of one TypeScript file, `app.ts`, checked.
+    fn check_typescript(source: &str, opts: &CheckOptions) -> RetirementReport {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::language_typescript())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let found = crate::usages::typescript::extract(&tree, source, "app.ts");
+        let input = ScanInput {
+            calls: &found.calls,
+            gaps: &found.gaps,
+            clients: &found.clients,
+        };
+        check(input, bundled().unwrap(), opts)
+    }
+
+    #[test]
+    fn typescript_calls_are_checked_like_python_ones() {
+        let source = r#"import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenAI } from "@google/genai";
+import { Configuration, OpenAIApi } from "openai";
+const openai = new OpenAI();
+const proxied = new OpenAI({ baseURL: "https://api.openai.com/v1" });
+const anthropic = new Anthropic();
+const ai = new GoogleGenAI({ vertexai: false });
+const legacy = new OpenAIApi(new Configuration({ apiKey: key }));
+export async function run() {
+  await openai.chat.completions.create({ model: "gpt-3.5-turbo", messages: [], max_tokens: 10 });
+  await proxied.chat.completions.create({ model: "gpt-4", messages: [] });
+  await anthropic.messages.create({ model: "claude-3-opus-20240229", max_tokens: 10, messages: [] });
+  await ai.models.generateContent({ model: "gemini-1.5-flash", contents: "x" });
+  await openai.fineTuning.jobs.create({ model: "gpt-3.5-turbo", training_file: "f" });
+  await legacy.createChatCompletion({ model: "gpt-4o", messages: [], max_tokens: 5 });
+  await anthropic.messages.create({ model: "claude-sonnet-4-5", max_tokens: 10, messages: [] });
+}
+"#;
+        let report = check_typescript(source, &options("2026-10-24"));
+        let at = |needle: &str| -> &Finding {
+            let line = line_of(source, needle);
+            let found: Vec<&Finding> = report.findings.iter().filter(|f| f.line == line).collect();
+            assert_eq!(found.len(), 1, "{needle}: {:#?}", report.findings);
+            found[0]
+        };
+        for needle in [
+            "\"gpt-3.5-turbo\", messages",
+            "\"gpt-4\"",
+            "claude-3-opus-20240229",
+            "gemini-1.5-flash",
+            "training_file",
+        ] {
+            let finding = at(needle);
+            assert_eq!(finding.status, State::Retired, "{needle}");
+            assert_eq!(finding.confidence, Confidence::Confirmed, "{needle}");
+            assert_eq!(finding.routing_class, RoutingClass::Direct, "{needle}");
+        }
+        // Endpoints read the JavaScript SDKs' camelCase members and openai
+        // v3's methods.
+        assert_eq!(at("gemini-1.5-flash").endpoint, Some("generate_content"));
+        assert_eq!(at("training_file").endpoint, Some(FINE_TUNING));
+        assert_eq!(
+            at("createChatCompletion").endpoint,
+            Some("chat.completions")
+        );
+        assert_eq!(at("createChatCompletion").status, State::Retiring);
+        // `baseURL` is the JavaScript SDKs' base URL option.
+        assert_eq!(at("\"gpt-4\"").base_url, Some(BaseUrl::ProviderHost));
+        // The argument rules read the options object's property names.
+        let swap = at("\"gpt-3.5-turbo\", messages");
+        assert_eq!(swap.changes[0].param, "max_tokens");
+        assert_eq!(swap.changes[0].to.as_deref(), Some("max_completion_tokens"));
+        // A decision's options are written the way the call passes them.
+        let thinking = at("claude-sonnet-4-5");
+        let between = &thinking.decisions[0].options[0].add[0];
+        assert_eq!(
+            source_argument(
+                &between.name,
+                &between.value,
+                Syntax::of_file(&thinking.file)
+            ),
+            "thinking: {\"type\": \"between_tools\"}"
+        );
+        assert_eq!(
+            source_argument(&between.name, &between.value, Syntax::Python),
+            "thinking={\"type\": \"between_tools\"}"
+        );
+    }
+
+    /// gpt-4o's move asks whether gpt-6-luna should reason, and an option
+    /// that adds nothing reads "no change" only when every argument the
+    /// call sends was read. In TypeScript a spread, a computed key or an
+    /// object passed by name may send any of them (#291).
+    #[test]
+    fn a_typescript_property_not_written_at_the_call_is_never_read_as_checked() {
+        let source = r#"import OpenAI from "openai";
+const openai = new OpenAI();
+const BASE = { temperature: 0.2 };
+export async function run(opts: any, key: string, client: any, params: any) {
+  await openai.chat.completions.create({ model: "gpt-4o", messages: [] });
+  await openai.chat.completions.create({ model: "gpt-4o-mini", ...opts });
+  await openai.chat.completions.create({ ...opts, model: "gpt-4.1", messages: [] });
+  await openai.chat.completions.create({ model: "gpt-4.1-mini", [key]: 1, messages: [] });
+  await openai.chat.completions.create({ ...BASE, model: "gpt-4o-2024-08-06", messages: [] });
+  await openai.chat.completions.create(...params, { model: "gpt-4o-2024-05-13" });
+  await client.chat.completions.create({ model: "gpt-4o", max_tokens: 5, messages: [] });
+  await client.chat.completions.create({ ...opts, model: "gpt-4o-mini", messages: [] });
+}
+"#;
+        let report = check_typescript(source, &options("2026-10-24"));
+        let at = |needle: &str| -> &Finding {
+            let line = line_of(source, needle);
+            let found: Vec<&Finding> = report.findings.iter().filter(|f| f.line == line).collect();
+            assert_eq!(found.len(), 1, "{needle}: {:#?}", report.findings);
+            found[0]
+        };
+        let unread = "Some properties of the options object are not written at the call (a spread, a computed key or an object passed by name), so Arbor could not check them all.";
+
+        // Every property written at the call: read in full.
+        let written = at("openai.chat.completions.create({ model: \"gpt-4o\"");
+        assert!(!written.decisions.is_empty(), "{written:#?}");
+        assert_eq!(written.decisions[0].unchecked_args, None);
+        assert!(written.review.iter().all(|r| r.message != unread));
+
+        for needle in [
+            "\"gpt-4o-mini\", ...opts",
+            "\"gpt-4.1\"",
+            "[key]",
+            "...BASE",
+            "...params",
+            "{ ...opts, model: \"gpt-4o-mini\"",
+        ] {
+            let finding = at(needle);
+            assert!(!finding.decisions.is_empty(), "{needle}: {finding:#?}");
+            for decision in &finding.decisions {
+                assert_eq!(
+                    decision.unchecked_args,
+                    Some(UncheckedArgs::Splat),
+                    "{needle}"
+                );
+                assert!(decision.unread_spreads.is_empty(), "{needle}");
+            }
+            assert!(
+                finding.review.iter().any(|r| r.message == unread),
+                "{needle}: {:#?}",
+                finding.review
+            );
+            assert_eq!(finding.fix, FixKind::Manual, "{needle}");
+        }
+
+        // A call whose client is not resolved still has its arguments
+        // checked: the TypeScript scan records them on the gap.
+        let unresolved = at("max_tokens: 5");
+        assert_eq!(unresolved.confidence, Confidence::Gap);
+        assert_eq!(unresolved.decisions[0].unchecked_args, None);
+        assert_eq!(unresolved.changes[0].param, "max_tokens");
+        assert_eq!(
+            unresolved.changes[0].to.as_deref(),
+            Some("max_completion_tokens")
+        );
+    }
+
+    #[test]
+    fn literals_follow_the_call_language() {
+        let value = serde_json::json!([true, null, 2, {"effort": "none"}]);
+        assert_eq!(
+            source_literal(&value, Syntax::Python),
+            "[True, None, 2, {\"effort\": \"none\"}]"
+        );
+        assert_eq!(
+            source_literal(&value, Syntax::JavaScript),
+            "[true, null, 2, {\"effort\": \"none\"}]"
+        );
+        for (file, syntax) in [
+            ("app.py", Syntax::Python),
+            ("scripts/run", Syntax::Python),
+            ("src/app.ts", Syntax::JavaScript),
+            ("pages/chat.tsx", Syntax::JavaScript),
+            ("lib/ai.MJS", Syntax::JavaScript),
+            ("server.cjs", Syntax::JavaScript),
+        ] {
+            assert_eq!(Syntax::of_file(file), syntax, "{file}");
+        }
+        assert_eq!(
+            endpoint_of("ai.models.embedContent", "models.embedContent"),
+            Some("embeddings")
+        );
+        assert_eq!(
+            endpoint_of("chat.sendMessage", "sendMessage"),
+            Some("generate_content")
+        );
+        assert_eq!(
+            endpoint_of("openai.createCompletion", "createCompletion"),
+            Some("completions_legacy")
+        );
+        assert_eq!(
+            endpoint_of("openai.createTranscription", "createTranscription"),
+            Some("audio")
+        );
+    }
+
     /// The 1-based line of the only line holding `needle`.
     fn line_of(source: &str, needle: &str) -> u32 {
         let lines: Vec<usize> = source
@@ -4321,7 +4622,10 @@ def run():
             let unseen = finding(at(args));
             assert_eq!(unseen.decisions[0].unchecked_args, Some(why));
             assert!(
-                unseen.review.iter().any(|r| r.message == why.message(&[])),
+                unseen
+                    .review
+                    .iter()
+                    .any(|r| r.message == why.message(&[], Syntax::Python)),
                 "{:#?}",
                 unseen.review
             );
@@ -4343,7 +4647,10 @@ def run():
             assert_eq!(finding.decisions[0].unchecked_args, why, "{finding:#?}");
             match why {
                 Some(why) => {
-                    assert!(finding.review.iter().any(|r| r.message == why.message(&[])));
+                    assert!(finding
+                        .review
+                        .iter()
+                        .any(|r| r.message == why.message(&[], Syntax::Python)));
                     assert_eq!(finding.fix, FixKind::Manual);
                 }
                 // Every argument was read and none conflicts: "no change"
@@ -4378,7 +4685,7 @@ def run():
         assert!(!finding
             .review
             .iter()
-            .any(|r| r.message == UncheckedArgs::ExtraBody.message(&[])));
+            .any(|r| r.message == UncheckedArgs::ExtraBody.message(&[], Syntax::Python)));
     }
 
     #[test]
@@ -5053,6 +5360,230 @@ _helper(plain)
         assert!(held >= 30, "only {held} findings had a gap at their call");
         assert_eq!(report.summary.not_analyzed, 1, "the nested scopes");
         assert!(report.summary.untracked_methods >= 1, "the getattr call");
+    }
+
+    /// TypeScript files that give the usage scan each gap the retirement
+    /// check must hold, each calling a retired model.
+    const TS_GAP_FIXTURES: &[(&str, &str)] = &[
+        (
+            "gaps/routes.ts",
+            r#"import OpenAI from "openai";
+import { GoogleGenAI } from "@google/genai";
+process.env.OPENAI_BASE_URL = proxy;
+const fromEnv = new OpenAI({ baseURL: process.env.GATEWAY ?? "https://api.openai.com/v1" });
+const unread = new OpenAI({ baseURL: `${host}/v1` });
+const moved = new OpenAI({ baseURL: "https://api.openai.com/v1" });
+moved.baseURL = elsewhere;
+let either = new OpenAI({ baseURL: "https://api.openai.com/v1" });
+if (flag) either = makeClient();
+const cloud = new GoogleGenAI({ vertexai: true, project: "p" });
+export async function run(typed: OpenAI) {
+  await fromEnv.chat.completions.create({ model: "gpt-3.5-turbo", messages: [] });
+  await unread.chat.completions.create({ model: "gpt-3.5-turbo", messages: [] });
+  await moved.chat.completions.create({ model: "gpt-3.5-turbo", messages: [] });
+  await either.chat.completions.create({ model: "gpt-3.5-turbo", messages: [] });
+  await typed.chat.completions.create({ model: "gpt-3.5-turbo", messages: [] });
+  await cloud.models.generateContent({ model: "gemini-1.5-flash", contents: "x" });
+  await new OpenAI().chat.completions.create({ model: "gpt-4", messages: [] });
+}
+"#,
+        ),
+        (
+            "gaps/values.ts",
+            r#"import OpenAI from "openai";
+import { MODEL } from "./config";
+const client = new OpenAI();
+export class Bot {
+  model = "gpt-3.5-turbo";
+  ask() {
+    return client.chat.completions.create({ model: this.model, messages: [] });
+  }
+}
+function overridden(model = "gpt-3.5-turbo") {
+  return client.chat.completions.create({ model, messages: [] });
+}
+overridden("gpt-4");
+export function exported(model = "gpt-3.5-turbo") {
+  return client.chat.completions.create({ model, messages: [] });
+}
+function passed(model = "gpt-3.5-turbo") {
+  return client.chat.completions.create({ model, messages: [] });
+}
+app.use(passed);
+export function rest(options: object) {
+  client.chat.completions.create({ model: "gpt-3.5-turbo", ...options, messages: [] });
+  client.chat.completions.create({ messages: [] });
+  client.chat.completions.create({ model: process.env.MODEL ?? "gpt-3.5-turbo", messages: [] });
+  client.chat.completions.create({ model: MODEL, messages: [] });
+  client.chat.completions[method]({ model: "gpt-3.5-turbo", messages: [] });
+  return client.chat.completions.create;
+}
+export function helper(llm: OpenAI) {
+  return llm.chat.completions.create({ model: "gpt-3.5-turbo", messages: [] });
+}
+helper(client);
+"#,
+        ),
+        (
+            "gaps/dynamic.ts",
+            r#"import OpenAI from "openai";
+eval(code);
+const MODEL = "gpt-3.5-turbo";
+const client = new OpenAI();
+client.chat.completions.create({ model: MODEL, messages: [] });
+"#,
+        ),
+    ];
+
+    /// The TypeScript and JavaScript files under `dir`, declaration files
+    /// left out, keyed by their path under `root`.
+    fn typescript_files(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut Vec<(String, String)>,
+    ) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            let name = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if path.is_dir() {
+                typescript_files(root, &path, out);
+            } else if crate::usages::is_usage_extension(
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or_default(),
+            ) && !name.ends_with(".py")
+                && !crate::usages::is_declaration_file(&name)
+            {
+                out.push((name, std::fs::read_to_string(&path).unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn no_gap_from_the_typescript_scan_reads_as_confirmed() {
+        let mut files: Vec<(String, String)> = TS_GAP_FIXTURES
+            .iter()
+            .map(|(name, source)| (name.to_string(), source.to_string()))
+            .collect();
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval/corpus");
+        let mut corpora = 0;
+        for entry in std::fs::read_dir(&corpus).expect("the eval corpus is in the workspace") {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("ts-sdk-"))
+            {
+                corpora += 1;
+                typescript_files(&corpus, &path, &mut files);
+            }
+        }
+        assert!(corpora >= 2, "the TypeScript SDK eval corpora moved");
+
+        let (mut calls, mut gaps_found, mut clients) = (Vec::new(), Vec::new(), Vec::new());
+        for (name, source) in &files {
+            let mut parser = tree_sitter::Parser::new();
+            let language =
+                if name.ends_with(".ts") || name.ends_with(".mts") || name.ends_with(".cts") {
+                    tree_sitter_typescript::language_typescript()
+                } else {
+                    tree_sitter_typescript::language_tsx()
+                };
+            parser.set_language(&language).unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            let found = crate::usages::typescript::extract(&tree, source, name);
+            calls.extend(found.calls);
+            gaps_found.extend(found.gaps);
+            clients.extend(found.clients);
+        }
+
+        let seen: BTreeSet<(GapKind, &str)> = gaps_found
+            .iter()
+            .map(|g| (g.kind, g.reason.as_str()))
+            .collect();
+        for (kind, reason) in &seen {
+            assert!(
+                gaps::gap_text(*kind, reason).is_some(),
+                "the TypeScript scan gave a {kind} gap with reason `{reason}`, which GAP_REASONS does not name"
+            );
+        }
+        let reasons: BTreeSet<&str> = seen.iter().map(|(_, r)| *r).collect();
+        for needed in [
+            "dynamic_feature",
+            "subclass_override",
+            "endpoint_option",
+            "endpoint_env",
+            "base_url_env",
+            "base_url_unresolved",
+            "base_url_assigned",
+            "multiple_assignments",
+            "in_file_callers",
+            "annotation",
+            "splat",
+            "unseen_callers",
+            "parameter_default",
+            "parameter_overridden",
+            "missing_model",
+            "env_var",
+            "imported_name",
+            "factory_call",
+            "computed_member",
+            "method_reference",
+        ] {
+            assert!(
+                reasons.contains(needed),
+                "no TypeScript fixture gives `{needed}`"
+            );
+        }
+
+        let opts = CheckOptions {
+            today: Date::parse("2026-10-24").unwrap(),
+            fail_within: Some(36_500),
+            include_routed: true,
+            count_unconfirmed: false,
+        };
+        let input = ScanInput {
+            calls: &calls,
+            gaps: &gaps_found,
+            clients: &clients,
+        };
+        let report = check(input, bundled().unwrap(), &opts);
+        assert!(report.findings.len() > 20, "{}", report.findings.len());
+        let mut held = 0;
+        for finding in report.findings.iter().chain(&report.routed) {
+            let here: Vec<&UsageGap> = gaps_found
+                .iter()
+                .filter(|g| {
+                    g.file == finding.file
+                        && g.chain.is_some()
+                        && g.span
+                            .is_some_and(|s| s.line == finding.line && s.column == finding.column)
+                })
+                .collect();
+            let value_gap = here.iter().any(|g| gaps::holds_value(g, &finding.key));
+            let routing_gap = here.iter().any(|g| gaps::holds_routing(g));
+            let at = format!("{}:{} {}", finding.file, finding.line, finding.model);
+            if value_gap {
+                assert_ne!(finding.confidence, Confidence::Confirmed, "{at}");
+            }
+            if routing_gap {
+                assert_ne!(finding.routing_class, RoutingClass::Direct, "{at}");
+            }
+            if value_gap || routing_gap {
+                held += 1;
+                assert!(!finding.fails, "{at} counts toward the exit code");
+                assert_ne!(finding.fix, FixKind::Swap, "{at}");
+                assert_ne!(finding.fix, FixKind::Decide, "{at}");
+            }
+        }
+        assert!(held >= 15, "only {held} findings had a gap at their call");
     }
 
     #[test]
