@@ -24,7 +24,7 @@ A fix release: retirement data read again on 28 October 2026, `npx` on npm 12, a
 - **`arbor refactor` exited 0 for a missing symbol (#195):** it now exits 1 and prints `error: Symbol '<name>' not found` to stderr after the "Did you mean" suggestions, matching `inspect` and `callers`.
 
 ### Security
-- **`arbor-gui` dependencies (RUSTSEC-2026-0381, RUSTSEC-2026-0382):** `Cargo.lock` pins `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.10. Only `arbor-gui` uses them (through `egui_extras`); the `arbor` CLI, the MCP server and the npm package do not.
+- **`arbor-gui` dependencies:** `Cargo.lock` pins `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382) and `webpki-roots` 1.0.10 (RUSTSEC-2026-0381). Only `arbor-gui` uses them (through `egui_extras`); the `arbor` CLI, the MCP server and the npm package do not.
 
 ## [3.1.0] - 2026-10-20
 

@@ -63,17 +63,18 @@ rebuilt once on first use.
 |-----|----------------|
 | **Bare `gpt-5` and `o3`** | OpenAI's deprecations page started listing bare IDs next to the dated snapshots after 3.1.0 was built, so `model="gpt-5"` or `model="o3"` was not listed at all. Both are listed now (11 December 2026, to GPT-5.6), with the 13 other IDs the page added. |
 | **Data read again on 28 October 2026** | Every provider page behind the bundled data was read and checked again. OpenAI's deprecations page lists the five dated `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` snapshots for 14 January 2027; for the bare aliases the report now cites OpenAI's API reference ("Deprecated. Announced shutdown date: 2027-01-14") and its models API. A call moving to `claude-haiku-4-5-20251001` with `temperature` now gets a check line: Anthropic's API version 2026-10-21 rejects it on every model. |
-| **`(no change)` next to arguments that need reasoning off** | For a call whose client Arbor could not resolve, `temperature`, `tools` or `max_tokens` went unchecked and "let the model reason" read `(no change)`. They are checked now. An option reads `no change` only when Arbor read every argument the call sends and no check line names one of them; otherwise it says what it could not check. |
+| **`(no change)` next to arguments that need reasoning off** | For a call whose client Arbor could not resolve, `temperature`, `tools` or `max_tokens` went unchecked and "let the model reason" read `(no change)`. They are checked now. When Arbor cannot read some of a call's arguments (`**kwargs`, `extra_body`) or a check line names one of them, each option says so instead of `no change`. |
 | **`npx` on npm 12** | npm 12 skips install scripts, so the binary was never downloaded. The wrapper now downloads it on first run and checks it against the release's `SHA256SUMS`. |
 | **The home folder as the project** | `~/.arbor` holds the global config (and, on Windows, the installed binary), so a folder under home with no nearer project marker resolved to the whole home folder, and `arbor index .` indexed all of it. The search now stops at the home folder. |
-| **Code graph: aliased imports and bare calls** | After `from m import f as g`, a call to `g()` now reaches `f` (also for `import { f as g }` in TypeScript and JavaScript). A bare call to a function in another file counts only when the calling file can see it: in Python, when it imports the name. |
+| **Code graph: aliased imports and bare calls** | After `from m import f as g`, a call to `g()` now reaches `f` (also for `import { f as g }` in TypeScript and JavaScript). In Python, JavaScript, TypeScript and Go, a bare call to a function in another file counts only when the calling file can see it (in Python, when it imports the name); other languages are unchanged. |
 
 When the terminal report of `arbor retirements` lists a call to a retired or
 retiring model, it now ends with an offer of a paid readiness review. The link
 carries three values from the run: how many calls are listed, how many are
-already retired and the next shutdown date. Arbor sends nothing, and the offer is
-never printed in CI, in the GitHub Action, or with `--json`, `--markdown`,
-`--annotations` or `--quiet`. [Release notes](docs/RELEASE_NOTES_v3.1.1.md)
+already retired and the next shutdown date. Arbor sends nothing. The offer is not
+printed with `--json`, `--markdown`, `--annotations` or `--quiet`, or when the `CI`
+environment variable is set (GitHub Actions sets it), and the GitHub Action does
+not show it. [Release notes](docs/RELEASE_NOTES_v3.1.1.md)
 
 <details>
 <summary><strong>v3.1.0</strong> (<code>arbor retirements</code> and <code>arbor usages</code>)</summary>

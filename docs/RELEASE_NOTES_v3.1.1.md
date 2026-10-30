@@ -80,15 +80,14 @@ reason" still read `(no change)`, although on gpt-6-luna `temperature` and
 `tools` return 400 unless the call sends `reasoning_effort="none"`, and
 `max_tokens` returned 400 at every effort the live checks tried (#290).
 
-Those arguments are now checked as for any other call. An option reads
-`no change` only when Arbor read every argument the call sends and no check
-line names one of them. Otherwise:
+Those arguments are now checked as for any other call, and an option that used
+to read `no change` now says what still needs a look:
 
 - Arguments Arbor cannot read, from a `**` expression such as `**kwargs` or
   sent in `extra_body`, make each option say
   `could not check the arguments from **kwargs` (or `in extra_body`), and a
   check line asks you to look at them. A dict literal in the same file spread
-  in with `**` is read.
+  in with `**` is read; a change made to it from another module is not seen.
 - An argument a check line names is named on each option: `check stop` where
   the line says it fails or changes on the replacement, and
   `could not check temperature` where nothing verified it for that API, such
@@ -140,9 +139,10 @@ retired and, when a call is retiring, the soonest shutdown date
 file names, repository names or model names.
 
 - **Terminal only.** The offer is printed only in the human report. It is not
-  printed with `--json`, `--markdown`, `--markdown-out`, `--annotations` or
-  `--quiet`, or when `CI` is set, so it never appears in CI or in the GitHub
-  Action's summary and annotations.
+  printed with `--json`, `--markdown`, `--annotations` or `--quiet`, or when
+  the `CI` environment variable is set (GitHub Actions sets it), and the file
+  `--markdown-out` writes does not have it. The GitHub Action's summary and
+  annotations do not show it.
 - **Nothing is sent by Arbor.** `arbor retirements` still makes no network
   requests and has no telemetry. Opening the link is up to you: it sends those
   three values to getarbor.dev like any page visit, and your email only if you
@@ -211,8 +211,9 @@ the home folder count as the home folder too.
 
 ## Also
 
-- `arbor-gui`'s lockfile moves to `rustls-webpki` 0.103.16 and `webpki-roots`
-  1.0.10 (RUSTSEC-2026-0382 and RUSTSEC-2026-0381). Only the GUI uses them.
+- `Cargo.lock` moves `rustls-webpki` to 0.103.16 (RUSTSEC-2026-0382) and
+  `webpki-roots` to 1.0.10 (RUSTSEC-2026-0381). Only `arbor-gui` uses them; the
+  `arbor` CLI does not.
 - [Live checks, 18 October 2026](LIVE_CHECKS_2026-10-18.md) lists each live
   API call behind a rule marked `live`, with its request, status and error
   message.
@@ -225,12 +226,16 @@ the home folder count as the home folder too.
 - **GitHub Action.** `uses: Anandb71/arbor@v3.1.1`. The Action installs the
   latest release by default (`arbor-version: latest`), so a workflow that pins
   `@v3.1.0` runs the 3.1.1 binary once this release is out; set `arbor-version`
-  to pin the binary.
+  to pin the binary. With 3.1.1's data the report lists calls that 3.1.0 did
+  not, such as bare `gpt-5` and `o3` (11 December 2026), so a workflow that
+  sets `retirements-fail-on` can fail where it passed before.
 - **Saved graphs** are rebuilt once on first use (`extract-6`).
 - **The home folder.** If an earlier run indexed your whole home folder, its
   graph and cache are still in `~/.arbor`, next to the global `config.json`
   (and, on Windows, `bin/`). 3.1.1 leaves them alone; removing them is up to
-  you.
+  you. The same goes for `arbor hook claude .` run in a folder under home with
+  no nearer marker: it wrote `~/CLAUDE.md` and `~/.claude/settings.json`,
+  Claude Code's user settings.
 
 ## Known limits
 
