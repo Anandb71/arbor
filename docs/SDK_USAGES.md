@@ -722,7 +722,9 @@ The receiver must be one of these:
   send their requests through the global `fetch`, so a `fetch` the file
   writes on an object it cannot identify (`globalThis.fetch = ...`,
   `(window as any).fetch = ...`, `Object.assign(globalThis, { fetch })`, a
-  bare `fetch = ...`) gives the same gap to every call whose client would
+  bare `fetch = ...`), or replaces with a test double
+  (`jest.spyOn(globalThis, "fetch")`, `vi.stubGlobal("fetch", ...)`), gives
+  the same gap to every call whose client would
   route to a provider's own API, but openai v3's `OpenAIApi`, which sends
   through axios.
 - **A Gemini client** also needs no `vertexai` or `enterprise` option other
