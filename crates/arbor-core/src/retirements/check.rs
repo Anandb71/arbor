@@ -2710,7 +2710,10 @@ mod tests {
         assert_eq!(finding.call_kind, CallKind::Request);
         assert_eq!(finding.endpoint, Some("chat.completions"));
         assert!(!finding.in_window, "retiring is not failing by default");
-        assert!(finding.notes.iter().any(|n| n.contains("efficient tier")));
+        assert!(finding
+            .notes
+            .iter()
+            .any(|n| n.contains("most efficient model for focused, high-volume tasks")));
 
         // The day after the date the call is retired.
         let report = run(&[openai("gpt-4o", &[])], &[], &options("2027-01-15"));
@@ -3278,15 +3281,32 @@ mod tests {
         assert!(advice.contains("does not support fine-tuning"), "{advice}");
         assert!(!advice.contains("retrain on gpt-6-luna"), "{advice}");
 
-        // A listed base that cannot be fine-tuned is named, not recommended.
-        let finding = one(&[openai("ft:gpt-3.5-turbo:acme::abc123", &[])]);
+        // A listed base that cannot be fine-tuned is named, not recommended:
+        // ft-o4-mini-2025-04-16 is the 23 Oct table's only fine-tune row.
+        let finding = one(&[openai("ft:o4-mini-2025-04-16:acme::abc123", &[])]);
         assert_eq!(
             finding.replacement_text.as_deref(),
             Some("no fine-tunable replacement is listed")
         );
         assert!(finding.review[0]
             .message
-            .contains("OpenAI lists gpt-5.6-terra for fine-tunes of gpt-3.5-turbo"));
+            .contains("OpenAI lists gpt-5.6-terra for fine-tunes of o4-mini-2025-04-16"));
+
+        // Since OpenAI removed its separate fine-tune table (26-27 Oct), the
+        // page names no replacement for fine-tunes of gpt-3.5-turbo: they
+        // follow their base model, and no base is named.
+        let finding = one(&[openai("ft:gpt-3.5-turbo:acme::abc123", &[])]);
+        assert_eq!(finding.date.unwrap().iso(), "2026-10-23");
+        assert_eq!(
+            finding.replacement_text.as_deref(),
+            Some("no fine-tunable replacement is listed")
+        );
+        let advice = &finding.review[0].message;
+        assert!(
+            advice.contains("OpenAI lists no replacement for fine-tunes of gpt-3.5-turbo"),
+            "{advice}"
+        );
+        assert!(!advice.contains("gpt-5.6-terra"), "{advice}");
     }
 
     #[test]
@@ -3347,10 +3367,20 @@ mod tests {
         );
         // A listed fine-tune base that cannot be fine-tuned is named, not
         // recommended.
-        let finding = one(&[job("gpt-3.5-turbo")]);
+        let finding = one(&[job("o4-mini-2025-04-16")]);
         assert!(finding.review[0]
             .message
-            .contains("OpenAI lists gpt-5.6-terra for fine-tunes of gpt-3.5-turbo"));
+            .contains("OpenAI lists gpt-5.6-terra for fine-tunes of o4-mini-2025-04-16"));
+        // gpt-3.5-turbo has no fine-tune row since OpenAI removed that table:
+        // its listed replacement is named as a replacement, not as a base.
+        let finding = one(&[job("gpt-3.5-turbo")]);
+        assert!(
+            finding.review[0].message.contains(
+                "OpenAI lists gpt-5.6-terra as the replacement for gpt-3.5-turbo, not as a base for fine-tuning"
+            ),
+            "{:#?}",
+            finding.review
+        );
         // An `ft:` model continued in a job keeps the fine-tune advice.
         let finding = one(&[job("ft:gpt-4o-mini-2024-07-18:acme::abc123")]);
         assert_eq!(finding.match_kind, MatchKind::FineTuned);
@@ -3767,6 +3797,92 @@ def known(model):
     }
 
     #[test]
+    fn bare_gpt_5_and_o3_shut_down_with_their_snapshots_on_11_december() {
+        // OpenAI's deprecations page lists each 11 Dec row as the bare ID and
+        // its snapshot (`gpt-5` | `gpt-5-2025-08-07`) since late October 2026;
+        // Arbor 3.1.0 had only the snapshots, so `model="gpt-5"` and
+        // `model="o3"` were not listed at all.
+        let source = r#"from openai import OpenAI
+
+client = OpenAI()
+
+
+def run(question):
+    messages = [{"role": "user", "content": question}]
+    client.chat.completions.create(model="gpt-5-2025-08-07", messages=messages)
+    client.chat.completions.create(model="gpt-5", messages=messages)
+    client.chat.completions.create(model="o3", messages=messages)
+    client.chat.completions.create(model="gpt-5-mini", messages=messages)
+    client.chat.completions.create(model="gpt-5-nano", messages=messages)
+    client.chat.completions.create(model="gpt-5-pro", messages=messages)
+    client.chat.completions.create(model="o3-pro", messages=messages)
+    client.chat.completions.create(model="o1-preview", messages=messages)
+"#;
+        let report = check_source(source, &options("2026-10-28"));
+        let at = |model: &str| -> Finding {
+            let line = line_of(source, &format!("model=\"{model}\""));
+            let found: Vec<&Finding> = report.findings.iter().filter(|f| f.line == line).collect();
+            assert_eq!(found.len(), 1, "{model}: {:#?}", report.findings);
+            found[0].clone()
+        };
+        for (model, replacement, text) in [
+            ("gpt-5-2025-08-07", "gpt-5.6-sol", None),
+            ("gpt-5", "gpt-5.6-sol", None),
+            ("o3", "gpt-5.6-sol", None),
+            ("gpt-5-mini", "gpt-5.6-terra", None),
+            ("gpt-5-nano", "gpt-5.6-luna", None),
+            (
+                "gpt-5-pro",
+                "gpt-5.6-sol",
+                Some("gpt-5.6-sol (reasoning.mode: pro)"),
+            ),
+            (
+                "o3-pro",
+                "gpt-5.6-sol",
+                Some("gpt-5.6-sol (reasoning.mode: pro)"),
+            ),
+        ] {
+            let finding = at(model);
+            assert_eq!(finding.matched, model, "matched exactly, never by prefix");
+            assert_eq!(finding.match_kind, MatchKind::Exact, "{model}");
+            assert_eq!(finding.provider, Table::Openai, "{model}");
+            assert_eq!(finding.status, State::Retiring, "{model}");
+            assert_eq!(finding.date.unwrap().iso(), "2026-12-11", "{model}");
+            assert_eq!(finding.days_left, Some(44), "{model}");
+            assert_eq!(finding.replacement.as_deref(), Some(replacement), "{model}");
+            assert_eq!(finding.replacement_text.as_deref(), text, "{model}");
+            assert_eq!(finding.confidence, Confidence::Confirmed, "{model}");
+            // The page is the source: these rows carry no models API note.
+            assert_eq!(
+                finding.source_url.as_deref(),
+                Some("https://developers.openai.com/api/docs/deprecations"),
+                "{model}"
+            );
+            assert!(finding.notes.is_empty(), "{model}: {:?}", finding.notes);
+            // No recipe has rules for GPT-5.6 targets of these rows yet: the
+            // date and replacement only, and a manual check, never a change.
+            assert!(finding.changes.is_empty(), "{model}");
+            assert!(finding.decisions.is_empty(), "{model}");
+            assert_eq!(finding.fix, FixKind::Manual, "{model}");
+            assert!(
+                finding.review.iter().any(|r| r.message
+                    == format!("The parameters {replacement} needs have not been checked yet.")),
+                "{model}: {:#?}",
+                finding.review
+            );
+        }
+        // o1-preview (shut down 28 Jul 2025) lists o3, which now has a date
+        // too, so the chain goes on to gpt-5.6-sol.
+        let preview = at("o1-preview");
+        assert_eq!(preview.status, State::Retired);
+        assert_eq!(preview.replacement.as_deref(), Some("o3"));
+        assert_eq!(preview.live_replacement.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(preview.replacement_chain[0].model, "o3");
+        assert_eq!(preview.replacement_chain[0].status, Some(State::Retiring));
+        assert_eq!(report.findings.len(), 8, "{:#?}", report.findings);
+    }
+
+    #[test]
     fn matching_is_exact() {
         for not_listed in [
             "GPT-4O",
@@ -4065,15 +4181,18 @@ def run():
         assert_eq!(report.findings[0].fix, FixKind::Manual);
 
         // Each provider's pages carry their own date; as_of is the oldest.
+        // The 28 Oct 2026 refresh read every provider's pages that day.
         let dates: Vec<(&str, String)> = report
             .data
             .providers
             .iter()
             .map(|p| (p.provider.as_str(), p.as_of.iso()))
             .collect();
-        assert_eq!(dates[0], ("OpenAI", "2026-10-18".to_string()));
-        assert_eq!(dates[1], ("Anthropic", "2026-10-16".to_string()));
-        assert_eq!(report.data.as_of.iso(), "2026-10-16");
+        assert_eq!(dates[0], ("OpenAI", "2026-10-28".to_string()));
+        assert_eq!(dates[1], ("Anthropic", "2026-10-28".to_string()));
+        let oldest = report.data.providers.iter().map(|p| p.as_of).min().unwrap();
+        assert_eq!(report.data.as_of, oldest);
+        assert_eq!(report.data.as_of.iso(), "2026-10-28");
 
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["version"], 1);
