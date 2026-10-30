@@ -343,6 +343,9 @@ const MAX_LITERAL_BYTES: usize = 4096;
 const MAX_NESTED_ENTRIES: usize = 256;
 /// Spreads expanded per object literal; past it, a spread is opaque.
 const MAX_SPREADS: usize = 64;
+/// Items of a `middleware` array checked for the SDK's own refusal
+/// fallback; a longer array keeps its gap.
+const MAX_MIDDLEWARE: usize = 16;
 /// Literals below an option's value a search for nested model keys
 /// descends, as in Python (`requests: [{ params: { model } }]` is 2).
 const MAX_NESTED_DEPTH: usize = 4;
@@ -5632,18 +5635,74 @@ impl<'t> Ctx<'t> {
                     fallback: false,
                 });
             }
-            // A custom `fetch` receives every request's URL.
-            if options.keys.iter().any(|k| k == "fetch") {
+            if let Some(option) = self.request_hook(&options, client.family) {
                 client.routing = Routing::Unknown;
-                client.caveat = Some(ClientCaveat::EndpointOption {
-                    option: "a custom `fetch`",
-                });
+                client.caveat = Some(ClientCaveat::EndpointOption { option });
             }
         }
         Val::Client {
             client,
             path: Vec::new(),
         }
+    }
+
+    /// The option of a direct client that sees every request it sends and
+    /// may send it elsewhere: a custom `fetch`, which receives each
+    /// request's URL, or Anthropic's `middleware`, which may change a
+    /// request before passing it on or answer it itself. A `middleware`
+    /// array whose items are all calls of the SDK's own
+    /// `betaRefusalFallbackMiddleware` keeps the route: that one only sends
+    /// the request again with a fallback model.
+    fn request_hook(&mut self, options: &Options<'t>, family: Family) -> Option<&'static str> {
+        if let Lookup::Found(..) = options.lookup("fetch") {
+            return Some("a custom `fetch`");
+        }
+        if family != Family::AnthropicDirect {
+            return None;
+        }
+        match options.lookup("middleware") {
+            Lookup::Found(value, false, scope) if self.refusal_fallbacks_only(value, scope) => None,
+            Lookup::Found(..) => Some("`middleware`"),
+            Lookup::Missing | Lookup::Opaque => None,
+        }
+    }
+
+    /// Whether `value` is an array literal whose items are all calls of the
+    /// Anthropic SDK's own `betaRefusalFallbackMiddleware`, imported from
+    /// the package: a same-named function of the file or another module's
+    /// is not it.
+    fn refusal_fallbacks_only(&mut self, value: Node<'t>, scope: usize) -> bool {
+        let array = unwrap_expression(value);
+        if array.kind() != "array" {
+            return false;
+        }
+        let mut cursor = array.walk();
+        let items: Vec<Node<'t>> = array
+            .named_children(&mut cursor)
+            .filter(|n| n.kind() != "comment")
+            .take(MAX_MIDDLEWARE + 1)
+            .collect();
+        if items.len() > MAX_MIDDLEWARE {
+            return false;
+        }
+        for item in items {
+            let item = unwrap_expression(item);
+            let Some(function) = item
+                .child_by_field_name("function")
+                .filter(|_| item.kind() == "call_expression")
+            else {
+                return false;
+            };
+            let sdk_own = matches!(
+                self.eval(function, scope, 0),
+                Val::Symbol { pkg: Pkg::Anthropic, path }
+                    if matches!(path.as_slice(), [name] if name == "betaRefusalFallbackMiddleware")
+            );
+            if !sdk_own {
+                return false;
+            }
+        }
+        true
     }
 
     /// `genAI.getGenerativeModel({ model }, { baseUrl })`: a model object
@@ -5798,14 +5857,13 @@ impl<'t> Ctx<'t> {
         match class.family {
             Family::OpenaiDirect | Family::AnthropicDirect => {
                 let options = self.options(node, scope, 0);
-                let option = options.keys.iter().find_map(|k| match k.as_str() {
-                    "dataResidency" if class.family == Family::OpenaiDirect => {
-                        Some("`dataResidency`")
-                    }
-                    // A custom `fetch` receives every request's URL.
-                    "fetch" => Some("a custom `fetch`"),
-                    _ => None,
-                });
+                let residency = class.family == Family::OpenaiDirect
+                    && options.keys.iter().any(|k| k == "dataResidency");
+                let option = if residency {
+                    Some("`dataResidency`")
+                } else {
+                    self.request_hook(&options, class.family)
+                };
                 (option, None)
             }
             Family::Genai => {

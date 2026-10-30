@@ -2723,6 +2723,92 @@ client.chat.completions.create({{ model: \"gpt-4\", messages: [] }});"
 }
 
 #[test]
+fn a_middleware_may_send_requests_elsewhere_unless_it_is_the_sdk_refusal_fallback() {
+    // A middleware may change the request before passing it on, or answer
+    // it itself: the same power as a custom `fetch`.
+    let gateway = "const viaGateway = async (req: any, next: any) =>
+  next({ ...req, url: String(req.url).replace(\"api.anthropic.com\", \"gateway.example.com\") });
+";
+    let request = "client.messages.create({ model: \"claude-3-5-sonnet-20241022\", max_tokens: 10, messages: [] });";
+    let fallback = "betaRefusalFallbackMiddleware([{ model: \"claude-opus-4-8\" }])";
+    for (imports, client) in [
+        (
+            "import Anthropic from \"@anthropic-ai/sdk\";",
+            "new Anthropic({ middleware: [viaGateway] })".to_string(),
+        ),
+        (
+            "import Anthropic from \"@anthropic-ai/sdk\";",
+            "new Anthropic().withOptions({ middleware: [viaGateway] })".to_string(),
+        ),
+        // The SDK's fallback next to one of the file's own.
+        (
+            "import Anthropic, { betaRefusalFallbackMiddleware } from \"@anthropic-ai/sdk\";",
+            format!("new Anthropic({{ middleware: [{fallback}, viaGateway] }})"),
+        ),
+        // A function of the same name that is not the SDK's.
+        (
+            "import Anthropic from \"@anthropic-ai/sdk\";
+function betaRefusalFallbackMiddleware(fallbacks: any) { return viaGateway; }",
+            format!("new Anthropic({{ middleware: [{fallback}] }})"),
+        ),
+        (
+            "import Anthropic from \"@anthropic-ai/sdk\";
+import { betaRefusalFallbackMiddleware } from \"./gateway\";",
+            format!("new Anthropic({{ middleware: [{fallback}] }})"),
+        ),
+        // An array the file may change, or one read from elsewhere.
+        (
+            &format!(
+                "import Anthropic, {{ betaRefusalFallbackMiddleware }} from \"@anthropic-ai/sdk\";
+const MIDDLEWARE = [{fallback}];"
+            ),
+            "new Anthropic({ middleware: MIDDLEWARE })".to_string(),
+        ),
+        (
+            "import Anthropic from \"@anthropic-ai/sdk\";",
+            "new Anthropic({ middleware: loadMiddleware() })".to_string(),
+        ),
+        // An item read off the client being built is not the SDK's.
+        (
+            "import Anthropic from \"@anthropic-ai/sdk\";",
+            "new Anthropic({ middleware: [client.hook()] })".to_string(),
+        ),
+    ] {
+        let source = format!("{imports}\n{gateway}const client = {client};\n{request}");
+        let (routing, gaps) = route(&source, "messages.create");
+        assert_eq!(routing, Routing::Unknown, "{source}");
+        assert_eq!(gaps, vec!["ambiguous_client/endpoint_option"], "{source}");
+    }
+
+    // The SDK's own refusal fallback only sends the request again with a
+    // fallback model: the route stays.
+    for (imports, client) in [
+        (
+            "import Anthropic, { betaRefusalFallbackMiddleware } from \"@anthropic-ai/sdk\";",
+            format!("new Anthropic({{ middleware: [{fallback}] }})"),
+        ),
+        (
+            "import Anthropic, { betaRefusalFallbackMiddleware } from \"@anthropic-ai/sdk\";",
+            format!("new Anthropic().withOptions({{ middleware: [{fallback}] }})"),
+        ),
+        (
+            "import { Anthropic, betaRefusalFallbackMiddleware as onRefusal } from \"@anthropic-ai/sdk\";",
+            "new Anthropic({ middleware: [onRefusal([{ model: \"claude-opus-4-8\" }])] })"
+                .to_string(),
+        ),
+        (
+            "import * as sdk from \"@anthropic-ai/sdk\";",
+            format!("new sdk.Anthropic({{ middleware: [sdk.{fallback}] }})"),
+        ),
+    ] {
+        let source = format!("{imports}\n{gateway}const client = {client};\n{request}");
+        let (routing, gaps) = route(&source, "messages.create");
+        assert_eq!(routing, Routing::AnthropicDirect, "{source}");
+        assert!(gaps.is_empty(), "{source}: {gaps:?}");
+    }
+}
+
+#[test]
 fn an_unresolved_client_on_any_model_bearing_member_is_a_gap() {
     for (call_text, sdk) in [
         (
