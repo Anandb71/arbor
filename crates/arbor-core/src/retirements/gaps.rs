@@ -112,7 +112,12 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     (
         GapKind::UnresolvedModel,
         "missing_model",
-        "no model is passed, so the SDK's or the server's default applies",
+        "no model is passed, so the SDK's, the server's or LangChain's default applies",
+    ),
+    (
+        GapKind::UnresolvedModel,
+        "langchain_copy",
+        "a copy of a LangChain chat model may be given another model, and calls on the copy are not followed",
     ),
     (
         GapKind::UnresolvedModel,

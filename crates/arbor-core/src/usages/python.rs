@@ -7033,12 +7033,27 @@ impl<'t> Ctx<'t> {
                 client.caveat = Some(ClientCaveat::Dynamic(feature));
             }
         }
-        if let Some(feature) = self.sdk_patched.get(&client.pkg) {
+        if let Some(feature) = self.sdk_patch(client.pkg) {
             if client.caveat.is_none() && !client.ambiguous {
-                client.caveat = Some(ClientCaveat::Dynamic(*feature));
+                client.caveat = Some(ClientCaveat::Dynamic(feature));
             }
         }
         client
+    }
+
+    /// A member of `pkg` replaced in this file, or, for a LangChain chat
+    /// model, one of the SDK whose client it builds (`openai.OpenAI = ...`).
+    fn sdk_patch(&self, pkg: Pkg) -> Option<Feature> {
+        let base = match pkg.sdk() {
+            _ if !pkg.is_langchain() => None,
+            Sdk::Openai => Some(Pkg::Openai),
+            Sdk::Anthropic => Some(Pkg::Anthropic),
+            _ => None,
+        };
+        self.sdk_patched
+            .get(&pkg)
+            .or_else(|| base.and_then(|b| self.sdk_patched.get(&b)))
+            .copied()
     }
 
     /// Why the module-level API of `pkg` may not route as reported.
@@ -7208,11 +7223,9 @@ impl<'t> Ctx<'t> {
                         routing: self.module_routing(class.pkg),
                         client_line: None,
                         ambiguous: false,
-                        caveat: self.module_caveat(class.pkg).or_else(|| {
-                            self.sdk_patched
-                                .get(&class.pkg)
-                                .map(|f| ClientCaveat::Dynamic(*f))
-                        }),
+                        caveat: self
+                            .module_caveat(class.pkg)
+                            .or_else(|| self.sdk_patch(class.pkg).map(ClientCaveat::Dynamic)),
                     };
                     self.record_call(call, function, scope, target);
                 }
@@ -7281,8 +7294,16 @@ impl<'t> Ctx<'t> {
         let args = self.arguments(call);
         let sdk = target.pkg.sdk();
         let member = clip_owned(strip_wrappers(&target.member));
-        let request = is_request(&member);
+        // A LangChain call is a construction or a call on a chat model, never
+        // an SDK request, whatever its method is called (`llm.stream`).
+        let request = is_request(&member) && !target.pkg.is_langchain();
         let model_bearing = is_model_bearing(&member);
+        // `llm.copy(update=...)` and `llm.model_copy(update=...)` set fields
+        // by their own names, not LangChain's aliases, and the copy is not
+        // followed: what `update` holds is never a value of the call.
+        let langchain_copy = target.pkg.is_langchain()
+            && target.receiver == Receiver::Client
+            && matches!(member.as_str(), "copy" | "model_copy");
 
         // An unresolved model matters where it reaches a request, a model
         // object, or any call on a client or SDK module; on an SDK type
@@ -7341,7 +7362,9 @@ impl<'t> Ctx<'t> {
             let run_option = keyword
                 .as_deref()
                 .is_none_or(|k| LANGCHAIN_RUN_OPTIONS.contains(&k));
-            if target.pkg.is_langchain() && run_option {
+            if target.pkg.is_langchain() && run_option
+                || langchain_copy && keyword.as_deref() == Some("update")
+            {
                 continue;
             }
             let prefix = keyword
@@ -7416,8 +7439,26 @@ impl<'t> Ctx<'t> {
                 self.take_value(&site, key, false, result, &mut values);
             }
             let list = self.dict_nested(&expansion);
-            nested.extend(list.found.iter().cloned());
-            nested_overridden.extend(list.overridden.iter().cloned());
+            // The dict is read once for every call that expands it: the
+            // run options (and a copy's `update`) it holds are dropped here,
+            // for a LangChain call.
+            let reaches_request = |path: &str| {
+                let option = path.split('.').next().unwrap_or(path);
+                !(target.pkg.is_langchain() && LANGCHAIN_RUN_OPTIONS.contains(&option)
+                    || langchain_copy && option == "update")
+            };
+            nested.extend(
+                list.found
+                    .iter()
+                    .filter(|v| reaches_request(&v.path))
+                    .cloned(),
+            );
+            nested_overridden.extend(
+                list.overridden
+                    .iter()
+                    .filter(|path| reaches_request(path))
+                    .cloned(),
+            );
             nested_cut |= list.cut;
         }
         self.take_nested(&site, nested, nested_cut, &mut values);
@@ -7471,10 +7512,49 @@ impl<'t> Ctx<'t> {
             let unresolved = Unresolved::new("splat", "**kwargs".to_string());
             self.unresolved_gap(&site, model_key, &unresolved, None);
         } else if !keyed && model_bearing && !args.list_splat {
-            // No model at all: the SDK's or the server's default applies,
-            // and it may be one that retires.
-            let unresolved = Unresolved::new("missing_model", String::new());
+            // No model at all: the SDK's, the server's or LangChain's
+            // default applies, and it may be one that retires.
+            let default = if target.pkg.is_langchain() {
+                "LangChain's default model"
+            } else {
+                ""
+            };
+            let unresolved = Unresolved::new("missing_model", default.to_string());
             self.unresolved_gap(&site, model_key, &unresolved, None);
+        }
+        // A copy whose `update` may name the model (by either name, since
+        // which one is the field depends on the class) may have another
+        // model, or its own: either way it is not confirmed.
+        if langchain_copy {
+            let changes_model = match keyword_value(call, |n| self.text(n), |k| k == "update") {
+                Some(update) if update.kind() == "none" => false,
+                Some(update) => match self.dict_node(update, scope, 0) {
+                    Some(dict) => ["model", "model_name"]
+                        .into_iter()
+                        .any(|key| !matches!(self.dict_lookup(dict.node, key), Lookup::Absent)),
+                    None => true,
+                },
+                // An opaque `**` without `update=` has its `splat` gap.
+                None => false,
+            };
+            if changes_model {
+                self.out.gaps.push(UsageGap {
+                    kind: GapKind::UnresolvedModel,
+                    sdk: Some(sdk),
+                    file: self.file.clone(),
+                    span: Some(span),
+                    symbol: symbol.clone(),
+                    chain: Some(chain.clone()),
+                    key: Some("model".to_string()),
+                    reason: "langchain_copy".to_string(),
+                    detail: format!(
+                        "`{chain}` copies a LangChain chat model with an `update` that may name its model; the copy sets fields by their own names (`model_name` on the OpenAI classes, `model` on `ChatAnthropic`), not by alias, and calls on it are not followed"
+                    ),
+                    values: Vec::new(),
+                    values_complete: false,
+                    args: None,
+                });
+            }
         }
         // A LangChain chat model takes its model as `model` or as
         // `model_name`. Given both, which one it keeps is not confirmed;
@@ -7501,14 +7581,16 @@ impl<'t> Ctx<'t> {
             _ => None,
         };
         // Its requests read the model field when they are sent, so
-        // `llm.model_name = ...` after it is built changes it. Any write of
-        // that name, or one with a run-time name, on an object other than
-        // `self` or a same-file class may be one.
-        let rewritten = (target.receiver != Receiver::Client)
+        // `llm.model_name = ...` after it is built changes it, and so does a
+        // `model` in `model_kwargs` or `extra_body`, which are sent over it.
+        // Any write of those names, or one with a run-time name, on an
+        // object other than `self` or a same-file class may be one. A
+        // constructor given no model already has its own gap.
+        let rewritten = (target.receiver != Receiver::Client && names != (false, false))
             .then(|| {
                 self.wild_attr_any
                     .or_else(|| {
-                        ["model", "model_name"]
+                        ["model", "model_name", "model_kwargs", "extra_body"]
                             .iter()
                             .find_map(|attr| self.outside_attr_writes.get(attr).copied())
                     })
@@ -7853,6 +7935,9 @@ impl<'t> Ctx<'t> {
             ),
             _ if unresolved.reason == "splat" => {
                 format!("`{key}` for `{chain}` is not passed by name and may come from `**kwargs`")
+            }
+            _ if unresolved.reason == "missing_model" && !shape.is_empty() => {
+                format!("`{key}` for `{chain}` is not passed, so {shape} applies")
             }
             _ if unresolved.reason == "missing_model" => {
                 format!("`{key}` for `{chain}` is not passed, so the SDK or server default applies")

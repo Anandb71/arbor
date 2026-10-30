@@ -7028,3 +7028,175 @@ llm.invoke("hi", model="gpt-3.5-turbo-0301")
     );
     assert!(gaps_on(&found, 5).is_empty() && gaps_on(&found, 6).is_empty());
 }
+
+/// Every `(line, key, value)` the calls of `found` carry.
+fn model_values(found: &FileUsages) -> Vec<(u32, &str, &str)> {
+    found
+        .calls
+        .iter()
+        .flat_map(|c| {
+            c.values
+                .iter()
+                .map(move |v| (c.span.line, v.key.as_str(), v.value.as_str()))
+        })
+        .collect()
+}
+
+#[test]
+fn langchain_run_options_in_an_expanded_dict_are_not_read() {
+    // Run options never reach the request, whether written at the call or
+    // in a same-file dict expanded with `**`.
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI
+
+LLM_KWARGS = {"model": "gpt-6-luna", "metadata": {"model": "gpt-3.5-turbo-0301"}}
+RUN = {"config": {"configurable": {"model": "gpt-4"}}, "tags": [{"model": "gpt-4-0613"}]}
+REPLACED = {"metadata": {"model": "gpt-4-0314"}, **extra}
+llm = ChatOpenAI(**LLM_KWARGS)
+llm.invoke("hi", **RUN)
+llm.invoke("hi", **REPLACED)
+"#,
+    );
+    assert_eq!(model_values(&found), vec![(7, "model", "gpt-6-luna")]);
+    // What `**extra` holds may still be the call's own model; the run
+    // option's model it may replace is no gap. (A client built from a `**`
+    // dict has a `base_url_unresolved` route, as an SDK client does.)
+    let model_gaps: Vec<(u32, &str, Option<&str>)> = found
+        .gaps
+        .iter()
+        .filter(|g| g.kind == GapKind::UnresolvedModel)
+        .map(|g| (g.span.unwrap().line, g.reason.as_str(), g.key.as_deref()))
+        .collect();
+    assert_eq!(model_gaps, vec![(9, "splat", Some("model"))]);
+}
+
+#[test]
+fn a_langchain_copy_that_may_change_its_model_is_a_gap() {
+    // `copy` and `model_copy` set fields by their own names, without
+    // LangChain's aliases, and the copy is not followed: `update` is never
+    // a value, and one that may name the model is a gap.
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+llm = ChatOpenAI(model="gpt-6-luna")
+claude = ChatAnthropic(model="claude-sonnet-5-5")
+UPDATE = {"model_name": "gpt-4-0613"}
+legacy = llm.copy(update={"model": "gpt-3.5-turbo-0301"})
+older = claude.model_copy(update={"model_name": "claude-2.1"})
+named = llm.copy(update=UPDATE)
+unknown = llm.model_copy(update=choose())
+cooler = llm.copy(update={"temperature": 0})
+plain = llm.copy(deep=True)
+"#,
+    );
+    assert_eq!(
+        model_values(&found),
+        vec![
+            (5, "model", "gpt-6-luna"),
+            (6, "model", "claude-sonnet-5-5")
+        ]
+    );
+    for line in [8, 9, 10, 11] {
+        assert_eq!(
+            gaps_on(&found, line),
+            vec!["unresolved_model/langchain_copy".to_string()],
+            "line {line}"
+        );
+    }
+    let copied = found
+        .gaps
+        .iter()
+        .find(|g| g.reason == "langchain_copy")
+        .unwrap();
+    assert_eq!(copied.key.as_deref(), Some("model"));
+    for line in [12, 13] {
+        assert!(
+            gaps_on(&found, line).is_empty(),
+            "line {line}: {:?}",
+            found.gaps
+        );
+    }
+}
+
+#[test]
+fn langchain_calls_are_not_requests_and_name_langchain_in_their_gaps() {
+    // Every call on a chat model is recorded the same way, whatever its
+    // method is called.
+    let found = usages(
+        r#"
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-6-luna")
+llm.invoke("hi")
+llm.stream("hi")
+llm.generate([["hi"]])
+"#,
+    );
+    for line in [4, 5, 6, 7] {
+        assert!(!call_on(&found, line).request, "line {line}");
+    }
+
+    // No model is LangChain's default, and a write of `model` elsewhere
+    // adds nothing to that gap; an Azure deployment gets none.
+    let found = usages(
+        "from langchain_openai import ChatOpenAI, AzureChatOpenAI\nllm = ChatOpenAI()\nazure = AzureChatOpenAI(azure_deployment=\"prod\")\nsettings.model = choose()\n",
+    );
+    assert_eq!(
+        gaps_on(&found, 2),
+        vec!["unresolved_model/missing_model".to_string()]
+    );
+    let missing = found
+        .gaps
+        .iter()
+        .find(|g| g.reason == "missing_model")
+        .unwrap();
+    assert!(
+        missing.detail.contains("LangChain's default model"),
+        "{}",
+        missing.detail
+    );
+    assert!(gaps_on(&found, 3).is_empty(), "{:?}", found.gaps);
+
+    // A replaced member of the SDK a chat model builds its client from.
+    for (patch, class, gapped) in [
+        ("openai.OpenAI = Recorder", "ChatOpenAI", true),
+        (
+            "openai.resources.chat.Completions.create = record",
+            "ChatOpenAI",
+            true,
+        ),
+        ("anthropic.Anthropic = Recorder", "ChatAnthropic", true),
+        ("anthropic.Anthropic = Recorder", "ChatOpenAI", false),
+    ] {
+        let source = format!(
+            "import openai, anthropic\nfrom langchain_openai import ChatOpenAI\nfrom langchain_anthropic import ChatAnthropic\n{patch}\nllm = {class}(model=\"m\")\nllm.invoke(\"hi\")\n"
+        );
+        let found = usages(&source);
+        let expected: Vec<String> = if gapped {
+            vec!["ambiguous_client/dynamic_feature".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(gaps_on(&found, 5), expected, "{patch} / {class}");
+        assert_eq!(gaps_on(&found, 6), expected, "{patch} / {class}");
+    }
+
+    // `model_kwargs` and `extra_body` are sent over the model field.
+    for write in [
+        "llm.model_kwargs = extra",
+        "llm.extra_body = {\"model\": \"m2\"}",
+    ] {
+        let source = format!(
+            "from langchain_openai import ChatOpenAI\nllm = ChatOpenAI(model=\"gpt-6-luna\")\n{write}\n"
+        );
+        let found = usages(&source);
+        assert_eq!(
+            gaps_on(&found, 2),
+            vec!["unresolved_model/dynamic_feature".to_string()],
+            "{write}"
+        );
+    }
+}

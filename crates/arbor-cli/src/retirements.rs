@@ -734,7 +734,7 @@ fn not_checked_lines(report: &RetirementReport, markdown: bool) -> Vec<String> {
     }
     if s.no_model_calls > 0 {
         lines.push(format!(
-            "Not checked: {} {} no model, so the SDK's or the server's default applies.",
+            "Not checked: {} {} no model, so the SDK's, the server's or LangChain's default applies.",
             calls(s.no_model_calls),
             verb(s.no_model_calls, "passes", "pass")
         ));
