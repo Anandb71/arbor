@@ -283,12 +283,16 @@ LangChain's helpers report nothing.
   The classes are pydantic models that take keyword arguments only, so a
   positional argument is not read. A built model's requests send its model
   field, read when they are sent, unless the call passes its own `model`
-  (see the calls below). So a write of `model` or `model_name` on any
-  object other than `self` or a same-file class (`llm.model_name = ...`,
-  `settings.model = ...`), or of an attribute with a run-time name, gives
-  every LangChain chat model's value in the file a `dynamic_feature` gap.
-  So does making the model configurable at run time
+  (see the calls below). A `model` in `model_kwargs` or `extra_body` is
+  sent over the field too. So a write of `model`, `model_name`,
+  `model_kwargs` or `extra_body` on any object other than `self` or a
+  same-file class (`llm.model_name = ...`, `settings.model = ...`), or of an
+  attribute with a run-time name, gives every LangChain chat model's value in
+  the file a `dynamic_feature` gap (a chat model built with no model already
+  has its `missing_model` gap). So does making the model configurable at run time
   (`configurable_fields(model_name=...)`, `configurable_alternatives(...)`).
+  A change made in place (`llm.model_kwargs["model"] = ...`,
+  `llm.model_kwargs.update(...)`) is not seen.
 - **The route.** A chat model routes like the SDK client it builds, under the
   client rules in [Routes](#routes). Its endpoint is `base_url` or LangChain's
   own name for it (`openai_api_base`, `anthropic_api_url`), routed by host.
@@ -303,17 +307,23 @@ LangChain's helpers report nothing.
   client it holds (`llm.client`, `root_client`, `_client` and their async
   versions) is a `dynamic_feature` gap. Passing one of those to the
   constructor (`ChatOpenAI(client=OpenAI(base_url=...).chat.completions)`)
-  routes it `unknown` with a `given_client` gap.
+  routes it `unknown` with a `given_client` gap. A member of the SDK it builds
+  its client from replaced in the file (`openai.OpenAI = Recorder`) is a
+  `dynamic_feature` gap, as it is for that SDK's own clients.
 - **The pre-1.0 SDK.** The deprecated `ChatOpenAI` also runs on `openai<1.0`,
   where a chat model given no endpoint sends its requests through the
   module-level API. In a file that configures the module-level API (any
   routing setting, anywhere in the file), such a model routes `unknown` with a
   `langchain_module_config` gap. `langchain_openai` needs `openai>=1`, so this
   does not apply to it.
-- **Calls on a chat model** (`llm.invoke(...)`,
+- **Calls on a chat model** (`llm.invoke(...)`, `llm.stream(...)`,
   `llm.with_structured_output(...)`) are recorded with its routing, as calls on
-  a client are. What such a call returns, including a copy
-  (`llm.copy(update=...)`, which may change any field), is not followed.
+  a client are, and all with `request: false`, whatever the method is called.
+  What such a call returns is not followed, including a copy
+  (`llm.copy(update=...)`, `llm.model_copy(update=...)`). A copy's `update`
+  is not read: pydantic sets those fields by their own names, not LangChain's
+  aliases (`model_name` on the OpenAI classes, `model` on `ChatAnthropic`), so
+  an `update` that may name either is a `langchain_copy` gap.
   LangChain sends a call's keyword arguments over the model's own parameters,
   so a call may pass its own `model` (`llm.invoke(q, model=...)`,
   `llm.bind(model=...)`), which is sent in place of the field: a literal is
@@ -321,7 +331,8 @@ LangChain's helpers report nothing.
   the file cannot read is a `splat` gap on `model`, as for an SDK request.
   LangChain's run options (`config`, `configurable`, `metadata`, `tags`,
   `callbacks`, `run_name`) and a call's positional input never reach the
-  provider's request, so a `model` key inside them is not read.
+  provider's request, so a `model` key inside them is not read, whether they
+  are written at the call or come from a same-file dict expanded with `**`.
 
 `arbor retirements` checks only the model of these calls: LangChain takes its
 own arguments and builds the request, so the SDK's argument rules do not
