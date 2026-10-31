@@ -60,7 +60,9 @@
 //! # Scope of this version
 //!
 //! Python only ([`python`]): `.py` files and extensionless scripts with a
-//! Python shebang. The TypeScript/ESM slice will implement
+//! Python shebang. LangChain's OpenAI and Anthropic chat models
+//! (`ChatOpenAI(model=...)`) are recorded as a construction and a call that
+//! binds the model, like `genai.GenerativeModel(...)`. The TypeScript/ESM slice will implement
 //! [`crate::LanguageParser::extract_usages`] for its parsers and reuse these
 //! types. Resolution is per file: a client or model constant imported from
 //! another module is a gap, not a usage.
@@ -117,16 +119,19 @@ impl std::fmt::Display for Sdk {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Routing {
-    /// `OpenAI()` / `AsyncOpenAI()` with no `base_url`, or the module-level API.
+    /// `OpenAI()` / `AsyncOpenAI()` with no `base_url`, the module-level API,
+    /// or LangChain's `ChatOpenAI` built the same way.
     OpenaiDirect,
-    /// `AzureOpenAI` / `AsyncAzureOpenAI`, or `openai.api_type = "azure"`.
+    /// `AzureOpenAI` / `AsyncAzureOpenAI`, `openai.api_type = "azure"`, or
+    /// LangChain's `AzureChatOpenAI`.
     AzureOpenai,
     /// A client given a `base_url` / `api_base` whose host is not the
     /// provider's own (OpenRouter, LiteLLM, a local server), or a
     /// module-level `openai.api_base` / `base_url` set that way. A `base_url`
     /// of `api.openai.com` or `api.anthropic.com` is direct.
     CustomBaseUrl,
-    /// `Anthropic()` / `AsyncAnthropic()` with no `base_url`.
+    /// `Anthropic()` / `AsyncAnthropic()` with no `base_url`, or LangChain's
+    /// `ChatAnthropic` built the same way.
     AnthropicDirect,
     /// `AnthropicBedrock` / `AsyncAnthropicBedrock`.
     AnthropicBedrock,
@@ -202,7 +207,9 @@ pub enum BindingKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SdkImport {
     pub sdk: Sdk,
-    /// `openai`, `anthropic`, `google.genai` or `google.generativeai`.
+    /// `openai`, `anthropic`, `google.genai` or `google.generativeai`, or the
+    /// LangChain package a chat model comes from (`langchain_openai`,
+    /// `langchain_anthropic`, `langchain_community`, `langchain`).
     pub package: String,
     /// The module named in the statement (`openai.types.chat`).
     pub module: String,
@@ -371,13 +378,19 @@ pub struct SdkCall {
     pub chain: String,
     /// The part after the tracked root (`chat.completions.create`), with the
     /// response wrappers `with_raw_response` / `with_streaming_response` and
-    /// client copies (`with_options(...)`, `copy(...)`) removed.
+    /// client copies (`with_options(...)`, `copy(...)`) removed. A call
+    /// through the SDK client a LangChain chat model holds has the path on
+    /// that client (`llm.client.create(...)` is `chat.completions.create`,
+    /// since the OpenAI classes hold that resource in `client`).
     pub member: String,
     /// Whether the call sends a request to the provider: its last member is
     /// a request method (`create`, `stream`, `generate_content`,
     /// `send_message`...). `false` for SDK helpers and types
     /// (`genai.configure`, `GenerativeModel(...)`, `types.Part(...)`,
-    /// `ChatCompletion(...)` built from `openai.types`). A name heuristic.
+    /// `ChatCompletion(...)` built from `openai.types`), and for every call
+    /// on a LangChain chat model (`ChatOpenAI(...)`, `llm.invoke(...)`,
+    /// `llm.stream(...)`), whose request LangChain builds; a request through
+    /// the SDK client it holds is the SDK's. A name heuristic.
     pub request: bool,
     pub receiver: Receiver,
     pub routing: Routing,
@@ -438,10 +451,10 @@ pub enum GapKind {
     /// allowlisted key's value is not a resolvable string literal
     /// (environment, config attribute, function call, f-string, parameter,
     /// `**kwargs`, a name imported from another module...), or a call that
-    /// takes a model passes none (`missing_model`: the SDK or server
-    /// default applies). A value captured next to such a gap is one the code
-    /// names but cannot confirm: an environment fallback, a parameter
-    /// default (`parameter_default`, `parameter_overridden`,
+    /// takes a model passes none (`missing_model`: the SDK's, the server's
+    /// or LangChain's default applies). A value captured next to such a gap
+    /// is one the code names but cannot confirm: an environment fallback, a
+    /// parameter default (`parameter_default`, `parameter_overridden`,
     /// `unseen_callers`), an attribute a subclass in another module may
     /// override (`subclass_override`) or a value a dynamic feature of the
     /// file may change (`dynamic_feature`, which names the feature and its

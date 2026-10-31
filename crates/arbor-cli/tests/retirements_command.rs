@@ -520,6 +520,99 @@ fn routed_calls_are_reported_separately() {
 }
 
 #[test]
+fn the_clean_line_never_sits_over_a_listed_call() {
+    // An `AzureChatOpenAI` and a `ChatOpenAI` given another host are routed,
+    // never direct. With --include-routed they are listed and the retired
+    // one fails the check, so the line that says Arbor found none must not
+    // print.
+    let dir = project(
+        r#"from langchain_openai import AzureChatOpenAI, ChatOpenAI
+
+azure = AzureChatOpenAI(azure_deployment="legacy", model="gpt-3.5-turbo-0301", api_version="2024-02-01")
+router = ChatOpenAI(model="gpt-4o", base_url="https://openrouter.ai/api/v1")
+"#,
+    );
+    let clean = "Arbor found no direct calls";
+
+    // Not listed by default: no direct call uses a retired model, and the
+    // line above the summary counts the routed ones.
+    let output = arbor(dir.path(), &["retirements", ".", "--today", TODAY]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = stdout(&output);
+    assert!(
+        text.contains("Not listed: 2 calls reach these models through Azure, another host in base_url or another cloud"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("Summary: {clean} to OpenAI, Anthropic or Google")),
+        "{text}"
+    );
+
+    // Listed: their own summary line, the failure, and no clean line.
+    let output = arbor(
+        dir.path(),
+        &["retirements", ".", "--include-routed", "--today", TODAY],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let text = stdout(&output);
+    assert!(!text.contains(clean), "{text}");
+    assert!(text.contains(
+        "Summary: Through Azure, another host in base_url or another cloud, 2 calls use retired or retiring models: 1 already retired, 1 retiring. The provider's dates may not apply there.\nFailing (exit 1): 1 call uses a model that is already retired.\n"
+    ), "{text}");
+    let markdown = stdout(&arbor(
+        dir.path(),
+        &[
+            "retirements",
+            ".",
+            "--include-routed",
+            "--markdown",
+            "--today",
+            TODAY,
+        ],
+    ));
+    assert!(!markdown.contains(clean), "{markdown}");
+    assert!(
+        markdown.contains("**Through Azure, another host in base_url or another cloud, 2 calls use retired or retiring models: 1 already retired, 1 retiring."),
+        "{markdown}"
+    );
+
+    // Next to a listed direct call, the routed ones get their own line too,
+    // so the failing count adds up.
+    let dir = project(APP);
+    let text = stdout(&arbor(
+        dir.path(),
+        &["retirements", ".", "--include-routed", "--today", TODAY],
+    ));
+    assert!(!text.contains(clean), "{text}");
+    assert!(text.contains(
+        "Summary: 4 calls in 1 file use retired or retiring models: 1 already retired, 3 retiring (next: 14 Jan 2027, 88 days)."
+    ), "{text}");
+    assert!(text.contains(
+        "Through Azure, another host in base_url or another cloud, 2 calls use retired or retiring models: 1 already retired, 1 retiring. The provider's dates may not apply there.\n"
+    ), "{text}");
+    assert!(
+        text.contains("Failing (exit 1): 2 calls use a model that is already retired."),
+        "{text}"
+    );
+
+    // A LangChain chat model on a current model, reaching OpenAI directly:
+    // the clean line, which names what is not checked.
+    let dir = project(
+        r#"from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-6-luna")
+"#,
+    );
+    let output = arbor(dir.path(), &["retirements", ".", "--today", TODAY]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = stdout(&output);
+    assert!(text.contains(
+        "Summary: Arbor found no direct calls to OpenAI, Anthropic or Google that use retired or retiring models in 1 Python file. Calls through LiteLLM, LangChain models other than ChatOpenAI, AzureChatOpenAI and ChatAnthropic, or other wrappers are not checked yet.\n"
+    ), "{text}");
+    assert!(!text.contains("Not listed"), "{text}");
+}
+
+#[test]
 fn a_base_url_on_the_provider_host_is_a_direct_call() {
     let dir = project(BASE_URLS);
     let (code, report) = run_json(dir.path(), &[]);
@@ -797,7 +890,7 @@ fn exit_codes_follow_the_window() {
     let output = arbor(clean.path(), &["retirements", ".", "--today", TODAY]);
     assert_eq!(output.status.code(), Some(0));
     assert!(stdout(&output).contains(
-        "No direct openai/anthropic/google SDK calls to retired or retiring models in 1 Python file. Calls through LangChain, LiteLLM or other wrappers are not checked yet."
+        "Arbor found no direct calls to OpenAI, Anthropic or Google that use retired or retiring models in 1 Python file. Calls through LiteLLM, LangChain models other than ChatOpenAI, AzureChatOpenAI and ChatAnthropic, or other wrappers are not checked yet."
     ));
 }
 
@@ -1370,7 +1463,7 @@ def factory(make):
     let line = "Not checked: 3 calls through clients Arbor could not resolve (built by a factory or passed in), whose model it could not read either; arbor usages lists them.";
     let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
     assert!(
-        text.contains("No direct openai/anthropic/google SDK calls"),
+        text.contains("Arbor found no direct calls to OpenAI, Anthropic or Google"),
         "{text}"
     );
     assert!(text.contains(line), "{text}");

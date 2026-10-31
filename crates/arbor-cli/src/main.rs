@@ -356,7 +356,7 @@ enum Commands {
         path: PathBuf,
     },
 
-    /// Find OpenAI, Anthropic and Gemini SDK calls (Python today): routing, model IDs and gaps. Never prints credential values
+    /// Find OpenAI, Anthropic and Gemini SDK calls and LangChain's OpenAI and Anthropic chat models (Python today): routing, model IDs and gaps. Never prints credential values
     Usages {
         /// Directory or file to scan (defaults to current directory)
         #[arg(default_value = ".")]
@@ -371,7 +371,7 @@ enum Commands {
         json: bool,
     },
 
-    /// Find direct SDK calls to AI models their provider has retired or is retiring, with the replacement, the argument changes and the choices it needs (Python today). Runs locally. Exit 0: nothing failing, 1: a confirmed call uses a retired model (or one retiring within --fail-within days), 2: error
+    /// Find direct SDK calls and LangChain's OpenAI and Anthropic chat models that use AI models their provider has retired or is retiring, with the replacement, the argument changes and the choices it needs (Python today). Runs locally. Exit 0: nothing failing, 1: a confirmed call uses a retired model (or one retiring within --fail-within days), 2: error
     Retirements {
         /// Directory or file to scan (defaults to current directory)
         #[arg(default_value = ".")]

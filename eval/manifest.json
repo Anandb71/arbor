@@ -102,6 +102,12 @@
       "language": "python",
       "suite": "usages",
       "covers": "the third review of #276: nonlocal, match, except and wildcard-import bindings, globals() writes, constructor calls against __init__ defaults, subclasses and outside writes against self attributes, functions used as values, constructors chosen at run time, dict aliases through chains and attributes, candidate values with no credential, a clipped import path"
+    },
+    {
+      "name": "py-sdk-langchain",
+      "language": "python",
+      "suite": "usages",
+      "covers": "LangChain chat models: ChatOpenAI, ChatAnthropic and AzureChatOpenAI as clients and model-bearing calls, base_url routing, a missing model, OPENAI_API_BASE set in the file, the deprecated langchain.chat_models import, calls on the built model, OpenAIEmbeddings not tracked"
     }
   ]
 }
