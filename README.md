@@ -285,7 +285,7 @@ npx @anandb71/arbor-cli retirements .
 - **Runs locally.** No account, no API key, no telemetry; no code leaves your machine.
 - **Honest about confidence.** A literal is confirmed only where the usage scan has no doubt about the call. `os.getenv("MODEL", "gpt-4o")` fallbacks, parameter defaults, class attributes a subclass may override and calls whose routing is not certain are marked *confirm first* with the reason, and fail the check only with `--count-unconfirmed`. Calls through Azure, OpenRouter or a proxy are listed apart (`--include-routed`), because the provider's dates may not apply there; a `base_url` on the provider's own host is a direct call. Models Arbor cannot read, and code it did not analyze, are counted, not hidden.
 - **Arbor does not decide for you.** When the replacement behaves differently by design (gpt-6-luna runs at medium reasoning effort by default, so it can reason, where gpt-4o did not; claude-sonnet-5-5 thinks by default, where the Sonnet models it replaces did not), the report shows both options and what each costs, and changes nothing until you choose.
-- **Plain swaps as a patch.** `--diff` prints the calls that need no decision and no manual check as a unified diff for `git apply`, and writes no file ([how](docs/RETIREMENTS.md#apply-the-plain-swaps)).
+- **Plain swaps as a patch.** `--diff` prints the plain swaps Arbor can make at the call as a unified diff for `git apply`, and writes no file ([how](docs/RETIREMENTS.md#apply-the-plain-swaps)).
 - **CI ready.** `--json`, `--markdown`, `--annotations`, `--markdown-out <file>` and `--fail-within <days>`. Exit code 1 means a confirmed call uses a retired model, or one retiring inside your window; the shutdown day itself counts as retired (UTC).
 - **Scope today:** Python with the `openai`, `anthropic` and Google GenAI SDKs. TypeScript and JavaScript are coming.
 
@@ -360,7 +360,7 @@ Every tool returns `{ ok, tool, data, meta: { suggested_next_tool, suggested_nex
 | `arbor path <a> <b>` | Shortest call-graph path |
 | `arbor refactor <sym>` | Blast radius before refactoring |
 | `arbor usages` | OpenAI, Anthropic and Gemini SDK calls in Python: client routing (direct, Azure, custom `base_url`, Bedrock, Vertex), model IDs and typed gaps; never prints credentials. `--sdk openai\|anthropic\|google`, `--json`. What a value with no gap confirms: [docs/SDK_USAGES.md](docs/SDK_USAGES.md) |
-| `arbor retirements` | Direct SDK calls to AI models their provider has retired or is retiring (Python): date and days left, listed replacement, the argument changes and per-repo choices it needs. `--fail-within <days>`, `--count-unconfirmed`, `--include-routed`, `--json`, `--markdown`, `--annotations` ([guide](docs/RETIREMENTS.md)) |
+| `arbor retirements` | Direct SDK calls to AI models their provider has retired or is retiring (Python): date and days left, listed replacement, the argument changes and per-repo choices it needs. `--fail-within <days>`, `--count-unconfirmed`, `--include-routed`, `--json`, `--markdown`, `--markdown-out <file>`, `--annotations`, `--diff` ([guide](docs/RETIREMENTS.md)) |
 | `arbor diff` | Git-change impact report, per symbol: new symbols carry no blast radius. `--base <ref>` compares against the merge base (what a PR shows), `--staged` only staged changes |
 | `arbor check` | CI safety gate (`--max-blast-radius N`, `--base <ref>`) |
 | `arbor summary` | Auto-generate PR description (`--base <ref>`) |

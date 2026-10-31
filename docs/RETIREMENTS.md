@@ -107,13 +107,13 @@ exit 1 only with `--count-unconfirmed`.
 | `--fail-within <days>` | Also fail when a model retires within this many days |
 | `--count-unconfirmed` | Also let unconfirmed calls fail the check (see below) |
 | `--include-routed` | List calls through Azure, another host in `base_url` or another cloud, and let them fail the check |
-| `--quiet` | Only the calls and the summary |
+| `--quiet` | Only the calls and the summary; with `--diff`, only the patch and any warning about control or bidirectional characters in it ([below](#apply-the-plain-swaps)) |
 
 | Exit code | Meaning |
 |---|---|
 | `0` | Nothing failing. Calls to models that retire later, and unconfirmed calls, are still listed. |
 | `1` | A confirmed call uses a model that is already retired, or, with `--fail-within N`, one that retires within N days |
-| `2` | The check could not run (a missing path, a bad flag) |
+| `2` | The check could not run (a missing path, a bad flag), or `--diff` could not write the patch |
 
 By default only **confirmed** values at **direct** calls count toward exit 1. The
 others are listed, and a "Not counted" line says how many there are:
@@ -130,11 +130,21 @@ already be retired" and does not fail.
 
 ## Apply the plain swaps
 
-`--diff` prints a patch for the calls that need nothing but the swap. It writes no
+`--diff` prints a patch for the plain swaps Arbor can make at the call. It writes no
 file:
 
 ```bash
 arbor retirements --diff . > retirements.patch
+git apply retirements.patch
+```
+
+In Windows PowerShell 5.1, `>` writes the patch as UTF-16, which `git apply` rejects,
+and `Out-File` or a pipe into `git apply` changes its encoding or line endings. Let
+cmd write the file instead; it keeps the bytes as Arbor prints them. PowerShell 7.4
+and later keep them too, so `>` works there.
+
+```powershell
+cmd /c "arbor retirements --diff . > retirements.patch"
 git apply retirements.patch
 ```
 
@@ -144,26 +154,67 @@ replacement that still works, no decision to make and nothing to check by hand. 
 patch rewrites that string in place, keeping its quotes and prefix, and renames the
 arguments the replacement requires, such as `max_tokens` to `max_completion_tokens` on
 Chat Completions. It never adds or removes an argument, never bumps an SDK and never
-makes a decision for you.
+makes a decision for you. So check that your SDK takes the new name: openai-python
+accepts `max_completion_tokens` from 1.45.0 (September 2024) on, and an older version
+raises a `TypeError` for it.
 
-Everything else is left out, and stderr counts each reason:
+Everything else is left out. On stderr, Arbor says how many calls the patch swaps and
+counts the ones it leaves out, by reason:
 
 - a call that needs a choice your repository makes first (the reasoning effort on
-  gpt-6-luna and GPT-5.6, Claude's thinking) or a manual check, and a call where any
-  other model value does, such as a model nested in `extra_body`;
+  gpt-6-luna and GPT-5.6, Claude's thinking) or a manual check (passing `extra_body`
+  makes it one), and a call where another model value needs one, such as a model
+  nested in `metadata`;
+- a call that needs no change: the provider routes its model to a newer one, so the
+  call still works (Google routes `gemini-3-pro-preview` to `gemini-3.1-pro-preview`);
+- a call whose method Arbor does not know to send the model. Arbor edits only the
+  methods it knows send the model to be served (`create`, `parse`, `stream`,
+  `generate_content` and the like), so it leaves out `chat.completions.list(model=...)`,
+  which filters stored completions by it, `models.get`, which reads its details, and
+  any method it does not list yet;
+- a call that takes arguments from a `**` expansion (`**LIMITS`): the report checks the
+  keys of a dict defined in the same file, but the patch edits only what is written at
+  the call;
 - a model that comes from a constant or a default: other code, or another module, may
   read the same value, so edit it by hand;
 - a swap that needs an argument added, such as `reasoning={"mode": "pro"}` for `o1-pro`;
 - a call that already passes the new name of an argument to rename (both
   `max_tokens` and `max_completion_tokens`);
 - a model written in another form, such as implicit concatenation (`"gpt-" "4"`);
-- a file with syntax errors, or one that changed while Arbor read it.
+- a file with syntax errors, one that changed while Arbor read it, one Arbor could not
+  read or parse again, and one whose name in the patch (relative to the directory you
+  run Arbor in) holds control or bidirectional characters.
 
-`arbor retirements` without `--diff` lists every one of them. The patch names each file
-relative to the directory you run Arbor in, however you write the path to scan, so
-apply it from there; swaps in files outside that directory are left out. The exit codes
-are the check's, and `--quiet` keeps only the patch. Read the patch before you apply it: a
-replacement can cost more or answer differently, and no static check sees that.
+`arbor retirements` without `--diff` lists each of them. stderr also counts, as the
+report does, the calls the patch could not include and what the report says it did not check:
+
+- the routed calls, on a "Not in the diff" line: the report lists them only with
+  `--include-routed`, and with it they are left out by reason, like the calls above;
+- on a "Not checked" line, calls whose model Arbor could not read, whether or not it
+  resolved the client (`arbor usages` lists them), calls that pass no model, calls in
+  hidden directories such as `.github/`, calls through SDK methods reached with
+  `getattr` or passed as a value, parts of files the usage scan did not analyze, and
+  files over the size limit or not readable as UTF-8;
+- on a "Partly checked" line, files with syntax errors, where calls inside a broken
+  region may be missing.
+
+The patch names each file relative to the directory you run Arbor in, however you write
+the path to scan, so apply it from there; swaps in files outside that directory are left
+out. The exit codes are the check's, except that Arbor exits 2 when it cannot write the
+patch (a full disk or a closed pipe, say), and `--quiet` keeps only the patch and the
+warning below. On Linux and macOS, Arbor writes to `/dev/null` when stdout was closed
+with `>&-`, so there the patch is lost without an error. Read the patch before you apply
+it: a replacement can cost more or answer differently, and no static check sees that.
+
+The patch is the source as written. Each change comes with up to three lines on either
+side, so a key written in the code near a call can be in it: read it before it goes
+anywhere others can see it, such as a CI log. Lines are printed as they are, because
+`git apply` needs the exact text. A control or bidirectional character in one can make
+it look different in a terminal or a log from what it holds, so when a printed line has
+one, Arbor names the file and line on stderr, even with `--quiet`. A tab and the line
+end (`\n` or `\r\n`) do not count; a carriage return anywhere else does, since a
+terminal goes back to the start of the line there and Python ends the line. Check those
+lines in an editor that shows such characters before you apply the patch.
 
 ## In CI: GitHub Action
 
@@ -257,9 +308,11 @@ it (see [RELEASING.md](RELEASING.md)).
 
 `arbor retirements` reads source files on your machine and prints a report. It makes no
 network requests and has no telemetry. Model values are captured only for model
-arguments, and credential-shaped strings are never captured or printed. For a client
-given a `base_url`, Arbor reads that argument to tell the provider's own host from a
-proxy; it reports only that class, never the URL.
+arguments, and credential-shaped strings are never captured or printed. `--diff` is
+the exception: its patch holds the source lines around each swap as written
+([above](#apply-the-plain-swaps)). For a client given a `base_url`, Arbor reads that
+argument to tell the provider's own host from a proxy; it reports only that class,
+never the URL.
 
 The human report can end with an offer of help. It is never printed with `--json`,
 `--markdown`, `--annotations`, `--quiet`, or when `CI` is set, and Arbor opens nothing
