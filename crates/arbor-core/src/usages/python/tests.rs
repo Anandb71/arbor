@@ -790,6 +790,160 @@ def seven(azure: AzureOpenAI, flag):
 }
 
 #[test]
+fn a_declaration_types_a_value_combined_before_the_binding() {
+    // A typed parameter and a factory's client combined in one expression
+    // (`client or make()`, a local default) were ambiguous before the
+    // binding's declaration was seen, while the same values written as an
+    // if/else were typed by it.
+    let found = usages(
+        r#"from openai import AzureOpenAI
+from myapp.llm import get_azure_client
+
+class OrForm:
+    client: AzureOpenAI
+
+    def __init__(self, client: AzureOpenAI | None = None) -> None:
+        self.client = client or get_azure_client()
+
+    def ask(self):
+        return self.client.chat.completions.create(model="gpt-4o", messages=[])
+
+class LocalDefault:
+    client: AzureOpenAI
+
+    def __init__(self, client: AzureOpenAI | None = None) -> None:
+        if client is None:
+            client = get_azure_client()
+        self.client = client
+
+    def ask(self):
+        return self.client.chat.completions.create(model="gpt-4o", messages=[])
+
+class AnnotatedOr:
+    def __init__(self, client: AzureOpenAI | None = None) -> None:
+        self.client: AzureOpenAI = client or get_azure_client()
+
+    def ask(self):
+        return self.client.chat.completions.create(model="gpt-4o", messages=[])
+
+def undeclared(client: AzureOpenAI | None = None):
+    client = client or get_azure_client()
+    return client.chat.completions.create(model="gpt-4o", messages=[])
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (11, Routing::AzureOpenai, vec![]),
+            (22, Routing::AzureOpenai, vec![]),
+            (29, Routing::AzureOpenai, vec![]),
+            // With nothing to type the factory's client, it stays a gap.
+            (
+                33,
+                Routing::Unknown,
+                vec!["ambiguous_client/multiple_assignments".to_string()]
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_declaration_set_to_none_yields_to_a_construction_where_it_is_read() {
+    // `client: Optional[OpenAI] = None` that nothing assigns holds `None`,
+    // as the unannotated `client = None` does: read next to a construction
+    // in another binding, it yields to it too.
+    let found = usages(
+        r#"from typing import Optional
+from openai import AzureOpenAI, OpenAI
+
+class Summarizer:
+    client: Optional[OpenAI] = None
+
+    def run(self):
+        client = self.client or OpenAI()
+        return client.chat.completions.create(model="gpt-3.5-turbo-0125", messages=[])
+
+_default: Optional[OpenAI] = None
+
+def run2():
+    client = _default if _default is not None else OpenAI()
+    return client.chat.completions.create(model="gpt-3.5-turbo-0125", messages=[])
+
+class Bare:
+    client: OpenAI
+
+    def run(self):
+        client = self.client or OpenAI()
+        return client.chat.completions.create(model="gpt-3.5-turbo-0125", messages=[])
+
+class Direct:
+    client: Optional[AzureOpenAI] = None
+
+    def run(self):
+        return self.client.chat.completions.create(model="gpt-4o", messages=[])
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (9, Routing::OpenaiDirect, vec![]),
+            (15, Routing::OpenaiDirect, vec![]),
+            // A bare declaration is set somewhere else, to any client.
+            (
+                22,
+                Routing::Unknown,
+                vec!["ambiguous_client/multiple_assignments".to_string()]
+            ),
+            // Read on its own, the declaration still types the call.
+            (28, Routing::AzureOpenai, vec![]),
+        ]
+    );
+}
+
+#[test]
+fn a_private_functions_typed_parameter_is_read_from_its_callers() {
+    // Every in-file caller of a private function passes the client, which
+    // says more than the parameter's annotation, as it does with none.
+    let found = usages(
+        r#"from typing import Optional
+from openai import OpenAI
+
+def _ask(client: Optional[OpenAI] = None):
+    client = client or OpenAI()
+    return client.chat.completions.create(model="gpt-4", messages=[])
+
+def main():
+    _ask(OpenAI())
+
+def _route(client: OpenAI):
+    return client.chat.completions.create(model="gpt-4", messages=[])
+
+def go():
+    _route(OpenAI(base_url="https://openrouter.ai/api/v1"))
+
+def ask(client: OpenAI):
+    return client.chat.completions.create(model="gpt-4", messages=[])
+
+def go2():
+    ask(OpenAI())
+"#,
+    );
+    let rows = routes_and_gaps(&found);
+    assert_eq!(rows[0], (6, Routing::OpenaiDirect, vec![]));
+    assert_eq!(rows[1], (12, Routing::CustomBaseUrl, vec![]));
+    // A public function may be called from other modules: its annotation
+    // decides.
+    assert_eq!(
+        rows[2],
+        (
+            18,
+            Routing::Unknown,
+            vec!["ambiguous_client/annotation".to_string()]
+        )
+    );
+}
+
+#[test]
 fn a_walrus_binds_the_whole_conditional() {
     // tree-sitter-python reads `x := a if c else b` as
     // `(x := a) if c else b`, which bound the first branch alone: a model

@@ -156,7 +156,8 @@ always keeps its gap.
 A call's routing is confirmed when its receiver reaches it through the
 value rules above (one kind of client per name, where a parameter is one
 more value whatever its annotation), or through a parameter that every
-in-file caller of a private function passes. The receiver must be one of
+in-file caller of a private function passes, annotated or not (the clients
+the callers pass say more than the annotation). The receiver must be one of
 these:
 
 - **A client from a tracked constructor** (`OpenAI`, `AzureOpenAI`,
@@ -251,7 +252,11 @@ When the name or attribute is given other values too:
 - A construction the file shows decides the route over a **declaration**
   (`client: OpenAI` in a class body with no value, or with `None` or
   another literal as in `client: Optional[OpenAI] = None`, and
-  `self.client = OpenAI()` in `__init__`).
+  `self.client = OpenAI()` in `__init__`). A declaration with `None` that
+  nothing else assigns holds `None`, so it yields to a construction where
+  another binding reads it too (`client = self.client or OpenAI()`), as an
+  unannotated `client = None` does; a bare one is set somewhere else, to any
+  client, and counts as a typed value there.
 - A **typed value** (a parameter, or an annotated assignment with any other
   value, `self.client: OpenAI = make()`) is one more value. It agrees with a
   construction only when its class decides that construction's route
@@ -259,7 +264,12 @@ When the name or attribute is given other values too:
   Otherwise the call gets a `multiple_assignments` gap, as with an untyped
   parameter (`def ask(client: OpenAI | None = None): client = client or
   OpenAI()`). So does a typed value next to a value that is not a client,
-  unless a declaration types the binding.
+  unless a declaration types the binding: `self.client = client or
+  make_client()` under `client: AzureOpenAI`, or `self.client: AzureOpenAI =
+  client or make_client()`, routes `azure_openai` when `client:
+  AzureOpenAI`, whether the two values are combined in that expression, in a
+  local default (`if client is None: client = make_client()`) or in two
+  assignments.
 - With no construction, the declarations and typed values decide the route
   only when every one of them does, and all the same way, as in one
   annotation; a declaration says more than the values next to it that are

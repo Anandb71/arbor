@@ -614,8 +614,19 @@ struct Client {
     /// Typed by a declaration, which gives the binding a type but no client:
     /// bare (`client: OpenAI` in a class body) or with a placeholder
     /// (`client: Optional[OpenAI] = None`). Only [`combine`] reads it, and
-    /// what it returns never has it.
+    /// what it returns has it only for a placeholder declaration read on
+    /// its own (see `placeholder`).
     declared: bool,
+    /// A declaration with a placeholder value (`client: Optional[OpenAI] =
+    /// None`): read on its own it still yields to a construction next to
+    /// it (`self.client or OpenAI()`), as `None` does unannotated.
+    placeholder: bool,
+    /// The route typed clients agree on when they are combined with values
+    /// that are not clients (`client or make()`, with `client:
+    /// AzureOpenAI`). Such a value is ambiguous, but a declaration or an
+    /// annotation of the binding it is assigned to types the other values
+    /// too, and then this route holds.
+    typed_route: Option<Routing>,
     /// Why the routing may not hold at a call, reported there as an
     /// `ambiguous_client` gap.
     caveat: Option<ClientCaveat>,
@@ -5212,6 +5223,21 @@ impl<'t> Ctx<'t> {
     fn param_value(&mut self, name: &str, param: Param<'t>, scope: usize) -> Val {
         if let Some(annotation) = param.annotation {
             if let Some(val) = self.typed(annotation, scope) {
+                // The clients every in-file caller of a private function
+                // passes say more than its annotation, as for a parameter
+                // with none.
+                if self.is_private(scope) {
+                    let parent = self.scopes[scope].parent.unwrap_or(0);
+                    let default_client = param
+                        .default
+                        .map(|default| self.eval(default, parent, 0))
+                        .filter(|val| matches!(val, Val::Client { .. }));
+                    if let Some(passed @ Val::Client { .. }) =
+                        self.param_from_callers(scope, name, default_client)
+                    {
+                        return passed;
+                    }
+                }
                 return val;
             }
         }
@@ -5559,6 +5585,27 @@ impl<'t> Ctx<'t> {
             return Val::untracked(Origin::Other);
         }
         let value = assign.value.map(|v| self.eval(v, assign.scope, 0));
+        // `self.client: AzureOpenAI = client or make()`: the annotation
+        // types the value that is not a client, as a declaration would.
+        if let (Some(annotation), Some(Val::Client { client, .. })) = (assign.annotation, &value) {
+            if client.typed_route.is_some() {
+                if let Some(Val::Client {
+                    client: mut declared,
+                    path,
+                }) = self.typed(annotation, assign.scope)
+                {
+                    declared.declared = true;
+                    let typed = value.clone().unwrap_or(Val::untracked(Origin::Other));
+                    return combine(vec![
+                        Val::Client {
+                            client: declared,
+                            path,
+                        },
+                        typed,
+                    ]);
+                }
+            }
+        }
         if let Some(val @ Val::Client { .. }) = &value {
             return val.clone();
         }
@@ -5570,6 +5617,7 @@ impl<'t> Ctx<'t> {
                 let declared = matches!(value, None | Some(Val::Untracked(Origin::Placeholder)));
                 if let (true, Val::Client { client, .. }) = (declared, &mut val) {
                     client.declared = true;
+                    client.placeholder = value.is_some();
                 }
                 return val;
             }
@@ -5620,6 +5668,8 @@ impl<'t> Ctx<'t> {
                 ambiguous: false,
                 typed: true,
                 declared: false,
+                placeholder: false,
+                typed_route: None,
                 caveat: (!decided).then_some(ClientCaveat::Annotation),
             },
             path: Vec::new(),
@@ -5961,6 +6011,8 @@ impl<'t> Ctx<'t> {
                     ambiguous: true,
                     typed: false,
                     declared: false,
+                    placeholder: false,
+                    typed_route: None,
                     caveat: None,
                 },
                 path: Vec::new(),
@@ -6115,6 +6167,8 @@ impl<'t> Ctx<'t> {
                 ambiguous: false,
                 typed: false,
                 declared: false,
+                placeholder: false,
+                typed_route: None,
                 caveat,
             };
         }
@@ -6207,6 +6261,8 @@ impl<'t> Ctx<'t> {
             ambiguous: false,
             typed: false,
             declared: false,
+            placeholder: false,
+            typed_route: None,
             caveat,
         }
     }
@@ -9943,12 +9999,45 @@ fn combine(vals: Vec<Val>) -> Val {
             .next()
             .unwrap_or(Val::untracked(Origin::Unbound));
     }
+    // A declaration types every value of the binding, so a value that was
+    // ambiguous only because typed clients sat next to values that are not
+    // clients (`self.client = client or make()` under `client:
+    // AzureOpenAI`) is a typed client of the route they agree on.
+    let declares = real
+        .iter()
+        .any(|v| matches!(v, Val::Client { client, path } if path.is_empty() && client.declared));
+    let real: Vec<Val> = if declares {
+        real.into_iter()
+            .map(|v| match v {
+                Val::Client { client, path } if path.is_empty() => match client.typed_route {
+                    Some(routing) => Val::Client {
+                        client: Client {
+                            routing,
+                            ambiguous: false,
+                            typed: true,
+                            typed_route: None,
+                            caveat: None,
+                            ..client
+                        },
+                        path,
+                    },
+                    None => Val::Client { client, path },
+                },
+                other => other,
+            })
+            .collect()
+    } else {
+        real
+    };
     if real.len() == 1 {
         return match real.into_iter().next() {
-            // Read as the binding's value, a declaration is a typed value
-            // like any other.
+            // Read as the binding's value, a bare declaration is a typed
+            // value like any other. One with a placeholder (`client:
+            // Optional[OpenAI] = None`, nothing else assigned) still yields
+            // to a construction it is read next to (`self.client or
+            // OpenAI()`), as `None` does unannotated.
             Some(Val::Client { mut client, path }) => {
-                client.declared = false;
+                client.declared = client.placeholder;
                 Val::Client { client, path }
             }
             Some(val) => val,
@@ -10000,6 +10089,8 @@ fn combine(vals: Vec<Val>) -> Val {
                     ambiguous: true,
                     typed: false,
                     declared: false,
+                    placeholder: false,
+                    typed_route: None,
                     caveat: None,
                     ..first
                 },
@@ -10053,6 +10144,8 @@ fn combine(vals: Vec<Val>) -> Val {
                 ambiguous,
                 typed: false,
                 declared: false,
+                placeholder: false,
+                typed_route: None,
                 caveat: constructed.iter().find_map(|c| c.caveat.clone()),
             },
             path: Vec::new(),
@@ -10071,6 +10164,10 @@ fn combine(vals: Vec<Val>) -> Val {
             .iter()
             .all(|c| c.pkg == first.pkg && c.routing == first.routing);
         let decided = !ambiguous && alike && clients.iter().all(|c| decides(c));
+        // Ambiguous only because of the values that are not clients: a
+        // declaration of the binding this flows into would type them.
+        let typed_route =
+            (ambiguous && alike && clients.iter().all(|c| decides(c))).then_some(first.routing);
         return Val::Client {
             client: Client {
                 pkg: first.pkg,
@@ -10084,6 +10181,8 @@ fn combine(vals: Vec<Val>) -> Val {
                 ambiguous,
                 typed: !ambiguous,
                 declared: false,
+                placeholder: false,
+                typed_route,
                 // Clients that route alike keep the reason one of them
                 // carries (a field, say); ones that do not, the annotation's.
                 caveat: (!decided && !ambiguous).then(|| {
