@@ -16,10 +16,14 @@
 //! Everything else is left as it is and listed in [`SwapPlan::skipped`] with
 //! a [`SkipReason`]: a call that needs a decision (the reasoning effort,
 //! Claude's thinking) or a person, a call where any other model value needs
-//! one, a model defined outside the call (a constant or a default other
-//! code may read too), a swap that adds an argument, and a call whose
-//! source does not read the way the usage scan recorded it. Nothing here bumps an SDK, reads files, runs code or reaches
-//! the network.
+//! one, a call whose method is not one the plan knows to send the model to
+//! be served (`chat.completions.list` filters by it), a call that takes
+//! arguments from a `**` expansion, a model defined outside the call (a
+//! constant or a default other code may read too), a swap that adds an
+//! argument, and a call whose source does not read the way the usage scan
+//! recorded it.
+//! Nothing here bumps an SDK, reads files, runs code or reaches the
+//! network.
 //!
 //! The edits are byte ranges in the text the usage scan read, so scan the
 //! exact text being edited. Python only, like [`crate::usages`].
@@ -37,6 +41,52 @@ type CallAt<'f> = (u32, u32, Option<&'f str>);
 
 /// The longest replacement model ID that is written into code.
 const MAX_MODEL_ID_BYTES: usize = 200;
+
+/// The last members of the calls that send the model to be served: the
+/// usage scan's request methods that run the model, the other Google GenAI
+/// SDK methods that do (`models.edit_image`, `batches.create_embeddings`
+/// and the like), and `GenerativeModel`, which binds it for later requests.
+/// Most of the scan's other request methods take a model as a filter or a name
+/// (`list`, `retrieve`, `delete`), and `models.get` reads a model's
+/// details. A call whose method is not listed here is skipped with
+/// [`SkipReason::UnlistedMethod`], whether or not it sends the model.
+const SENDS_MODEL: &[&str] = &[
+    "create",
+    "acreate",
+    "stream",
+    "parse",
+    "completion",
+    "completion_stream",
+    "generate",
+    "edit",
+    "create_variation",
+    "connect",
+    "generate_content",
+    "generate_content_async",
+    "generate_content_stream",
+    "embed_content",
+    "embed_content_async",
+    "batch_embed_contents",
+    "count_tokens",
+    "count_tokens_async",
+    "count_text_tokens",
+    "compute_tokens",
+    "send_message",
+    "send_message_async",
+    "send_message_stream",
+    "generate_text",
+    "generate_embeddings",
+    "generate_message",
+    "generate_images",
+    "generate_videos",
+    "chat",
+    "edit_image",
+    "upscale_image",
+    "recontext_image",
+    "segment_image",
+    "create_embeddings",
+    "GenerativeModel",
+];
 
 /// One replacement of a range of the source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -83,10 +133,19 @@ pub enum SkipReason {
     /// first, a manual check, or no change ([`SkippedSwap::fix`] says
     /// which).
     NotPlainSwap,
-    /// The finding is a plain swap, but another finding at the same call is
-    /// not swapped (a model nested in the call's arguments that needs a
-    /// manual check, say), so nothing at the call is edited.
+    /// The finding is a plain swap, but another finding at the same call
+    /// cannot be swapped (a model nested in the call's arguments that needs
+    /// a manual check, say), so nothing at the call is edited.
     CallNeedsReview,
+    /// The call's method is not one the plan knows to send the model to be
+    /// served. Most such methods take the model as a filter
+    /// (`chat.completions.list(model=...)`) or read or delete it
+    /// (`models.get`, `models.delete`); a method that sends it but is not
+    /// listed is skipped too.
+    UnlistedMethod,
+    /// The call takes arguments from a `**` expansion (`**LIMITS`), which
+    /// the plan does not edit: an argument to rename may be set there.
+    SpreadArguments,
     /// The model is not written at the call: it comes from a constant or a
     /// default, which other code (or another module) may read too.
     ValueNotAtCall,
@@ -118,6 +177,8 @@ impl SkipReason {
         match self {
             SkipReason::NotPlainSwap => "not_plain_swap",
             SkipReason::CallNeedsReview => "call_needs_review",
+            SkipReason::UnlistedMethod => "unlisted_method",
+            SkipReason::SpreadArguments => "spread_arguments",
             SkipReason::ValueNotAtCall => "value_not_at_call",
             SkipReason::AddsArgument => "adds_argument",
             SkipReason::ArgumentNotRenamable => "argument_not_renamable",
@@ -165,8 +226,10 @@ pub struct SwapPlan {
 
 /// Plans the plain swaps in one file. `usages` is the usage scan of
 /// `source`; `findings` may hold other files' findings, which are ignored.
-/// A finding's edits go in together or not at all, and a call is edited
-/// only when every finding at it is swapped.
+/// A finding's edits go in together or not at all. A call is not edited
+/// when another finding at it cannot be swapped (one that needs no change
+/// aside). A finding whose edits only clash with another swap's is skipped
+/// with [`SkipReason::Overlap`] and does not hold its call back.
 pub fn plan_swaps(source: &str, usages: &FileUsages, findings: &[Finding]) -> SwapPlan {
     let mut plan = SwapPlan {
         file: usages.file.clone(),
@@ -268,6 +331,12 @@ fn swap_edits(
     if !plain_swap(finding) {
         return Err(SkipReason::NotPlainSwap);
     }
+    if !listed_method(finding) {
+        return Err(SkipReason::UnlistedMethod);
+    }
+    if finding.splat {
+        return Err(SkipReason::SpreadArguments);
+    }
     if usages.language != "python" {
         return Err(SkipReason::UnsupportedLanguage);
     }
@@ -325,11 +394,17 @@ fn plain_swap(finding: &Finding) -> bool {
         && finding.match_kind == MatchKind::Exact
         && finding.call_kind != CallKind::RequestParam
         && !finding.candidate
-        && !finding.splat
         && finding.review.is_empty()
         && finding.decisions.is_empty()
         && finding.replacement.is_some()
         && finding.live_replacement == finding.replacement
+}
+
+/// Whether the last member of the finding's chain is one of the methods
+/// [`SENDS_MODEL`] lists.
+fn listed_method(finding: &Finding) -> bool {
+    let last = finding.chain.as_deref().and_then(|c| c.rsplit('.').next());
+    last.is_some_and(|m| SENDS_MODEL.contains(&m))
 }
 
 /// The call and the literal the finding names: the call at the finding's

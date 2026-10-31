@@ -167,10 +167,33 @@ def b(q):
 
 #[test]
 fn a_call_with_another_model_value_that_needs_a_person_is_left_alone() {
-    // `extra_body` may override the top-level model, so swapping only the
-    // top-level one would change nothing at run time.
+    // `extra_body` may override the top-level model, and the check reads
+    // none of its entries, so both models need a manual check.
     let source = project(&[
         r#"client.chat.completions.create(model="o3-mini", max_tokens=1, messages=[], extra_body={"model": "o3-mini"})"#,
+        r#"client.chat.completions.create(model="o4-mini", messages=[])"#,
+    ]);
+    let (plan, fixed) = fix(&source);
+    assert_eq!(
+        fixed,
+        source.replace(r#"model="o4-mini""#, r#"model="gpt-5.6-terra""#),
+        "{plan:#?}"
+    );
+    assert_eq!(
+        reasons(&plan),
+        vec![
+            ("o3-mini", FixKind::Manual, SkipReason::NotPlainSwap),
+            ("o3-mini", FixKind::Manual, SkipReason::NotPlainSwap),
+        ]
+    );
+}
+
+#[test]
+fn a_plain_swap_at_a_call_with_a_model_that_needs_a_person_is_left_alone() {
+    // The top-level model is a plain swap, but the one in `metadata` needs
+    // a manual check, so neither is edited.
+    let source = project(&[
+        r#"client.chat.completions.create(model="o3-mini", messages=[], metadata={"model": "o3-mini"})"#,
         r#"client.chat.completions.create(model="o4-mini", messages=[])"#,
     ]);
     let (plan, fixed) = fix(&source);
@@ -188,6 +211,103 @@ fn a_call_with_another_model_value_that_needs_a_person_is_left_alone() {
             ("o3-mini", FixKind::Swap, SkipReason::CallNeedsReview),
         ]
     );
+}
+
+#[test]
+fn a_plain_swap_that_spreads_arguments_in_is_left_alone() {
+    // The check reads `LIMITS` like arguments written at the call, so the
+    // swap renames its `max_tokens`, which is not at the call.
+    let source =
+        project(&[r#"client.chat.completions.create(model="o3-mini", messages=q, **LIMITS)"#])
+            .replace(
+                "claude = Anthropic()\n",
+                "claude = Anthropic()\nLIMITS = {\"max_tokens\": 50}\n",
+            );
+    let (plan, fixed) = fix(&source);
+    assert_eq!(fixed, source);
+    assert!(plan.edits.is_empty() && plan.swaps.is_empty(), "{plan:#?}");
+    assert_eq!(
+        reasons(&plan),
+        vec![("o3-mini", FixKind::Swap, SkipReason::SpreadArguments)]
+    );
+}
+
+#[test]
+fn a_call_whose_method_is_not_listed_as_sending_the_model_is_left_alone() {
+    // `list` filters stored completions by the model; `models.get` reads
+    // its details. Both are plain swaps to the check, and neither method is
+    // in `SENDS_MODEL`.
+    let source = project(&[
+        r#"client.chat.completions.list(model="o3-mini")"#,
+        r#"client.chat.completions.create(model="o3-mini", messages=[])"#,
+    ]);
+    let (plan, fixed) = fix(&source);
+    assert_eq!(
+        fixed,
+        source.replace(r#"create(model="o3-mini""#, r#"create(model="gpt-5.6-sol""#),
+        "{plan:#?}"
+    );
+    assert_eq!(
+        reasons(&plan),
+        vec![("o3-mini", FixKind::Swap, SkipReason::UnlistedMethod)]
+    );
+    // The name says only what the plan knows: the method is not listed.
+    assert_eq!(SkipReason::UnlistedMethod.as_str(), "unlisted_method");
+    assert_eq!(
+        serde_json::to_value(SkipReason::UnlistedMethod).unwrap(),
+        "unlisted_method"
+    );
+
+    let source = r#"from google import genai
+
+
+def ask(prompt):
+    client = genai.Client()
+    client.models.get(model="gemini-2.0-flash")
+    return client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+"#;
+    let (plan, fixed) = fix(source);
+    assert_eq!(
+        fixed,
+        source.replace(
+            r#"generate_content(model="gemini-2.0-flash""#,
+            r#"generate_content(model="gemini-3.6-flash""#
+        ),
+        "{plan:#?}"
+    );
+    assert_eq!(
+        reasons(&plan),
+        vec![(
+            "gemini-2.0-flash",
+            FixKind::Swap,
+            SkipReason::UnlistedMethod
+        )]
+    );
+}
+
+#[test]
+fn gemini_methods_the_usage_scan_does_not_list_as_requests_are_swapped() {
+    // They send the model to be served, so `SENDS_MODEL` lists them and
+    // they are swapped like `generate_content`.
+    let source = r#"from google import genai
+
+
+def images(prompt):
+    client = genai.Client()
+    client.models.edit_image(model="gemini-2.0-flash", prompt=prompt, reference_images=[])
+    client.models.upscale_image(model="gemini-2.0-flash", image=None, upscale_factor="x2")
+    client.models.recontext_image(model="gemini-2.0-flash", source=None)
+    client.models.segment_image(model="gemini-2.0-flash", source=None)
+    return client.batches.create_embeddings(model="gemini-2.0-flash", src=prompt)
+"#;
+    let (plan, fixed) = fix(source);
+    assert_eq!(
+        fixed,
+        source.replace(r#"model="gemini-2.0-flash""#, r#"model="gemini-3.6-flash""#),
+        "{plan:#?}"
+    );
+    assert_eq!(plan.swaps.len(), 5, "{plan:#?}");
+    assert!(plan.skipped.is_empty(), "{plan:#?}");
 }
 
 #[test]
