@@ -65,6 +65,10 @@ These are reported with no gap (`model`, `engine`, `deployment_id`,
      `type NAME = ...`, and `global` or `nonlocal` in a class body.
    - A walrus in a default argument (`def f(a=(M := ...))`) binds where the
      `def` or `lambda` runs, in the enclosing scope.
+   - A walrus binds the whole expression after `:=`, a conditional included:
+     `(model := "gpt-4o" if fast else "o3-mini")` gives `model` both
+     candidates, as Python does (the parser reads it as
+     `(model := "gpt-4o") if fast else "o3-mini"`, which this rule undoes).
    - When more than one assignment reaches the use, the call gets a
      `reassigned` gap.
 3. **A class attribute assigned once.** It is read by class name (`Bot.MODEL`)
@@ -263,6 +267,12 @@ When the name or attribute is given other values too:
   `annotation` gap (`client = azure if flag else direct`, with
   `azure: AzureOpenAI` and `direct: OpenAI`, in either order), or the gap
   one of them already carries when they route alike.
+- A **member of a client** (`azure.chat.completions`,
+  `client.embeddings.create`) follows the same rules when every value is
+  that same member of a client: `chat = azure.chat.completions if flag else
+  direct.chat.completions` gets the `annotation` gap in either order, and
+  the member is kept. Different members, or a member next to a value that is
+  not one, get a `multiple_assignments` gap.
 
 An OpenAI or Anthropic client's `base_url` routes by its host (a Gemini
 client's endpoint options are a gap, above). The URL itself is never

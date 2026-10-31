@@ -2054,7 +2054,19 @@ impl<'t> Ctx<'t> {
                     }
                     "named_expression" => {
                         if let Some(name) = node.child_by_field_name("name") {
-                            let value = node.child_by_field_name("value");
+                            // tree-sitter-python reads `x := a if c else b`
+                            // as `(x := a) if c else b`; Python binds the
+                            // whole conditional, whose first branch is then
+                            // this walrus (read as its value).
+                            let value = match frame.parent {
+                                Some(parent)
+                                    if parent.kind() == "conditional_expression"
+                                        && parent.named_child(0) == Some(node) =>
+                                {
+                                    Some(parent)
+                                }
+                                _ => node.child_by_field_name("value"),
+                            };
                             // A walrus in a comprehension binds in the
                             // enclosing function or module (PEP 572), and
                             // one in a default or annotation of a `def` or
@@ -4874,6 +4886,11 @@ impl<'t> Ctx<'t> {
             }
             "parenthesized_expression" | "await" => match node.named_child(0) {
                 Some(inner) => self.eval(inner, scope, depth + 1),
+                None => Val::untracked(Origin::Other),
+            },
+            // `(client := OpenAI())` is its value.
+            "named_expression" => match node.child_by_field_name("value") {
+                Some(value) => self.eval(value, scope, depth + 1),
                 None => Val::untracked(Origin::Other),
             },
             "assignment" => match node.child_by_field_name("right") {
@@ -8125,6 +8142,11 @@ impl<'t> Ctx<'t> {
                 Some(inner) => self.resolve_value(inner, scope, depth + 1),
                 None => Err(Unresolved::new("non_literal", self.render(expr))),
             },
+            // `(model := "gpt-4o")` is its value.
+            "named_expression" => match expr.child_by_field_name("value") {
+                Some(value) => self.resolve_value(value, scope, depth + 1),
+                None => Err(Unresolved::new("non_literal", self.render(expr))),
+            },
             "identifier" => {
                 let name = self.text(expr).to_string();
                 self.resolve_constant(&name, scope, expr.start_byte(), depth)
@@ -9932,6 +9954,58 @@ fn combine(vals: Vec<Val>) -> Val {
             Some(val) => val,
             None => Val::untracked(Origin::Other),
         };
+    }
+
+    // Values that are a member of a client (`azure.chat.completions`,
+    // `client.embeddings.create`): when every value is the same member, its
+    // clients combine as the clients themselves would, and the member is
+    // kept. Members of different names, or a member next to a value that is
+    // not one, are ambiguous; the first value only says which member.
+    if let Some(first_path) = real.iter().find_map(|v| match v {
+        Val::Client { path, .. } if !path.is_empty() => Some(path.clone()),
+        _ => None,
+    }) {
+        let same_member = real
+            .iter()
+            .all(|v| matches!(v, Val::Client { path, .. } if *path == first_path));
+        if same_member {
+            let clients: Vec<Val> = real
+                .into_iter()
+                .map(|v| match v {
+                    Val::Client { client, .. } => Val::Client {
+                        client,
+                        path: Vec::new(),
+                    },
+                    other => other,
+                })
+                .collect();
+            return match combine(clients) {
+                Val::Client { client, .. } => Val::Client {
+                    client,
+                    path: first_path,
+                },
+                other => other,
+            };
+        }
+        let first = real.iter().find_map(|v| match v {
+            Val::Client { client, path } if *path == first_path => Some(client.clone()),
+            _ => None,
+        });
+        if let Some(first) = first {
+            return Val::Client {
+                client: Client {
+                    routing: Routing::Unknown,
+                    line: None,
+                    site: None,
+                    ambiguous: true,
+                    typed: false,
+                    declared: false,
+                    caveat: None,
+                    ..first
+                },
+                path: first_path,
+            };
+        }
     }
 
     let clients: Vec<&Client> = real

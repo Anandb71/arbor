@@ -730,6 +730,124 @@ class Svc(BaseModel):
 }
 
 #[test]
+fn members_of_clients_that_route_differently_are_a_gap_in_any_order() {
+    // A binding given the same member of two clients (`azure.chat.completions`
+    // or `direct.chat.completions`) took the first client's route with no
+    // gap. Its clients now combine as the clients themselves do.
+    let annotation = || vec!["ambiguous_client/annotation".to_string()];
+    let ambiguous = || vec!["ambiguous_client/multiple_assignments".to_string()];
+    let found = usages(
+        r#"from typing import Optional
+from openai import AzureOpenAI, OpenAI
+
+def one(azure: AzureOpenAI, direct: OpenAI, flag):
+    chat = azure.chat.completions if flag else direct.chat.completions
+    return chat.create(model="gpt-4-0314", messages=[])
+
+def two(azure: AzureOpenAI, direct: OpenAI, flag):
+    chat = direct.chat.completions if flag else azure.chat.completions
+    return chat.create(model="gpt-4-0314", messages=[])
+
+def three(azure: AzureOpenAI, direct: OpenAI, flag):
+    if flag:
+        create = direct.chat.completions.create
+    else:
+        create = azure.chat.completions.create
+    return create(model="gpt-4-0314", messages=[])
+
+def four(flag):
+    chat = AzureOpenAI().chat.completions if flag else OpenAI().chat.completions
+    return chat.create(model="gpt-4-0314", messages=[])
+
+def five(client: Optional[OpenAI] = None):
+    chat = OpenAI().chat.completions if client is None else client.chat.completions
+    return chat.create(model="gpt-4-0314", messages=[])
+
+def six(a: AzureOpenAI, b: AzureOpenAI, flag):
+    chat = a.chat.completions if flag else b.chat.completions
+    return chat.create(model="gpt-4-0314", messages=[])
+
+def seven(azure: AzureOpenAI, flag):
+    api = azure.chat.completions if flag else azure.embeddings
+    return api.create(model="gpt-4-0314", messages=[])
+"#,
+    );
+    assert_eq!(
+        routes_and_gaps(&found),
+        vec![
+            (6, Routing::Unknown, annotation()),
+            (10, Routing::Unknown, annotation()),
+            (17, Routing::Unknown, annotation()),
+            (21, Routing::Unknown, ambiguous()),
+            // A typed parameter next to a construction, as in scenario A.
+            (25, Routing::Unknown, ambiguous()),
+            // The same member of clients that route alike.
+            (29, Routing::AzureOpenai, vec![]),
+            // Two members of one client.
+            (33, Routing::Unknown, ambiguous()),
+        ]
+    );
+}
+
+#[test]
+fn a_walrus_binds_the_whole_conditional() {
+    // tree-sitter-python reads `x := a if c else b` as
+    // `(x := a) if c else b`, which bound the first branch alone: a model
+    // or a client that may be the second was confirmed.
+    let found = usages(
+        r#"from openai import AzureOpenAI, OpenAI
+client = OpenAI()
+
+def pick(fast):
+    if (model := "gpt-4o" if fast else "o3-mini"):
+        return client.chat.completions.create(model=model, messages=[])
+
+def route(azure: AzureOpenAI, direct: OpenAI, flag):
+    if (chosen := azure if flag else direct):
+        return chosen.embeddings.create(model="text-embedding-3-small", input="x")
+
+def built(flag):
+    if (chosen := AzureOpenAI() if flag else OpenAI()):
+        return chosen.embeddings.create(model="text-embedding-3-small", input="x")
+
+def plain():
+    if (chosen := OpenAI()):
+        return chosen.embeddings.create(model="text-embedding-3-small", input="x")
+"#,
+    );
+    let picked = found.calls.iter().find(|c| c.span.line == 6).unwrap();
+    assert!(picked.values.is_empty(), "{:?}", picked.values);
+    let gap = found
+        .gaps
+        .iter()
+        .find(|g| g.span.is_some_and(|s| s.line == 6) && g.key.as_deref() == Some("model"))
+        .unwrap();
+    assert_eq!(gap.reason, "conditional");
+    let candidates: Vec<&str> = gap.values.iter().map(|v| v.value.as_str()).collect();
+    assert_eq!(candidates, ["gpt-4o", "o3-mini"]);
+    assert_eq!(
+        routes_and_gaps(&found)
+            .into_iter()
+            .filter(|(line, ..)| *line != 6)
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                10,
+                Routing::Unknown,
+                vec!["ambiguous_client/annotation".to_string()]
+            ),
+            (
+                14,
+                Routing::Unknown,
+                vec!["ambiguous_client/multiple_assignments".to_string()]
+            ),
+            // A walrus outside a conditional is its value.
+            (18, Routing::OpenaiDirect, vec![]),
+        ]
+    );
+}
+
+#[test]
 fn global_assignment_in_function_is_a_module_client() {
     let found = usages(
         r#"
