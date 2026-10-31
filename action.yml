@@ -30,7 +30,7 @@ inputs:
     required: false
     default: "${{ github.token }}"
   mode:
-    description: "'command' (default) runs the command input. Any other value fails the step before anything is installed. 'retirements' finds direct SDK calls to AI models their provider has retired or is retiring, writes a job summary and annotates the affected lines (up to GitHub's 10 warnings per step; the summary lists every call). It runs on the runner; no code is sent anywhere."
+    description: "'command' (default) runs the command input. Any other value fails the step before anything is installed. 'retirements' finds direct SDK calls to AI models their provider has retired or is retiring, writes a job summary and annotates the affected lines (up to GitHub's 10 warnings per step; the summary lists every call found). It runs on the runner; no code is sent anywhere."
     required: false
     default: command
   retirements-path:

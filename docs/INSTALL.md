@@ -88,7 +88,7 @@ cargo install arbor-graph-cli
 crates.io can lag the GitHub releases. Check with `cargo search arbor-graph-cli`; if it is behind the [latest release](https://github.com/Anandb71/arbor/releases/latest), build the release tag from source instead:
 
 ```bash
-cargo install --git https://github.com/Anandb71/arbor --tag v3.1.0 arbor-graph-cli
+cargo install --git https://github.com/Anandb71/arbor --tag v3.1.1 arbor-graph-cli
 ```
 
 Run `arbor --version` afterwards. An older `arbor` earlier on your `PATH` (for example in `~/.cargo/bin`) wins over a newer one elsewhere. The crates.io crate named plain `arbor` is an unrelated project.
@@ -108,6 +108,12 @@ Downloads the matching release binary on install:
 ```bash
 npx @anandb71/arbor-cli
 ```
+
+npm 12 skips install scripts unless its `allow-scripts` setting names the package. When the install script did not run, the first `arbor` run downloads the release archive for your platform from the GitHub Release matching the package version, checks it against that release's `SHA256SUMS`, and installs the binary next to the wrapper (or, when that folder is not writable, under your user cache folder). Progress goes to stderr, so `--json` output is unaffected. A failed download exits 2 and prints the reason and the manual steps.
+
+- Behind a proxy: Node.js 22.21+ and 24.5+ use `HTTPS_PROXY`/`NO_PROXY`, or npm's `https-proxy`/`noproxy` settings. For a proxy that inspects HTTPS, set `NODE_EXTRA_CA_CERTS` to its CA certificate.
+- Mirror: set `ARBOR_NPM_DOWNLOAD_BASE` to a folder (https) holding the release archives and `SHA256SUMS`.
+- Cache folder: `ARBOR_NPM_CACHE_DIR` overrides the fallback folder.
 
 ## Homebrew
 

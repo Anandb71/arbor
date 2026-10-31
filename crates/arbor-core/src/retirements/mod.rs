@@ -24,10 +24,11 @@ mod gaps;
 
 pub use base_url::BaseUrl;
 pub use check::{
-    check, python_literal, CallKind, ChainStep, Change, ChangeKind, CheckOptions, Confidence,
-    DataInfo, Decision, DecisionOption, Finding, FixKind, MatchKind, NextShutdown, OptionEffect,
-    ParamValue, ProviderDate, RecipeRef, ReportOptions, RetirementReport, ReviewItem, RoutingClass,
-    ScanInput, State, Summary, Unreadable, FINE_TUNING, REPORT_VERSION,
+    check, python_literal, spread_list, CallKind, ChainStep, Change, ChangeKind, CheckOptions,
+    Confidence, DataInfo, Decision, DecisionOption, Finding, FixKind, MatchKind, NextShutdown,
+    OptionEffect, ParamValue, ProviderDate, RecipeRef, ReportOptions, RetirementReport, ReviewItem,
+    RoutingClass, ScanInput, State, Summary, UncheckedArgs, Unreadable, FINE_TUNING,
+    REPORT_VERSION,
 };
 pub use date::Date;
 pub use fix::{
@@ -849,6 +850,23 @@ mod data_tests {
             assert_eq!(entry.date.as_deref(), Some("2027-01-14"));
             assert_eq!(entry.replacement.as_deref(), Some("gpt-6-luna"));
         }
+        // OpenAI's deprecations page lists these bare IDs in its own 11 Dec
+        // rows (read 28 Oct 2026), so they cite the page, not the models API.
+        for (alias, replacement) in [
+            ("gpt-5", "gpt-5.6-sol"),
+            ("gpt-5-mini", "gpt-5.6-terra"),
+            ("gpt-5-nano", "gpt-5.6-luna"),
+            ("gpt-5-pro", "gpt-5.6-sol"),
+            ("o3", "gpt-5.6-sol"),
+            ("o3-pro", "gpt-5.6-sol"),
+        ] {
+            let entry = r.entry(Table::Openai, alias).expect(alias);
+            assert_eq!(entry.status, EntryStatus::Retiring, "{alias}");
+            assert_eq!(entry.date.as_deref(), Some("2026-12-11"), "{alias}");
+            assert_eq!(entry.replacement.as_deref(), Some(replacement), "{alias}");
+            assert_eq!(entry.recipe, "openai-2026-10-23", "{alias}");
+            assert!(entry.notes.is_empty(), "{alias}: {:?}", entry.notes);
+        }
         let sonnet = r
             .entry(Table::Anthropic, "claude-3-5-sonnet-20241022")
             .unwrap();
@@ -876,6 +894,197 @@ mod data_tests {
             max_tokens.see_choice.as_deref(),
             Some("G6-REASONING-DEFAULT")
         );
+    }
+
+    #[test]
+    fn ids_the_page_added_after_23_october_follow_their_rows() {
+        // Between 23 and 26 Oct 2026 OpenAI's deprecations page started listing
+        // bare IDs and dated snapshots together in its rows, which added these
+        // 15 IDs (7 bare, 8 snapshots). Each value is its row's date and
+        // replacement cell as read on 28 Oct 2026. No recipe has argument rules
+        // for them, so they are report-only with no rule set.
+        const PRO: Option<&str> = Some("gpt-5.6-sol (reasoning.mode: pro)");
+        const IMAGE: Option<&str> = Some("gpt-image-2.5-sunburst or gpt-image-2.5-flare");
+        const TRANSCRIBE: Option<&str> = Some("gpt-live-transcribe or gpt-transcribe");
+        let r = data();
+        for (model, date, replacement, text) in [
+            ("gpt-5", "2026-12-11", Some("gpt-5.6-sol"), None),
+            ("gpt-5-mini", "2026-12-11", Some("gpt-5.6-terra"), None),
+            ("gpt-5-nano", "2026-12-11", Some("gpt-5.6-luna"), None),
+            ("gpt-5-pro", "2026-12-11", Some("gpt-5.6-sol"), PRO),
+            ("o3", "2026-12-11", Some("gpt-5.6-sol"), None),
+            ("o3-pro", "2026-12-11", Some("gpt-5.6-sol"), PRO),
+            ("gpt-image-1.5-2025-12-16", "2026-12-01", None, IMAGE),
+            (
+                "gpt-4o-mini-tts",
+                "2027-01-06",
+                Some("gpt-realtime-2.1-mini"),
+                None,
+            ),
+            (
+                "gpt-realtime-2025-08-28",
+                "2027-01-20",
+                Some("gpt-realtime-2.1"),
+                None,
+            ),
+            (
+                "gpt-audio-2025-08-28",
+                "2027-01-20",
+                Some("gpt-audio-1.5"),
+                None,
+            ),
+            (
+                "gpt-realtime-mini-2025-12-15",
+                "2027-01-20",
+                Some("gpt-realtime-2.1-mini"),
+                None,
+            ),
+            (
+                "gpt-audio-mini-2025-12-15",
+                "2027-01-20",
+                Some("gpt-audio-1.5"),
+                None,
+            ),
+            (
+                "gpt-4o-mini-transcribe-2025-12-15",
+                "2027-02-26",
+                None,
+                TRANSCRIBE,
+            ),
+            ("gpt-5.1-2025-11-13", "2027-04-01", Some("gpt-6-sol"), None),
+            (
+                "gpt-5.4-nano-2026-03-17",
+                "2027-04-01",
+                Some("gpt-6-luna"),
+                None,
+            ),
+        ] {
+            let entry = r.entry(Table::Openai, model).expect(model);
+            assert_eq!(entry.status, EntryStatus::Retiring, "{model}");
+            assert_eq!(entry.date.as_deref(), Some(date), "{model}");
+            assert_eq!(entry.replacement.as_deref(), replacement, "{model}");
+            assert_eq!(entry.replacement_text.as_deref(), text, "{model}");
+            assert_eq!(entry.action, Action::ReportOnly, "{model}");
+            assert_eq!(entry.rule_set, None, "{model}");
+            assert_eq!(entry.recipe, "openai-2026-10-23", "{model}");
+            assert!(entry.notes.is_empty(), "{model}: {:?}", entry.notes);
+        }
+        // The five snapshots the 14 Jan rows list keep their rewrite and rules.
+        for snapshot in [
+            "gpt-4o-2024-08-06",
+            "gpt-4o-2024-11-20",
+            "gpt-4o-mini-2024-07-18",
+            "gpt-4.1-2025-04-14",
+            "gpt-4.1-mini-2025-04-14",
+        ] {
+            let entry = r.entry(Table::Openai, snapshot).expect(snapshot);
+            assert_eq!(entry.date.as_deref(), Some("2027-01-14"), "{snapshot}");
+            assert_eq!(
+                entry.replacement.as_deref(),
+                Some("gpt-6-luna"),
+                "{snapshot}"
+            );
+            assert_eq!(entry.action, Action::Rewrite, "{snapshot}");
+            assert_eq!(
+                entry.rule_set.as_deref(),
+                Some("openai-2027-01-14"),
+                "{snapshot}"
+            );
+            assert_eq!(entry.kind.as_deref(), Some("snapshot"), "{snapshot}");
+        }
+    }
+
+    #[test]
+    fn the_28_october_page_reading_reaches_what_people_are_told() {
+        // Each assertion fails on the data generated from the 20 Oct recipes.
+        let r = data();
+        let rule = |set: &str, id: &str| {
+            r.rules(set)
+                .find(|rule| rule.id == id)
+                .unwrap_or_else(|| panic!("{set} {id}"))
+        };
+        // The deprecations page gives the bare aliases no row; OpenAI's API
+        // reference lists each "Deprecated. Announced shutdown date:
+        // 2027-01-14", and its models API gave that date on 18 Oct.
+        for alias in ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"] {
+            let entry = r.entry(Table::Openai, alias).expect(alias);
+            assert_eq!(entry.notes.len(), 1, "{alias}: {:?}", entry.notes);
+            let note = &entry.notes[0];
+            assert!(
+                note.contains("deprecations page gives it no shutdown date"),
+                "{note}"
+            );
+            assert!(
+                note.contains(
+                    "API reference lists it as deprecated with shutdown date 14 Jan 2027"
+                ),
+                "{note}"
+            );
+            assert!(
+                note.contains("models API gave that date on 18 Oct 2026"),
+                "{note}"
+            );
+            assert!(!note.contains("does not list"), "{note}");
+        }
+        // Haiku 4.5 is no longer said to accept the sampling parameters: API
+        // version 2026-10-21 rejects them on every model.
+        let haiku = rule("anthropic-retirements", "ANT-SAMPLING-HAIKU45");
+        assert_eq!(haiku.effect, RuleEffect::Review);
+        assert_eq!(haiku.verified, Verified::Unverified);
+        assert!(!haiku.message.contains("accepts"), "{}", haiku.message);
+        assert!(haiku.message.contains("2026-10-21"), "{}", haiku.message);
+        let claude = rule("anthropic-retirements", "ANT-SAMPLING");
+        assert!(claude
+            .message
+            .contains("at any value under API version 2026-10-21"));
+        // The "Using GPT-6" guide states the Responses rule; no Responses
+        // call was made, and the message says so.
+        let responses = rule("openai-2027-01-14", "G6-SAMPLING-RESPONSES");
+        assert_eq!(responses.verified, Verified::Docs);
+        assert!(responses.message.contains("\"Using GPT-6\" guide"));
+        assert!(responses
+            .message
+            .contains("has not tested this on the Responses API"));
+        let tier = rule("openai-2027-01-14", "G6-TIER-CHANGE");
+        assert!(!tier.message.contains("flagship"), "{}", tier.message);
+        assert!(tier.source_url.is_some());
+        // stop and logit_bias were called on gpt-5.6-terra only, and no page
+        // backs them on the other GPT-5.6 tiers.
+        for id in ["OAI-STOP", "OAI-LOGIT-BIAS"] {
+            let check = rule("openai-2026-10-23", id);
+            assert_eq!(check.verified, Verified::Live, "{id}");
+            assert_eq!(check.live_models, ["gpt-5.6-terra"], "{id}");
+            assert_eq!(check.otherwise_verified, Some(Verified::Unverified), "{id}");
+            assert!(
+                check
+                    .message
+                    .contains("not tested on gpt-5.6-sol, gpt-5.6-luna"),
+                "{id}: {}",
+                check.message
+            );
+        }
+        let max_tokens = rule("openai-2026-10-23", "OAI-MAX-TOKENS");
+        assert!(max_tokens
+            .message
+            .contains("deprecated in favour of max_completion_tokens"));
+        // top_p and logprobs were sent only at "none" on GPT-5.6, and only on Chat
+        // Completions; no GPT-5.6 page states the rule, so it is not `docs` elsewhere.
+        let reasoning = rule("openai-2026-10-23", "OAI-SAMPLING-REASONING-SOURCE");
+        assert_eq!(reasoning.verified, Verified::Live);
+        assert_eq!(reasoning.live_endpoints, ["chat.completions"]);
+        assert_eq!(reasoning.otherwise_verified, Some(Verified::Unverified));
+        assert!(reasoning
+            .message
+            .contains("top_p and logprobs were tested only at"));
+        // The 23 Oct section's only fine-tune row is ft-o4-mini-2025-04-16.
+        let oct23: Vec<&str> = r
+            .data
+            .fine_tunes
+            .iter()
+            .filter(|fine| fine.recipe == "openai-2026-10-23")
+            .map(|fine| fine.base.as_str())
+            .collect();
+        assert_eq!(oct23, ["o4-mini-2025-04-16"]);
     }
 
     #[test]

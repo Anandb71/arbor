@@ -20,11 +20,11 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 
-arbor-core = { path = "../arbor-core", version = "3.1.0" }
-arbor-graph = { path = "../arbor-graph", version = "3.1.0" }
-arbor-watcher = { path = "../arbor-watcher", version = "3.1.0" }
-arbor-server = { path = "../arbor-server", version = "3.1.0" }
-arbor-mcp = { path = "../arbor-mcp", version = "3.1.0" }
+arbor-core = { path = "../arbor-core", version = "3.1.1" }
+arbor-graph = { path = "../arbor-graph", version = "3.1.1" }
+arbor-watcher = { path = "../arbor-watcher", version = "3.1.1" }
+arbor-server = { path = "../arbor-server", version = "3.1.1" }
+arbor-mcp = { path = "../arbor-mcp", version = "3.1.1" }
 
 clap = { version = "4.0", features = ["derive"] }
 colored = "2.0"
@@ -36,6 +36,7 @@ petgraph = "0.6"
 anyhow = "1.0"
 bincode = "1.3"
 fs2 = "0.4"
+same-file = "1.0"
 
 [dev-dependencies]
 tempfile = "3"

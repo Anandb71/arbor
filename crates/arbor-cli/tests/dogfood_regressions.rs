@@ -55,6 +55,15 @@ fn write(dir: &Path, path: &str, content: &str) {
     fs::write(full, content).unwrap();
 }
 
+/// A temp folder that is its own project (an empty `.arbor/`), so Arbor never
+/// walks up from it to a marker in a parent folder, such as `~/.arbor` when
+/// the temp folder is under the home folder (#273).
+fn project() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join(".arbor")).unwrap();
+    temp
+}
+
 #[test]
 fn a_branch_switch_never_answers_from_the_other_branch() {
     let temp = tempfile::tempdir().unwrap();
@@ -98,7 +107,7 @@ fn a_branch_switch_never_answers_from_the_other_branch() {
 
 #[test]
 fn an_upgrade_rebuilds_a_graph_the_old_version_saved() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = project();
     let dir = temp.path();
     let lib = "pub fn helper() -> u32 {\n    1\n}\n\npub fn other() -> u32 {\n    2\n}\n";
     write(dir, "src/lib.rs", lib);
@@ -137,7 +146,7 @@ fn an_upgrade_rebuilds_a_graph_the_old_version_saved() {
 }
 
 fn mixed_project() -> tempfile::TempDir {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = project();
     let dir = temp.path();
     write(dir, "src/jobs.rs", "pub fn enqueue() -> u32 {\n    1\n}\n");
     write(

@@ -46,7 +46,7 @@ bodies are under [The messages, verbatim](#the-messages-verbatim).
 
 | Check | Model | Status | Recorded | Supports in the bundled data |
 |---|---|---|---|---|
-| L-OAI-1 | `gpt-4o`, `gpt-4o-mini`, `gpt-4.1`, `gpt-4.1-mini` (aliases) | 200 | `"shutdown_date": "2027-01-14"` | The entries for the four aliases: retiring on 2027-01-14, replacement `gpt-6-luna`, `verified: live`. OpenAI's deprecations page lists only their dated snapshots. |
+| L-OAI-1 | `gpt-4o`, `gpt-4o-mini`, `gpt-4.1`, `gpt-4.1-mini` (aliases) | 200 | `"shutdown_date": "2027-01-14"` | The entries for the four aliases: retiring on 2027-01-14, replacement `gpt-6-luna`, `verified: live`. OpenAI's deprecations page lists only their dated snapshots; its Chat Completions API reference lists each alias as "Deprecated. Announced shutdown date: 2027-01-14" (read 28 October 2026). |
 | L-OAI-1 | `gpt-4o-2024-08-06`, `gpt-4o-2024-11-20`, `gpt-4o-mini-2024-07-18`, `gpt-4.1-2025-04-14`, `gpt-4.1-mini-2025-04-14` | 200 | `"shutdown_date": "2027-01-14"` | Their entries (2027-01-14, `verified: docs`): the API agrees with the page. |
 | L-OAI-1 | `gpt-4o-2024-05-13`, `gpt-3.5-turbo`, `gpt-4` | 200 | `"shutdown_date": "2026-10-23"` | Their entries (2026-10-23, `verified: docs`): the API agrees with the page. |
 | L-OAI-1 | `gpt-4-1106-preview` | 404 | `The model 'gpt-4-1106-preview' does not exist` ([E8](#e8-gpt-4-1106-preview-does-not-exist)) | The `gpt-4-1106-preview` entry: `status: shut_down`, `verified: live`, note `OpenAI lists 23 Oct 2026, but the API already answers 404 (checked 18 Oct 2026).` |
@@ -101,8 +101,10 @@ Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_c
 ```
 
 The same request with `"max_completion_tokens": 50` in place of `max_tokens` returned 200
-on both models. Supports `OAI-MAX-TOKENS` and `G6-MAX-TOKENS`, whose message is
-`max_tokens is rejected on {target}: use max_completion_tokens (same value).`
+on both models. Supports `G6-MAX-TOKENS` (`max_tokens is rejected on {target}: use
+max_completion_tokens (same value).`) and `OAI-MAX-TOKENS`, whose message since the
+28 October 2026 data refresh says that OpenAI's API reference deprecates `max_tokens`
+in favour of `max_completion_tokens` and that only gpt-5.6-terra was called.
 
 ### E2: a non-default temperature is rejected
 
@@ -162,7 +164,8 @@ of 2 calls (`gpt-5.6-terra`, `gpt-6-luna`), at `reasoning_effort` `"none"`.
 Unsupported parameter: 'stop' is not supported with this model.
 ```
 
-Supports `OAI-STOP` (`stop is not supported on {target} (400).`) and
+Supports `OAI-STOP` on gpt-5.6-terra only (since the 28 October 2026 data refresh its
+message says gpt-5.6-sol, gpt-5.6-luna and the default effort were not tested) and
 `G6-STOP-LOGIT-BIAS` (`stop and logit_bias are not supported on {target} (400).`).
 
 ### E5: logit_bias is rejected
@@ -178,7 +181,8 @@ on 2 of 2 calls (`gpt-5.6-terra`, `gpt-6-luna`), at `reasoning_effort` `"none"`.
 Unsupported parameter: 'logit_bias' is not supported with this model.
 ```
 
-Supports `OAI-LOGIT-BIAS` (`logit_bias is not supported on {target} (400).`) and
+Supports `OAI-LOGIT-BIAS` on gpt-5.6-terra only (since the 28 October 2026 data refresh
+its message says gpt-5.6-sol, gpt-5.6-luna and the default effort were not tested) and
 `G6-STOP-LOGIT-BIAS`.
 
 ### E6: prediction is rejected

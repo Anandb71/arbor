@@ -13,6 +13,11 @@
 </p>
 
 <p align="center">
+  <code>arbor retirements</code> finds direct OpenAI, Anthropic and Google SDK calls in Python code that use a retired or retiring model, and says what has to change.<br>
+  OpenAI shuts down the dated gpt-4o and gpt-4.1 snapshots on 14 January 2027. <a href="https://getarbor.dev/retirements">Shutdown list</a>
+</p>
+
+<p align="center">
   <a href="https://github.com/Anandb71/arbor/actions"><img src="https://img.shields.io/github/actions/workflow/status/Anandb71/arbor/rust.yml?style=flat-square&label=Rust%20CI" alt="Rust CI" /></a>
   <a href="https://crates.io/crates/arbor-graph-cli"><img src="https://img.shields.io/crates/v/arbor-graph-cli?style=flat-square&label=crates.io" alt="Crates.io" /></a>
   <a href="https://github.com/Anandb71/arbor/releases"><img src="https://img.shields.io/github/v/release/Anandb71/arbor?style=flat-square&label=release" alt="Latest release" /></a>
@@ -28,7 +33,7 @@
   <sub>Simulated replay — the <code>arbor</code> commands and their output are real (tokio @ 178k LOC). Methodology: <a href="docs/BENCHMARKS.md">BENCHMARKS.md</a></sub>
 </p>
 
-> **v3.1.0** · Find code that calls retiring AI models: `arbor retirements` lists the direct OpenAI, Anthropic and Google SDK calls in a Python project that use a retired or retiring model, with the listed replacement and what has to change, locally or as a GitHub Action. `arbor usages` and the MCP tool `find_api_usages` list every such SDK call with its routing and model. [Release notes](docs/RELEASE_NOTES_v3.1.0.md)
+> **v3.1.1** · A fix release. The `arbor retirements` data was read again on 28 October 2026 and now lists the bare `gpt-5` and `o3`, which OpenAI's deprecations page gives 11 December 2026. `npx @anandb71/arbor-cli` runs on npm 12, and Arbor no longer takes your home folder as the project because `~/.arbor` exists. [Release notes](docs/RELEASE_NOTES_v3.1.1.md)
 
 ---
 
@@ -49,20 +54,43 @@ Where the graph is *unsure*, it says so — edges carry a confidence, and ambigu
 
 ---
 
-## What's new in v3.1.0
+## What's new in v3.1.1
 
-A feature release: two commands for Python code that calls AI model APIs. Both run
-locally, with no account, API key or telemetry.
+A fix release. No breaking changes; as after every upgrade, a saved graph is
+rebuilt once on first use.
+
+| Fix | What was wrong |
+|-----|----------------|
+| **Bare `gpt-5` and `o3`** | OpenAI's deprecations page started listing bare IDs next to the dated snapshots after 3.1.0 was built, so `model="gpt-5"` or `model="o3"` was not listed at all. Both are listed now (11 December 2026, to GPT-5.6), with the 13 other IDs the page added. |
+| **Data read again on 28 October 2026** | Every provider page behind the bundled data was read and checked again. OpenAI's deprecations page lists the five dated `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` snapshots for 14 January 2027; for the bare aliases the report now cites OpenAI's API reference ("Deprecated. Announced shutdown date: 2027-01-14") and its models API. A call moving to `claude-haiku-4-5-20251001` with `temperature` now gets a check line: Anthropic's API version 2026-10-21 rejects it on every model. |
+| **`(no change)` next to arguments that need reasoning off** | For a call whose client Arbor could not resolve, `temperature`, `tools` or `max_tokens` went unchecked and "let the model reason" read `(no change)`. They are checked now. When Arbor cannot read some of a call's arguments (`**kwargs`, `extra_body`) or a check line names one of them, each option says so instead of `no change`. |
+| **`npx` on npm 12** | npm 12 skips install scripts, so the binary was never downloaded. The wrapper now downloads it on first run and checks it against the release's `SHA256SUMS`. |
+| **The home folder as the project** | `~/.arbor` holds the global config (and, on Windows, the installed binary), so a folder under home with no nearer project marker resolved to the whole home folder, and `arbor index .` indexed all of it. The search now stops at the home folder. |
+| **Code graph: aliased imports and bare calls** | After `from m import f as g`, a call to `g()` now reaches `f` (also for `import { f as g }` in TypeScript and JavaScript). In Python, JavaScript, TypeScript and Go, a bare call to a function in another file counts only when the calling file can see it (in Python, when it imports the name); other languages are unchanged. |
+
+When the terminal report of `arbor retirements` lists a call to a retired or
+retiring model, it now ends with an offer of a paid readiness review. The link
+carries three values from the run: how many calls are listed, how many are
+already retired and the next shutdown date. Arbor sends nothing. The offer is not
+printed with `--json`, `--markdown`, `--annotations` or `--quiet`, or when the `CI`
+environment variable is set (GitHub Actions sets it), and the GitHub Action does
+not show it. [Release notes](docs/RELEASE_NOTES_v3.1.1.md)
+
+<details>
+<summary><strong>v3.1.0</strong> (<code>arbor retirements</code> and <code>arbor usages</code>)</summary>
+
+Two commands for Python code that calls AI model APIs. Both run locally, with no
+account, API key or telemetry.
 
 | New | What it does |
 |-----|--------------|
-| **`arbor retirements`** | Lists the direct `openai`, `anthropic` and Google SDK calls that use a model its provider has retired or is retiring: the date, the replacement the provider lists, the arguments that change with it and the choices your repo makes first. OpenAI shuts down `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` on 14 January 2027. [More below](#find-code-that-calls-retiring-ai-models) |
-| **GitHub Action `mode: retirements`** | The same check in CI: a job summary that lists every affected call, and warnings on the most urgent lines. It warns by default and fails the build only when you set `retirements-fail-on`, or when the check cannot run. |
-| **`arbor usages` and `find_api_usages`** | Every OpenAI, Anthropic and Gemini SDK call with its file and line, client routing (direct, Azure, custom `base_url`, Bedrock, Vertex) and model IDs, for people and agents. A value is confirmed only inside a small supported grammar; everything else carries a typed gap. [What a report confirms](docs/SDK_USAGES.md) |
+| **`arbor retirements`** | Lists the direct `openai`, `anthropic` and Google SDK calls that use a model its provider has retired or is retiring: the date, the replacement the provider lists, the arguments that change with it and the choices your repo makes first. OpenAI's deprecations page lists the dated `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` snapshots for shutdown on 14 January 2027; OpenAI's API reference and models API give the bare aliases the same date. [More below](#find-code-that-calls-retiring-ai-models) |
+| **GitHub Action `mode: retirements`** | The same check in CI: a job summary of the affected calls it finds, and warnings on the most urgent lines. It warns by default and fails the build only when you set `retirements-fail-on`, or when the check cannot run. |
+| **`arbor usages` and `find_api_usages`** | The OpenAI, Anthropic and Gemini SDK calls Arbor finds, with their file and line, client routing (direct, Azure, custom `base_url`, Bedrock, Vertex) and model IDs, for people and agents. A value is confirmed only inside a small supported grammar; everything else carries a typed gap. [What a report confirms](docs/SDK_USAGES.md) |
 
-Python only for now; graph extraction is unchanged (a saved graph is rebuilt
-once on first use, as after every upgrade). See the
-[3.0.5 release notes](docs/RELEASE_NOTES_v3.0.5.md) for the previous release.
+Python only for now. [Release notes](docs/RELEASE_NOTES_v3.1.0.md)
+
+</details>
 
 <details>
 <summary><strong>v3.0.3</strong> (Rust calls through paths and macros, per-symbol diff, <code>--base</code>)</summary>
@@ -238,7 +266,7 @@ claude mcp add --transport stdio --scope project arbor -- arbor bridge
 
 ## Find code that calls retiring AI models
 
-OpenAI shuts down `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` on 14 January 2027, and Anthropic and Google retire models on their own dates. `arbor retirements` lists the direct `openai`, `anthropic` and Google SDK calls that use a retired or retiring model. For each one it shows the replacement the provider lists, the arguments that have to change with it, and the choices your repo makes first (such as whether gpt-6-luna should reason). Calls through LangChain, LiteLLM or other wrappers are not checked yet.
+OpenAI's deprecations page lists five dated GPT-4o, GPT-4o mini, GPT-4.1 and GPT-4.1 mini snapshots, such as `gpt-4o-2024-08-06`, for shutdown on 14 January 2027. It gives the bare `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` no row, but OpenAI's [API reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) lists each as "Deprecated. Announced shutdown date: 2027-01-14", and its models API returned that date when checked on 18 October 2026. Anthropic and Google retire models on their own dates. `arbor retirements` lists the direct `openai`, `anthropic` and Google SDK calls that use a retired or retiring model. For each one it shows the replacement the provider lists, the arguments that have to change with it, and the choices your repo makes first (such as whether gpt-6-luna should reason). Calls through LangChain, LiteLLM or other wrappers are not checked yet.
 
 ```bash
 npx @anandb71/arbor-cli retirements .
@@ -250,7 +278,7 @@ npx @anandb71/arbor-cli retirements .
                   also change: max_tokens → max_completion_tokens
                   decide: keep reasoning off (add reasoning_effort="none"; keep temperature) or let the model reason (remove temperature)
   app/chat.py:21  gpt-4o-mini (line 22) → gpt-6-luna  fallback of an environment or config lookup: confirm the deployed value
-                  decide: keep reasoning off (add reasoning_effort="none") or let the model reason (no change)
+                  decide: keep reasoning off (add reasoning_effort="none"; check stop) or let the model reason (check stop)
                   check: stop and logit_bias are not supported on gpt-6-luna (400).
 ```
 
@@ -264,7 +292,7 @@ npx @anandb71/arbor-cli retirements .
 GitHub Action (warns by default; it fails the build only if you ask it to):
 
 ```yaml
-      - uses: Anandb71/arbor@v3.1.0
+      - uses: Anandb71/arbor@v3.1.1
         with:
           mode: retirements
           retirements-fail-on: never   # or: retired, or a number of days such as 90
@@ -415,14 +443,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: Anandb71/arbor@v3.1.0
+      - uses: Anandb71/arbor@v3.1.1
         with:
           command: check . --max-blast-radius 30 --markdown
           comment-on-pr: true
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-`mode: retirements` runs `arbor retirements` instead. It writes a job summary that lists every call to a retiring model and annotates the 10 most urgent lines, GitHub's limit per step ([guide](docs/RETIREMENTS.md#in-ci-github-action)).
+`mode: retirements` runs `arbor retirements` instead. It writes a job summary that lists each call it finds to a retiring model and annotates the 10 most urgent lines, GitHub's limit per step ([guide](docs/RETIREMENTS.md#in-ci-github-action)).
 
 ---
 

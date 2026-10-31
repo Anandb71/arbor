@@ -1,6 +1,6 @@
 {
   "name": "@anandb71/arbor-cli",
-  "version": "3.1.0",
+  "version": "3.1.1",
   "description": "Graph-native intelligence for codebases — know what breaks before you break it",
   "license": "MIT",
   "repository": {
@@ -23,11 +23,13 @@
     "arbor": "bin/arbor.js"
   },
   "scripts": {
-    "postinstall": "node install.js"
+    "postinstall": "node install.js",
+    "test": "node --test test/download.test.js"
   },
   "files": [
     "install.js",
-    "bin/"
+    "bin/arbor.js",
+    "lib/"
   ],
   "os": ["darwin", "linux", "win32"],
   "cpu": ["x64", "arm64"],

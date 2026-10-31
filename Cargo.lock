@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "arbor-core"
-version = "3.1.0"
+version = "3.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "arbor-graph"
-version = "3.1.0"
+version = "3.1.1"
 dependencies = [
  "arbor-core",
  "bincode",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "arbor-graph-cli"
-version = "3.1.0"
+version = "3.1.1"
 dependencies = [
  "anyhow",
  "arbor-core",
@@ -320,6 +320,7 @@ dependencies = [
  "fs2",
  "indicatif",
  "petgraph",
+ "same-file",
  "serde",
  "serde_json",
  "strsim",
@@ -332,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "arbor-gui"
-version = "3.1.0"
+version = "3.1.1"
 dependencies = [
  "arboard",
  "arbor-core",
@@ -347,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "arbor-mcp"
-version = "3.1.0"
+version = "3.1.1"
 dependencies = [
  "anyhow",
  "arbor-core",
@@ -369,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "arbor-server"
-version = "3.1.0"
+version = "3.1.1"
 dependencies = [
  "arbor-core",
  "arbor-graph",
@@ -389,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "arbor-watcher"
-version = "3.1.0"
+version = "3.1.1"
 dependencies = [
  "arbor-core",
  "arbor-graph",

@@ -102,9 +102,10 @@
 //! gap listing the values the callers pass.
 
 use super::{
-    is_capturable_value, is_credential_value, is_identifier_key, is_secret_key, is_value_key,
-    model_family, BindingKind, CapturedValue, ClientConstruction, ClientScope, FileUsages, GapKind,
-    Receiver, Routing, Sdk, SdkCall, SdkImport, Span, UsageGap, ValueOrigin, VertexAi,
+    is_argument_name, is_capturable_value, is_credential_value, is_identifier_key, is_secret_key,
+    is_value_key, model_family, BindingKind, CallArgs, CapturedValue, ClientConstruction,
+    ClientScope, FileUsages, GapKind, Receiver, Routing, Sdk, SdkCall, SdkImport, Span, Spread,
+    UsageGap, ValueOrigin, VertexAi,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -281,6 +282,9 @@ const MAX_STARS: usize = 16;
 /// Longest string literal read, in source bytes. A captured value is at
 /// most 256 bytes, so a longer literal is refused without being copied.
 const MAX_LITERAL_BYTES: usize = 4096;
+/// Most argument names recorded for one `**` expression. A dict with more
+/// is recorded as one Arbor could not read in full.
+const MAX_SPREAD_KEYS: usize = 64;
 /// Most arguments an environment, config or dict lookup takes. A call with
 /// more is not a lookup and its arguments are not scanned.
 const MAX_LOOKUP_ARGS: usize = 8;
@@ -1383,6 +1387,15 @@ struct DictSummary<'t> {
     expansion: Vec<(String, usize, Node<'t>)>,
     /// Part of the dict could not be read, or the expansion list was cut.
     opaque: bool,
+    /// Its string keys in the order Python sends them (first occurrence),
+    /// at most [`MAX_SPREAD_KEYS`]: the argument names a `**` expansion of
+    /// it passes. Secret-sounding names (`max_tokens`) are listed: they are
+    /// names, never values.
+    keys: Vec<String>,
+    /// It sends a key `keys` does not list: one past [`MAX_SPREAD_KEYS`],
+    /// or one that is not an argument name Arbor records (not an
+    /// identifier, or shaped like a credential).
+    keys_missing: bool,
 }
 
 impl DictSummary<'_> {
@@ -6264,6 +6277,7 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
             return;
         }
@@ -6286,6 +6300,7 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         }
         self.settle_builtin_values();
@@ -6354,6 +6369,7 @@ impl<'t> Ctx<'t> {
             ),
             values: Vec::new(),
             values_complete: false,
+            args: None,
         });
     }
 
@@ -7113,6 +7129,7 @@ impl<'t> Ctx<'t> {
                     ),
                     values: Vec::new(),
                     values_complete: false,
+                    args: None,
                 });
             }
         }
@@ -7147,6 +7164,7 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         } else if let Some(caveat) = &target.caveat {
             let (reason, detail) = match caveat {
@@ -7253,6 +7271,7 @@ impl<'t> Ctx<'t> {
                 detail,
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         } else if let Some(feature) = self.file_dynamic {
             // Anything in this file may be rebound, the receiver and the
@@ -7272,6 +7291,7 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         }
 
@@ -7291,6 +7311,7 @@ impl<'t> Ctx<'t> {
             }
         }
 
+        let spreads = self.spreads(&args, scope);
         self.out.calls.push(SdkCall {
             sdk,
             package: target.pkg.package().to_string(),
@@ -7303,6 +7324,7 @@ impl<'t> Ctx<'t> {
             file: self.file.clone(),
             span,
             symbol,
+            spreads,
             kwargs: args.kwargs,
             positional: args.positional,
             splat: args.splat,
@@ -7401,6 +7423,7 @@ impl<'t> Ctx<'t> {
                 ),
                 values: Vec::new(),
                 values_complete: false,
+                args: None,
             });
         }
     }
@@ -7511,6 +7534,7 @@ impl<'t> Ctx<'t> {
             reason: unresolved.reason.to_string(),
             detail,
             values_complete: complete && !values.is_empty(),
+            args: None,
             values,
         });
     }
@@ -7570,6 +7594,7 @@ impl<'t> Ctx<'t> {
             ),
             values: Vec::new(),
             values_complete: false,
+            args: None,
         });
     }
 
@@ -7646,6 +7671,7 @@ impl<'t> Ctx<'t> {
                 values.push(captured(key, resolved, false));
             }
         }
+        let spreads = self.spreads(&args, scope);
         self.out.gaps.push(UsageGap {
             kind: GapKind::UnknownClientFactory,
             sdk: Some(sdk),
@@ -7658,6 +7684,13 @@ impl<'t> Ctx<'t> {
             detail,
             values,
             values_complete: false,
+            // The arguments are known even when the client is not: the
+            // retirement check applies its argument rules to them.
+            args: Some(CallArgs {
+                spreads,
+                kwargs: args.kwargs,
+                splat: args.splat,
+            }),
         });
     }
 
@@ -7688,6 +7721,7 @@ impl<'t> Ctx<'t> {
             ),
             values: Vec::new(),
             values_complete: false,
+            args: None,
         });
     }
 
@@ -8935,6 +8969,53 @@ impl<'t> Ctx<'t> {
         })
     }
 
+    /// What each `**` expression of a call is: its name, and the argument
+    /// names it sends when it is a same-file dict literal (read through the
+    /// same summary as [`Self::expand_splat`], so each dict is read once).
+    /// Names only: a value is never recorded.
+    fn spreads(&mut self, args: &Args<'t>, scope: usize) -> Vec<Spread> {
+        let mut out = Vec::new();
+        for splat in &args.splats {
+            let name = self.spread_name(*splat);
+            let Some(expansion) = self.expand_splat(*splat, scope) else {
+                out.push(Spread {
+                    name,
+                    keys: Vec::new(),
+                    complete: false,
+                });
+                continue;
+            };
+            // Read once per dict: a large dict spread into many calls costs
+            // at most [`MAX_SPREAD_KEYS`] names per call. A dict with more
+            // keys than that, or with a key it does not record, is one Arbor
+            // could not read in full.
+            let summary = &expansion.summary;
+            out.push(Spread {
+                name,
+                keys: summary.keys.clone(),
+                complete: !expansion.opaque() && !summary.keys_missing,
+            });
+        }
+        out
+    }
+
+    /// The name of a `**` expression as written, values elided (`PARAMS`,
+    /// `self.options`, `config[...]`), or `None` when it has none (a dict
+    /// written inline, a conditional) or a part of it is credential-named.
+    fn spread_name(&self, expr: Node<'t>) -> Option<String> {
+        if !matches!(
+            expr.kind(),
+            "identifier" | "attribute" | "subscript" | "call"
+        ) {
+            return None;
+        }
+        let name = self.render(expr);
+        let secret = name
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(is_secret_key);
+        (!secret && !name.contains("<expr>")).then_some(name)
+    }
+
     /// Looks `key` up in a dict literal: the last matching entry wins, as in
     /// Python, unless an unreadable entry after it could override it.
     fn dict_lookup(&mut self, dict: Node<'t>, key: &str) -> Lookup<'t> {
@@ -8956,6 +9037,8 @@ impl<'t> Ctx<'t> {
             last_unknown: None,
             expansion: Vec::new(),
             opaque: false,
+            keys: Vec::new(),
+            keys_missing: false,
         };
         let entries = dict_entries(dict, |n| self.literal(n).ok(), |n| self.text(n));
         for (index, entry) in entries.into_iter().enumerate() {
@@ -8976,6 +9059,17 @@ impl<'t> Ctx<'t> {
                     summary.expansion.push((key.clone(), index, value));
                 } else {
                     summary.opaque = true;
+                }
+            }
+            // Every key is an argument the expansion sends, whatever it is
+            // called: `max_tokens` must be checked like the call's own
+            // `max_tokens=`. A key that is not recorded leaves the dict
+            // unread in full, so the call never reads as fully checked.
+            if !summary.last.contains_key(&key) {
+                if !is_argument_name(&key) || summary.keys.len() >= MAX_SPREAD_KEYS {
+                    summary.keys_missing = true;
+                } else {
+                    summary.keys.push(key.clone());
                 }
             }
             summary.last.insert(key, (index, value));
