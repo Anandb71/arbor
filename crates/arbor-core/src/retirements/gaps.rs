@@ -125,7 +125,11 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
         "the call passes more model values than the scan reads, so not all are listed",
     ),
     // The client the call goes through.
-    (GapKind::AmbiguousClient, "multiple_assignments", "the client is assigned more than one way"),
+    (
+        GapKind::AmbiguousClient,
+        "multiple_assignments",
+        "the client, or the class that builds it, is assigned more than one way",
+    ),
     (
         GapKind::AmbiguousClient,
         "in_file_callers",

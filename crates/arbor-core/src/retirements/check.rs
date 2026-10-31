@@ -33,9 +33,10 @@
 //! (`genai.GenerativeModel(...)`, a LangChain chat model) or set a model in
 //! a request parameter object (a tool config) are checked. A LangChain chat
 //! model takes LangChain's arguments, so only the rules about its model
-//! apply there, and the finding says to check its parameters by hand. Response and type objects built in
-//! code (`ChatCompletion(...)`, `Message(...)`, `.model_validate(...)`) send
-//! nothing; they are counted in [`Summary::response_objects`] and skipped.
+//! apply there, and the finding says to check its parameters by hand.
+//! Response and type objects built in code (`ChatCompletion(...)`,
+//! `Message(...)`, `.model_validate(...)`) send nothing; they are counted
+//! in [`Summary::response_objects`] and skipped.
 
 use super::base_url::{base_url_of, BaseUrl};
 use super::gaps;
@@ -525,7 +526,8 @@ pub struct Summary {
     pub routed_calls: usize,
     /// Requests whose model could not be read.
     pub unreadable_calls: usize,
-    /// Requests that pass no model, so the SDK's or server's default applies.
+    /// Requests and LangChain chat models given no model, so the SDK's, the
+    /// server's or LangChain's default applies.
     pub no_model_calls: usize,
     /// SDK response or type objects built in code with a model value
     /// (`ChatCompletion(...)`, `.model_validate(...)`): no request, skipped.
@@ -3527,6 +3529,10 @@ llm = ChatOpenAI(model="gpt-4o", max_tokens=256, temperature=0)
 claude = ChatAnthropic(model="claude-3-5-sonnet-20241022", temperature=0.2)
 old = ChatOpenAI(model_name="gpt-3.5-turbo")
 plain = client.chat.completions.create(model="gpt-4o", messages=[], max_tokens=256, temperature=0)
+through = llm.root_client.chat.completions.create(model="gpt-4o", messages=[], max_tokens=256, temperature=0)
+held = claude._client.messages.create(model="claude-3-5-sonnet-20241022", max_tokens=8, messages=[])
+resource = llm.client.create(model="gpt-4o", messages=[], max_tokens=256, temperature=0)
+odd = llm._client.create(model="gpt-4o", messages=[], max_tokens=256, temperature=0)
 "#;
         let report = check_source(source, &options("2026-10-27"));
         let at = |needle: &str| -> Finding {
@@ -3573,14 +3579,35 @@ plain = client.chat.completions.create(model="gpt-4o", messages=[], max_tokens=2
         assert_eq!(old.status, State::Retired);
         assert!(old.fails);
         assert_eq!(report.exit_code, 1);
-        // The same model at an SDK request keeps its argument rules.
-        let plain = at("plain = ");
-        assert!(change(&plain, "max_tokens").is_some(), "{plain:#?}");
-        assert_eq!(plain.decisions.len(), 1);
-        assert!(plain
+        // The same model at an SDK request keeps its argument rules, and so
+        // does a request through the SDK client a chat model holds, the
+        // `chat.completions` resource in `client` included.
+        for needle in ["plain = ", "through = ", "resource = "] {
+            let plain = at(needle);
+            assert_eq!(plain.call_kind, CallKind::Request, "{needle}");
+            assert!(change(&plain, "max_tokens").is_some(), "{plain:#?}");
+            assert_eq!(plain.decisions.len(), 1, "{needle}");
+            assert!(plain
+                .review
+                .iter()
+                .all(|r| !r.message.contains("LangChain")));
+        }
+        let through = at("held = ");
+        assert_eq!(through.call_kind, CallKind::Request);
+        assert_eq!(through.routing_class, RoutingClass::Direct);
+        assert!(through
             .review
             .iter()
             .all(|r| !r.message.contains("LangChain")));
+        // A field the class holds no SDK client in is a call on the chat
+        // model: its parameters are checked by hand, not swapped as they are.
+        let odd = at("odd = ");
+        assert!(odd.changes.is_empty(), "{:#?}", odd.changes);
+        assert_eq!(odd.fix, FixKind::Manual);
+        assert!(odd
+            .review
+            .iter()
+            .any(|r| r.message.contains("goes through LangChain")));
 
         // A model the file may rewrite after the chat model is built is
         // listed once, as confirm-first, under the name the call passes.
@@ -3596,6 +3623,48 @@ args.model = pick()
             Some("dynamic_feature")
         );
         assert!(report.unreadable.is_empty(), "{:#?}", report.unreadable);
+
+        // `model_kwargs` set to a dict with no `model` (JSON mode) keeps the
+        // model, and a write of `model` elsewhere (an argparse namespace)
+        // keeps the one in `extra_body`, which is sent over it: a retired
+        // one still fails.
+        for source in [
+            "from langchain_openai import ChatOpenAI
+llm = ChatOpenAI(model_name=\"gpt-3.5-turbo\")
+llm.model_kwargs = {\"response_format\": {\"type\": \"json_object\"}}
+",
+            "import argparse
+from langchain_openai import ChatOpenAI
+args = argparse.ArgumentParser().parse_args()
+args.model = args.model or \"default\"
+llm = ChatOpenAI(base_url=\"https://api.openai.com/v1\", extra_body={\"model\": \"gpt-3.5-turbo\"})
+",
+        ] {
+            let report = check_source(source, &options("2026-10-27"));
+            assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
+            assert_eq!(report.findings[0].confidence, Confidence::Confirmed);
+            assert!(report.findings[0].fails);
+            assert_eq!(report.exit_code, 1);
+        }
+
+        // A chat model whose class is chosen at run time is listed, as a
+        // call whose route is not confirmed.
+        let source = "import os
+if os.getenv(\"USE_AZURE\"):
+    from langchain_openai import AzureChatOpenAI as Chat
+else:
+    from langchain_openai import ChatOpenAI as Chat
+llm = Chat(model=\"gpt-3.5-turbo\")
+";
+        let report = check_source(source, &options("2026-10-27"));
+        assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
+        assert_eq!(report.findings[0].routing_class, RoutingClass::Unknown);
+        assert_eq!(
+            report.findings[0].routing_gap.as_deref(),
+            Some("multiple_assignments")
+        );
+        assert!(!report.findings[0].fails);
+        assert_eq!(report.exit_code, 0);
     }
 
     #[test]
