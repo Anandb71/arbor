@@ -30,7 +30,7 @@ inputs:
     required: false
     default: "${{ github.token }}"
   mode:
-    description: "'command' (default) runs the command input. Any other value fails the step before anything is installed. 'retirements' finds direct SDK calls and LangChain chat models that use AI models their provider has retired or is retiring, writes a job summary and annotates the affected lines (up to GitHub's 10 warnings per step; the summary lists every call found). It runs on the runner; no code is sent anywhere."
+    description: "'command' (default) runs the command input. Any other value fails the step before anything is installed. 'retirements' finds direct SDK calls and LangChain's OpenAI and Anthropic chat models that use AI models their provider has retired or is retiring, writes a job summary and annotates the affected lines (up to GitHub's 10 warnings per step; the summary lists every call found). It runs on the runner; no code is sent anywhere."
     required: false
     default: command
   retirements-path:
