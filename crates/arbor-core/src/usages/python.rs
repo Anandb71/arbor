@@ -235,6 +235,29 @@ const MODEL_BEARING: &[&str] = &[
 /// (`client.chat.completions.with_raw_response.create`).
 const RESPONSE_WRAPPERS: &[&str] = &["with_raw_response", "with_streaming_response"];
 
+/// The API resources of the v0 OpenAI SDK (`openai<1.0`). Their methods take
+/// `api_base` and `api_type` per call, which route that call whatever the
+/// module's settings are (`openai.ChatCompletion.create(api_base=...)`).
+const LEGACY_RESOURCES: &[&str] = &[
+    "Audio",
+    "ChatCompletion",
+    "Completion",
+    "Customer",
+    "Deployment",
+    "Edit",
+    "Embedding",
+    "Engine",
+    "File",
+    "FineTune",
+    "FineTuningJob",
+    "Image",
+    "Model",
+    "Moderation",
+];
+
+/// The arguments with which a v0 resource method routes its own call.
+const CALL_ROUTING_KEYS: &[&str] = &["api_base", "api_type"];
+
 /// Legacy `google.generativeai` functions whose first positional argument is
 /// the model (`genai.embed_content("models/embedding-001", text)`).
 const LEGACY_POSITIONAL_MODEL: &[&str] = &[
@@ -588,6 +611,22 @@ struct Client {
     ambiguous: bool,
     /// Known only from a type annotation, not from a construction.
     typed: bool,
+    /// Typed by a declaration, which gives the binding a type but no client:
+    /// bare (`client: OpenAI` in a class body) or with a placeholder
+    /// (`client: Optional[OpenAI] = None`). Only [`combine`] reads it, and
+    /// what it returns has it only for a placeholder declaration read on
+    /// its own (see `placeholder`).
+    declared: bool,
+    /// A declaration with a placeholder value (`client: Optional[OpenAI] =
+    /// None`): read on its own it still yields to a construction next to
+    /// it (`self.client or OpenAI()`), as `None` does unannotated.
+    placeholder: bool,
+    /// The route typed clients agree on when they are combined with values
+    /// that are not clients (`client or make()`, with `client:
+    /// AzureOpenAI`). Such a value is ambiguous, but a declaration or an
+    /// annotation of the binding it is assigned to types the other values
+    /// too, and then this route holds.
+    typed_route: Option<Routing>,
     /// Why the routing may not hold at a call, reported there as an
     /// `ambiguous_client` gap.
     caveat: Option<ClientCaveat>,
@@ -633,6 +672,20 @@ enum ClientCaveat {
     /// setup block (in a function, a branch, after a `def`...), so it may
     /// not hold when a call runs (see [`Ctx::module_openai_routing`]).
     ModuleSetup(Feature),
+    /// The module-level API is routed by a setting this version does not
+    /// decide: `openai.api_type` set to a value that is not a string
+    /// literal, or an `openai.bedrock_*` setting.
+    ModuleRouting(Feature),
+    /// A v0 resource call (`openai.ChatCompletion.create`) passes its own
+    /// `api_base` or `api_type`, or a `**` expansion that may hold one
+    /// (`what`), which routes it whatever the module's settings are.
+    CallRouting { what: &'static str },
+    /// A client known only from a type annotation that does not decide its
+    /// route: one that names a direct class (`def ask(client: OpenAI)`; also
+    /// `Anthropic`, `genai.Client`), whose `base_url` or other endpoint is
+    /// not seen, or classes that route differently, in one annotation
+    /// (`AzureOpenAI | OpenAI`) or across a binding's typed values.
+    Annotation,
 }
 
 /// A Python feature that can change what a name, attribute, dict or the
@@ -2012,7 +2065,19 @@ impl<'t> Ctx<'t> {
                     }
                     "named_expression" => {
                         if let Some(name) = node.child_by_field_name("name") {
-                            let value = node.child_by_field_name("value");
+                            // tree-sitter-python reads `x := a if c else b`
+                            // as `(x := a) if c else b`; Python binds the
+                            // whole conditional, whose first branch is then
+                            // this walrus (read as its value).
+                            let value = match frame.parent {
+                                Some(parent)
+                                    if parent.kind() == "conditional_expression"
+                                        && parent.named_child(0) == Some(node) =>
+                                {
+                                    Some(parent)
+                                }
+                                _ => node.child_by_field_name("value"),
+                            };
                             // A walrus in a comprehension binds in the
                             // enclosing function or module (PEP 572), and
                             // one in a default or annotation of a `def` or
@@ -4834,6 +4899,11 @@ impl<'t> Ctx<'t> {
                 Some(inner) => self.eval(inner, scope, depth + 1),
                 None => Val::untracked(Origin::Other),
             },
+            // `(client := OpenAI())` is its value.
+            "named_expression" => match node.child_by_field_name("value") {
+                Some(value) => self.eval(value, scope, depth + 1),
+                None => Val::untracked(Origin::Other),
+            },
             "assignment" => match node.child_by_field_name("right") {
                 Some(right) => self.eval(right, scope, depth + 1),
                 None => Val::untracked(Origin::Other),
@@ -5153,6 +5223,21 @@ impl<'t> Ctx<'t> {
     fn param_value(&mut self, name: &str, param: Param<'t>, scope: usize) -> Val {
         if let Some(annotation) = param.annotation {
             if let Some(val) = self.typed(annotation, scope) {
+                // The clients every in-file caller of a private function
+                // passes say more than its annotation, as for a parameter
+                // with none.
+                if self.is_private(scope) {
+                    let parent = self.scopes[scope].parent.unwrap_or(0);
+                    let default_client = param
+                        .default
+                        .map(|default| self.eval(default, parent, 0))
+                        .filter(|val| matches!(val, Val::Client { .. }));
+                    if let Some(passed @ Val::Client { .. }) =
+                        self.param_from_callers(scope, name, default_client)
+                    {
+                        return passed;
+                    }
+                }
                 return val;
             }
         }
@@ -5500,11 +5585,40 @@ impl<'t> Ctx<'t> {
             return Val::untracked(Origin::Other);
         }
         let value = assign.value.map(|v| self.eval(v, assign.scope, 0));
+        // `self.client: AzureOpenAI = client or make()`: the annotation
+        // types the value that is not a client, as a declaration would.
+        if let (Some(annotation), Some(Val::Client { client, .. })) = (assign.annotation, &value) {
+            if client.typed_route.is_some() {
+                if let Some(Val::Client {
+                    client: mut declared,
+                    path,
+                }) = self.typed(annotation, assign.scope)
+                {
+                    declared.declared = true;
+                    let typed = value.clone().unwrap_or(Val::untracked(Origin::Other));
+                    return combine(vec![
+                        Val::Client {
+                            client: declared,
+                            path,
+                        },
+                        typed,
+                    ]);
+                }
+            }
+        }
         if let Some(val @ Val::Client { .. }) = &value {
             return val.clone();
         }
         if let Some(annotation) = assign.annotation {
-            if let Some(val) = self.typed(annotation, assign.scope) {
+            if let Some(mut val) = self.typed(annotation, assign.scope) {
+                // `client: Optional[OpenAI] = None` declares the binding as
+                // much as a bare `client: OpenAI` does: the placeholder is
+                // not a client, as it is not one unannotated.
+                let declared = matches!(value, None | Some(Val::Untracked(Origin::Placeholder)));
+                if let (true, Val::Client { client, .. }) = (declared, &mut val) {
+                    client.declared = true;
+                    client.placeholder = value.is_some();
+                }
                 return val;
             }
         }
@@ -5512,26 +5626,20 @@ impl<'t> Ctx<'t> {
     }
 
     /// A client typed by an annotation (`client: OpenAI`,
-    /// `Optional[AzureOpenAI]`).
+    /// `Optional[AzureOpenAI]`, `AzureOpenAI | OpenAI`).
     fn typed(&mut self, annotation: Node<'t>, scope: usize) -> Option<Val> {
+        // Every client class the annotation names, in order: a union may
+        // name several. There are only so many tracked classes.
+        let mut classes: Vec<ClientClass> = Vec::new();
         // Each entry: a node and whether its parent is an attribute.
         let mut stack = vec![(annotation, false)];
         while let Some((node, in_attribute)) = stack.pop() {
             let top_chain = matches!(node.kind(), "identifier" | "attribute") && !in_attribute;
             if top_chain {
                 if let Val::Class(class) = self.eval(node, scope, 0) {
-                    return Some(Val::Client {
-                        client: Client {
-                            pkg: class.pkg,
-                            routing: class.typed_routing(),
-                            line: None,
-                            site: None,
-                            ambiguous: false,
-                            typed: true,
-                            caveat: None,
-                        },
-                        path: Vec::new(),
-                    });
+                    if !classes.contains(&class) {
+                        classes.push(class);
+                    }
                 }
                 continue;
             }
@@ -5540,7 +5648,32 @@ impl<'t> Ctx<'t> {
                 stack.push((child, is_attribute));
             }
         }
-        None
+        let first = *classes.first()?;
+        // A direct class's route depends on how the client was built; a
+        // platform class routes the same however it was. A union decides
+        // the route only when every class in it does, and all the same way.
+        let routing = first.typed_routing();
+        let decided = classes.iter().all(|class| {
+            !matches!(
+                class.family,
+                Family::OpenaiDirect | Family::AnthropicDirect | Family::Genai
+            ) && class.typed_routing() == routing
+        });
+        Some(Val::Client {
+            client: Client {
+                pkg: first.pkg,
+                routing: if decided { routing } else { Routing::Unknown },
+                line: None,
+                site: None,
+                ambiguous: false,
+                typed: true,
+                declared: false,
+                placeholder: false,
+                typed_route: None,
+                caveat: (!decided).then_some(ClientCaveat::Annotation),
+            },
+            path: Vec::new(),
+        })
     }
 
     /// A class's own assignments of attribute `attr`: class-body names and
@@ -5877,6 +6010,9 @@ impl<'t> Ctx<'t> {
                     site: None,
                     ambiguous: true,
                     typed: false,
+                    declared: false,
+                    placeholder: false,
+                    typed_route: None,
                     caveat: None,
                 },
                 path: Vec::new(),
@@ -6030,6 +6166,9 @@ impl<'t> Ctx<'t> {
                 site,
                 ambiguous: false,
                 typed: false,
+                declared: false,
+                placeholder: false,
+                typed_route: None,
                 caveat,
             };
         }
@@ -6121,6 +6260,9 @@ impl<'t> Ctx<'t> {
             site,
             ambiguous: false,
             typed: false,
+            declared: false,
+            placeholder: false,
+            typed_route: None,
             caveat,
         }
     }
@@ -6512,10 +6654,21 @@ impl<'t> Ctx<'t> {
                     Some(kind) => match kind.to_ascii_lowercase().as_str() {
                         "azure" | "azure_ad" | "azuread" => azure = true,
                         "openai" | "open_ai" => {}
-                        // `amazon-bedrock` and anything newer.
+                        // `amazon-bedrock` and anything newer: a platform
+                        // this version does not name, like a hosted-platform
+                        // client.
                         _ => unknown = true,
                     },
-                    None => unknown = true,
+                    // Read from the environment, a name or anything else:
+                    // any route at all.
+                    None => {
+                        unknown = true;
+                        self.openai_caveat
+                            .get_or_insert(ClientCaveat::ModuleRouting(Self::feature(
+                                "`openai.api_type` set to a value that is not a string literal",
+                                assign.object,
+                            )));
+                    }
                 },
                 "azure_endpoint" | "azure_ad_token" | "azure_ad_token_provider" => azure = true,
                 "api_base" | "base_url" => {
@@ -6548,7 +6701,14 @@ impl<'t> Ctx<'t> {
                         }
                     }
                 }
-                _ if attr.starts_with("bedrock_") => unknown = true,
+                _ if attr.starts_with("bedrock_") => {
+                    unknown = true;
+                    self.openai_caveat
+                        .get_or_insert(ClientCaveat::ModuleRouting(Self::feature(
+                        "an `openai.bedrock_*` setting, which may send requests to Amazon Bedrock",
+                        assign.object,
+                    )));
+                }
                 _ => {}
             }
         }
@@ -6786,17 +6946,26 @@ impl<'t> Ctx<'t> {
     }
 
     /// Routing of a module-level API call (`openai.ChatCompletion.create`)
-    /// and why it may not hold: the file's configuration (see
-    /// [`Self::module_openai_routing`]), a configuration written after a
-    /// call that runs at import, or (with no configuration in the file) an
+    /// and why it may not hold: a v0 resource call's own `api_base` or
+    /// `api_type` (see [`Self::call_routing`]), the file's configuration
+    /// (see [`Self::module_openai_routing`]), a configuration written after
+    /// a call that runs at import, or (with no configuration in the file) an
     /// `engine`/`deployment_id` argument, which another module's Azure
-    /// configuration would serve.
+    /// configuration would serve. `path` is the member path below the
+    /// package.
     fn module_target(
         &mut self,
         pkg: Pkg,
+        path: &[String],
         call: Node<'t>,
         scope: usize,
     ) -> (Routing, Option<ClientCaveat>) {
+        // The call's own routing arguments decide over the module's.
+        if pkg == Pkg::Openai && is_legacy_resource_call(path) {
+            if let Some(what) = self.call_routing(call, scope) {
+                return (Routing::Unknown, Some(ClientCaveat::CallRouting { what }));
+            }
+        }
         let mut routing = self.module_routing(pkg);
         let mut caveat = self.module_caveat(pkg);
         if caveat.is_none() {
@@ -6853,6 +7022,35 @@ impl<'t> Ctx<'t> {
             s = current.parent.unwrap_or(0);
         }
         true
+    }
+
+    /// What a v0 resource call passes that routes it on its own: `api_base`
+    /// or `api_type` by keyword (`None` routes nothing), or a `**` expansion
+    /// that may hold either. Two lookups per expansion, however many keys
+    /// its dict has. A routing argument passed by position
+    /// (`create(key, base)`) is not read: v0 code passes them by name.
+    fn call_routing(&mut self, call: Node<'t>, scope: usize) -> Option<&'static str> {
+        for (key, what) in [("api_base", "`api_base`"), ("api_type", "`api_type`")] {
+            if keyword_value(call, |n| self.text(n), |k| k == key)
+                .is_some_and(|v| v.kind() != "none")
+            {
+                return Some(what);
+            }
+        }
+        let args = self.arguments(call);
+        let expands = args
+            .splats
+            .iter()
+            .any(|splat| match self.expand_splat(*splat, scope) {
+                Some(expansion) => {
+                    expansion.opaque()
+                        || CALL_ROUTING_KEYS
+                            .iter()
+                            .any(|key| expansion.summary.last.contains_key(*key))
+                }
+                None => true,
+            });
+        expands.then_some("a `**` expansion that may hold `api_base` or `api_type`")
     }
 
     /// Whether `call` passes `engine` or `deployment_id`, by keyword or
@@ -6914,7 +7112,7 @@ impl<'t> Ctx<'t> {
                 }
             }
             Val::Module { pkg, path } if !path.is_empty() => {
-                let (routing, caveat) = self.module_target(pkg, call, scope);
+                let (routing, caveat) = self.module_target(pkg, &path, call, scope);
                 let target = CallTarget {
                     pkg,
                     member: path.join("."),
@@ -6927,7 +7125,7 @@ impl<'t> Ctx<'t> {
                 self.record_call(call, function, scope, target);
             }
             Val::Symbol { pkg, path } => {
-                let (routing, caveat) = self.module_target(pkg, call, scope);
+                let (routing, caveat) = self.module_target(pkg, &path, call, scope);
                 let target = CallTarget {
                     pkg,
                     member: path.join("."),
@@ -7256,6 +7454,25 @@ impl<'t> Ctx<'t> {
                     "module_config",
                     format!(
                         "`{chain}` passes `engine` or `deployment_id`, which Azure deployments take, but this file does not configure the module-level API, so another module may route it to Azure"
+                    ),
+                ),
+                ClientCaveat::ModuleRouting(feature) => (
+                    "module_routing",
+                    format!(
+                        "the module-level API is routed by a setting this version does not decide ({}), so where `{chain}` sends its requests is not known",
+                        feature.describe()
+                    ),
+                ),
+                ClientCaveat::CallRouting { what } => (
+                    "call_routing",
+                    format!(
+                        "`{chain}` passes {what}, which routes this call whatever the module's settings are, so where it sends its requests is not known"
+                    ),
+                ),
+                ClientCaveat::Annotation => (
+                    "annotation",
+                    format!(
+                        "the client behind `{chain}` is known only by its type annotation, which does not decide its route"
                     ),
                 ),
             };
@@ -7979,6 +8196,11 @@ impl<'t> Ctx<'t> {
             },
             "parenthesized_expression" => match expr.named_child(0) {
                 Some(inner) => self.resolve_value(inner, scope, depth + 1),
+                None => Err(Unresolved::new("non_literal", self.render(expr))),
+            },
+            // `(model := "gpt-4o")` is its value.
+            "named_expression" => match expr.child_by_field_name("value") {
+                Some(value) => self.resolve_value(value, scope, depth + 1),
                 None => Err(Unresolved::new("non_literal", self.render(expr))),
             },
             "identifier" => {
@@ -9415,6 +9637,23 @@ fn is_module_routing_attr(attr: &str) -> bool {
     ) || attr.starts_with("bedrock_")
 }
 
+/// Whether `path`, below the `openai` package, is a method of a v0 API
+/// resource (`ChatCompletion.create`, `api_resources.Completion.acreate`):
+/// its first capitalized segment is one of [`LEGACY_RESOURCES`], a member
+/// follows it, and no `types` module comes before it (the v1 SDK's
+/// `openai.types.Model` is a response type).
+fn is_legacy_resource_call(path: &[String]) -> bool {
+    let Some(at) = path
+        .iter()
+        .position(|p| p.starts_with(|c: char| c.is_ascii_uppercase()))
+    else {
+        return false;
+    };
+    at + 1 < path.len()
+        && LEGACY_RESOURCES.contains(&path[at].as_str())
+        && !path[..at].iter().any(|p| p == "types")
+}
+
 fn is_top_statement(frame: &Frame<'_>) -> bool {
     frame
         .parent
@@ -9760,11 +9999,104 @@ fn combine(vals: Vec<Val>) -> Val {
             .next()
             .unwrap_or(Val::untracked(Origin::Unbound));
     }
+    // A declaration types every value of the binding, so a value that was
+    // ambiguous only because typed clients sat next to values that are not
+    // clients (`self.client = client or make()` under `client:
+    // AzureOpenAI`) is a typed client of the route they agree on.
+    let declares = real
+        .iter()
+        .any(|v| matches!(v, Val::Client { client, path } if path.is_empty() && client.declared));
+    let real: Vec<Val> = if declares {
+        real.into_iter()
+            .map(|v| match v {
+                Val::Client { client, path } if path.is_empty() => match client.typed_route {
+                    Some(routing) => Val::Client {
+                        client: Client {
+                            routing,
+                            ambiguous: false,
+                            typed: true,
+                            typed_route: None,
+                            caveat: None,
+                            ..client
+                        },
+                        path,
+                    },
+                    None => Val::Client { client, path },
+                },
+                other => other,
+            })
+            .collect()
+    } else {
+        real
+    };
     if real.len() == 1 {
-        return real
-            .into_iter()
-            .next()
-            .unwrap_or(Val::untracked(Origin::Other));
+        return match real.into_iter().next() {
+            // Read as the binding's value, a bare declaration is a typed
+            // value like any other. One with a placeholder (`client:
+            // Optional[OpenAI] = None`, nothing else assigned) still yields
+            // to a construction it is read next to (`self.client or
+            // OpenAI()`), as `None` does unannotated.
+            Some(Val::Client { mut client, path }) => {
+                client.declared = client.placeholder;
+                Val::Client { client, path }
+            }
+            Some(val) => val,
+            None => Val::untracked(Origin::Other),
+        };
+    }
+
+    // Values that are a member of a client (`azure.chat.completions`,
+    // `client.embeddings.create`): when every value is the same member, its
+    // clients combine as the clients themselves would, and the member is
+    // kept. Members of different names, or a member next to a value that is
+    // not one, are ambiguous; the first value only says which member.
+    if let Some(first_path) = real.iter().find_map(|v| match v {
+        Val::Client { path, .. } if !path.is_empty() => Some(path.clone()),
+        _ => None,
+    }) {
+        let same_member = real
+            .iter()
+            .all(|v| matches!(v, Val::Client { path, .. } if *path == first_path));
+        if same_member {
+            let clients: Vec<Val> = real
+                .into_iter()
+                .map(|v| match v {
+                    Val::Client { client, .. } => Val::Client {
+                        client,
+                        path: Vec::new(),
+                    },
+                    other => other,
+                })
+                .collect();
+            return match combine(clients) {
+                Val::Client { client, .. } => Val::Client {
+                    client,
+                    path: first_path,
+                },
+                other => other,
+            };
+        }
+        let first = real.iter().find_map(|v| match v {
+            Val::Client { client, path } if *path == first_path => Some(client.clone()),
+            _ => None,
+        });
+        if let Some(first) = first {
+            return Val::Client {
+                client: Client {
+                    routing: Routing::Unknown,
+                    line: None,
+                    site: None,
+                    ambiguous: true,
+                    typed: false,
+                    declared: false,
+                    placeholder: false,
+                    typed_route: None,
+                    caveat: None,
+                    ..first
+                },
+                path: first_path,
+            };
+        }
     }
 
     let clients: Vec<&Client> = real
@@ -9774,20 +10106,25 @@ fn combine(vals: Vec<Val>) -> Val {
             _ => None,
         })
         .collect();
-    // A construction says more than an annotation; an annotation alone says
-    // more than an unknown factory next to it (`client: OpenAI` in the class
-    // body, `self.client = make_client()` in `__init__`).
+    // Whether a typed client's class alone decides its route.
+    let decides = |c: &Client| c.caveat.is_none() && !c.ambiguous;
+    // A construction says more than a bare declaration (`client: OpenAI` in
+    // the class body, `self.client = OpenAI()` in `__init__`). A typed value
+    // (a parameter, an annotated assignment from a factory) is one more
+    // value: it agrees with the constructions only when its class decides
+    // their route (`AzureOpenAI` next to `AzureOpenAI(...)`).
     let constructed: Vec<&Client> = clients.iter().copied().filter(|c| !c.typed).collect();
-    if constructed.is_empty() {
-        if let Some(typed) = clients.first() {
-            return Val::Client {
-                client: (*typed).clone(),
-                path: Vec::new(),
-            };
-        }
-    } else {
-        let first = constructed[0].clone();
-        let others = real.len() - clients.len();
+    if let Some(first) = constructed.first() {
+        let first = (*first).clone();
+        let disagree = clients
+            .iter()
+            .filter(|c| {
+                c.typed
+                    && !c.declared
+                    && !(decides(c) && c.pkg == first.pkg && c.routing == first.routing)
+            })
+            .count();
+        let others = real.len() - clients.len() + disagree;
         let same_routing = constructed.iter().all(|c| c.routing == first.routing);
         let same_pkg = constructed.iter().all(|c| c.pkg == first.pkg);
         let same_line = constructed.iter().all(|c| c.line == first.line);
@@ -9806,7 +10143,55 @@ fn combine(vals: Vec<Val>) -> Val {
                 site: if same_site { first.site } else { None },
                 ambiguous,
                 typed: false,
+                declared: false,
+                placeholder: false,
+                typed_route: None,
                 caveat: constructed.iter().find_map(|c| c.caveat.clone()),
+            },
+            path: Vec::new(),
+        };
+    }
+    // Typed clients alone. A declaration types every value of the binding,
+    // so it says more than an unknown factory next to it (`client: OpenAI`
+    // in the class body, `self.client = make_client()` in `__init__`). A
+    // typed value types only itself: next to another value it is
+    // ambiguous, as a construction is.
+    if let Some(first) = clients.first() {
+        let ambiguous = real.len() > clients.len() && !clients.iter().any(|c| c.declared);
+        // As in one annotation (see `Ctx::typed`), the route is decided only
+        // when every typed client decides it, and all the same way.
+        let alike = clients
+            .iter()
+            .all(|c| c.pkg == first.pkg && c.routing == first.routing);
+        let decided = !ambiguous && alike && clients.iter().all(|c| decides(c));
+        // Ambiguous only because of the values that are not clients: a
+        // declaration of the binding this flows into would type them.
+        let typed_route =
+            (ambiguous && alike && clients.iter().all(|c| decides(c))).then_some(first.routing);
+        return Val::Client {
+            client: Client {
+                pkg: first.pkg,
+                routing: if decided {
+                    first.routing
+                } else {
+                    Routing::Unknown
+                },
+                line: None,
+                site: None,
+                ambiguous,
+                typed: !ambiguous,
+                declared: false,
+                placeholder: false,
+                typed_route,
+                // Clients that route alike keep the reason one of them
+                // carries (a field, say); ones that do not, the annotation's.
+                caveat: (!decided && !ambiguous).then(|| {
+                    clients
+                        .iter()
+                        .find_map(|c| c.caveat.clone())
+                        .filter(|_| alike)
+                        .unwrap_or(ClientCaveat::Annotation)
+                }),
             },
             path: Vec::new(),
         };
