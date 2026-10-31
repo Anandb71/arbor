@@ -16,9 +16,9 @@
 //!
 //! Exit codes: 0 when nothing counts as failing, 1 when a confirmed call
 //! uses a model that is already retired (or, with `--fail-within N`, retires
-//! within N days), 2 when the check could not run. Unconfirmed calls count
-//! only with `--count-unconfirmed`, routed ones only with
-//! `--include-routed`.
+//! within N days), 2 when the check could not run or `--diff` could not
+//! write its patch. Unconfirmed calls count only with `--count-unconfirmed`,
+//! routed ones only with `--include-routed`.
 
 use arbor_core::languages::get_parser;
 use arbor_core::retirements::{apply_edits, plan_swaps, FixKind, SkipReason, SwapPlan};
@@ -28,11 +28,12 @@ use arbor_core::retirements::{
     MatchKind, OptionStatus, RetirementReport, RoutingClass, ScanInput, State, Summary,
     UncheckedArgs, FINE_TUNING, REPORT_VERSION,
 };
+use arbor_core::usages::FileUsages;
 use arbor_core::usages::{is_unsafe_char, ValueOrigin};
 use arbor_core::{detect_language, parse_source_usages};
 use arbor_watcher::usages::{scan_usages, UsageScanOptions};
 use colored::Colorize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Component, Path};
 
@@ -84,7 +85,9 @@ pub fn run(args: &Args) -> i32 {
                     Err(error) => return fail(args, &format!("cannot write JSON: {error}")),
                 }
             } else if args.diff {
-                print_diff(&report, args.quiet);
+                if let Err(message) = print_diff(&report, args.quiet) {
+                    return fail(args, &message);
+                }
             } else if args.markdown {
                 print!("{}", markdown(&report));
             } else if args.annotations {
@@ -105,7 +108,14 @@ fn fail(args: &Args, message: &str) -> i32 {
     if args.json {
         print_json_error(message);
     }
-    eprintln!("{} {}", "error:".red().bold(), clean(message));
+    // Not eprintln!, which panics (exit 101) when stderr cannot be written
+    // (a pipe whose reader has gone): the exit code stays 2.
+    let _ = writeln!(
+        std::io::stderr(),
+        "{} {}",
+        "error:".red().bold(),
+        clean(message)
+    );
     2
 }
 
@@ -1276,7 +1286,10 @@ enum LeftOut {
     Manual,
     NoChange,
     Skip(SkipReason),
-    /// The file could not be read again, parsed, or named in a patch.
+    /// The name the patch would give the file, relative to the current
+    /// directory, holds a control or bidirectional character.
+    UnsafeName,
+    /// The file could not be read or parsed again.
     Unreadable,
     /// The file is outside the directory Arbor runs in, so a patch applied
     /// there cannot name it.
@@ -1305,6 +1318,14 @@ impl LeftOut {
                 SkipReason::CallNeedsReview => (
                     "is at a call where another model value needs a choice or a manual check",
                     "are at calls where another model value needs a choice or a manual check",
+                ),
+                SkipReason::UnlistedMethod => (
+                    "uses a method --diff does not know to send the model (such as chat.completions.list, which filters by it)",
+                    "use a method --diff does not know to send the model (such as chat.completions.list, which filters by it)",
+                ),
+                SkipReason::SpreadArguments => (
+                    "takes arguments from a ** expansion (which --diff does not edit)",
+                    "take arguments from a ** expansion (which --diff does not edit)",
                 ),
                 SkipReason::ValueNotAtCall => (
                     "takes its model from a constant or a default (other code may read it too)",
@@ -1338,9 +1359,13 @@ impl LeftOut {
                 SkipReason::Overlap => ("overlaps another swap", "overlap another swap"),
                 SkipReason::NotPlainSwap => ("needs a manual check", "need a manual check"),
             },
+            LeftOut::UnsafeName => (
+                "is in a file whose name in the patch would have a control or bidirectional character",
+                "are in files whose names in the patch would have a control or bidirectional character",
+            ),
             LeftOut::Unreadable => (
-                "is in a file Arbor could not read again",
-                "are in files Arbor could not read again",
+                "is in a file Arbor could not read or parse again",
+                "are in files Arbor could not read or parse again",
             ),
             LeftOut::OutsideDirectory => (
                 "is in a file outside the current directory (run Arbor from the repository root)",
@@ -1351,87 +1376,258 @@ impl LeftOut {
     }
 }
 
+/// What [`write_diff`] swapped and left out.
+#[derive(Debug, Default)]
+struct DiffCounts {
+    swapped: usize,
+    swapped_files: usize,
+    left_out: BTreeMap<LeftOut, usize>,
+    /// Each file, as the patch names it, with the lines (1-based) it prints
+    /// that hold a control or bidirectional character.
+    hidden: Vec<(String, Vec<usize>)>,
+}
+
+impl DiffCounts {
+    fn leave_out(&mut self, why: LeftOut, n: usize) {
+        *self.left_out.entry(why).or_default() += n;
+    }
+}
+
 /// Prints the plain swaps as a unified diff on stdout, read from the files
 /// as they are now and named relative to the current directory, and on
 /// stderr how many calls it swaps and why it leaves the others out. Writes
-/// no file.
-fn print_diff(report: &RetirementReport, quiet: bool) {
-    let findings: Vec<Finding> = report
-        .findings
-        .iter()
-        .chain(&report.routed)
-        .cloned()
-        .collect();
-    let files: BTreeSet<&str> = findings.iter().map(|f| f.file.as_str()).collect();
+/// no file. Fails when stdout cannot be written, so a cut-off patch is not
+/// reported as made.
+fn print_diff(report: &RetirementReport, quiet: bool) -> Result<(), String> {
     let cwd = std::env::current_dir().and_then(|d| d.canonicalize()).ok();
-    let mut swapped = 0;
-    let mut swapped_files = 0;
-    let mut left_out: BTreeMap<LeftOut, usize> = BTreeMap::new();
-    let mut stdout = std::io::stdout().lock();
-    for file in files {
-        let planned = file_plan(file, &findings).and_then(|(source, plan)| {
-            let fixed = apply_edits(&source, &plan.edits).ok()?;
-            Some((source, fixed, plan))
-        });
-        let Some((source, fixed, plan)) = planned else {
-            let count = findings.iter().filter(|f| f.file == file).count();
-            *left_out.entry(LeftOut::Unreadable).or_default() += count;
+    let counts = patch_out()
+        .and_then(|mut out| write_diff(report, cwd.as_deref(), &mut out))
+        .map_err(|error| format!("cannot write the diff: {error}"))?;
+    // Not eprintln!, which panics (exit 101) when stderr cannot be written
+    // (a pipe whose reader has gone): the patch is written by now, and the
+    // exit code stays the check's.
+    let mut stderr = std::io::stderr().lock();
+    // Even with --quiet: the patch prints these lines as they are.
+    for (file, lines) in &counts.hidden {
+        let _ = writeln!(stderr, "{}", hidden_warning(file, lines));
+    }
+    if !quiet {
+        for line in diff_summary(report, &counts) {
+            let _ = writeln!(stderr, "{line}");
+        }
+    }
+    Ok(())
+}
+
+/// Where the patch goes: stdout, as a stream that reports a failed write.
+/// Rust's stdout takes a write to a closed or invalid handle as made (after
+/// `>&-` in a Windows shell, say), so outside a terminal the patch goes
+/// through a copy of the handle, whose writes fail as they should.
+fn patch_out() -> std::io::Result<Box<dyn Write>> {
+    let stdout = std::io::stdout();
+    if std::io::IsTerminal::is_terminal(&stdout) {
+        return Ok(Box::new(stdout.lock()));
+    }
+    let copy = std::fs::File::from(stdout_copy(&stdout)?);
+    Ok(Box::new(std::io::BufWriter::new(copy)))
+}
+
+#[cfg(unix)]
+fn stdout_copy(stdout: &std::io::Stdout) -> std::io::Result<std::os::fd::OwnedFd> {
+    std::os::fd::AsFd::as_fd(stdout).try_clone_to_owned()
+}
+
+#[cfg(windows)]
+fn stdout_copy(stdout: &std::io::Stdout) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    std::os::windows::io::AsHandle::as_handle(stdout).try_clone_to_owned()
+}
+
+/// Writes the patch to `out` and counts what it swaps and leaves out.
+/// `cwd` is the canonical directory the patch is applied in. A file is read
+/// and parsed again only when one of its findings may be swapped.
+fn write_diff(
+    report: &RetirementReport,
+    cwd: Option<&Path>,
+    out: &mut impl Write,
+) -> std::io::Result<DiffCounts> {
+    let mut by_file: BTreeMap<&str, Vec<Finding>> = BTreeMap::new();
+    for finding in report.findings.iter().chain(&report.routed) {
+        by_file
+            .entry(finding.file.as_str())
+            .or_default()
+            .push(finding.clone());
+    }
+    let mut counts = DiffCounts::default();
+    for (file, findings) in by_file {
+        // The plan with nothing read: a finding it skips as a source
+        // mismatch is one only the file as it reads now can settle.
+        let unread = plan_swaps("", &FileUsages::new(file, "python"), &findings);
+        let needs_source = unread
+            .skipped
+            .iter()
+            .any(|s| s.reason == SkipReason::SourceMismatch);
+        if !needs_source {
+            for s in &unread.skipped {
+                counts.leave_out(LeftOut::of(s.fix, s.reason), 1);
+            }
+            continue;
+        }
+        let Some((source, plan)) = file_plan(file, &findings) else {
+            // The other findings keep a reason that needs no source.
+            for s in &unread.skipped {
+                match s.reason {
+                    SkipReason::SourceMismatch => counts.leave_out(LeftOut::Unreadable, 1),
+                    reason => counts.leave_out(LeftOut::of(s.fix, reason), 1),
+                }
+            }
             continue;
         };
-        for skipped in &plan.skipped {
-            *left_out
-                .entry(LeftOut::of(skipped.fix, skipped.reason))
-                .or_default() += 1;
+        for s in &plan.skipped {
+            counts.leave_out(LeftOut::of(s.fix, s.reason), 1);
         }
         if plan.swaps.is_empty() {
             continue;
         }
-        match cwd.as_deref().and_then(|cwd| patch_path(cwd, file)) {
-            Some(name) => {
-                swapped += plan.swaps.len();
-                swapped_files += 1;
-                let _ = stdout.write_all(unified_diff(&name, &source, &fixed).as_bytes());
-            }
-            None => {
-                *left_out.entry(LeftOut::OutsideDirectory).or_default() += plan.swaps.len();
-            }
+        let Ok(fixed) = apply_edits(&source, &plan.edits) else {
+            // Not expected: the plan was made from this text.
+            counts.leave_out(LeftOut::Skip(SkipReason::SourceMismatch), plan.swaps.len());
+            continue;
+        };
+        let Some(name) = cwd.and_then(|cwd| patch_path(cwd, file)) else {
+            counts.leave_out(LeftOut::OutsideDirectory, plan.swaps.len());
+            continue;
+        };
+        // The name the patch prints, not the path scanned: that may run
+        // through directories above this one, which the patch never names.
+        if name.chars().any(hidden_char) {
+            counts.leave_out(LeftOut::UnsafeName, plan.swaps.len());
+            continue;
         }
+        out.write_all(unified_diff(&name, &source, &fixed).as_bytes())?;
+        let lines = hidden_lines(&source, &fixed);
+        if !lines.is_empty() {
+            counts.hidden.push((name, lines));
+        }
+        counts.swapped += plan.swaps.len();
+        counts.swapped_files += 1;
     }
-    let _ = stdout.flush();
-    if quiet {
-        return;
-    }
-    if swapped == 0 {
-        eprintln!("No plain model swaps to make.");
+    out.flush()?;
+    Ok(counts)
+}
+
+/// The stderr lines after the patch: how many calls it swaps, how many
+/// findings it leaves out and why, the routed calls it was not given, and
+/// what Arbor did not check or checked only in part, from the report's
+/// summary, so each count is the report's own.
+fn diff_summary(report: &RetirementReport, counts: &DiffCounts) -> Vec<String> {
+    let mut lines = Vec::new();
+    if counts.swapped == 0 {
+        lines.push("No plain model swaps to make.".to_string());
     } else {
-        eprintln!(
+        lines.push(format!(
             "Diff: {} swapped in {} {}.",
-            calls(swapped),
-            swapped_files,
-            verb(swapped_files, "file", "files")
-        );
+            calls(counts.swapped),
+            counts.swapped_files,
+            verb(counts.swapped_files, "file", "files")
+        ));
     }
-    let total: usize = left_out.values().sum();
+    let total: usize = counts.left_out.values().sum();
     if total > 0 {
-        let parts: Vec<String> = left_out
+        let parts: Vec<String> = counts
+            .left_out
             .iter()
             .map(|(why, n)| format!("{n} {}", why.phrase(*n)))
             .collect();
         let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
-        eprintln!(
+        lines.push(format!(
             "Left out {}: {}. Run arbor retirements without --diff to see each one.",
             calls(total),
             join_and(&parts)
-        );
+        ));
     }
+    let s = &report.summary;
+    // With --include-routed they are findings, counted above.
+    if s.routed_calls > 0 && !report.options.include_routed {
+        let lead = if total > 0 {
+            "Not in the diff either"
+        } else {
+            "Not in the diff"
+        };
+        lines.push(format!(
+            "{lead}: {} routed {} (add --include-routed to count {} by reason).",
+            s.routed_calls,
+            verb(s.routed_calls, "call", "calls"),
+            verb(s.routed_calls, "it", "them")
+        ));
+    }
+    let mut unchecked = Vec::new();
+    // The report counts the two apart; neither is a finding.
+    let unread = s.unreadable_calls + s.unresolved_clients;
+    if unread > 0 {
+        unchecked.push(format!(
+            "{} whose model Arbor could not read",
+            calls(unread)
+        ));
+    }
+    if s.no_model_calls > 0 {
+        unchecked.push(format!(
+            "{} that {} no model",
+            calls(s.no_model_calls),
+            verb(s.no_model_calls, "passes", "pass")
+        ));
+    }
+    if s.hidden_calls > 0 {
+        unchecked.push(format!(
+            "{} in hidden directories (such as .github/)",
+            calls(s.hidden_calls)
+        ));
+    }
+    if s.untracked_methods > 0 {
+        unchecked.push(format!(
+            "calls through {} SDK {} reached with getattr or stored or passed as a value",
+            s.untracked_methods,
+            verb(s.untracked_methods, "method", "methods")
+        ));
+    }
+    if s.not_analyzed > 0 {
+        unchecked.push(format!(
+            "{} {} Arbor did not analyze",
+            s.not_analyzed,
+            verb(s.not_analyzed, "part of a file", "parts of files")
+        ));
+    }
+    if s.skipped_files > 0 {
+        unchecked.push(format!(
+            "{} {} over the size limit or not readable as UTF-8",
+            s.skipped_files,
+            verb(s.skipped_files, "file", "files")
+        ));
+    }
+    if !unchecked.is_empty() {
+        let unchecked: Vec<&str> = unchecked.iter().map(String::as_str).collect();
+        lines.push(format!("Not checked: {}.", join_and(&unchecked)));
+    }
+    if s.syntax_error_files > 0 {
+        lines.push(format!(
+            "Partly checked: {} {} syntax errors, so calls inside a broken region may be missing.",
+            s.syntax_error_files,
+            verb(s.syntax_error_files, "file has", "files have")
+        ));
+    }
+    lines
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`file_plan`] tried to read a file on this thread.
+    static FILES_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The file as it reads now and the plain swaps in it. `None` when it
-/// cannot be read or parsed again, or its name cannot go in a patch.
+/// cannot be read or parsed again.
 fn file_plan(file: &str, findings: &[Finding]) -> Option<(String, SwapPlan)> {
-    if file.chars().any(is_unsafe_char) {
-        return None;
-    }
+    #[cfg(test)]
+    FILES_READ.with(|n| n.set(n.get() + 1));
     let path = Path::new(file);
     let source = std::fs::read_to_string(path).ok()?;
     // As the usage scan does: an extensionless file is a Python script.
@@ -1442,6 +1638,49 @@ fn file_plan(file: &str, findings: &[Finding]) -> Option<(String, SwapPlan)> {
     let usages = parse_source_usages(&source, file, parser.as_ref()).ok()??;
     let plan = plan_swaps(&source, &usages, findings);
     Some((source, plan))
+}
+
+/// A character a terminal does not show as itself: a control character,
+/// or a bidirectional control or mark that reorders the text around it.
+fn hidden_char(c: char) -> bool {
+    is_unsafe_char(c) || matches!(c, '\u{200E}' | '\u{200F}' | '\u{061C}')
+}
+
+/// The lines (1-based) [`unified_diff`] prints from `old` and `new` that
+/// hold a [`hidden_char`] other than a tab or the line end (`\n` or
+/// `\r\n`). A carriage return anywhere else counts: a terminal goes back
+/// to the start of the line there, and Python ends the line.
+fn hidden_lines(old: &str, new: &str) -> Vec<usize> {
+    let a: Vec<&str> = old.split_inclusive('\n').collect();
+    let b: Vec<&str> = new.split_inclusive('\n').collect();
+    let shows = |line: &str| {
+        let text = match line.strip_suffix('\n') {
+            Some(text) => text.strip_suffix('\r').unwrap_or(text),
+            None => line,
+        };
+        text.chars().any(|c| hidden_char(c) && c != '\t')
+    };
+    hunks(&a, &b)
+        .into_iter()
+        .flat_map(|(start, end)| start..end)
+        .filter(|&i| shows(a[i]) || shows(b[i]))
+        .map(|i| i + 1)
+        .collect()
+}
+
+/// `Warning: line 7 of app.py, which the patch prints as it is, holds...`
+fn hidden_warning(file: &str, lines: &[usize]) -> String {
+    let numbers: Vec<String> = lines.iter().map(usize::to_string).collect();
+    let numbers: Vec<&str> = numbers.iter().map(String::as_str).collect();
+    let n = lines.len();
+    format!(
+        "Warning: {} {} of {}, which the patch prints as {}, {} a control or bidirectional character; check the patch in an editor that shows such characters before you apply it.",
+        verb(n, "line", "lines"),
+        join_and(&numbers),
+        clean(file),
+        verb(n, "it is", "they are"),
+        verb(n, "holds", "hold")
+    )
 }
 
 /// `file` as a patch applied in `cwd` (canonical) names it: relative to
@@ -1467,22 +1706,12 @@ fn patch_path(cwd: &Path, file: &str) -> Option<String> {
 fn unified_diff(file: &str, old: &str, new: &str) -> String {
     let a: Vec<&str> = old.split_inclusive('\n').collect();
     let b: Vec<&str> = new.split_inclusive('\n').collect();
-    let changed: Vec<usize> = (0..a.len().min(b.len()))
-        .filter(|&i| a[i] != b[i])
-        .collect();
-    if a.len() != b.len() || changed.is_empty() {
+    let hunks = hunks(&a, &b);
+    if hunks.is_empty() {
         return String::new();
     }
     let mut out = format!("--- a/{file}\n+++ b/{file}\n");
-    let mut i = 0;
-    while i < changed.len() {
-        // Changes whose context touches are one hunk.
-        let mut j = i;
-        while j + 1 < changed.len() && changed[j + 1] - changed[j] <= 2 * DIFF_CONTEXT + 1 {
-            j += 1;
-        }
-        let start = changed[i].saturating_sub(DIFF_CONTEXT);
-        let end = (changed[j] + DIFF_CONTEXT + 1).min(a.len());
+    for (start, end) in hunks {
         let count = end - start;
         out.push_str(&format!(
             "@@ -{},{count} +{},{count} @@\n",
@@ -1506,9 +1735,32 @@ fn unified_diff(file: &str, old: &str, new: &str) -> String {
             }
             line = run_end;
         }
-        i = j + 1;
     }
     out
+}
+
+/// The lines (0-based, end exclusive) a diff of `a` to `b` prints: each
+/// changed line with [`DIFF_CONTEXT`] lines around it. Empty unless both
+/// have the same number of lines and some differ.
+fn hunks(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
+    if a.len() != b.len() {
+        return Vec::new();
+    }
+    let changed: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+    let mut hunks = Vec::new();
+    let mut i = 0;
+    while i < changed.len() {
+        // Changes whose context touches are one hunk.
+        let mut j = i;
+        while j + 1 < changed.len() && changed[j + 1] - changed[j] <= 2 * DIFF_CONTEXT + 1 {
+            j += 1;
+        }
+        let start = changed[i].saturating_sub(DIFF_CONTEXT);
+        let end = (changed[j] + DIFF_CONTEXT + 1).min(a.len());
+        hunks.push((start, end));
+        i = j + 1;
+    }
+    hunks
 }
 
 fn diff_line(out: &mut String, sign: char, line: &str) {
@@ -1787,6 +2039,8 @@ mod tests {
         for reason in [
             SkipReason::NotPlainSwap,
             SkipReason::CallNeedsReview,
+            SkipReason::UnlistedMethod,
+            SkipReason::SpreadArguments,
             SkipReason::ValueNotAtCall,
             SkipReason::AddsArgument,
             SkipReason::ArgumentNotRenamable,
@@ -1811,9 +2065,132 @@ mod tests {
             LeftOut::of(FixKind::Decide, SkipReason::NotPlainSwap).phrase(2),
             "need a choice this repository makes first"
         );
-        assert_ne!(
-            LeftOut::OutsideDirectory.phrase(1),
-            LeftOut::OutsideDirectory.phrase(2)
+        assert_eq!(
+            LeftOut::of(FixKind::Swap, SkipReason::SpreadArguments).phrase(1),
+            "takes arguments from a ** expansion (which --diff does not edit)"
+        );
+        assert!(LeftOut::of(FixKind::Swap, SkipReason::UnlistedMethod)
+            .phrase(2)
+            .starts_with("use a method --diff does not know to send the model ("));
+        for why in [
+            LeftOut::UnsafeName,
+            LeftOut::Unreadable,
+            LeftOut::OutsideDirectory,
+        ] {
+            assert_ne!(why.phrase(1), why.phrase(2));
+        }
+    }
+
+    #[test]
+    fn hidden_characters_are_found_only_in_the_lines_a_diff_prints() {
+        let old = numbered(20)
+            .replace("line 2\n", "line\u{7}2\n")
+            .replace("line 9\n", "line\u{200E}9\n")
+            .replace("line 13\n", "line\t13\r\n");
+        // Lines 7 to 13 are printed: the bell on line 2 is not, and a tab
+        // or a line end is not hidden.
+        let new = old.replace("line 10\n", "line ten\n");
+        assert_eq!(hidden_lines(&old, &new), [9]);
+        let new = old.replace("line 10\n", "line \u{061C}ten\n");
+        assert_eq!(hidden_lines(&old, &new), [9, 10]);
+        assert!(hidden_lines(&old, &old).is_empty());
+        // A carriage return inside a line is hidden: a terminal draws the
+        // rest of the line over its start.
+        let lone = old.replace("line 8\n", "x = 1\r    y = 2\n");
+        let new = lone.replace("line 10\n", "line ten\n");
+        assert_eq!(hidden_lines(&lone, &new), [8, 9]);
+        let warning = hidden_warning("a\u{1b}.py", &[3]);
+        assert!(
+            warning.starts_with(
+                "Warning: line 3 of a\\u{1b}.py, which the patch prints as it is, holds a control or bidirectional character;"
+            ),
+            "{warning}"
+        );
+    }
+
+    /// The report for `files` written to a new directory, which lives as
+    /// long as the report needs it.
+    fn report_for(files: &[(&str, &str)]) -> (tempfile::TempDir, RetirementReport) {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, source) in files {
+            std::fs::write(dir.path().join(name), source).unwrap();
+        }
+        let report = build_report(&Args {
+            path: dir.path().to_str().unwrap().to_string(),
+            today: Some("2026-10-18".to_string()),
+            ..Args::default()
+        })
+        .unwrap();
+        (dir, report)
+    }
+
+    /// One plain swap and one call that needs a decision.
+    const PLAIN_AND_DECIDE: &str = r#"from openai import OpenAI
+
+client = OpenAI()
+
+
+def plain(q):
+    return client.chat.completions.create(model="o3-mini", messages=[])
+
+
+def decide(q):
+    return client.chat.completions.create(model="gpt-4o", messages=[], max_tokens=5)
+"#;
+
+    /// Fails as a full disk or a closed pipe does: on write, or on flush.
+    struct Broken {
+        on_flush: bool,
+    }
+
+    impl Write for Broken {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.on_flush {
+                Ok(buf.len())
+            } else {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test]
+    fn a_patch_that_cannot_be_written_is_an_error() {
+        let (dir, report) = report_for(&[("app.py", PLAIN_AND_DECIDE)]);
+        let cwd = dir.path().canonicalize().unwrap();
+        let mut patch = Vec::new();
+        let counts = write_diff(&report, Some(&cwd), &mut patch).unwrap();
+        assert_eq!(counts.swapped, 1);
+        assert!(String::from_utf8(patch)
+            .unwrap()
+            .starts_with("--- a/app.py\n"));
+        for on_flush in [false, true] {
+            assert!(write_diff(&report, Some(&cwd), &mut Broken { on_flush }).is_err());
+        }
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_again_keeps_its_other_reasons() {
+        let decide_only = PLAIN_AND_DECIDE.replace("\"o3-mini\"", "\"gpt-4o\"");
+        let (dir, report) = report_for(&[("app.py", PLAIN_AND_DECIDE), ("more.py", &decide_only)]);
+        let cwd = dir.path().canonicalize().unwrap();
+        // Both are gone since the scan. Only the plain swap needs its file:
+        // more.py has nothing to swap, so it is not read again (a failed
+        // read of it would change no count, so the reads are counted).
+        std::fs::remove_file(dir.path().join("app.py")).unwrap();
+        std::fs::remove_file(dir.path().join("more.py")).unwrap();
+        let read = FILES_READ.with(std::cell::Cell::get);
+        let mut patch = Vec::new();
+        let counts = write_diff(&report, Some(&cwd), &mut patch).unwrap();
+        assert_eq!(FILES_READ.with(std::cell::Cell::get) - read, 1);
+        assert!(patch.is_empty());
+        assert_eq!(counts.swapped, 0);
+        assert_eq!(
+            counts.left_out.into_iter().collect::<Vec<_>>(),
+            [(LeftOut::Decide, 3), (LeftOut::Unreadable, 1)]
         );
     }
 }

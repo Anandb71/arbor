@@ -919,6 +919,395 @@ fn diff_names_files_relative_to_where_arbor_runs() {
 }
 
 #[test]
+fn diff_gives_spread_arguments_and_unlisted_methods_their_own_reason() {
+    // Since #291 the check makes both plain swaps; --diff edits neither, and
+    // says why instead of "needs a manual check".
+    let dir = project(
+        r#"from openai import OpenAI
+
+client = OpenAI()
+LIMITS = {"max_tokens": 50}
+
+
+def spread(m):
+    return client.chat.completions.create(model="o3-mini", messages=m, **LIMITS)
+
+
+def stored():
+    return client.chat.completions.list(model="o3-mini")
+
+
+def plain(m):
+    return client.chat.completions.create(model="o3-mini", messages=m)
+"#,
+    );
+    let output = arbor(
+        dir.path(),
+        &["retirements", ".", "--diff", "--today", TODAY],
+    );
+    let patch = stdout(&output);
+    let added = patch
+        .lines()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+        .count();
+    assert_eq!(added, 1, "{patch}");
+    assert!(
+        patch.contains(
+            r#"+    return client.chat.completions.create(model="gpt-5.6-sol", messages=m)"#
+        ),
+        "{patch}"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("Left out 2 calls: 1 uses a method --diff does not know to send the model (such as chat.completions.list, which filters by it) and 1 takes arguments from a ** expansion (which --diff does not edit)."),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn diff_counts_routed_calls_and_models_it_could_not_read() {
+    let dir = project(
+        r#"import os
+from openai import AzureOpenAI, OpenAI
+
+client = OpenAI()
+azure = AzureOpenAI(azure_endpoint="https://example.openai.azure.com", api_version="2024-02-01")
+
+
+def plain(m):
+    return client.chat.completions.create(model="o3-mini", messages=m)
+
+
+def via_azure(m):
+    return azure.chat.completions.create(model="o3-mini", messages=m)
+
+
+def unknown(m):
+    return client.chat.completions.create(model=os.environ["MODEL"], messages=m)
+
+
+def helper(api, model, messages):
+    return api.chat.completions.create(model=model, messages=messages)
+"#,
+    );
+    // No finding stands for these calls, so the summary's counts do.
+    let output = arbor(
+        dir.path(),
+        &["retirements", ".", "--diff", "--today", TODAY],
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.ends_with("Diff: 1 call swapped in 1 file.\nNot in the diff: 1 routed call (add --include-routed to count it by reason).\nNot checked: 2 calls whose model Arbor could not read.\n"),
+        "{stderr}"
+    );
+    // With --include-routed the routed call is a finding, counted once.
+    let output = arbor(
+        dir.path(),
+        &[
+            "retirements",
+            ".",
+            "--diff",
+            "--include-routed",
+            "--today",
+            TODAY,
+        ],
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.ends_with("Left out 1 call: 1 needs a manual check. Run arbor retirements without --diff to see each one.\nNot checked: 2 calls whose model Arbor could not read.\n"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn diff_counts_the_calls_and_files_arbor_did_not_check() {
+    // The report's "Not checked" and "Partly checked" counts: a patch
+    // applied without them could look like the whole job.
+    let dir = project(
+        r#"from openai import OpenAI
+
+client = OpenAI()
+
+
+def plain(m):
+    return client.chat.completions.create(model="o3-mini", messages=m)
+
+
+def default(m):
+    return client.chat.completions.create(messages=m)
+
+
+def dispatch(m):
+    return getattr(client.chat.completions, "create")(model="o3-mini", messages=m)
+"#,
+    );
+    let call = r#"client.chat.completions.create(model="o3-mini", messages=[])"#;
+    let header = "from openai import OpenAI\nclient = OpenAI()\n";
+    fs::create_dir_all(dir.path().join(".github/scripts")).unwrap();
+    fs::write(
+        dir.path().join(".github/scripts/b.py"),
+        format!("{header}{call}\n"),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("broken.py"),
+        format!("{header}def f(:\n    pass\n{call}\n"),
+    )
+    .unwrap();
+    let mut latin1 = format!("{header}# caf").into_bytes();
+    latin1.push(0xE9);
+    latin1.extend_from_slice(format!("\n{call}\n").as_bytes());
+    fs::write(dir.path().join("latin1.py"), latin1).unwrap();
+    // Scopes nested past the usage scan's cap are not analyzed.
+    let mut deep = call.to_string();
+    for _ in 0..70 {
+        deep = format!("(lambda: {deep})");
+    }
+    fs::write(
+        dir.path().join("deep.py"),
+        format!("{header}deep = {deep}\n"),
+    )
+    .unwrap();
+
+    let output = arbor(
+        dir.path(),
+        &["retirements", ".", "--diff", "--today", TODAY],
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.ends_with("Diff: 1 call swapped in 1 file.\nLeft out 1 call: 1 is in a file with syntax errors. Run arbor retirements without --diff to see each one.\nNot checked: 1 call that passes no model, 1 call in hidden directories (such as .github/), calls through 1 SDK method reached with getattr or stored or passed as a value, 1 part of a file Arbor did not analyze and 1 file over the size limit or not readable as UTF-8.\nPartly checked: 1 file has syntax errors, so calls inside a broken region may be missing.\n"),
+        "{stderr}"
+    );
+    // The report counts the same.
+    let text = stdout(&arbor(dir.path(), &["retirements", ".", "--today", TODAY]));
+    for line in [
+        "Not checked: 1 call passes no model",
+        "Not checked: 1 part of a file Arbor did not analyze",
+        "Not checked: calls through 1 SDK method reached with getattr",
+        "Partly checked: 1 file has syntax errors",
+        "Not checked: 1 file over the size limit or not readable as UTF-8.",
+        "Not checked: 1 call in hidden directories",
+    ] {
+        assert!(text.contains(line), "missing {line:?} in:\n{text}");
+    }
+}
+
+#[test]
+fn diff_keeps_each_reason_in_a_file_it_cannot_name() {
+    // A bidirectional override in the name: the plain swaps there cannot go
+    // in a patch, and the other calls keep their own reasons.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("odd\u{202E}name.py"), SWAPS).unwrap();
+    let output = arbor(
+        dir.path(),
+        &["retirements", ".", "--diff", "--today", TODAY],
+    );
+    assert_eq!(stdout(&output), "");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("No plain model swaps to make.\nLeft out 5 calls: 1 needs a choice this repository makes first, 1 takes its model from a constant or a default (other code may read it too), 1 needs an argument added and 2 are in files whose names in the patch would have a control or bidirectional character."),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn diff_checks_the_names_it_prints_not_the_directories_above() {
+    // Scanned by its absolute path, app.py's path runs through a directory
+    // whose name holds a bidirectional override. The patch, applied here,
+    // names it app.py, so the swaps go in.
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("odd\u{202E}name").join("repo");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("app.py"), SWAPS).unwrap();
+    let absolute = dir.to_str().unwrap();
+    let output = arbor(&dir, &["retirements", "--diff", absolute, "--today", TODAY]);
+    let patch = stdout(&output);
+    assert!(
+        patch.starts_with("--- a/app.py\n+++ b/app.py\n@@ "),
+        "{patch}"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("Diff: 2 calls swapped in 1 file.\nLeft out 3 calls: 1 needs a choice this repository makes first, 1 takes its model from a constant or a default (other code may read it too) and 1 needs an argument added."),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn diff_counts_calls_that_need_no_change() {
+    // Google routes gemini-3-pro-preview to a newer model, so the call works
+    // as written: the patch leaves it alone and stderr says why.
+    let dir = project(
+        r#"from google import genai
+
+
+def ask(prompt):
+    client = genai.Client()
+    return client.models.generate_content(model="gemini-3-pro-preview", contents=prompt)
+"#,
+    );
+    let output = arbor(
+        dir.path(),
+        &["retirements", ".", "--diff", "--today", TODAY],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "No plain model swaps to make.\nLeft out 1 call: 1 needs no change. Run arbor retirements without --diff to see each one.\n"
+    );
+}
+
+/// Runs arbor with the reader of its stdout, its stderr or both gone
+/// before it writes, as when the other end of a pipe exits early.
+fn arbor_closing(dir: &Path, args: &[&str], close_stdout: bool, close_stderr: bool) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arbor"))
+        .args(args)
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .env_remove("CI")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn arbor");
+    if close_stdout {
+        drop(child.stdout.take());
+    }
+    if close_stderr {
+        drop(child.stderr.take());
+    }
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn diff_fails_when_the_patch_cannot_be_written() {
+    // More than any pipe buffer holds, so the write fails whenever the
+    // reader goes away: before the first byte or once the buffer is full.
+    let pad = "x".repeat(2000);
+    let mut source = String::from("from openai import OpenAI\n\nclient = OpenAI()\n\n\n");
+    for _ in 0..250 {
+        source.push_str(&format!(
+            "client.chat.completions.create(model=\"o3-mini\", messages=[])  # {pad}\n"
+        ));
+    }
+    let dir = project(&source);
+    let args = ["retirements", ".", "--diff", "--today", TODAY];
+    let output = arbor_closing(dir.path(), &args, true, false);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.starts_with("error: cannot write the diff: "),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("swapped"), "{stderr}");
+    // With no reader for stderr either, the error goes nowhere, and the
+    // exit code is still 2.
+    let output = arbor_closing(dir.path(), &args, true, true);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn diff_keeps_its_exit_code_when_stderr_is_closed() {
+    // The patch is written before stderr, so a reader of stderr that has
+    // gone changes neither the patch nor the exit code: the summary, and
+    // the warning --quiet keeps, are not written.
+    let hidden = SWAPS.replace(
+        "max_tokens=100, messages=[])",
+        "max_tokens=100, messages=[])  # \x1b[2J",
+    );
+    for (source, quiet) in [(SWAPS, false), (hidden.as_str(), true)] {
+        let dir = project(source);
+        let mut args = vec!["retirements", ".", "--diff", "--today", TODAY];
+        if quiet {
+            args.push("--quiet");
+        }
+        let expected = arbor(dir.path(), &args);
+        assert!(!expected.stderr.is_empty() && !expected.stdout.is_empty());
+        let output = arbor_closing(dir.path(), &args, false, true);
+        assert_eq!(output.status.code(), expected.status.code(), "{args:?}");
+        assert_eq!(output.stdout, expected.stdout, "{args:?}");
+    }
+}
+
+/// Rust's stdout takes a write to an invalid handle as made, as it is after
+/// `>&-` in a Windows shell. A thread's handle is one that is not a stream.
+/// (On Unix, Rust opens /dev/null for a closed stdout before main.)
+#[cfg(windows)]
+#[test]
+fn diff_fails_when_stdout_is_not_a_stream() {
+    use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
+    let thread = std::thread::spawn(|| {}).into_raw_handle();
+    // SAFETY: the join handle gave up the handle, and nothing else owns it.
+    let not_a_stream = unsafe { OwnedHandle::from_raw_handle(thread) };
+    let dir = project(SWAPS);
+    let output = Command::new(env!("CARGO_BIN_EXE_arbor"))
+        .args(["retirements", ".", "--diff", "--today", TODAY])
+        .current_dir(dir.path())
+        .env("NO_COLOR", "1")
+        .env_remove("CI")
+        .stdout(std::process::Stdio::from(not_a_stream))
+        .output()
+        .expect("spawn arbor");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.starts_with("error: cannot write the diff: "),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("swapped"), "{stderr}");
+}
+
+#[test]
+fn diff_warns_about_control_and_bidi_characters_it_prints() {
+    // A form feed far from the swap; a bidirectional override, a
+    // right-to-left mark and an escape sequence in the lines printed.
+    let source = "from openai import OpenAI\n\x0c\nclient = OpenAI()\n\n\n\n\ndef plain(q):\n    # \u{202E}etoN\u{202C}\n    x = 1  # \u{200F}\n    return client.chat.completions.create(model=\"o3-mini\", messages=[])  # \x1b[2J\n";
+    let dir = project(source);
+    let output = arbor(
+        dir.path(),
+        &["retirements", ".", "--diff", "--today", TODAY],
+    );
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    assert!(
+        stderr.starts_with("Warning: lines 9, 10 and 11 of app.py, which the patch prints as they are, hold a control or bidirectional character; check the patch in an editor that shows such characters before you apply it.\nDiff: 1 call swapped in 1 file.\n"),
+        "{stderr:?}"
+    );
+    // --quiet keeps the warning.
+    let quiet = arbor(
+        dir.path(),
+        &["retirements", ".", "--diff", "--quiet", "--today", TODAY],
+    );
+    let quiet = String::from_utf8(quiet.stderr).unwrap();
+    assert!(
+        quiet.starts_with("Warning: lines 9, 10 and 11 of app.py") && !quiet.contains("Diff:"),
+        "{quiet:?}"
+    );
+    // The patch keeps every byte, so it still applies.
+    let patch = stdout(&output);
+    assert!(patch.contains("\x1b[2J") && patch.contains('\u{202E}'));
+    fs::write(dir.path().join("fix.patch"), &patch).unwrap();
+    git(dir.path(), &["init", "-q"]);
+    git(
+        dir.path(),
+        &["-c", "core.autocrlf=false", "apply", "fix.patch"],
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("app.py")).unwrap(),
+        source.replace("o3-mini", "gpt-5.6-sol")
+    );
+
+    // Tabs, and a form feed outside the lines printed, give no warning.
+    let tabs = project("from openai import OpenAI\n\x0c\nclient = OpenAI()\n\n\n\n\ndef plain(q):\n\treturn client.chat.completions.create(model=\"o3-mini\", messages=[])\t# tab\n");
+    let output = arbor(
+        tabs.path(),
+        &["retirements", ".", "--diff", "--today", TODAY],
+    );
+    assert!(stdout(&output).contains("+\treturn"));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("Warning"), "{stderr:?}");
+}
+
+#[test]
 fn exit_codes_follow_the_window() {
     let dir = project(RETIRING_ONLY);
     let run = |extra: &[&str]| {

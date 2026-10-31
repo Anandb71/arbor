@@ -389,7 +389,7 @@ enum Commands {
         #[arg(long)]
         annotations: bool,
 
-        /// Print the plain model swaps (the calls that need no decision and no manual check) as a unified diff to review and apply with `git apply`; writes no file. What it leaves out, and why, goes to stderr
+        /// Print the plain swaps Arbor can make at the call as a unified diff to review and apply with `git apply`; writes no file. What it leaves out, and why, goes to stderr
         #[arg(long, conflicts_with_all = ["json", "markdown", "annotations"])]
         diff: bool,
 
@@ -413,7 +413,7 @@ enum Commands {
         #[arg(long)]
         count_unconfirmed: bool,
 
-        /// Print only the calls and the summary
+        /// Print only the calls and the summary; with --diff, only the patch and any warning about control or bidirectional characters in it
         #[arg(short, long)]
         quiet: bool,
 
