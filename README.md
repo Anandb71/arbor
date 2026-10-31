@@ -84,9 +84,9 @@ account, API key or telemetry.
 
 | New | What it does |
 |-----|--------------|
-| **`arbor retirements`** | Lists the direct `openai`, `anthropic` and Google SDK calls, and LangChain's OpenAI and Anthropic chat models, that use a model its provider has retired or is retiring: the date, the replacement the provider lists, the arguments that change with it and the choices your repo makes first. OpenAI's deprecations page lists the dated `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` snapshots for shutdown on 14 January 2027; OpenAI's API reference and models API give the bare aliases the same date. [More below](#find-code-that-calls-retiring-ai-models) |
+| **`arbor retirements`** | Lists the direct `openai`, `anthropic` and Google SDK calls that use a model its provider has retired or is retiring: the date, the replacement the provider lists, the arguments that change with it and the choices your repo makes first. OpenAI's deprecations page lists the dated `gpt-4o`, `gpt-4o-mini`, `gpt-4.1` and `gpt-4.1-mini` snapshots for shutdown on 14 January 2027; OpenAI's API reference and models API give the bare aliases the same date. [More below](#find-code-that-calls-retiring-ai-models) |
 | **GitHub Action `mode: retirements`** | The same check in CI: a job summary of the affected calls it finds, and warnings on the most urgent lines. It warns by default and fails the build only when you set `retirements-fail-on`, or when the check cannot run. |
-| **`arbor usages` and `find_api_usages`** | The OpenAI, Anthropic and Gemini SDK calls, and LangChain's OpenAI and Anthropic chat models, that Arbor finds, with their file and line, client routing (direct, Azure, custom `base_url`, Bedrock, Vertex) and model IDs, for people and agents. A value is confirmed only inside a small supported grammar; everything else carries a typed gap. [What a report confirms](docs/SDK_USAGES.md) |
+| **`arbor usages` and `find_api_usages`** | The OpenAI, Anthropic and Gemini SDK calls Arbor finds, with their file and line, client routing (direct, Azure, custom `base_url`, Bedrock, Vertex) and model IDs, for people and agents. A value is confirmed only inside a small supported grammar; everything else carries a typed gap. [What a report confirms](docs/SDK_USAGES.md) |
 
 Python only for now. [Release notes](docs/RELEASE_NOTES_v3.1.0.md)
 
