@@ -1,0 +1,147 @@
+{
+  "corpus_version": 1,
+  "suite": "usages",
+  "language": "typescript",
+  "covers": [
+    "ESM default and named imports, CommonJS require of the module object and of a named class (.cjs), openai v3 Configuration/OpenAIApi (.js)",
+    "OpenAI, AzureOpenAI (endpoint, deployment; and with no endpoint), baseURL routing, withOptions({ baseURL }) re-routing the copy",
+    "Anthropic, AnthropicBedrock (default import), AnthropicVertex",
+    "this.client from a field initializer, this.anthropic assigned in the constructor; this.model in an exported class (subclass_override) and in an unexported class (confirmed)",
+    "module constants, an as-const object spread into the options, a same-file object read by literal key and by run-time key",
+    "a private function's parameter default taken by its only in-file caller; an exported function's client parameter resolved from its in-file caller (in_file_callers)",
+    "@google/generative-ai getGenerativeModel/generateContent/startChat/sendMessage and @google/genai with and without vertexai",
+    "env fallback (env_default + env_var), template literal, imported constant, options spread, a property-lookup fallback as gaps",
+    "a computed member and a stored method reference as dynamic_dispatch gaps",
+    "an imported client (Next.js @/lib alias), a cross-file factory and an untyped parameter receiver as unknown_client_factory gaps",
+    "jest.mock of the SDK in a test makes its routes dynamic_feature gaps",
+    "pricing table and Twilio messages.create not reported; a .d.ts file not scanned",
+    "vendor/ excluded and counted, a hidden .github/ directory counted",
+    "secrets never captured: a secret-named constant and parameter, a credential-shaped literal"
+  ],
+  "usages_expected": [
+    {"at": "src/app/api/chat/route.ts:5", "chain": "openai.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o-mini"}},
+
+    {"at": "src/assistant.ts:8", "chain": "this.client.messages.create", "routing": "anthropic_direct", "values": {"model": "claude-3-5-sonnet-20241022"}},
+    {"at": "src/assistant.ts:26", "chain": "this.anthropic.messages.stream", "routing": "anthropic_direct", "values": {"model": "claude-3-haiku-20240307"}},
+
+    {"at": "src/chat.ts:9", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-3.5-turbo"}},
+    {"at": "src/chat.ts:18", "chain": "router.chat.completions.create", "routing": "custom_base_url", "values": {"model": "openai/gpt-4o"}},
+    {"at": "src/chat.ts:25", "chain": "client.embeddings.create", "routing": "openai_direct", "values": {"model": "text-embedding-3-small"}},
+
+    {"at": "src/dynamic.ts:8", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "src/dynamic.ts:15", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "src/dynamic.ts:19", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "src/dynamic.ts:23", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "src/dynamic.ts:32", "chain": "llm.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-3.5-turbo"}},
+
+    {"at": "src/gemini.ts:5", "chain": "genAI.getGenerativeModel", "routing": "google_generativeai_legacy", "values": {"model": "gemini-1.5-flash"}},
+    {"at": "src/gemini.ts:8", "chain": "model.generateContent", "routing": "google_generativeai_legacy"},
+    {"at": "src/gemini.ts:9", "chain": "model.startChat", "routing": "google_generativeai_legacy"},
+    {"at": "src/gemini.ts:10", "chain": "chat.sendMessage", "routing": "google_generativeai_legacy"},
+    {"at": "src/gemini.ts:18", "chain": "ai.models.generateContent", "routing": "google_genai", "values": {"model": "gemini-2.0-flash"}},
+    {"at": "src/gemini.ts:19", "chain": "vertex.models.generateContent", "routing": "unknown", "values": {"model": "gemini-2.5-pro"}},
+
+    {"at": "src/cjs/commonjs.cjs:8", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4"}},
+    {"at": "src/cjs/commonjs.cjs:12", "chain": "azure.chat.completions.create", "routing": "azure_openai", "values": {"model": "gpt-35-turbo"}},
+
+    {"at": "src/legacy/v3.js:3", "chain": "Configuration", "routing": "unknown"},
+    {"at": "src/legacy/v3.js:7", "chain": "openai.createCompletion", "routing": "openai_direct", "values": {"model": "text-davinci-003"}},
+    {"at": "src/legacy/v3.js:16", "chain": "openai.createChatCompletion", "routing": "openai_direct", "values": {"model": "gpt-3.5-turbo"}},
+
+    {"at": "src/platforms.ts:15", "chain": "azure.chat.completions.create", "routing": "azure_openai", "values": {"model": "gpt-4o"}},
+    {"at": "src/platforms.ts:16", "chain": "bedrock.messages.create", "routing": "anthropic_bedrock", "values": {"model": "anthropic.claude-3-5-sonnet-20241022-v2:0"}},
+    {"at": "src/platforms.ts:21", "chain": "vertex.messages.create", "routing": "anthropic_vertex", "values": {"model": "claude-3-5-sonnet-v2@20241022"}},
+
+    {"at": "src/recall.ts:4", "chain": "client.withOptions", "routing": "openai_direct"},
+    {"at": "src/recall.ts:14", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4-turbo"}},
+    {"at": "src/recall.ts:19", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o-mini"}},
+    {"at": "src/recall.ts:20", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "src/recall.ts:21", "chain": "proxied.chat.completions.create", "routing": "custom_base_url", "values": {"model": "gpt-4o"}},
+    {"at": "src/recall.ts:26", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "src/recall.ts:30", "chain": "llm.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "src/recall.ts:34", "chain": "client.chat.completions.create", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+
+    {"at": "src/secrets_review.ts:9", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "src/secrets_review.ts:10", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+    {"at": "src/secrets_review.ts:11", "chain": "client.chat.completions.create", "routing": "openai_direct"},
+
+    {"at": "tests/assistant.test.ts:9", "chain": "client.chat.completions.create", "routing": "unknown", "values": {"model": "gpt-4o"}}
+  ],
+  "clients_expected": [
+    {"at": "src/assistant.ts:4", "constructor": "@anthropic-ai/sdk.Anthropic", "binding": "this.client", "routing": "anthropic_direct"},
+    {"at": "src/assistant.ts:22", "constructor": "@anthropic-ai/sdk.Anthropic", "binding": "this.anthropic", "routing": "anthropic_direct"},
+    {"at": "src/chat.ts:5", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "src/chat.ts:6", "constructor": "openai.OpenAI", "binding": "router", "routing": "custom_base_url"},
+    {"at": "src/dynamic.ts:5", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "src/factory.ts:4", "constructor": "openai.OpenAI", "routing": "openai_direct"},
+    {"at": "src/gemini.ts:4", "constructor": "@google/generative-ai.GoogleGenerativeAI", "binding": "genAI", "routing": "google_generativeai_legacy"},
+    {"at": "src/gemini.ts:14", "constructor": "@google/genai.GoogleGenAI", "binding": "ai", "routing": "google_genai"},
+    {"at": "src/gemini.ts:15", "constructor": "@google/genai.GoogleGenAI", "binding": "vertex", "routing": "unknown"},
+    {"at": "src/cjs/commonjs.cjs:4", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "src/cjs/commonjs.cjs:5", "constructor": "openai.AzureOpenAI", "binding": "azure", "routing": "azure_openai"},
+    {"at": "src/legacy/v3.js:4", "constructor": "openai.OpenAIApi", "binding": "openai", "routing": "openai_direct"},
+    {"at": "src/lib/openai.ts:3", "constructor": "openai.OpenAI", "binding": "openai", "routing": "openai_direct"},
+    {"at": "src/platforms.ts:5", "constructor": "openai.AzureOpenAI", "binding": "azure", "routing": "azure_openai"},
+    {"at": "src/platforms.ts:11", "constructor": "@anthropic-ai/bedrock-sdk.AnthropicBedrock", "binding": "bedrock", "routing": "anthropic_bedrock"},
+    {"at": "src/platforms.ts:12", "constructor": "@anthropic-ai/vertex-sdk.AnthropicVertex", "binding": "vertex", "routing": "anthropic_vertex"},
+    {"at": "src/recall.ts:3", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "src/secrets_review.ts:4", "constructor": "openai.OpenAI", "binding": "client", "routing": "openai_direct"},
+    {"at": "tests/assistant.test.ts:5", "constructor": "openai.OpenAI", "binding": "client", "routing": "unknown"}
+  ],
+  "gaps_expected": [
+    {"at": "src/app/api/chat/route.ts:5", "kind": "unknown_client_factory", "reason": "imported_name"},
+
+    {"at": "src/assistant.ts:8", "kind": "unresolved_model", "reason": "subclass_override"},
+
+    {"at": "src/dynamic.ts:8", "kind": "unresolved_model", "reason": "env_var"},
+    {"at": "src/dynamic.ts:15", "kind": "unresolved_model", "reason": "f_string"},
+    {"at": "src/dynamic.ts:19", "kind": "unresolved_model", "reason": "imported_name"},
+    {"at": "src/dynamic.ts:23", "kind": "unresolved_model", "reason": "splat"},
+    {"at": "src/dynamic.ts:27", "kind": "dynamic_dispatch", "reason": "computed_member"},
+    {"at": "src/dynamic.ts:32", "kind": "unknown_client_factory", "reason": "factory_call"},
+    {"at": "src/dynamic.ts:36", "kind": "unknown_client_factory", "reason": "parameter"},
+    {"at": "src/dynamic.ts:39", "kind": "dynamic_dispatch", "reason": "method_reference"},
+
+    {"at": "src/gemini.ts:19", "kind": "ambiguous_client", "reason": "endpoint_option"},
+
+    {"at": "src/recall.ts:26", "kind": "unresolved_model", "reason": "subscript"},
+    {"at": "src/recall.ts:30", "kind": "ambiguous_client", "reason": "in_file_callers"},
+    {"at": "src/recall.ts:34", "kind": "unresolved_model", "reason": "attribute"},
+
+    {"at": "src/secrets_review.ts:9", "kind": "unresolved_model", "reason": "credential"},
+    {"at": "src/secrets_review.ts:10", "kind": "unresolved_model", "reason": "credential"},
+    {"at": "src/secrets_review.ts:11", "kind": "unresolved_model", "reason": "credential"},
+
+    {"at": "tests/assistant.test.ts:9", "kind": "ambiguous_client", "reason": "dynamic_feature"},
+
+    {"at": "vendor/", "kind": "vendored_path", "reason": "vendored"}
+  ],
+  "skipped_expected": {"vendored_files": 1, "vendored_calls": 1, "hidden_files": 1, "hidden_calls": 1},
+  "forbidden_in_output": [
+    "sk-test-NOT-A-REAL-KEY",
+    "EVALSECRET",
+    "sk-proj-",
+    "OPENAI_MODEL",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "AZURE_OPENAI_ENDPOINT",
+    "TWILIO_SID",
+    "TWILIO_TOKEN",
+    "openrouter.ai",
+    "localhost:4000",
+    "claude-2.1",
+    "0.00015",
+    "gpt-3.5-turbo-0301",
+    "Your order shipped",
+    "and then?"
+  ],
+  "known_missing": [
+    "usage src/app/api/chat/route.ts:5 openai.chat.completions.create openai_direct",
+    "value src/app/api/chat/route.ts:5 openai.chat.completions.create model=gpt-4o-mini",
+    "value src/dynamic.ts:19 client.chat.completions.create model=gpt-4o",
+    "usage src/dynamic.ts:32 llm.chat.completions.create openai_direct",
+    "value src/dynamic.ts:32 llm.chat.completions.create model=gpt-3.5-turbo"
+  ],
+  "known_extra": [],
+  "notes": "Synthetic. Truth is what each line does at run time under docs/SDK_USAGES.md (TypeScript and JavaScript), except where a policy turns a value into a gap (credentials). Resolution is per file, so three cross-file facts are recorded as known misses with the gap the contract reports instead: src/app/api/chat/route.ts:5 uses the client exported by src/lib/openai.ts (an OpenAI built with only an apiKey, so openai_direct; imported through the Next.js @/ alias for src/), src/dynamic.ts:32 uses the client returned by src/factory.ts:makeClient (factory_call, as in the Python fixture), and src/dynamic.ts:19 reads DEFAULT_MODEL = \"gpt-4o\" from src/settings.ts. src/dynamic.ts:36 receives an untyped parameter that nothing in the fixture passes, so its provider is not knowable and it is a gap only. src/dynamic.ts:27 picks the request method by a run-time name (client.chat.completions[method]), so like Python's getattr dispatch it is a computed_member gap only, with no usage record. src/dynamic.ts:39 stores the request method (method_reference) and is not a call. src/legacy/v3.js:3 new Configuration(...) is an SDK object, not a client: a usage of `Configuration` with an unknown route; v3.js:4 new OpenAIApi(configuration) has no basePath, so openai_direct. assistant.ts:8 reads this.model in the exported class Assistant, so the field's value keeps a subclass_override gap; assistant.ts:26 reads it in Summarizer, which is never exported, passed or stored (only constructed by the exported arrow), so it is confirmed; this.anthropic is declared without a value and assigned once in the constructor. recall.ts:14 takes ask()'s default because ask is unexported and its only caller (run) passes nothing; recall.ts:30 resolves llm from run(), its only in-file caller, and keeps in_file_callers because send is exported; recall.ts:21 is custom_base_url because withOptions was given a localhost baseURL; recall.ts:26 looks MODELS up by a run-time key (subscript; candidates are gap values, not compared); recall.ts:34 captures the || fallback of options.model as env_default with the property lookup's attribute gap. dynamic.ts:8 captures the process.env fallback with its env_var gap. gemini.ts:15 sets vertexai: true, so the client and its call at :19 route unknown with an endpoint_option gap; the getGenerativeModel model object and the chat it starts keep the legacy client's routing. tests/assistant.test.ts mocks openai with jest.mock, so the client built there is a mock and its call routes unknown with a dynamic_feature gap; the literal at the call is still reported. secrets_review.ts: SECRET_MODEL (secret-named binding), a credential-shaped literal and authToken (secret-named parameter) are each a credential gap and print nothing. src/sms.ts (Twilio messages.create in a file with no Anthropic import) and src/pricing.ts report nothing; src/types.d.ts is not scanned; vendor/openai-shim/index.js holds one SDK call and is excluded and counted; .github/scripts/triage.mjs is counted under skipped.hidden_*."
+}

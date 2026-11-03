@@ -1,6 +1,8 @@
 //! SDK-usage evaluation: runs the real `arbor usages . --json` on every
 //! fixture the corpus manifest marks `"suite": "usages"` and diffs the report
-//! against hand-audited truth in `eval/expected/<name>.json`.
+//! against the truth in `eval/expected/<name>.json`, which is hand-audited
+//! except for the TypeScript fixtures (`eval/manifest.json` says how theirs
+//! was written).
 //!
 //! Records are compared as sets of canonical keys, so recall (missed) and
 //! precision (unexpected) failures are reported separately:

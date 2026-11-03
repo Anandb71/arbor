@@ -1,0 +1,7 @@
+{
+  "name": "legacy-v3",
+  "private": true,
+  "dependencies": {
+    "openai": "^3.3.0"
+  }
+}

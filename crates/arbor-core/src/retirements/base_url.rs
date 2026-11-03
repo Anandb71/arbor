@@ -38,8 +38,11 @@ pub enum BaseUrl {
     Unreadable,
 }
 
+/// The constructor options that set a client's endpoint: Python's
+/// `base_url`/`api_base`, the JavaScript SDKs' `baseURL` and openai v3's
+/// `basePath`.
 fn is_base_url_key(key: &str) -> bool {
-    key == "base_url" || key == "api_base"
+    matches!(key, "base_url" | "api_base" | "baseURL" | "basePath")
 }
 
 /// The class of the `base_url` behind `call`, or `None` when its client was

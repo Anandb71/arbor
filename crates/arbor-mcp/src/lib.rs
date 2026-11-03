@@ -910,7 +910,7 @@ impl McpServer {
                 },
                 {
                     "name": "find_api_usages",
-                    "description": "Finds calls to the OpenAI, Anthropic and Gemini SDKs (Python files and Python shebang scripts today): each call with file, line, enclosing symbol, client routing (openai_direct, azure_openai, custom_base_url, anthropic_bedrock, anthropic_vertex, google_genai...) and the model IDs passed as string literals, same-file constants, dict literals or parameter defaults. A literal fallback of an env/config lookup is returned with origin env_default and the call keeps a gap: confirm it before acting. Also returns client constructions, typed gaps for what could not be resolved (models from env/config, unknown client factories, getattr) and what was skipped: counts on every page, and the first 20 vendored and hidden directories, oversized, unreadable and syntax-error files on the first page. Use INSTEAD of grep to find where a deprecated model or SDK is used. Reads files directly; does not need the graph. Never returns credential values: a value is refused when any name it flows through looks like a secret (key, token, secret, password, pwd, auth, credential, private) or the value itself is credential-shaped (sk-, AIza, ghp_, xox..., URLs with a user or password, long random tokens).",
+                    "description": "Finds calls to the OpenAI, Anthropic and Gemini SDKs in Python (and Python shebang scripts), TypeScript and JavaScript files: each call with file, line, enclosing symbol, client routing (openai_direct, azure_openai, custom_base_url, anthropic_bedrock, anthropic_vertex, google_genai...) and the model IDs passed as string literals, same-file constants, dict and object literals or parameter defaults. A literal fallback of an env/config lookup is returned with origin env_default and the call keeps a gap: confirm it before acting. Also returns client constructions, typed gaps for what could not be resolved (models from env/config, unknown client factories, getattr and computed members) and what was skipped: counts on every page, and the first 20 vendored and hidden directories, oversized, unreadable and syntax-error files on the first page. Use INSTEAD of grep to find where a deprecated model or SDK is used. Reads files directly; does not need the graph. Never returns credential values: a value is refused when any name it flows through looks like a secret (key, token, secret, password, pwd, auth, credential, private) or the value itself is credential-shaped (sk-, AIza, ghp_, xox..., URLs with a user or password, long random tokens).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -2471,6 +2471,61 @@ mod tool_tests {
                 "{failed}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn find_api_usages_reads_typescript_and_javascript() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("web/lib")).unwrap();
+        std::fs::write(
+            dir.path().join("web/lib/ai.ts"),
+            "import OpenAI from \"openai\";\nconst client = new OpenAI({ apiKey: \"sk-test-NOT-A-REAL-KEY\" });\nexport async function ask() {\n  return client.chat.completions.create({ model: \"gpt-4o\", messages: [] });\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("web/lib/claude.cjs"),
+            "const Anthropic = require(\"@anthropic-ai/sdk\");\nconst client = new Anthropic();\nclient.messages.create({ model: process.env.CLAUDE_MODEL, max_tokens: 1, messages: [] });\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("web/lib/types.d.ts"),
+            // A declaration file is never scanned, even with a call in it.
+            "import OpenAI from \"openai\";\nnew OpenAI().chat.completions.create({ model: \"gpt-4\", messages: [] });\n",
+        )
+        .unwrap();
+        let shared: SharedGraph = Arc::new(RwLock::new(ArborGraph::new()));
+        let server = McpServer::with_project(shared, dir.path().to_path_buf());
+
+        let result = server
+            .call_tool(json!({ "name": "find_api_usages", "arguments": {} }))
+            .await
+            .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("sk-test-NOT-A-REAL-KEY"));
+        assert!(!text.contains("CLAUDE_MODEL"));
+        let envelope = tool_envelope(result);
+        assert_eq!(envelope["ok"], true);
+        let data = &envelope["data"];
+        assert_eq!(data["total"], 2, "{data:#}");
+        let usages = data["usages"].as_array().unwrap();
+        let ts = usages
+            .iter()
+            .find(|u| u["file"] == "web/lib/ai.ts")
+            .unwrap();
+        assert_eq!(ts["routing"], "openai_direct");
+        assert_eq!(ts["values"][0]["value"], "gpt-4o");
+        let cjs = usages
+            .iter()
+            .find(|u| u["file"] == "web/lib/claude.cjs")
+            .unwrap();
+        assert_eq!(cjs["routing"], "anthropic_direct");
+        assert_eq!(cjs["values"], json!([]));
+        let gaps = data["gaps"].as_array().unwrap();
+        assert!(
+            gaps.iter()
+                .any(|g| g["file"] == "web/lib/claude.cjs" && g["reason"] == "env_var"),
+            "{data:#}"
+        );
     }
 
     #[tokio::test]

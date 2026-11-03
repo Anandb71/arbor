@@ -59,13 +59,15 @@
 //!
 //! # Scope of this version
 //!
-//! Python only ([`python`]): `.py` files and extensionless scripts with a
-//! Python shebang. The TypeScript/ESM slice will implement
-//! [`crate::LanguageParser::extract_usages`] for its parsers and reuse these
+//! Python ([`python`]): `.py` files and extensionless scripts with a Python
+//! shebang. TypeScript and JavaScript ([`typescript`]): `.ts`, `.tsx`, `.mts`,
+//! `.cts`, `.js`, `.jsx`, `.mjs` and `.cjs` files, declaration files left out.
+//! Both implement [`crate::LanguageParser::extract_usages`] and share these
 //! types. Resolution is per file: a client or model constant imported from
 //! another module is a gap, not a usage.
 
 pub mod python;
+pub mod typescript;
 
 use serde::{Deserialize, Serialize};
 
@@ -136,15 +138,22 @@ pub enum Routing {
     GoogleGenai,
     /// `google.generativeai` (the deprecated SDK).
     GoogleGenerativeaiLegacy,
-    /// Not decided by this version: `**kwargs` passed to a direct
-    /// constructor, a client typed only by annotation, a binding assigned
+    /// Not decided by this version. With an `ambiguous_client` gap at each
+    /// call: `**kwargs` passed to a direct constructor, a client known only
+    /// from a type annotation that names a direct class or classes that
+    /// route differently (`annotation`), a binding assigned
     /// more than one kind of client, a direct client given a `base_url`
     /// after it is built or built in a file that sets `OPENAI_BASE_URL` /
     /// `ANTHROPIC_BASE_URL` or writes the environment with a run-time name,
     /// a `base_url` read from the environment with no fallback or one that
-    /// does not resolve to a string (each with an `ambiguous_client` gap at
-    /// each call), a non-literal or non-Azure
-    /// `openai.api_type`, or a hosted-platform client this list does not name
+    /// does not resolve to a string, a module-level API routed by an
+    /// `openai.api_type` that is not a string literal or by an
+    /// `openai.bedrock_*` setting (next to an Azure setting, the Azure
+    /// route is kept instead, under the same gap), and a v0 resource call
+    /// (`openai.ChatCompletion.create`) that passes its own `api_base` or
+    /// `api_type`. With no gap, because the route is known to be a platform
+    /// this list does not name: a literal `openai.api_type` other than Azure
+    /// or OpenAI (`amazon-bedrock`), and a hosted-platform client
     /// (`BedrockOpenAI`, `OpenAI(provider=...)`, `AnthropicAWS`,
     /// `AnthropicFoundry`, `AnthropicGoogleCloud` and their async variants).
     /// The construction's `constructor` field still names the class.
@@ -392,8 +401,10 @@ pub struct SdkCall {
     pub kwargs: Vec<String>,
     /// Number of positional arguments, the options object excluded.
     pub positional: u32,
-    /// Whether arguments were spread into the call (`**kwargs`; TypeScript
-    /// `...opts` in the options object).
+    /// Whether arguments were spread into the call (`**kwargs`). In
+    /// TypeScript, whether a property of the options object may not be
+    /// written at the call: `...opts`, a computed key, or the object passed
+    /// by name.
     pub splat: bool,
     /// Each expression spread into the call with `**`, in source order:
     /// its name and the argument names it was read to hold. Empty when
@@ -452,18 +463,31 @@ pub enum GapKind {
     /// imported from another module.
     UnknownClientFactory,
     /// A binding assigned more than one kind of client, so routing depends on
-    /// a runtime branch (`multiple_assignments`), or a client known from
+    /// a runtime branch, or a client read through `this` in a method that
+    /// may run with another object as `this` (`multiple_assignments`), or a
+    /// client known from
     /// only some of the places it can come from: the in-file callers of a
     /// function other modules may also call (`in_file_callers`), a client
     /// whose `base_url` is assigned after it is built (`base_url_assigned`),
     /// a file that sets the SDK's endpoint variable (`endpoint_env`), a
     /// `base_url` read from the environment (`base_url_env`) or not resolved
-    /// (`base_url_unresolved`), a Gemini client given an option that may
-    /// send it to Vertex AI or another endpoint (`endpoint_option`), a
-    /// module-level call that passes `engine` or `deployment_id` in a file
+    /// (`base_url_unresolved`), a client or one request given an option
+    /// that may send it to another endpoint (`endpoint_option`: Gemini's
+    /// `vertexai` or `http_options`, a custom `fetch`, Anthropic's
+    /// `middleware`, openai v3's own axios instance, a request's `path` or
+    /// `defaultBaseURL`), a file that may replace or intercept the global
+    /// `fetch` the SDK sends its requests through, or for openai v3 Node's
+    /// `http` module (`global_fetch`: `globalThis.fetch = ...`, a test
+    /// double of `fetch`, nock or msw), a module-level call that passes `engine` or `deployment_id` in a file
     /// that does not configure the module-level API, or any module-level
     /// call in a file that configures it outside its top-of-file setup block
-    /// (`module_config`), or a receiver or configuration a dynamic feature of
+    /// (`module_config`), a module-level API routed by an `openai.api_type`
+    /// that is not a string literal or by an `openai.bedrock_*` setting
+    /// (`module_routing`), a v0 resource call that passes its own `api_base`
+    /// or `api_type`, or a `**` expansion that may hold one
+    /// (`call_routing`), a client known only from a type annotation that
+    /// names a direct class or classes that route differently
+    /// (`annotation`), or a receiver or configuration a dynamic feature of
     /// the file may change (`dynamic_feature`).
     AmbiguousClient,
     /// `getattr` on a tracked binding, or an SDK method stored or passed as a
@@ -593,18 +617,29 @@ impl FileUsages {
 }
 
 /// Languages that have a usage extractor.
-pub const USAGE_LANGUAGES: &[&str] = &["python"];
+pub const USAGE_LANGUAGES: &[&str] = &["python", "typescript", "javascript"];
 
-/// File extensions that have a usage extractor. `.pyi` stubs are excluded:
+/// File extensions that have a usage extractor. `.pyi` stubs and TypeScript
+/// declaration files (`.d.ts`, see [`is_declaration_file`]) are excluded:
 /// they declare types, they do not make requests. Extensionless scripts are
 /// scanned when [`is_python_shebang`] accepts their first line.
-pub const USAGE_EXTENSIONS: &[&str] = &["py"];
+pub const USAGE_EXTENSIONS: &[&str] = &["py", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
 /// Whether files with this extension have a usage extractor.
 pub fn is_usage_extension(extension: &str) -> bool {
     USAGE_EXTENSIONS
         .iter()
         .any(|e| e.eq_ignore_ascii_case(extension))
+}
+
+/// Whether a file name is a TypeScript declaration file (`index.d.ts`,
+/// `globals.d.mts`, `types.d.cts`), which declares types and makes no
+/// requests.
+pub fn is_declaration_file(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    [".d.ts", ".d.mts", ".d.cts"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
 }
 
 /// Whether the start of an extensionless file is a Python shebang
