@@ -65,6 +65,10 @@ These are reported with no gap (`model`, `engine`, `deployment_id`,
      `type NAME = ...`, and `global` or `nonlocal` in a class body.
    - A walrus in a default argument (`def f(a=(M := ...))`) binds where the
      `def` or `lambda` runs, in the enclosing scope.
+   - A walrus binds the whole expression after `:=`, a conditional included:
+     `(model := "gpt-4o" if fast else "o3-mini")` gives `model` both
+     candidates, as Python does (the parser reads it as
+     `(model := "gpt-4o") if fast else "o3-mini"`, which this rule undoes).
    - When more than one assignment reaches the use, the call gets a
      `reassigned` gap.
 3. **A class attribute assigned once.** It is read by class name (`Bot.MODEL`)
@@ -150,8 +154,10 @@ always keeps its gap.
 ### Routes
 
 A call's routing is confirmed when its receiver reaches it through the
-value rules above (one kind of client per name), or through a parameter that
-every in-file caller of a private function passes. The receiver must be one of
+value rules above (one kind of client per name, where a parameter is one
+more value whatever its annotation), or through a parameter that every
+in-file caller of a private function passes, annotated or not (the clients
+the callers pass say more than the annotation). The receiver must be one of
 these:
 
 - **A client from a tracked constructor** (`OpenAI`, `AzureOpenAI`,
@@ -196,6 +202,24 @@ these:
   so none of its own code can run before the configuration is complete. The
   report does not follow import-time execution any further than that.
 
+  In the block, a string literal decides `openai.api_type`: `azure`,
+  `azure_ad` or `azuread` routes to Azure, `openai` or `open_ai` direct,
+  and any other (`amazon-bedrock`) `unknown` with no gap, a platform this
+  version does not name. An `api_type` that is not a string literal
+  (`os.environ[...]`, a name bound to one), and any `openai.bedrock_*`
+  setting, give a `module_routing` gap. The route is `unknown`, unless an
+  Azure setting is next to them: then `azure_openai` is kept as the
+  candidate, under the gap, as `module_config` keeps the routing the
+  settings suggest.
+
+  A v0 resource call (`openai<1.0`: `openai.ChatCompletion.create`,
+  `Completion`, `Embedding`, `Audio`, `Model` and the other resources) also
+  takes its own `api_base` and `api_type`, which route that call whatever
+  the settings say. A call that passes either (other than `None`), or a
+  `**` expansion that may hold one, routes `unknown` with a `call_routing`
+  gap. A routing argument passed by position is not read: v0 code passes
+  them by name.
+
   Anything else gives every module-level call of the file a `module_config`
   gap that keeps the routing the settings suggest: a setting in a function,
   in an `if`, loop, `try`, `with` or class body, after the setup block, by
@@ -211,6 +235,97 @@ A client read through `self` (`self.client`) is confirmed under rule 3
 without the `subclass_override` gap that a model value read the same way
 gets. That is an assumption of the report: a subclass in another module
 that replaces a public class's client is not seen.
+
+A client known only from a type annotation (`def ask(client: OpenAI)`,
+`client: OpenAI` in a class body) routes by its class when the class alone
+decides the route (`AzureOpenAI`, `AnthropicBedrock`, `AnthropicVertex`). A
+direct class (`OpenAI`, `Anthropic`, `genai.Client`) may have been given a
+`base_url` or another endpoint, so its calls route `unknown` with an
+`annotation` gap. An annotation that names several client classes
+(`AzureOpenAI | OpenAI`, `Union[AnthropicBedrock, Anthropic]`) decides the
+route only when every one of them does, and all the same way; otherwise its
+calls get the same gap. Its other members (`None`, a class of the
+project's own, as in `AzureOpenAI | Gateway`) are not read.
+
+When the name or attribute is given other values too:
+
+- A construction the file shows decides the route over a **declaration**
+  (`client: OpenAI` in a class body with no value, or with `None` or
+  another literal as in `client: Optional[OpenAI] = None`, and
+  `self.client = OpenAI()` in `__init__`). A declaration with `None` or
+  another literal that nothing else assigns holds that value, not a client.
+  Read on its own (`self.client.chat.completions.create(...)`), it routes
+  by its annotation, as above. Where another binding reads it next to any
+  other value (a construction, a factory's client, a parameter, a name
+  from another module), it is dropped, as an unannotated `client = None`
+  is, and types none of them: `client = self.client or OpenAI()` routes as
+  `OpenAI()` does, and `self.client or make_client()` gets the factory's
+  gap, whatever the annotation. Several such declarations, read together
+  (`self._a or self._b`) or made for one attribute (in the class body and
+  in `__init__`), combine as typed values do (below), and are dropped
+  together next to any other value. A member of one
+  (`self.client.chat.completions`) is combined as members are (below): it
+  is dropped next to the same member of a client, and next to anything
+  else (`self.client.chat.completions if flag else
+  make_client().chat.completions`) the call gets a `multiple_assignments`
+  gap. Next to a value that a dynamic feature affects and that is not
+  known to be a client, though, the declaration is kept, with that
+  feature's gap. A bare declaration is set somewhere else, to any client,
+  and counts as a typed value there.
+- A class attribute that one of the class-attribute dynamic features may
+  set (see "Class attributes" under [Dynamic features](#dynamic-features):
+  a field of a dataclass, attrs class, `NamedTuple` or pydantic model, an
+  attribute of a class with a base from another module, of a decorated
+  class or of one used as a value, one written on another object...) is
+  not one that nothing else assigns. A declaration with `None` there is a
+  typed value (below) with a gap. Read on its own, it routes by its
+  annotation with a `dynamic_feature` gap (a direct class keeps its
+  `annotation` gap). Next to a construction its class decides the route of
+  (`self.client or AzureOpenAI(...)` under `client:
+  Optional[AzureOpenAI] = None`), the call takes that route and keeps the
+  `dynamic_feature` gap. Next to any other construction (`self.client or
+  OpenAI()`, also under `client: Optional[OpenAI] = None`) or a value that
+  is not a client (`self.client or make_client()`), it gets a
+  `multiple_assignments` gap. A dynamic feature of the whole file (`exec`)
+  does not make a declaration one of these: it is dropped as above, and
+  the route the call takes gets that feature's gap (`self.client or
+  OpenAI()` is `openai_direct` with a `dynamic_feature` gap).
+- A **typed value** (a parameter, or an annotated assignment with any other
+  value, `self.client: OpenAI = make()`) is one more value. It agrees with a
+  construction only when its class decides that construction's route
+  (`AzureOpenAI` next to `AzureOpenAI(...)`), and then the call keeps any
+  gap the typed value carries for another reason (a field's
+  `dynamic_feature`); a direct class never does. Otherwise the call gets a
+  `multiple_assignments` gap, as with an untyped
+  parameter (`def ask(client: OpenAI | None = None): client = client or
+  OpenAI()`). So does a typed value next to a value that is not a client,
+  unless a declaration types the binding: `self.client = client or
+  make_client()` under `client: AzureOpenAI`, or `self.client: AzureOpenAI =
+  client or make_client()`, routes `azure_openai` when `client:
+  AzureOpenAI`, whether the two values are combined in that expression, in a
+  local default (`if client is None: client = make_client()`) or in two
+  assignments.
+- With no construction, the typed values and the binding's own
+  declarations (not a `= None` declaration read next to another value,
+  which is dropped, above) decide the route only when every one of them
+  does, and all the same way, as in one annotation; a declaration says
+  more than the values next to it that are not clients (`self.client =
+  make_client()`). Otherwise the call gets the `annotation` gap (`client =
+  azure if flag else direct`, with `azure: AzureOpenAI` and `direct:
+  OpenAI`, in either order), or the gap one of them already carries when
+  they route alike.
+- A **member of a client** (`azure.chat.completions`,
+  `client.embeddings.create`) follows the same rules when every value is
+  that same member of a client: `chat = azure.chat.completions if flag else
+  direct.chat.completions` gets the `annotation` gap in either order, and
+  the member is kept. Different members, or a member next to a value that is
+  not one, get a `multiple_assignments` gap. A call through a name bound to
+  a member of a client the file does not resolve (`chat =
+  make_client().chat.completions`, then `chat.create(...)`; the same with a
+  parameter or an imported name, or `(self.client or
+  make_client()).chat.completions` under a `= None` declaration) is not
+  reported, not even as a gap: only a call that names the member
+  (`make_client().chat.completions.create(...)`) is, with the client's gap.
 
 An OpenAI or Anthropic client's `base_url` routes by its host (a Gemini
 client's endpoint options are a gap, above). The URL itself is never
@@ -420,4 +535,14 @@ generators of each later review:
 - 2.6 MB to 4 MiB: the generated shapes at most 3.4 s and 660 MB (a
   400,000-key dict expanded at 10,000 calls), and the 3 MB scale files about
   3.3 s and 780 MB, bound by the tree-sitter parse;
-- 4 MiB: about 5 s and 1 GB, bound by the parse.
+- 4 MiB: about 5 s and 1 GB on ordinary code, bound by the parse.
+
+A file made of little but calls costs more at the same size: the scan
+indexes every call and evaluates each one's callee. Time and memory still
+grow linearly with the number of calls (half the file takes half the time
+and memory). Release builds on the same laptop:
+
+| 4 MiB of | Calls | Time | Peak memory |
+|---|---|---|---|
+| bare calls, `f()` on each line | about 1M | about 9 s, 4 s of it the parse | about 1.4 GB, 0.96 GB of it the parse |
+| chained calls, `f()()()...` 60 to a line | about 2M | about 20 s, over half of it naming each call's callee | about 1.8 GB |
