@@ -101,11 +101,6 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     ),
     (
         GapKind::UnresolvedModel,
-        "litellm_provider",
-        "a LiteLLM fallback names its own `custom_llm_provider`, so its model goes to that provider",
-    ),
-    (
-        GapKind::UnresolvedModel,
         "parameter_default",
         "the model is the default of a parameter other modules may pass",
     ),
@@ -191,7 +186,7 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     (
         GapKind::AmbiguousClient,
         "litellm_provider",
-        "LiteLLM is given `custom_llm_provider`, which picks the provider in place of the model's name",
+        "LiteLLM is given a `custom_llm_provider` or `azure` the file does not show, which picks the provider in place of the model's name",
     ),
     (
         GapKind::AmbiguousClient,
