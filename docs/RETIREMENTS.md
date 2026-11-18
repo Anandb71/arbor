@@ -163,8 +163,10 @@ counts the ones it leaves out, by reason:
 
 - a call that needs a choice your repository makes first (the reasoning effort on
   gpt-6-luna and GPT-5.6, Claude's thinking) or a manual check (passing `extra_body`
-  makes it one), and a call where another model value needs one, such as a model
-  nested in `metadata`;
+  makes it one), and a call where another model value Arbor reads needs one, such as
+  a literal model nested in `metadata`. A nested model Arbor cannot read, a lookup
+  such as `metadata={"model": PICK[k]}` or a parameter, gets no finding and no count
+  on stderr, so it does not hold the call back and the patch swaps the call's own model;
 - a call that needs no change: the provider routes its model to a newer one, so the
   call still works (Google routes `gemini-3-pro-preview` to `gemini-3.1-pro-preview`);
 - a call whose method Arbor does not know to send the model. Arbor edits only the
