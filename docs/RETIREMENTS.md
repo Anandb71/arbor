@@ -98,10 +98,20 @@ counted, and `--include-routed` lists them
 on the schedule its router prefix names (`anthropic/claude-3-5-sonnet-20241022` on
 Anthropic's), else by its shape (`gpt-4o` on OpenAI's), with only the checks about the
 model, since LiteLLM takes OpenAI-style arguments and translates them for each provider.
-A Gemini model with no prefix (`gemini-2.5-flash`) is looked up on Google Cloud's (Vertex
-AI) schedule, where LiteLLM sends it; `gemini/gemini-2.5-flash` reaches the Gemini API, and
-a call that picks its provider itself (`custom_llm_provider`) is looked up on neither.
-A LiteLLM call the usage scan puts a routing gap on (a provider it picks itself, a
+A Gemini model with no prefix (`gemini-2.5-flash`), in a call that names no provider, is
+looked up on Google Cloud's (Vertex AI) schedule, where LiteLLM sends it;
+`gemini/gemini-2.5-flash` reaches the Gemini API. A provider the call names with a string
+literal or a same-file constant (`custom_llm_provider="gemini"`, by keyword or in a
+same-file dict expanded with `**`, or `azure=True`, which names `azure` and wins over it;
+a fallback dict may name its own) comes before the model's name:
+the model is looked up as `<provider>/<model>` would be. So `gemini` is the Gemini API's
+schedule (`gemini-3.7-flash` is auto-routed there, with no date), `vertex_ai` Vertex AI's,
+`openai` and `anthropic` their own, and `bedrock`, `azure` or a provider the data does
+not hold look nothing up. A fallback that names its own provider is looked up by it, and
+one that names none by the call's. A provider the file does not show (a parameter, the
+environment, a function call) leaves the call's routing not confirmed, and a Gemini model
+with no prefix there is looked up on neither Google schedule.
+A LiteLLM call the usage scan puts a routing gap on (such a provider, a
 replaced `litellm.completion`) is listed with *routing not confirmed*, and a model
 LiteLLM may not send (one next to a `deployment_id` or a `prompt_id`, a fallback that
 names its own deployment) is *confirm first*.

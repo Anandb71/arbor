@@ -7606,9 +7606,10 @@ litellm.completion(model="gpt-4o", engine="x", model_name="y", messages=[])
 
     // The `deployment_id` is sent in place of every fallback too; a
     // fallback's own `deployment_id` or provider decides that fallback; a
-    // `prompt_id` may name another model; `custom_llm_provider` (or
-    // `azure=True`) picks the provider; a positional model next to a
-    // `deployment_id` is still read.
+    // `prompt_id` may name another model; a literal `custom_llm_provider`
+    // (or `azure=True`) is the provider of the call's values, with no gap
+    // (see litellm_providers_are_read_like_router_prefixes); a positional
+    // model next to a `deployment_id` is still read.
     let found = usages(
         r#"
 import litellm
@@ -7649,17 +7650,20 @@ litellm.completion("gpt-3.5-turbo-0613", [], deployment_id="chat-prod")
     );
     assert_eq!(
         gap_keys(4),
-        vec![
-            pair("unresolved_model/deployment_id", "fallbacks.model"),
-            pair("unresolved_model/litellm_provider", "fallbacks.model"),
-        ]
+        vec![pair("unresolved_model/deployment_id", "fallbacks.model")]
     );
+    let providers: Vec<Option<&str>> = call_on(&found, 4)
+        .values
+        .iter()
+        .map(|v| v.provider.as_deref())
+        .collect();
+    assert_eq!(providers, vec![None, None, None, Some("gemini")]);
     assert_eq!(gap_keys(5), vec![pair("unresolved_model/prompt_id", "")]);
-    for line in [6, 7] {
+    for (line, provider) in [(6, "gemini"), (7, "azure")] {
+        assert!(gap_keys(line).is_empty(), "{line}: {:?}", gap_keys(line));
         assert_eq!(
-            gap_keys(line),
-            vec![pair("ambiguous_client/litellm_provider", "")],
-            "{line}"
+            call_on(&found, line).values[0].provider.as_deref(),
+            Some(provider)
         );
     }
     let positional = call_on(&found, 8);
@@ -7669,6 +7673,148 @@ litellm.completion("gpt-3.5-turbo-0613", [], deployment_id="chat-prod")
         gap_keys(8),
         vec![pair("unresolved_model/deployment_id", "model")]
     );
+}
+
+#[test]
+fn litellm_providers_are_read_like_router_prefixes() {
+    // A provider the call names (`custom_llm_provider`, or `azure=True`,
+    // which wins over it) is read under the value rules and recorded on
+    // each value LiteLLM sends to it; a fallback's own decides that
+    // fallback. One the file does not show is a routing gap.
+    let found = usages(
+        r#"
+import os
+import litellm
+PROVIDER = "vertex_ai"
+CFG = {"custom_llm_provider": "gemini"}
+LATE = {"custom_llm_provider": "gemini", **extra}
+litellm.completion(model="gemini-3.7-flash", custom_llm_provider="gemini", messages=[])
+litellm.completion(model="gemini-3.7-flash", custom_llm_provider="vertex_ai", messages=[])
+litellm.completion(model="claude-3-5-sonnet-20241022", custom_llm_provider="bedrock", messages=[])
+litellm.completion(model="gpt-4o", custom_llm_provider="azure", messages=[])
+litellm.completion(model="gpt-4o", azure=True, custom_llm_provider="openai", messages=[])
+litellm.completion(model="gpt-4o", custom_llm_provider="openrouter", messages=[])
+litellm.completion(model="gemini-3.7-flash", custom_llm_provider=PROVIDER, messages=[])
+litellm.completion(model="gemini-3.7-flash", messages=[], **CFG)
+litellm.completion(model="gemini-3.7-flash", custom_llm_provider=None, azure=False, messages=[])
+litellm.completion(model="gemini-3.7-flash", custom_llm_provider=os.environ["LLM_PROVIDER"], messages=[])
+litellm.completion(model="gemini-3.7-flash", custom_llm_provider=pick(), messages=[])
+litellm.completion(model="gemini-3.7-flash", azure=use_azure, messages=[])
+litellm.completion(model="gemini-3.7-flash", messages=[], **LATE)
+def ask(provider, model="gemini-2.5-flash"):
+    return litellm.completion(model=model, custom_llm_provider=provider, messages=[])
+def chat(model="gemini-2.5-flash"):
+    return litellm.completion(model=model, custom_llm_provider="gemini", messages=[])
+chat("gemini-3.7-flash")
+litellm.completion(model="gemini-3.7-flash", custom_llm_provider="gemini", fallbacks=[{"model": "gemini-2.5-flash", "custom_llm_provider": "vertex_ai"}, {"model": "gemini-2.0-flash"}], messages=[])
+litellm.completion(model="gpt-4o", azure=True, fallbacks=[{"model": "gemini-2.5-flash", "custom_llm_provider": "gemini"}], messages=[])
+litellm.completion(model="gpt-4o", fallbacks=[{"model": "gemini-2.5-flash", "custom_llm_provider": os.environ["P"]}], messages=[])
+litellm.completion(model="gpt-4o", custom_llm_provider="gemini", deployment_id="chat-prod", messages=[])
+"#,
+    );
+    // (line, key, provider) of every value of the calls with no gap.
+    let provider_of = |line: u32| -> Vec<(String, Option<String>)> {
+        call_on(&found, line)
+            .values
+            .iter()
+            .map(|v| (v.key.clone(), v.provider.clone()))
+            .collect()
+    };
+    let named = |key: &str, provider: Option<&str>| (key.to_string(), provider.map(str::to_string));
+    for (line, provider) in [
+        (7, Some("gemini")),
+        (8, Some("vertex_ai")),
+        (9, Some("bedrock")),
+        (10, Some("azure")),
+        (11, Some("azure")),
+        (12, Some("openrouter")),
+        (13, Some("vertex_ai")),
+        (14, Some("gemini")),
+        (15, None),
+    ] {
+        assert_eq!(provider_of(line), vec![named("model", provider)], "{line}");
+        assert!(
+            gaps_on(&found, line).is_empty(),
+            "{line}: {:?}",
+            gaps_on(&found, line)
+        );
+    }
+    // Not shown: the call's route is not known, and no value names a
+    // provider.
+    for line in [16, 17, 18, 19, 21] {
+        assert_eq!(provider_of(line), vec![named("model", None)], "{line}");
+        assert!(
+            gaps_on(&found, line).contains(&"ambiguous_client/litellm_provider".to_string()),
+            "{line}: {:?}",
+            gaps_on(&found, line)
+        );
+    }
+    let detail = found
+        .gaps
+        .iter()
+        .find(|g| g.reason == "litellm_provider")
+        .map(|g| g.detail.clone())
+        .unwrap();
+    assert!(detail.contains("does not show"), "{detail}");
+    // A parameter default's candidates go where the call's value goes.
+    let chat = found
+        .gaps
+        .iter()
+        .find(|g| g.span.is_some_and(|s| s.line == 23) && !g.values.is_empty())
+        .unwrap_or_else(|| panic!("{:?}", gaps_on(&found, 23)));
+    assert_eq!(chat.values[0].value, "gemini-3.7-flash");
+    assert_eq!(chat.values[0].provider.as_deref(), Some("gemini"));
+    assert_eq!(provider_of(23), vec![named("model", Some("gemini"))]);
+    // A fallback's own provider, else the call's; `azure=True` on the call
+    // reaches every fallback and wins over a fallback's own
+    // `custom_llm_provider`.
+    assert_eq!(
+        provider_of(25),
+        vec![
+            named("model", Some("gemini")),
+            named("fallbacks.model", Some("vertex_ai")),
+            named("fallbacks.model", Some("gemini")),
+        ]
+    );
+    assert!(gaps_on(&found, 25).is_empty(), "{:?}", gaps_on(&found, 25));
+    assert_eq!(
+        provider_of(26),
+        vec![
+            named("model", Some("azure")),
+            named("fallbacks.model", Some("azure")),
+        ]
+    );
+    // A fallback's own provider the file does not show.
+    assert_eq!(
+        provider_of(27),
+        vec![named("model", None), named("fallbacks.model", None)]
+    );
+    assert_eq!(
+        gaps_on(&found, 27),
+        vec!["ambiguous_client/litellm_provider".to_string()]
+    );
+    let fallback = found
+        .gaps
+        .iter()
+        .find(|g| g.span.is_some_and(|s| s.line == 27))
+        .unwrap();
+    assert!(
+        fallback.detail.starts_with("a fallback of"),
+        "{}",
+        fallback.detail
+    );
+    // A `deployment_id` is sent to Azure whatever the call names: it gets
+    // no provider.
+    assert_eq!(
+        provider_of(28),
+        vec![named("model", Some("gemini")), named("deployment_id", None),]
+    );
+
+    // In JSON, `provider` is there only when a provider is named.
+    let json = serde_json::to_value(call_on(&found, 7)).unwrap();
+    assert_eq!(json["values"][0]["provider"], "gemini");
+    let json = serde_json::to_value(call_on(&found, 15)).unwrap();
+    assert!(json["values"][0].get("provider").is_none(), "{json}");
 }
 
 #[test]

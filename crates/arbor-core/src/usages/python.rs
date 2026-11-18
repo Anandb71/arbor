@@ -1499,15 +1499,97 @@ struct NestedValue {
     path: String,
     positional: bool,
     resolved: Resolved,
-    /// A LiteLLM option the dict holding the value names next to it, which
-    /// replaces the model that dict sends (`deployment_id`) or picks its
-    /// provider (`custom_llm_provider`): a LiteLLM fallback's own.
-    beside: Option<&'static str>,
+    /// The dict holding the value names a `deployment_id` next to it, which
+    /// replaces the model that dict sends: a LiteLLM fallback's own.
+    deployment: bool,
+    /// The provider arguments the dict holding the value names next to it:
+    /// a LiteLLM fallback's own, which decide where that fallback goes.
+    providers: ProviderArgs,
 }
 
-/// LiteLLM options a fallback dict may name next to its `model`, which then
-/// does not decide what that fallback sends, or where.
-const LITELLM_FALLBACK_OPTIONS: &[&str] = &["deployment_id", "custom_llm_provider"];
+/// How a LiteLLM provider argument reads: `custom_llm_provider`, or
+/// `azure`, whose `True` makes `completion` set `custom_llm_provider` to
+/// `azure`. Given a provider, `get_llm_provider` reads the model as
+/// `<provider>/<model>` (unless it already starts with that prefix) before
+/// any rule about its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProviderPick {
+    /// `None`, `False` or an empty string: the model's name decides.
+    Absent,
+    /// A string literal or a same-file constant (`azure=True` names `azure`).
+    Named(String),
+    /// A value this file does not show (a parameter, the environment, a
+    /// call, an entry a `**` written after it may replace).
+    Unknown,
+}
+
+impl ProviderPick {
+    fn named(&self) -> Option<String> {
+        match self {
+            ProviderPick::Named(name) => Some(name.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// The provider arguments a LiteLLM call, or one of its fallback dicts,
+/// gives: `None` for one it does not give.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProviderArgs {
+    custom: Option<ProviderPick>,
+    azure: Option<ProviderPick>,
+}
+
+impl ProviderArgs {
+    /// LiteLLM's provider arguments, by name.
+    const NAMES: [&'static str; 2] = ["custom_llm_provider", "azure"];
+
+    fn given(&self) -> bool {
+        self.custom.is_some() || self.azure.is_some()
+    }
+
+    /// Records `pick` for argument `name`. Given twice (a keyword and a
+    /// same-file dict expanded with `**`, a `TypeError` when it runs), two
+    /// different readings are not known.
+    fn give(&mut self, name: &str, pick: ProviderPick) {
+        let slot = if name == "azure" {
+            &mut self.azure
+        } else {
+            &mut self.custom
+        };
+        *slot = match slot.take() {
+            Some(earlier) if earlier != pick => Some(ProviderPick::Unknown),
+            _ => Some(pick),
+        };
+    }
+
+    /// These arguments of a fallback dict over the call's: each fallback
+    /// attempt gets the call's arguments, updated with its dict.
+    fn over(&self, call: &ProviderArgs) -> ProviderArgs {
+        ProviderArgs {
+            custom: self.custom.clone().or_else(|| call.custom.clone()),
+            azure: self.azure.clone().or_else(|| call.azure.clone()),
+        }
+    }
+
+    /// The provider LiteLLM picks: `azure=True` wins over
+    /// `custom_llm_provider`.
+    fn pick(&self) -> ProviderPick {
+        let custom = self.custom.clone().unwrap_or(ProviderPick::Absent);
+        match self.azure.as_ref().unwrap_or(&ProviderPick::Absent) {
+            ProviderPick::Named(_) => ProviderPick::Named("azure".to_string()),
+            ProviderPick::Unknown if custom == ProviderPick::Named("azure".to_string()) => custom,
+            ProviderPick::Unknown => ProviderPick::Unknown,
+            ProviderPick::Absent => custom,
+        }
+    }
+}
+
+/// Whether a LiteLLM value key is a `deployment_id`, which `completion`
+/// sends to Azure whatever provider the call names.
+fn is_deployment_key(key: &str) -> bool {
+    key.rsplit('.').next() == Some("deployment_id")
+}
 
 /// A bounded read of nested model values.
 struct NestedRead {
@@ -8419,7 +8501,8 @@ impl<'t> Ctx<'t> {
                         .filter(|v| sent(&v.path))
                         .cloned()
                         .collect();
-                    self.take_nested(&site, found, nested.cut, &mut values);
+                    // Not a LiteLLM call, so no value gets a `provider`.
+                    self.take_nested(&site, found, nested.cut, None, &mut values);
                     let mut seen: HashSet<&str> = HashSet::new();
                     for path in nested
                         .overridden
@@ -8721,14 +8804,19 @@ impl<'t> Ctx<'t> {
         // A LiteLLM call given a `deployment_id`, which replaces its `model`.
         let mut deployment =
             target.pkg == Pkg::Litellm && args.kwargs.iter().any(|k| k == "deployment_id");
-        // A LiteLLM call given a `prompt_id`, or a provider of its own
-        // (`custom_llm_provider`, `azure=True`).
+        // A LiteLLM call given a `prompt_id`.
         let mut prompt = target.pkg == Pkg::Litellm && args.kwargs.iter().any(|k| k == "prompt_id");
-        let mut provider = target.pkg == Pkg::Litellm
-            && args
-                .kwargs
-                .iter()
-                .any(|k| k == "custom_llm_provider" || k == "azure");
+        // The provider a LiteLLM call names itself (`custom_llm_provider`,
+        // `azure=True`), by keyword or in an expanded same-file dict.
+        let mut providers = ProviderArgs::default();
+        if pkg == Pkg::Litellm {
+            for name in ProviderArgs::NAMES {
+                if let Some(value) = keyword_value(call, |n| self.text(n), |k| k == name) {
+                    let pick = self.provider_pick(name, value, scope);
+                    providers.give(name, pick);
+                }
+            }
+        }
         let mut expanded: Vec<usize> = Vec::new();
         // The model keys the expanded same-file dicts give.
         let mut expanded_keys: HashSet<&'static str> = HashSet::new();
@@ -8806,11 +8894,14 @@ impl<'t> Ctx<'t> {
             if pkg == Pkg::Litellm && expansion.summary.last.contains_key("prompt_id") {
                 prompt = true;
             }
-            if pkg == Pkg::Litellm
-                && (expansion.summary.last.contains_key("custom_llm_provider")
-                    || expansion.summary.last.contains_key("azure"))
-            {
-                provider = true;
+            if pkg == Pkg::Litellm {
+                for name in ProviderArgs::NAMES {
+                    if let Some(pick) =
+                        self.dict_provider(&expansion.summary, name, expansion.scope)
+                    {
+                        providers.give(name, pick);
+                    }
+                }
             }
             if pkg != Pkg::Boto3 {
                 let list = self.dict_nested(&expansion);
@@ -8838,16 +8929,39 @@ impl<'t> Ctx<'t> {
                 nested_cut |= list.cut;
             }
         }
-        // A LiteLLM fallback that names its own `deployment_id` or provider.
-        let fallback_options: Vec<(String, &'static str)> = if pkg == Pkg::Litellm {
-            nested
-                .iter()
-                .filter_map(|v| v.beside.map(|option| (v.path.clone(), option)))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        self.take_nested(&site, nested, nested_cut, &mut values);
+        // A LiteLLM call sends each value to the provider it names: the
+        // call's own values and its candidates to the call's, and a
+        // fallback's to the one its dict names, else the call's. A provider
+        // the file does not show leaves the call's routing unknown.
+        let litellm = (pkg == Pkg::Litellm).then_some(&providers);
+        let call_provider = providers.pick();
+        if let Some(name) = call_provider.named() {
+            let candidates = self.out.gaps[gaps_before..]
+                .iter_mut()
+                .filter(|g| !g.key.as_deref().is_some_and(is_deployment_key))
+                .flat_map(|g| g.values.iter_mut());
+            for value in values
+                .iter_mut()
+                .filter(|v| !is_deployment_key(&v.key))
+                .chain(candidates)
+            {
+                value.provider = Some(name.clone());
+            }
+        }
+        // A LiteLLM fallback that names its own `deployment_id`, or a
+        // provider of its own this file does not show.
+        let mut fallback_deployments: Vec<String> = Vec::new();
+        let mut fallback_provider_unknown = false;
+        if let Some(call) = litellm {
+            for value in &nested {
+                if value.deployment {
+                    fallback_deployments.push(value.path.clone());
+                }
+                fallback_provider_unknown |= value.providers.given()
+                    && value.providers.over(call).pick() == ProviderPick::Unknown;
+            }
+        }
+        self.take_nested(&site, nested, nested_cut, litellm, &mut values);
         if site.gap_worthy && !nested_overridden.is_empty() {
             // One gap per key path, at most [`MAX_NESTED_VALUES`]; past
             // that, one `truncated` gap stands for the rest.
@@ -9107,12 +9221,9 @@ impl<'t> Ctx<'t> {
                     format!("`{chain}` is given a `prompt_id`: with a prompt-management integration registered, the prompt's template may name the model LiteLLM sends"),
                 ));
             }
-            for (key, option) in fallback_options {
-                let (reason, detail) = match option {
-                    "deployment_id" => ("deployment_id", format!("`{key}` for `{chain}` is not sent: its fallback names a `deployment_id`, which LiteLLM sends to Azure in its place")),
-                    _ => ("litellm_provider", format!("`{key}` for `{chain}` is sent to the provider its fallback's `custom_llm_provider` names, not the one its name suggests")),
-                };
-                remapped.push((Some(key), reason, detail));
+            for key in fallback_deployments {
+                let detail = format!("`{key}` for `{chain}` is not sent: its fallback names a `deployment_id`, which LiteLLM sends to Azure in its place");
+                remapped.push((Some(key), "deployment_id", detail));
             }
             for (key, reason, detail) in remapped {
                 self.out.gaps.push(UsageGap {
@@ -9130,10 +9241,18 @@ impl<'t> Ctx<'t> {
                     args: None,
                 });
             }
-            // `custom_llm_provider` (or `azure=True`) picks the provider
-            // before the model's name does, so where the call goes is not
-            // what its model suggests.
-            if provider {
+            // `custom_llm_provider` (or `azure`) picks the provider before
+            // the model's name does: a literal one is the value's
+            // `provider`, and one this file does not show leaves the call's
+            // route unknown.
+            let unknown_provider = if call_provider == ProviderPick::Unknown {
+                Some(format!("`{chain}` is given a `custom_llm_provider` or `azure` this file does not show, which picks the provider LiteLLM sends the request to in place of the model's name"))
+            } else if fallback_provider_unknown {
+                Some(format!("a fallback of `{chain}` names a `custom_llm_provider` or `azure` of its own that this file does not show, which picks the provider LiteLLM sends that fallback to in place of its model's name"))
+            } else {
+                None
+            };
+            if let Some(detail) = unknown_provider {
                 self.out.gaps.push(UsageGap {
                     kind: GapKind::AmbiguousClient,
                     sdk: Some(sdk),
@@ -9143,7 +9262,7 @@ impl<'t> Ctx<'t> {
                     chain: Some(chain.clone()),
                     key: None,
                     reason: "litellm_provider".to_string(),
-                    detail: format!("`{chain}` is given `custom_llm_provider` (or `azure=True`), which picks the provider LiteLLM sends the request to in place of the model's name"),
+                    detail,
                     values: Vec::new(),
                     values_complete: false,
                     args: None,
@@ -9411,11 +9530,14 @@ impl<'t> Ctx<'t> {
     /// and [`MAX_FILE_NESTED_VALUES`] per file. Values cut by either limit,
     /// or a read cut short after model values were found, leave a
     /// `truncated` gap: the call may carry values the report does not list.
+    /// On a LiteLLM call (`litellm`, the call's provider arguments), each
+    /// value gets the provider its dict names, else the call's.
     fn take_nested(
         &mut self,
         site: &Site<'_, 't>,
         nested: Vec<NestedValue>,
         read_cut: bool,
+        litellm: Option<&ProviderArgs>,
         values: &mut Vec<CapturedValue>,
     ) {
         if nested.is_empty() {
@@ -9434,7 +9556,18 @@ impl<'t> Ctx<'t> {
             }
             listed += 1;
             self.nested_left -= 1;
+            let provider = litellm
+                .filter(|_| !is_deployment_key(&item.path))
+                .and_then(|call| item.providers.over(call).pick().named());
+            let (values_before, gaps_before) = (values.len(), self.out.gaps.len());
             self.take_value(site, &item.path, item.positional, Ok(item.resolved), values);
+            // The value, and the candidates of the gaps next to it.
+            let candidates = self.out.gaps[gaps_before..]
+                .iter_mut()
+                .flat_map(|g| g.values.iter_mut());
+            for value in values[values_before..].iter_mut().chain(candidates) {
+                value.provider = provider.clone();
+            }
         }
         if (dropped || read_cut) && site.gap_worthy {
             let chain = site.chain;
@@ -9878,6 +10011,9 @@ impl<'t> Ctx<'t> {
             "dictionary" => {
                 // Read once per literal (memoized), like any dict lookup.
                 let summary = self.dict_summary(node);
+                // The provider arguments the dict names, read for its first
+                // model value.
+                let mut providers: Option<ProviderArgs> = None;
                 // Indexes as `dict_entries` counts them: every named child
                 // but comments.
                 let mut index = 0;
@@ -9920,17 +10056,28 @@ impl<'t> Ctx<'t> {
                         if overridden {
                             read.overridden.push(path);
                         } else if let Ok(resolved) = self.resolve_value(value, place.scope, 0) {
-                            let beside = LITELLM_FALLBACK_OPTIONS
-                                .iter()
-                                .find(|option| {
-                                    **option != key && summary.last.contains_key(**option)
-                                })
-                                .copied();
+                            let deployment = key != "deployment_id"
+                                && summary.last.contains_key("deployment_id");
+                            let providers = match &providers {
+                                Some(providers) => providers.clone(),
+                                None => {
+                                    let mut args = ProviderArgs::default();
+                                    for name in ProviderArgs::NAMES {
+                                        if let Some(pick) =
+                                            self.dict_provider(&summary, name, place.scope)
+                                        {
+                                            args.give(name, pick);
+                                        }
+                                    }
+                                    providers.insert(args).clone()
+                                }
+                            };
                             read.found.push(NestedValue {
                                 path,
                                 positional: place.positional,
                                 resolved,
-                                beside,
+                                deployment,
+                                providers,
                             });
                         }
                     } else if is_container(value) {
@@ -11137,6 +11284,59 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// How LiteLLM provider argument `name` (one of [`ProviderArgs::NAMES`])
+    /// reads with `value`. A provider is read under the value rules, and only
+    /// one that is the sole value its source gives (a literal or a same-file
+    /// constant) is named. `azure` names Azure only when it is `True`.
+    fn provider_pick(&mut self, name: &str, value: Node<'t>, scope: usize) -> ProviderPick {
+        if self.is_none_value(value, scope) {
+            return ProviderPick::Absent;
+        }
+        if name == "azure" {
+            return match value.kind() {
+                "true" => ProviderPick::Named("azure".to_string()),
+                "false" => ProviderPick::Absent,
+                _ => ProviderPick::Unknown,
+            };
+        }
+        match self.resolve_value(value, scope, 0) {
+            Ok(resolved)
+                if resolved.is_certain()
+                    && matches!(
+                        resolved.origin,
+                        ValueOrigin::Literal
+                            | ValueOrigin::ModuleConstant
+                            | ValueOrigin::ClassConstant
+                            | ValueOrigin::LocalConstant
+                    ) =>
+            {
+                if resolved.value.is_empty() {
+                    ProviderPick::Absent
+                } else {
+                    ProviderPick::Named(resolved.value)
+                }
+            }
+            _ => ProviderPick::Unknown,
+        }
+    }
+
+    /// How LiteLLM provider argument `name` reads in a dict literal, or
+    /// `None` when the dict has no such key. An entry that a `**` or a
+    /// computed key written after it may replace is not known.
+    fn dict_provider(
+        &mut self,
+        summary: &DictSummary<'t>,
+        name: &str,
+        scope: usize,
+    ) -> Option<ProviderPick> {
+        let (index, value) = *summary.last.get(name)?;
+        Some(if summary.overridable(index) {
+            ProviderPick::Unknown
+        } else {
+            self.provider_pick(name, value, scope)
+        })
+    }
+
     fn dict_summary(&mut self, dict: Node<'t>) -> Rc<DictSummary<'t>> {
         if let Some(summary) = self.dict_cache.get(&dict.id()) {
             return Rc::clone(summary);
@@ -11400,6 +11600,7 @@ fn captured(key: &str, resolved: Resolved, positional: bool) -> CapturedValue {
         positional,
         span: resolved.span,
         model_family: family,
+        provider: None,
     }
 }
 
