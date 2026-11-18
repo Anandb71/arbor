@@ -5,10 +5,10 @@ calls the OpenAI, Anthropic and Gemini SDKs, directly or through LangChain's
 OpenAI and Anthropic chat models ([LangChain chat
 models](#langchain-chat-models)), and where it calls models on Amazon Bedrock
 or through LiteLLM ([Amazon Bedrock and LiteLLM](#amazon-bedrock-and-litellm)),
-and where it posts JSON to OpenAI's or Anthropic's REST API with `requests` or
-`httpx` ([Raw HTTP requests](#raw-http-requests)), with each call's routing
-and model values. A consumer (a codemod, a reviewer)
-should treat the report this way:
+and where it sends `requests.post` or `httpx.post` to a listed OpenAI or
+Anthropic endpoint whose URL is a literal or a same-file constant ([Raw HTTP
+requests](#raw-http-requests)), with each call's routing and model values. A
+consumer (a codemod, a reviewer) should treat the report this way:
 
 - **A value or route with no gap at its call is confirmed.** It comes from one
   of the shapes in the supported grammar below, and nothing in the file can
@@ -636,11 +636,10 @@ requests; r.post = fake`, a parameter, `self.http`), and a test helper aimed at
 the library (`monkeypatch.setattr(requests, "post", ...)`,
 `mock.patch("requests.post")`, `patch.object(...)`) is a `dynamic_feature` gap
 on every raw HTTP request in the file, as is any dynamic feature of the whole
-file. A replaced
-`post` may also change the dict it is given, so in such a file a dict passed
-as `json=` counts as passed elsewhere again, for SDK calls that expand it
-too. A `def` or `class` that rebinds the imported `post` (or any other
-imported name) is a definition of that name from there on.
+file. A patched library may also change the dict `post` is given, so in such
+a file a dict passed as `json=` counts as passed elsewhere again, for SDK
+calls that expand it too. A `def` or `class` that rebinds the imported `post`
+(or any other imported name) is a definition of that name from there on.
 
 `arbor retirements` treats these as direct calls on the provider's schedule.
 Their argument names are the library's, and the scan reads only the model in

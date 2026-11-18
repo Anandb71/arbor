@@ -854,7 +854,7 @@ fn join_and(names: &[&str]) -> String {
 
 fn data_line(report: &RetirementReport) -> String {
     format!(
-        "Retirement data from the providers' deprecation pages: {}. Days are counted in UTC. Python only for now: the openai/anthropic/google SDKs, requests.post and httpx.post to OpenAI's and Anthropic's listed endpoints, LangChain's ChatOpenAI, AzureChatOpenAI and ChatAnthropic, and LiteLLM (routed). Runs locally: no code leaves this machine.",
+        "Retirement data from the providers' deprecation pages: {}. Days are counted in UTC. Python only for now: the openai/anthropic/google SDKs, requests.post and httpx.post to a listed OpenAI or Anthropic endpoint whose URL is a literal or a same-file constant, LangChain's ChatOpenAI, AzureChatOpenAI and ChatAnthropic, and LiteLLM (routed). Runs locally: no code leaves this machine.",
         provider_dates(report)
     )
 }

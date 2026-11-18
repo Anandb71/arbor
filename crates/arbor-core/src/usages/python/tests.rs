@@ -8977,7 +8977,7 @@ fn a_url_with_userinfo_or_assigned_twice_is_not_followed() {
 }
 
 #[test]
-fn a_local_post_that_shadows_the_import_keeps_an_sdk_spread_readable() {
+fn a_local_post_that_shadows_the_import_leaves_an_sdk_spread_unread() {
     // `post` is the file's own function, not requests': the dict it is
     // given is passed on like any other, so the SDK call's `**body` is a
     // spread the scan does not read.

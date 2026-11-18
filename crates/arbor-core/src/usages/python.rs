@@ -3718,7 +3718,10 @@ impl<'t> Ctx<'t> {
     fn settle_dict_escapes(&mut self) {
         // `requests.post` and `httpx.post` serialize the dict they are
         // given; anything else may keep or change it, and so may they once
-        // the file may replace them: `post` written on the library, or a
+        // the file may patch the library (`note_http_patch`: any attribute
+        // written, deleted or set with `setattr` at or below `requests` or
+        // `httpx`; `post` or a run-time name written on an object the scan
+        // cannot identify; a test helper aimed at the library) or has a
         // whole-file dynamic feature (`settle_builtin_values` may add one
         // later, so a builtin used as a value counts here already).
         self.note_http_patch();
