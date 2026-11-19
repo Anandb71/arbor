@@ -644,38 +644,46 @@ fn window_phrase(fail_within: Option<i64>) -> String {
     }
 }
 
+/// `1 already retired, 3 retiring (next: 14 Jan 2027, 88 days)`.
+fn state_counts(retired: usize, retiring: usize, other: usize, next: &str) -> String {
+    let mut parts = Vec::new();
+    if retired > 0 {
+        parts.push(format!("{retired} already retired"));
+    }
+    if retiring > 0 {
+        parts.push(format!("{retiring} retiring{next}"));
+    }
+    if other > 0 {
+        parts.push(format!("{other} to keep an eye on"));
+    }
+    parts.join(", ")
+}
+
 fn summary_lines(report: &RetirementReport, markdown: bool) -> Vec<String> {
     let s = &report.summary;
     let mut lines = Vec::new();
-    if s.affected_calls == 0 {
+    // Only when nothing is listed: a routed call (an `AzureChatOpenAI`, a
+    // client or `ChatOpenAI` given another host) is not direct, and with
+    // `--include-routed` it is listed and may fail the check.
+    if s.affected_calls == 0 && report.routed.is_empty() {
         lines.push(format!(
-            "No direct openai/anthropic/google SDK calls to retired or retiring models found in {} Python file{}. Arbor also reads LangChain's ChatOpenAI and ChatAnthropic, raw HTTP posts to their APIs and the agent-framework classes listed in docs/SDK_USAGES.md, where it can resolve them. Calls through LiteLLM count as routed; Bedrock's own model schedule and other wrappers are not checked yet.",
+            "Arbor found no direct calls to OpenAI, Anthropic or Google that use retired or retiring models in {} Python file{}, counting requests.post and httpx.post to a listed OpenAI or Anthropic endpoint whose URL is a literal or a constant in the same file, and the agent-framework classes listed in docs/SDK_USAGES.md. Calls through LiteLLM count as routed; Bedrock calls, LangChain models other than ChatOpenAI, AzureChatOpenAI and ChatAnthropic, other HTTP requests and other wrappers are not checked yet.",
             s.files_scanned,
             if s.files_scanned == 1 { "" } else { "s" }
         ));
-    } else {
-        let mut parts = Vec::new();
-        if s.retired > 0 {
-            parts.push(format!("{} already retired", s.retired));
-        }
-        if s.retiring > 0 {
-            let next = s
-                .next_shutdown
-                .as_ref()
-                .map(|n| format!(" (next: {}, {})", n.date.human(), days(n.days_left)))
-                .unwrap_or_default();
-            parts.push(format!("{} retiring{next}", s.retiring));
-        }
-        if s.other > 0 {
-            parts.push(format!("{} to keep an eye on", s.other));
-        }
+    } else if s.affected_calls > 0 {
+        let next = s
+            .next_shutdown
+            .as_ref()
+            .map(|n| format!(" (next: {}, {})", n.date.human(), days(n.days_left)))
+            .unwrap_or_default();
         lines.push(format!(
             "{} in {} file{} {} retired or retiring models: {}.",
             calls(s.affected_calls),
             s.affected_files,
             if s.affected_files == 1 { "" } else { "s" },
             verb(s.affected_calls, "uses", "use"),
-            parts.join(", ")
+            state_counts(s.retired, s.retiring, s.other, &next)
         ));
         let mut fixes = Vec::new();
         if s.swap > 0 {
@@ -700,6 +708,17 @@ fn summary_lines(report: &RetirementReport, markdown: bool) -> Vec<String> {
         if !fixes.is_empty() {
             lines.push(format!("{}.", capitalize(&fixes.join("; "))));
         }
+    }
+    if !report.routed.is_empty() {
+        let routed = &report.routed;
+        let count = |state: State| routed.iter().filter(|f| f.status == state).count();
+        let (retired, retiring) = (count(State::Retired), count(State::Retiring));
+        lines.push(format!(
+            "Through Azure, another host in base_url, another cloud or LiteLLM, {} {} retired or retiring models: {}. The provider's dates may not apply there.",
+            calls(routed.len()),
+            verb(routed.len(), "uses", "use"),
+            state_counts(retired, retiring, routed.len() - retired - retiring, "")
+        ));
     }
     if report.exit_code == 1 {
         lines.push(format!(
@@ -735,7 +754,7 @@ fn not_checked_lines(report: &RetirementReport, markdown: bool) -> Vec<String> {
     }
     if s.no_model_calls > 0 {
         lines.push(format!(
-            "Not checked: {} {} no model, so the SDK's or the server's default applies.",
+            "Not checked: {} {} no model, so the SDK's, the server's or LangChain's default applies.",
             calls(s.no_model_calls),
             verb(s.no_model_calls, "passes", "pass")
         ));
@@ -836,7 +855,7 @@ fn join_and(names: &[&str]) -> String {
 
 fn data_line(report: &RetirementReport) -> String {
     format!(
-        "Retirement data from the providers' deprecation pages: {}. Days are counted in UTC. Python only for now: direct SDK calls, raw HTTP posts to OpenAI's and Anthropic's APIs, LangChain chat models, the OpenAI Agents SDK, the Claude Agent SDK, AgentScope and LiteLLM (routed). Runs locally: no code leaves this machine.",
+        "Retirement data from the providers' deprecation pages: {}. Days are counted in UTC. Python only for now: the openai/anthropic/google SDKs, requests.post and httpx.post to a listed OpenAI or Anthropic endpoint whose URL is a literal or a same-file constant, LangChain's ChatOpenAI, AzureChatOpenAI and ChatAnthropic, the OpenAI Agents SDK, Claude Agent SDK and AgentScope classes listed in docs/SDK_USAGES.md, and LiteLLM (routed). Runs locally: no code leaves this machine.",
         provider_dates(report)
     )
 }
@@ -956,7 +975,7 @@ fn print_human(report: &RetirementReport, quiet: bool, offer: bool) {
     if !report.routed.is_empty() {
         println!(
             "\n{}",
-            "Through Azure, another host in base_url or another cloud (the provider's dates may not apply):"
+            "Through Azure, another host in base_url, another cloud or LiteLLM (the provider's dates may not apply):"
                 .bold()
         );
         for group in groups(&report.routed) {
@@ -1099,7 +1118,7 @@ fn markdown(report: &RetirementReport) -> String {
     let sections: [(&str, &[Finding]); 2] = [
         ("", &report.findings),
         (
-            "### Through Azure, another host in base_url or another cloud\n\nThe provider's dates may not apply to these calls.\n\n",
+            "### Through Azure, another host in base_url, another cloud or LiteLLM\n\nThe provider's dates may not apply to these calls.\n\n",
             &report.routed,
         ),
     ];

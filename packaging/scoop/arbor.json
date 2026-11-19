@@ -1,12 +1,12 @@
 {
-  "version": "3.1.0",
+  "version": "3.1.1",
   "description": "Graph-native intelligence for codebases \u2014 know what breaks before you break it",
   "homepage": "https://github.com/Anandb71/arbor",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/Anandb71/arbor/releases/download/v3.1.0/arbor-windows-x86_64.zip",
-      "hash": "a1f7ee896e981d69e38a216eb8ab5bdef14065114e8a7407452cfed1742d2383",
+      "url": "https://github.com/Anandb71/arbor/releases/download/v3.1.1/arbor-windows-x86_64.zip",
+      "hash": "8bc3779987b2061fa848dbe6b6cfef39e955c060261064ffc7db8fa1b500cf49",
       "bin": "arbor.exe"
     }
   },

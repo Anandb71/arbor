@@ -5,12 +5,12 @@ calls the OpenAI, Anthropic and Gemini SDKs, directly or through LangChain's
 OpenAI and Anthropic chat models ([LangChain chat
 models](#langchain-chat-models)), and where it calls models on Amazon Bedrock
 or through LiteLLM ([Amazon Bedrock and LiteLLM](#amazon-bedrock-and-litellm)),
-where it posts JSON to OpenAI's or Anthropic's REST API with `requests` or
-`httpx` ([Raw HTTP requests](#raw-http-requests)), and where an agent
-framework is given a model: the OpenAI Agents SDK, the Claude Agent SDK and
-AgentScope ([Agent frameworks](#agent-frameworks)), with each call's routing
-and model values. A consumer (a codemod, a reviewer)
-should treat the report this way:
+where it sends `requests.post` or `httpx.post` to a listed OpenAI or
+Anthropic endpoint whose URL is a literal or a same-file constant ([Raw HTTP
+requests](#raw-http-requests)), and where an agent framework is given a
+model: the OpenAI Agents SDK, the Claude Agent SDK and AgentScope ([Agent
+frameworks](#agent-frameworks)), with each call's routing and model values. A
+consumer (a codemod, a reviewer) should treat the report this way:
 
 - **A value or route with no gap at its call is confirmed.** It comes from one
   of the shapes in the supported grammar below, and nothing in the file can
@@ -252,8 +252,8 @@ The file must not do any of these:
 
 ## LangChain chat models
 
-LangChain's chat models call the OpenAI and Anthropic SDKs for you. The report
-follows these classes:
+LangChain's OpenAI and Anthropic chat models call those SDKs for you. The
+report follows these classes:
 
 | Class | Imported from | Routes like |
 |---|---|---|
@@ -263,17 +263,28 @@ follows these classes:
 | `ChatBedrock`, `ChatBedrockConverse` | `langchain_aws` | `boto3.client("bedrock-runtime")`: `bedrock` ([below](#amazon-bedrock-and-litellm)) |
 
 The partner packages (`langchain_openai`, `langchain_anthropic`,
-`langchain_aws`) are followed the way an SDK is: `from ... import`, `import
-langchain_openai` and a wildcard import. The deprecated
-`langchain_community.chat_models` and `langchain.chat_models` re-export other
-providers' models too, so they, and their submodules
-(`langchain_community.chat_models.openai`), are followed only through `from
-... import` of one of these classes; `import langchain_community.chat_models as
-cm` is not followed. No other LangChain name is tracked: other providers' chat
-models (`ChatOllama`, `ChatGoogleGenerativeAI`, `ChatVertexAI`, the deprecated
-`BedrockChat`), embeddings (`OpenAIEmbeddings`, `BedrockEmbeddings`),
-completion models (`langchain_openai.OpenAI`, `BedrockLLM`),
-`init_chat_model(...)` and LangChain's helpers report nothing.
+`langchain_aws`) are followed the way an SDK is: `from ... import`, `import langchain_openai` and a wildcard
+import. The deprecated `langchain_community.chat_models` and
+`langchain.chat_models` re-export other providers' models too, so they, and
+their submodules (`langchain_community.chat_models.openai`), are followed only
+through `from ... import` of one of these classes; `import
+langchain_community.chat_models as cm` is not followed. A name that more than
+one of these modules binds to the same class, as a `try`/`except ImportError`
+fallback from a partner package to a deprecated module does, is followed as
+that class; when one of them is the deprecated copy of an OpenAI class, the
+pre-1.0 rule below applies to it. A name bound to two different classes
+(`AzureChatOpenAI` or `ChatOpenAI`, chosen by a branch, a conditional
+expression or an import fallback), or to one of them and another value
+that may build a request (`None`, the usual optional-dependency fallback,
+does not), builds a chat model whose class is decided at run time: the
+constructor is recorded with its values, routes `unknown` and gets a
+`multiple_assignments` gap, under the first class that takes a model. When a
+fallback binds the partner `ChatOpenAI` and its deprecated copy, the record
+names the deprecated package, so the pre-1.0 rule applies to it. No other LangChain name is tracked: other
+providers' chat models (`ChatOllama`, `ChatGoogleGenerativeAI`, `ChatVertexAI`,
+the deprecated `BedrockChat`), embeddings (`OpenAIEmbeddings`,
+`BedrockEmbeddings`), completion models (`langchain_openai.OpenAI`,
+`BedrockLLM`), `init_chat_model(...)` and LangChain's helpers report nothing.
 
 - **The constructor binds the model.** `ChatOpenAI(model="gpt-4o")` is a
   construction and a call (`request: false`) whose `model` or `model_name`
@@ -291,14 +302,37 @@ completion models (`langchain_openai.OpenAI`, `BedrockLLM`),
     models fail to build without one, so neither is it there.
 
   The classes are pydantic models that take keyword arguments only, so a
-  positional argument is not read. A built model's requests read its model
-  field when they are sent, so a write of either of its names (`model` or
-  `model_name`; `model_id` or `model`) on any object other than `self` or a
-  same-file class (`llm.model_name = ...`, `settings.model = ...`), or of an
-  attribute with a run-time name, gives the LangChain chat model values in
-  the file a `dynamic_feature` gap. So does making the model configurable at
-  run time (`configurable_fields(model_name=...)`,
-  `configurable_alternatives(...)`).
+  positional argument is not read. A built model's requests send its model
+  field, read when they are sent, unless the call passes its own `model`
+  (`model_id` or `modelId` on a Bedrock model; see the calls below). LangChain sends `model_kwargs` over its own
+  parameters and `extra_body` over the request body, so a `model` in either
+  is sent over the field, and one in `extra_body` over one in
+  `model_kwargs`. A write, on any object other than `self` or a same-file
+  class, gives a value of a LangChain chat model in the file a
+  `dynamic_feature` gap when it may replace that value:
+  - a write of `model` or `model_name` (or `model_id`), with any value
+    (`llm.model_name = ...`, `settings.model = ...`), replaces the model
+    field under either of its names (`model_id` or `model` on a Bedrock
+    model). A `model` given in `model_kwargs` or
+    `extra_body` is sent over the field, so the write gives it no gap;
+  - a write of `model_kwargs` or `extra_body`, with any value
+    (`llm.extra_body = {"seed": 1}`), replaces what the constructor gives in
+    that field (`extra_body.model`);
+  - a write of `model_kwargs` or `extra_body` whose value may hold a key
+    replaces what is sent before it under that key: with a `model`, the
+    model field, and for `extra_body`, what `model_kwargs` gives under the
+    same key (`model_kwargs.model`). A value may hold any key unless it is
+    `None` (written there, or through a name assigned once, to `None`) or a
+    dict literal written there that cannot hold that key (no entry for it,
+    no `**` expansion and no computed key):
+    `llm.model_kwargs = {"response_format": ...}` keeps the model field.
+
+  An attribute written with a run-time name, and a model made configurable
+  at run time (`configurable_fields(model_name=...)`,
+  `configurable_alternatives(...)`), give every value the gap. A chat model
+  built with no model field already has its `missing_model` gap. A change
+  made in place (`llm.model_kwargs["model"] = ...`,
+  `llm.model_kwargs.update(...)`) is not seen.
 - **The route.** A chat model routes like the SDK client it builds, under the
   client rules in [Routes](#routes). Its endpoint is `base_url` or LangChain's
   own name for it (`openai_api_base`, `anthropic_api_url`), routed by host.
@@ -316,30 +350,71 @@ completion models (`langchain_openai.OpenAI`, `BedrockLLM`),
   client it holds (`llm.client`, `root_client`, `_client` and their async
   versions) is a `dynamic_feature` gap. Passing one of those to the
   constructor (`ChatOpenAI(client=OpenAI(base_url=...).chat.completions)`)
-  routes it `unknown` with a `given_client` gap.
+  routes it `unknown` with a `given_client` gap. A member of the SDK it builds
+  its client from replaced in the file (`openai.OpenAI = Recorder`) is a
+  `dynamic_feature` gap, as it is for that SDK's own clients.
 - **The pre-1.0 SDK.** The deprecated `ChatOpenAI` also runs on `openai<1.0`,
   where a chat model given no endpoint sends its requests through the
   module-level API. In a file that configures the module-level API (any
   routing setting, anywhere in the file), such a model routes `unknown` with a
   `langchain_module_config` gap. `langchain_openai` needs `openai>=1`, so this
   does not apply to it.
-- **Calls on a chat model** (`llm.invoke(...)`,
+- **Calls on a chat model** (`llm.invoke(...)`, `llm.stream(...)`,
   `llm.with_structured_output(...)`) are recorded with its routing, as calls on
-  a client are. What such a call returns, including a copy
-  (`llm.copy(update=...)`, which may change any field), is not followed.
+  a client are, and all with `request: false`, whatever the method is called.
+  What such a call returns is not followed, including a copy
+  (`llm.copy(update=...)`, `llm.model_copy(update=...)`). A copy's `update`
+  gives no value: pydantic sets those fields by their own names, not
+  LangChain's aliases (`model_name` on the OpenAI classes, `model` on
+  `ChatAnthropic`). An `update` that may set the model the copy sends is a
+  `langchain_copy` gap: one that names `model` or `model_name`, one that
+  gives `model_kwargs` or `extra_body` a value that may hold a `model` (the
+  rule for a write of those fields, above), or one the file cannot read as a
+  dict. The `update` is read where the call writes it, or as the `update`
+  entry of a same-file dict expanded with `**` (`llm.copy(**COPY_ARGS)`). A
+  name given as the `update` (`llm.copy(update=UPDATE)`) is passed on to
+  `copy`, so rule 5 does not read it: it is a gap unless it is assigned
+  once, to `None`. `update=None`, and a dict that sets none of those
+  (`llm.copy(update={"model_kwargs": {"response_format": ...}})`), are no
+  gap.
+  LangChain sends a call's keyword arguments over the model's own parameters,
+  so a call may pass its own `model` (`llm.invoke(q, model=...)`,
+  `llm.bind(model=...)`), which is sent in place of the field: a literal is
+  read under the value rules above, a parameter is a gap, and a `**` expansion
+  the file cannot read is a `splat` gap on `model`, as for an SDK request.
   LangChain's run options (`config`, `configurable`, `metadata`, `tags`,
   `callbacks`, `run_name`) and a call's positional input never reach the
-  provider's request, so a `model` key inside them is not read.
+  provider's request, so a `model` key inside them is not read, whether they
+  are written at the call or come from a same-file dict expanded with `**`.
+  A call through the SDK client a chat model holds is a call on that client,
+  not on the chat model: a request there is an SDK request (`request: true`)
+  of the SDK's package (`openai`, `anthropic`) with the chat model's routing,
+  read like any other, and its member is the path on that client. The OpenAI
+  classes hold the OpenAI client in `root_client` and `root_async_client`
+  (`langchain_openai` only) and its `chat.completions` resource in `client`
+  and `async_client`, so `llm.client.create(...)` is
+  `chat.completions.create`. `ChatAnthropic` holds the Anthropic client in
+  `_client` and `_async_client`, and the deprecated one in `client` and
+  `async_client` (`claude._client.messages.create(...)` is
+  `messages.create`). `ChatBedrock` and `ChatBedrockConverse` hold the
+  boto3 `bedrock-runtime` client in `client`, so
+  `llm.client.converse(modelId=...)` is a Bedrock request. A call through any
+  other field
+  (`llm._client.create(...)` on `ChatOpenAI`) stays a call on the chat model.
   On a Bedrock model, the Converse API sends a `model_id=` (or `modelId=`)
   given to the call instead of the model's own
   (`llm.invoke(q, model_id=...)`), so it is read there, and a `**` expansion
-  the file cannot read is a `splat` gap on `model_id`. `ChatBedrock` sends it
+  the file cannot read is a `splat` gap on `model_id`. langchain-aws folds
+  both spellings into one `modelId`, the later winning, so a call given both,
+  or one next to such a `**`, keeps a `reassigned` or `splat` gap. `ChatBedrock` sends it
   only when it runs on the Converse API (`beta_use_converse_api`), so there
   the value keeps a `conditional` gap; `ChatBedrockConverse` always does.
 
 `arbor retirements` checks only the model of these calls: LangChain takes its
 own arguments and builds the request, so the SDK's argument rules do not
-describe them (see [RETIREMENTS.md](RETIREMENTS.md)).
+describe them (see [RETIREMENTS.md](RETIREMENTS.md)). A request through the
+SDK client a chat model holds is checked like the same SDK request, on the
+member it reaches there.
 
 ## Amazon Bedrock and LiteLLM
 
@@ -407,9 +482,11 @@ session given `botocore_session` or a `**` expansion are not followed.
 **LiteLLM.** `litellm.completion(...)` and `litellm.acompletion(...)`,
 however they are imported (`from litellm import completion`,
 `litellm.main.completion`). The model is `model`, by keyword or as the first
-positional argument, read under the value rules; a `fallbacks=[{"model":
-...}]` entry is a nested value, while plain-string fallbacks
-(`fallbacks=["gpt-4o-mini"]`) and `litellm.model_fallbacks` are not read.
+positional argument (also next to a `deployment_id`), read under the value
+rules, and so is a `deployment_id`; `completion` takes no `engine` or
+`model_name`, so those are not read. A `fallbacks=[{"model": ...}]` entry is a nested value, while
+plain-string fallbacks (`fallbacks=["gpt-4o-mini"]`) and
+`litellm.model_fallbacks` are not read.
 No other LiteLLM function is followed
 (`embedding`, `text_completion`, `responses`, `Router`, `token_counter`,
 `supports_function_calling`...). A missing model is a `TypeError`, so it is
@@ -418,29 +495,59 @@ not a gap.
 - **The route** is `litellm`. LiteLLM picks the provider and endpoint from
   the model string (`anthropic/...`, `azure/...`, `bedrock/...`) and its
   arguments and configuration (`custom_llm_provider=`, `api_base=`, the
-  environment, `litellm.api_base`), so the report does not say which
-  provider's API the call reaches. Replacing `litellm.completion` is a
-  `dynamic_feature` gap on the route; a setting
-  (`litellm.drop_params = True`) changes nothing.
+  environment, `litellm.api_base`), so the route does not say which
+  provider's API the call reaches. `custom_llm_provider`, or `azure=True`
+  (which names `azure` and wins over it), by keyword or in a same-file dict
+  expanded with `**`, picks the provider before the model's name does:
+  LiteLLM sends the model as `<provider>/<model>`. A string literal or a
+  same-file constant is recorded on each value the call sends there as its
+  `provider` (`"provider": "gemini"` in `--json`), with no gap, since the
+  route is then known. A fallback dict's own provider is recorded on that
+  fallback's model, and a fallback that names none gets the call's; a
+  `deployment_id` gets none, since LiteLLM sends it to Azure whatever the
+  call names. A provider the file does not show (a parameter, the
+  environment, a function call, an entry a later `**` may replace), at the
+  call or in a fallback dict, is an `ambiguous_client` gap,
+  `litellm_provider`. Replacing `litellm.completion` is a `dynamic_feature`
+  gap on the route; a setting (`litellm.drop_params = True`) changes
+  nothing.
 - **Remapped models.** LiteLLM may send a model name it is given to another
   model, and these gaps hold no key, so they cover every model value of the
   call, nested fallbacks included:
   - `litellm.model_alias_map` maps it process-wide: a file that mentions it
-    anywhere gives every LiteLLM call a `dynamic_feature` gap;
+    anywhere gives each LiteLLM call in that file a `dynamic_feature` gap;
   - a `model_list` passed to the call, by keyword or in a same-file dict
     expanded with `**`, maps it to a deployment: a `model_list` gap, and the
     list's entries are not read as models;
-  - a `**` expansion the file cannot read may hold a `model_list`: a
-    `splat` gap.
+  - a `prompt_id`, by keyword or in a same-file dict, runs the prompt hooks
+    of a prompt-management integration registered elsewhere, whose
+    template may name the model: a `prompt_id` gap;
+  - a `**` expansion the file cannot read may hold a `model_list`, a
+    `deployment_id` or a `prompt_id`: a `splat` gap.
 
-`arbor retirements` lists both only with `--include-routed`. AWS keeps
-Bedrock's model schedule, which the bundled data does not hold, so nothing is
-looked up for a call routed `bedrock`, whatever its model ID. A LiteLLM model
-is looked up on the schedule its router prefix names (`openai/`,
-`anthropic/`, `gemini/`, `vertex_ai/`), else by its shape, except that a
-Gemini model with no prefix (`gemini-2.5-flash`) is looked up on Vertex AI's
-schedule, where LiteLLM sends it; only `gemini/<model>` reaches the Gemini
-API. As for LangChain, only the checks about the model apply (see
+  A `deployment_id`, by keyword or in a same-file dict expanded with `**`,
+  is sent to Azure in place of the `model` and of every fallback's model
+  (`completion` sets `model = deployment_id`, and each fallback attempt gets
+  the call's arguments): each of those values keeps a `deployment_id` gap,
+  and the deployment is the value sent. A fallback dict that names its own
+  `deployment_id` gives that fallback's model the same gap.
+
+`arbor retirements` does not check Bedrock calls: AWS keeps Bedrock's model
+schedule, which the bundled data does not hold, so nothing is looked up for a
+`boto3` Bedrock call or a LangChain Bedrock model's, whatever its routing
+(`bedrock`, `custom_base_url` for a gateway, `unknown`) and its model ID, and
+none is listed or counted. LiteLLM calls are routed: counted, and listed with
+`--include-routed`, or with their routing not confirmed when the call has a
+routing gap. A LiteLLM model is looked up on the schedule its router prefix
+names (`openai/`, `anthropic/`, `gemini/`, `vertex_ai/`), else by its shape.
+A value with a `provider` is looked up as `<provider>/<model>`, so
+`custom_llm_provider="gemini"` is the Gemini API's schedule and a provider
+with none in the data (`bedrock`, `azure`) looks nothing up. A Gemini model
+with no prefix (`gemini-2.5-flash`) and no provider is looked up on Vertex
+AI's schedule, where LiteLLM sends it (only `gemini/<model>` reaches the
+Gemini API), and on neither Google schedule when the call has a routing gap,
+such as a provider the file does not show. As for
+LangChain, only the checks about the model apply (see
 [RETIREMENTS.md](RETIREMENTS.md)).
 
 ## Raw HTTP requests
@@ -456,8 +563,9 @@ that is also assigned or is a parameter, a wildcard import, a session or
 client (`requests.Session().post`, `httpx.Client().post`),
 `requests.request("POST", ...)` and every other method are not followed.
 
-**The URL** is the first positional argument or `url=`. It is read under the
-value rules, and only a value with no gap counts: a literal, or a same-file
+**The URL** is the first positional argument or `url=`; a `*` argument before
+the first positional one hides which argument it is, so the call records
+nothing. It is read under the value rules, and only a value with no gap counts: a literal, or a same-file
 constant or local. An f-string, an environment lookup (with or without a
 fallback), a parameter or a parameter default records nothing. The URL's
 scheme must be `https` or `http` and its host exactly `api.openai.com` or
@@ -510,22 +618,30 @@ does. The body is:
 
 Only the body's top-level `model` is read, plus the model keys nested in its
 containers (`requests[].params.model` in a Message Batch), as for any dict
-argument. An entry a later `**` expansion or computed key may replace is a
+argument, except under `metadata`: the caller's own tags, which the API stores
+and never reads as the model. An entry a later `**` expansion or computed key may replace is a
 `splat` gap that lists it. A body with no `model` is a `missing_model` gap,
 except a Message Batch, whose models are nested. A body the file cannot read
 (a parameter, a mutated dict, a string, form data, `files=`, more than one
 body) is an `unresolved_model` gap with the reason `request_body`. A call
 given `*args` or `**kwargs`, which may hold another body, keeps a `splat` gap
-with no key, which covers every model value of the call.
+with no key, which covers every model value of the call; a `*` argument after
+the URL may hold the body itself, so the body is not read (`request_body`).
 
-**Replaced.** Writing `post` on the library's module (`requests.post =
-fake`, `setattr(requests, "post", ...)`, `del requests.post`) or any of its
-attributes with a run-time name is a `dynamic_feature` gap on every raw HTTP
-request in the file, as is any dynamic feature of the whole file. A replaced
-`post` may also change the dict it is given, so in such a file a dict passed
-as `json=` counts as passed elsewhere again, for SDK calls that expand it
-too. A `def` or `class` that rebinds the imported `post` (or any other
-imported name) is a definition of that name from there on.
+**Replaced.** `post` hands what it is given down to the rest of the library
+(`Session.request`, `Session.send`, its adapters), so the scan fails closed: any
+attribute written, deleted or set with `setattr` on the library or anything in
+it (`requests.post = fake`, `del requests.post`, `requests.Session.request =
+pin`, `Session.send = pin` after `from requests import Session`), `post` or an
+attribute named at run time written on an object the scan cannot identify (`r =
+requests; r.post = fake`, a parameter, `self.http`), and a test helper aimed at
+the library (`monkeypatch.setattr(requests, "post", ...)`,
+`mock.patch("requests.post")`, `patch.object(...)`) is a `dynamic_feature` gap
+on every raw HTTP request in the file, as is any dynamic feature of the whole
+file. A patched library may also change the dict `post` is given, so in such
+a file a dict passed as `json=` counts as passed elsewhere again, for SDK
+calls that expand it too. A `def` or `class` that rebinds the imported `post`
+(or any other imported name) is a definition of that name from there on.
 
 `arbor retirements` treats these as direct calls on the provider's schedule.
 Their argument names are the library's, and the scan reads only the model in
@@ -918,9 +1034,10 @@ The report assumes the rest. In particular:
 - Where a Bedrock client sends its requests may also come from the AWS
   configuration: an `endpoint_url` in `~/.aws/config`, under whichever
   profile the environment or the file selects (`AWS_PROFILE`,
-  `boto3.Session(profile_name=...)`). A LiteLLM call's may come from
-  settings another module makes (`litellm.api_base`,
-  `litellm.model_alias_map`). Neither is seen.
+  `boto3.Session(profile_name=...)`). Where a LiteLLM call sends its
+  requests may come from settings another module makes (`litellm.api_base`),
+  and another module may remap its model (`litellm.model_alias_map`). None
+  of these is seen.
 - A LangChain chat model's field names and aliases are those of the current
   `langchain-openai`, `langchain-anthropic` and `langchain-aws`; which LangChain version the
   project runs is not known. The agent frameworks' classes and fields are

@@ -410,6 +410,15 @@ pub struct CapturedValue {
     pub span: Span,
     /// Which provider's model-ID shape the value matches, if any.
     pub model_family: Option<Sdk>,
+    /// For a LiteLLM call: the provider the call names apart from the model,
+    /// a string literal or same-file constant given as `custom_llm_provider`
+    /// (or `azure=True`, which is `azure`), at the call or in the fallback
+    /// dict that holds the value. LiteLLM then sends the model as
+    /// `<provider>/<model>`. `None` (omitted from JSON) when none is named;
+    /// one the file does not show is an `ambiguous_client` gap
+    /// (`litellm_provider`) instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 /// A call whose member chain is rooted at a tracked binding.
@@ -426,15 +435,22 @@ pub struct SdkCall {
     pub chain: String,
     /// The part after the tracked root (`chat.completions.create`), with the
     /// response wrappers `with_raw_response` / `with_streaming_response` and
-    /// client copies (`with_options(...)`, `copy(...)`) removed. For a raw
-    /// HTTP request (`package` `requests` or `httpx`), the SDK method its
-    /// endpoint is (`chat.completions.create` for `/v1/chat/completions`).
+    /// client copies (`with_options(...)`, `copy(...)`) removed. A call
+    /// through the SDK client a LangChain chat model holds has the path on
+    /// that client (`llm.client.create(...)` is `chat.completions.create`,
+    /// since the OpenAI classes hold that resource in `client`).
+    /// For a raw HTTP request (`package` `requests` or `httpx`), the SDK
+    /// method its endpoint is (`chat.completions.create` for
+    /// `/v1/chat/completions`).
     pub member: String,
     /// Whether the call sends a request to the provider: its last member is
     /// a request method (`create`, `stream`, `generate_content`,
     /// `send_message`...). `false` for SDK helpers and types
     /// (`genai.configure`, `GenerativeModel(...)`, `types.Part(...)`,
-    /// `ChatCompletion(...)` built from `openai.types`). A name heuristic.
+    /// `ChatCompletion(...)` built from `openai.types`), and for every call
+    /// on a LangChain chat model (`ChatOpenAI(...)`, `llm.invoke(...)`,
+    /// `llm.stream(...)`), whose request LangChain builds; a request through
+    /// the SDK client it holds is the SDK's. A name heuristic.
     pub request: bool,
     pub receiver: Receiver,
     pub routing: Routing,
@@ -495,10 +511,10 @@ pub enum GapKind {
     /// allowlisted key's value is not a resolvable string literal
     /// (environment, config attribute, function call, f-string, parameter,
     /// `**kwargs`, a name imported from another module...), or a call that
-    /// takes a model passes none (`missing_model`: the SDK or server
-    /// default applies). A value captured next to such a gap is one the code
-    /// names but cannot confirm: an environment fallback, a parameter
-    /// default (`parameter_default`, `parameter_overridden`,
+    /// takes a model passes none (`missing_model`: the SDK's, the server's
+    /// or LangChain's default applies). A value captured next to such a gap
+    /// is one the code names but cannot confirm: an environment fallback, a
+    /// parameter default (`parameter_default`, `parameter_overridden`,
     /// `unseen_callers`), an attribute a subclass in another module may
     /// override (`subclass_override`) or a value a dynamic feature of the
     /// file may change (`dynamic_feature`, which names the feature and its

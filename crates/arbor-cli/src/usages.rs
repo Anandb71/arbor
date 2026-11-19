@@ -310,6 +310,12 @@ fn describe_value(value: &CapturedValue) -> String {
         }
         (_, Some(name)) => format!(" (via {name}, line {line})"),
     };
+    // The provider a LiteLLM call names for the value (`custom_llm_provider`).
+    let source = match (value.provider.as_deref(), source.strip_suffix(')')) {
+        (Some(provider), Some(open)) => format!("{open}, provider {provider})"),
+        (Some(provider), None) => format!(" (provider {provider})"),
+        (None, _) => source,
+    };
     clean(&format!("{}=\"{}\"{}", value.key, value.value, source))
 }
 
