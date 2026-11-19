@@ -23,7 +23,7 @@ pub fn run(path: &str, sdk: Option<&str>, json: bool) -> Result<()> {
             None => {
                 return fail(
                     json,
-                    format!("unknown sdk '{name}': use openai, anthropic or google (or gemini)"),
+                    format!("unknown sdk '{name}': use openai, anthropic, google (or gemini), aws (or bedrock) or litellm"),
                 )
             }
         },
@@ -36,6 +36,8 @@ pub fn run(path: &str, sdk: Option<&str>, json: bool) -> Result<()> {
         sdk,
         // Paths print relative to where the command was run.
         display_root: Some(path.display().to_string()),
+        // A module of the project's own may shadow an SDK import.
+        project_root: crate::commands::resolve_project_path(path).ok(),
         ..UsageScanOptions::default()
     };
     match scan_usages(path, &options) {
@@ -126,7 +128,7 @@ fn print_report(report: &UsageReport) {
     );
 
     if report.usages.is_empty() {
-        println!("\nNo OpenAI, Anthropic or Gemini SDK calls found.");
+        println!("\nNo OpenAI, Anthropic, Gemini, Bedrock or LiteLLM calls found.");
     }
     for sdk in Sdk::ALL {
         let calls: Vec<&SdkCall> = report.usages.iter().filter(|c| c.sdk == sdk).collect();
@@ -307,6 +309,12 @@ fn describe_value(value: &CapturedValue) -> String {
             format!(" (default of {name}, line {line})")
         }
         (_, Some(name)) => format!(" (via {name}, line {line})"),
+    };
+    // The provider a LiteLLM call names for the value (`custom_llm_provider`).
+    let source = match (value.provider.as_deref(), source.strip_suffix(')')) {
+        (Some(provider), Some(open)) => format!("{open}, provider {provider})"),
+        (Some(provider), None) => format!(" (provider {provider})"),
+        (None, _) => source,
     };
     clean(&format!("{}=\"{}\"{}", value.key, value.value, source))
 }

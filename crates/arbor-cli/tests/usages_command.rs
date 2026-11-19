@@ -179,6 +179,39 @@ fn human_output_names_sites_routing_and_gaps() {
     assert!(serde_json::from_str::<Value>(&stdout).is_err());
 }
 
+#[test]
+fn a_litellm_provider_is_named_in_human_and_json_output() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("app.py"),
+        "import litellm\nPROVIDER = \"gemini\"\nMODEL = \"gemini-3.7-flash\"\nlitellm.completion(model=\"gemini-3.7-flash\", custom_llm_provider=\"gemini\", messages=[])\nlitellm.completion(model=MODEL, custom_llm_provider=PROVIDER, messages=[])\nlitellm.completion(model=\"gemini-3.7-flash\", messages=[])\n",
+    )
+    .unwrap();
+    let output = arbor(dir.path(), &["usages"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("model=\"gemini-3.7-flash\" (provider gemini)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("model=\"gemini-3.7-flash\" (via MODEL, line 3, provider gemini)"),
+        "{stdout}"
+    );
+    let output = arbor(dir.path(), &["usages", ".", "--json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let providers: Vec<&Value> = report["usages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| &u["values"][0]["provider"])
+        .collect();
+    assert_eq!(
+        providers,
+        vec![&Value::from("gemini"), &Value::from("gemini"), &Value::Null]
+    );
+}
+
 /// The five leaks from the review of #276, plus model-shaped values behind
 /// secret-named bindings. None of the `LEAK` markers may be printed.
 const LEAKS: &str = r#"import os

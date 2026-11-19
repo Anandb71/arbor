@@ -1,0 +1,65 @@
+{
+  "corpus_version": 1,
+  "suite": "usages",
+  "language": "python",
+  "covers": [
+    "OpenAI Agents SDK: Agent with a model= literal and a module constant, an Agent with no model (missing_model), a litellm/ model name routed litellm, LitellmModel, and an OpenAIChatCompletionsModel on a local AsyncOpenAI client routed custom_base_url",
+    "an Agent given a model object records no call of its own, and its construction routes like the object; Runner, function_tool and a name a repository's own agents package exports are not tracked",
+    "Claude Agent SDK: ClaudeAgentOptions with model and fallback_model and an env= that names no endpoint variable (anthropic_direct), an AgentDefinition inside the options' agents dict, and options whose env= turns on Bedrock (unknown, endpoint_option)",
+    "AgentScope: OpenAIChatModel with AgentScope 1's model_name, OpenAIResponseModel with AgentScope 2's credential and model, AnthropicChatModel given a gateway base_url in client_kwargs (custom_base_url); DashScopeChatModel is not tracked",
+    "no API key, environment variable name, gateway host or untracked model reaches the output"
+  ],
+  "usages_expected": [
+    {"at": "app/triage.py:8", "chain": "Agent", "routing": "openai_direct", "values": {"model": "gpt-4o"}},
+    {"at": "app/triage.py:9", "chain": "Agent", "routing": "openai_direct", "values": {"model": "gpt-4o-mini"}},
+    {"at": "app/triage.py:10", "chain": "Agent", "routing": "openai_direct"},
+    {"at": "app/triage.py:13", "chain": "OpenAIChatCompletionsModel", "routing": "custom_base_url", "values": {"model": "llama3.1"}},
+    {"at": "app/triage.py:16", "chain": "LitellmModel", "routing": "litellm", "values": {"model": "anthropic/claude-3-5-haiku-20241022"}},
+    {"at": "app/triage.py:17", "chain": "Agent", "routing": "litellm", "values": {"model": "litellm/anthropic/claude-3-5-sonnet-20241022"}},
+
+    {"at": "app/claude_review.py:6", "chain": "ClaudeAgentOptions", "routing": "anthropic_direct", "values": {"model": "claude-sonnet-4-5-20250929", "fallback_model": "claude-haiku-4-5"}},
+    {"at": "app/claude_review.py:10", "chain": "AgentDefinition", "routing": "anthropic_direct", "values": {"model": "haiku"}},
+    {"at": "app/claude_review.py:12", "chain": "ClaudeAgentOptions", "routing": "unknown", "values": {"model": "claude-opus-4-1"}},
+
+    {"at": "app/scope_models.py:7", "chain": "OpenAIChatModel", "routing": "openai_direct", "values": {"model_name": "gpt-4.1-mini"}},
+    {"at": "app/scope_models.py:8", "chain": "OpenAIResponseModel", "routing": "openai_direct", "values": {"model": "o3-mini"}},
+    {"at": "app/scope_models.py:9", "chain": "AnthropicChatModel", "routing": "custom_base_url", "values": {"model_name": "claude-3-5-sonnet-20241022"}}
+  ],
+  "clients_expected": [
+    {"at": "app/triage.py:8", "constructor": "agents.Agent", "binding": "triage", "routing": "openai_direct"},
+    {"at": "app/triage.py:9", "constructor": "agents.Agent", "binding": "writer", "routing": "openai_direct"},
+    {"at": "app/triage.py:10", "constructor": "agents.Agent", "binding": "fallback", "routing": "openai_direct"},
+    {"at": "app/triage.py:12", "constructor": "openai.AsyncOpenAI", "binding": "local", "routing": "custom_base_url"},
+    {"at": "app/triage.py:13", "constructor": "agents.OpenAIChatCompletionsModel", "binding": "llama", "routing": "custom_base_url"},
+    {"at": "app/triage.py:14", "constructor": "agents.Agent", "binding": "offline", "routing": "custom_base_url"},
+    {"at": "app/triage.py:16", "constructor": "agents.LitellmModel", "binding": "claude", "routing": "litellm"},
+    {"at": "app/triage.py:17", "constructor": "agents.Agent", "binding": "reviewer", "routing": "litellm"},
+
+    {"at": "app/claude_review.py:6", "constructor": "claude_agent_sdk.ClaudeAgentOptions", "binding": "review_options", "routing": "anthropic_direct"},
+    {"at": "app/claude_review.py:10", "constructor": "claude_agent_sdk.AgentDefinition", "routing": "anthropic_direct"},
+    {"at": "app/claude_review.py:12", "constructor": "claude_agent_sdk.ClaudeAgentOptions", "binding": "bedrock_options", "routing": "unknown"},
+
+    {"at": "app/scope_models.py:7", "constructor": "agentscope.OpenAIChatModel", "binding": "chat", "routing": "openai_direct"},
+    {"at": "app/scope_models.py:8", "constructor": "agentscope.OpenAIResponseModel", "binding": "reasoner", "routing": "openai_direct"},
+    {"at": "app/scope_models.py:9", "constructor": "agentscope.AnthropicChatModel", "binding": "proxied", "routing": "custom_base_url"}
+  ],
+  "gaps_expected": [
+    {"at": "app/triage.py:10", "kind": "unresolved_model", "reason": "missing_model"},
+    {"at": "app/claude_review.py:12", "kind": "ambiguous_client", "reason": "endpoint_option"}
+  ],
+  "skipped_expected": {"vendored_files": 0, "vendored_calls": 0, "hidden_files": 0, "hidden_calls": 0},
+  "forbidden_in_output": [
+    "ollama-local-not-a-key",
+    "localhost:11434",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "DASHSCOPE_API_KEY",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "llm-gateway.internal.example.com",
+    "qwen-max",
+    "gpt-3.5-turbo-16k"
+  ],
+  "known_missing": [],
+  "known_extra": [],
+  "notes": "Synthetic. Truth is what each line does at run time, except where a policy turns it into a gap. triage.py: the Agents SDK sends a model name with no prefix through its default AsyncOpenAI() client (openai_direct); :10 gives no model, so the SDK's default applies (missing_model); :13 is a model object on a client given a localhost base_url (custom_base_url), and :14 hands it to an agent, which records no call (the object carries the model) and whose construction routes like the object; :16 is LitellmModel and :17 a litellm/ name, both routed litellm; Runner.run and @function_tool send nothing this scan reads. claude_review.py: the CLI runs on Anthropic's API unless its environment picks another provider; :6's env= names only the API key, :10 is an agent definition inside the options' agents dict (its model an alias, reported as written), :12's env= turns on Bedrock (unknown, endpoint_option). scope_models.py: :7 is AgentScope 1 (model_name), :8 AgentScope 2 (credential and model), :9 gives the Anthropic client a gateway base_url in client_kwargs (custom_base_url); DashScopeChatModel's provider is not tracked. local_agents.py imports a name from the repository's own agents package, which is not followed."
+}

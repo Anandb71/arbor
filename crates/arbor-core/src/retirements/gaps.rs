@@ -86,6 +86,21 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     (GapKind::UnresolvedModel, "splat", "a `**` expansion may replace the model"),
     (
         GapKind::UnresolvedModel,
+        "model_list",
+        "LiteLLM is given a `model_list`, which may map the model to another deployment",
+    ),
+    (
+        GapKind::UnresolvedModel,
+        "deployment_id",
+        "LiteLLM is given a `deployment_id`, which it sends to Azure in place of the model",
+    ),
+    (
+        GapKind::UnresolvedModel,
+        "prompt_id",
+        "LiteLLM is given a `prompt_id`, whose prompt template may name another model",
+    ),
+    (
+        GapKind::UnresolvedModel,
         "parameter_default",
         "the model is the default of a parameter other modules may pass",
     ),
@@ -112,7 +127,22 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
     (
         GapKind::UnresolvedModel,
         "missing_model",
-        "no model is passed, so the SDK's or the server's default applies",
+        "no model is passed, so the SDK's, the server's or LangChain's default applies",
+    ),
+    (
+        GapKind::UnresolvedModel,
+        "langchain_copy",
+        "a copy of a LangChain chat model may be given another model, and calls on the copy are not followed",
+    ),
+    (
+        GapKind::UnresolvedModel,
+        "request_body",
+        "an HTTP request's model is in a body the scan cannot read as JSON, or it sends no body the scan reads",
+    ),
+    (
+        GapKind::UnresolvedModel,
+        "local_module",
+        "the repository has its own module named like the SDK, which the import may load instead",
     ),
     (
         GapKind::UnresolvedModel,
@@ -120,7 +150,11 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
         "the call passes more model values than the scan reads, so not all are listed",
     ),
     // The client the call goes through.
-    (GapKind::AmbiguousClient, "multiple_assignments", "the client is assigned more than one way"),
+    (
+        GapKind::AmbiguousClient,
+        "multiple_assignments",
+        "the client, or the class that builds it, is assigned more than one way",
+    ),
     (
         GapKind::AmbiguousClient,
         "in_file_callers",
@@ -153,6 +187,36 @@ pub const GAP_REASONS: &[(GapKind, &str, &str)] = &[
         GapKind::AmbiguousClient,
         "module_config",
         "another module may route the module-level API to Azure",
+    ),
+    (
+        GapKind::AmbiguousClient,
+        "langchain_module_config",
+        "this file configures the module-level OpenAI API, which a deprecated LangChain chat model uses on the pre-1.0 SDK",
+    ),
+    (
+        GapKind::AmbiguousClient,
+        "litellm_provider",
+        "LiteLLM is given a `custom_llm_provider` or `azure` the file does not show, which picks the provider in place of the model's name",
+    ),
+    (
+        GapKind::AmbiguousClient,
+        "given_client",
+        "the requests go through an SDK client or model provider the chat model, agent or model object is given",
+    ),
+    (
+        GapKind::AmbiguousClient,
+        "local_module",
+        "the repository has its own module named like the SDK, which the import may load instead",
+    ),
+    (
+        GapKind::AmbiguousClient,
+        "options_route",
+        "the agent definition runs where the options it is given to do, which are not built around it",
+    ),
+    (
+        GapKind::AmbiguousClient,
+        "model_route",
+        "the Agents SDK picks where requests go from the model, which is not confirmed or names a provider Arbor does not follow",
     ),
     (
         GapKind::AmbiguousClient,
