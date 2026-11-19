@@ -30,7 +30,9 @@
 //!   resolves to a string (the provider's own host is direct, another host
 //!   is `custom_base_url`), and for Gemini no `vertexai=True`, endpoint
 //!   `http_options` or `**` expansion, in a file that does not configure
-//!   the endpoint some other way;
+//!   the endpoint some other way. A Bedrock client (`boto3.client(
+//!   "bedrock-runtime")`, LangChain's `ChatBedrock`) is read the same way
+//!   through its `endpoint_url`, and routes `bedrock` for any model;
 //! - the module-level API, configured only in the top-of-file setup block:
 //!   plain `=` statements, each routing setting once, on a name only
 //!   imports bind, before the first `def`, `class`, decorator, bare
@@ -104,10 +106,12 @@
 use super::{
     is_argument_name, is_capturable_value, is_credential_value, is_identifier_key, is_secret_key,
     is_value_key, model_family, BindingKind, CallArgs, CapturedValue, ClientConstruction,
-    ClientScope, FileUsages, GapKind, Receiver, Routing, Sdk, SdkCall, SdkImport, Span, Spread,
-    UsageGap, ValueOrigin, VertexAi,
+    ClientScope, FileUsages, GapKind, ModelParam, Receiver, Routing, Sdk, SdkCall, SdkImport, Span,
+    Spread, UsageGap, ValueOrigin, VertexAi, WrapperCall, WrapperLookup, WrapperRequest,
+    BEDROCK_VALUE_KEYS,
 };
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::rc::Rc;
 use tree_sitter::{Node, Tree};
 
@@ -125,6 +129,19 @@ const PREFILTER: &[&str] = &[
     "embeddings.",
     "generate_content",
     "embed_content",
+    // `from langchain.chat_models import ChatOpenAI` names no SDK in lower
+    // case; every LangChain class tracked contains one of these.
+    "ChatOpenAI",
+    "ChatAnthropic",
+    "ChatBedrock",
+    // A `boto3` client is followed only when its service name is this
+    // literal; the others are Bedrock's request names, which a client
+    // passed in from elsewhere is called by.
+    "bedrock-runtime",
+    "invoke_model",
+    "converse(",
+    "converse_stream(",
+    "litellm",
 ];
 
 /// Whether `source` mentions anything the extractor tracks. A file that does
@@ -182,10 +199,33 @@ const REQUEST_METHODS: &[&str] = &[
     "get_model",
 ];
 
+/// The requests of a Bedrock runtime client; each takes a `modelId`.
+const BEDROCK_REQUESTS: &[&str] = &[
+    "invoke_model",
+    "invoke_model_with_response_stream",
+    "invoke_model_with_bidirectional_stream",
+    "converse",
+    "converse_stream",
+    "start_async_invoke",
+    "count_tokens",
+];
+
 /// Whether a call's member path ends in a request method.
 fn is_request(member: &str) -> bool {
     let last = member.rsplit('.').next().unwrap_or(member);
     REQUEST_METHODS.contains(&last)
+}
+
+/// [`is_request`] for a member of `pkg`: a Bedrock client's requests are
+/// [`BEDROCK_REQUESTS`] and LiteLLM's [`LITELLM_REQUESTS`], and those names
+/// are no request of any other SDK.
+fn is_request_of(pkg: Pkg, member: &str) -> bool {
+    let last = member.rsplit('.').next().unwrap_or(member);
+    match pkg {
+        Pkg::Boto3 => BEDROCK_REQUESTS.contains(&last),
+        Pkg::Litellm => LITELLM_REQUESTS.contains(&last),
+        _ => REQUEST_METHODS.contains(&last),
+    }
 }
 
 /// Members that take a model. Like a request, an unresolved model value here
@@ -229,6 +269,12 @@ const MODEL_BEARING: &[&str] = &[
     "Completion.acreate",
     "Embedding.create",
     "GenerativeModel",
+    // LangChain chat models (`AzureChatOpenAI` is not: its deployment, not
+    // a `model`, decides what it serves).
+    "ChatOpenAI",
+    "ChatAnthropic",
+    "ChatBedrock",
+    "ChatBedrockConverse",
 ];
 
 /// Members that wrap a resource without changing the request
@@ -326,17 +372,34 @@ const MAX_FILE_IMPORTS: usize = MAX_FILE_RECORDS;
 
 /// Extracts SDK usages from a parsed Python file.
 pub fn extract(tree: &Tree, source: &str, file_path: &str) -> FileUsages {
-    if !may_use_sdk(source) {
+    extract_with(tree, source, file_path, None)
+}
+
+/// [`extract`], also recording calls to the wrappers in other files that
+/// `wrappers` resolves this file's imports to (see [`SdkCall::wrapper`]).
+/// With a lookup, the file is analyzed even when it mentions no SDK: the
+/// repository scan passes one only for a file that names a wrapper.
+pub fn extract_with(
+    tree: &Tree,
+    source: &str,
+    file_path: &str,
+    wrappers: Option<&dyn WrapperLookup>,
+) -> FileUsages {
+    if wrappers.is_none() && !may_use_sdk(source) {
         return FileUsages::new(file_path, "python");
     }
     let mut cx = Ctx::new(source, file_path);
     cx.collect(tree.root_node());
+    if let Some(lookup) = wrappers {
+        cx.resolve_wrappers(lookup);
+    }
     cx.place_nonlocal_assigns();
     cx.note_rebound_receivers();
     cx.bind_definitions();
     cx.index_definitions();
     cx.settle_dict_escapes();
     cx.analyze();
+    cx.settle_model_params();
     let mut found = cx.finish();
     found.syntax_errors = tree.root_node().has_error();
     found
@@ -352,14 +415,67 @@ enum Pkg {
     Anthropic,
     GoogleGenai,
     GoogleGenerativeai,
+    /// LangChain's chat models, which call a provider's SDK for you: the
+    /// partner packages (`langchain_openai`, `langchain_anthropic`), and the
+    /// deprecated copies in `langchain_community.chat_models` and
+    /// `langchain.chat_models`. Only their chat-model classes are tracked
+    /// (see [`LANGCHAIN_REEXPORTS`]).
+    LangchainOpenai,
+    LangchainAnthropic,
+    LangchainCommunityOpenai,
+    LangchainCommunityAnthropic,
+    LangchainLegacyOpenai,
+    LangchainLegacyAnthropic,
+    /// LangChain's Bedrock chat models (`langchain_aws`).
+    LangchainAws,
+    /// The AWS SDK: only `boto3.client("bedrock-runtime")` (also through a
+    /// `boto3.Session`) is followed.
+    Boto3,
+    /// LiteLLM: only its request functions ([`LITELLM_REQUESTS`]).
+    Litellm,
 }
 
 impl Pkg {
+    /// Whether a model passed to the project's own wrapper of this
+    /// package's requests is followed from another file. That needs the
+    /// checks [`Ctx::record_wrapper_call`] makes in the calling file to
+    /// cover what it can do to the package's models and routes (endpoint
+    /// variables, module-level configuration, a replaced SDK, model aliases,
+    /// writes to a returned object's model field), and [`ALL_PKGS`] to list
+    /// it, so its name reads back there. Every package is named here, so a
+    /// new one is decided, not followed by default.
+    fn followed_across_files(self) -> bool {
+        let covered = match self {
+            Pkg::Openai
+            | Pkg::Anthropic
+            | Pkg::GoogleGenai
+            | Pkg::GoogleGenerativeai
+            | Pkg::LangchainOpenai
+            | Pkg::LangchainAnthropic
+            | Pkg::LangchainCommunityOpenai
+            | Pkg::LangchainCommunityAnthropic
+            | Pkg::LangchainLegacyOpenai
+            | Pkg::LangchainLegacyAnthropic
+            | Pkg::LangchainAws
+            | Pkg::Boto3
+            | Pkg::Litellm => true,
+        };
+        covered && ALL_PKGS.contains(&self)
+    }
+
     fn sdk(self) -> Sdk {
         match self {
-            Pkg::Openai => Sdk::Openai,
-            Pkg::Anthropic => Sdk::Anthropic,
+            Pkg::Openai
+            | Pkg::LangchainOpenai
+            | Pkg::LangchainCommunityOpenai
+            | Pkg::LangchainLegacyOpenai => Sdk::Openai,
+            Pkg::Anthropic
+            | Pkg::LangchainAnthropic
+            | Pkg::LangchainCommunityAnthropic
+            | Pkg::LangchainLegacyAnthropic => Sdk::Anthropic,
             Pkg::GoogleGenai | Pkg::GoogleGenerativeai => Sdk::Google,
+            Pkg::LangchainAws | Pkg::Boto3 => Sdk::Aws,
+            Pkg::Litellm => Sdk::Litellm,
         }
     }
 
@@ -369,7 +485,89 @@ impl Pkg {
             Pkg::Anthropic => "anthropic",
             Pkg::GoogleGenai => "google.genai",
             Pkg::GoogleGenerativeai => "google.generativeai",
+            Pkg::LangchainOpenai => "langchain_openai",
+            Pkg::LangchainAnthropic => "langchain_anthropic",
+            Pkg::LangchainCommunityOpenai | Pkg::LangchainCommunityAnthropic => {
+                "langchain_community"
+            }
+            Pkg::LangchainLegacyOpenai | Pkg::LangchainLegacyAnthropic => "langchain",
+            Pkg::LangchainAws => "langchain_aws",
+            Pkg::Boto3 => "boto3",
+            Pkg::Litellm => "litellm",
         }
+    }
+
+    /// A LangChain package: only its chat-model classes are tracked, and
+    /// what they are built with is the model the requests use.
+    fn is_langchain(self) -> bool {
+        !matches!(
+            self,
+            Pkg::Openai
+                | Pkg::Anthropic
+                | Pkg::GoogleGenai
+                | Pkg::GoogleGenerativeai
+                | Pkg::Boto3
+                | Pkg::Litellm
+        )
+    }
+
+    /// A package followed only through the names it is tracked for: its
+    /// [`CLASSES`] and [`Pkg::named_symbols`]. Any other name imported from
+    /// it is an ordinary import, and its other module-level calls are not
+    /// recorded (`boto3.resource("s3")`, `litellm.token_counter(...)`).
+    fn follows_named_only(self) -> bool {
+        self.is_langchain() || matches!(self, Pkg::Boto3 | Pkg::Litellm)
+    }
+
+    /// The names other than [`CLASSES`] a [`Pkg::follows_named_only`]
+    /// package is followed through: `boto3.Session`, whose `client(...)`
+    /// is `boto3.client(...)`, and LiteLLM's request functions.
+    fn named_symbols(self) -> &'static [&'static str] {
+        match self {
+            Pkg::Boto3 => &["Session"],
+            Pkg::Litellm => LITELLM_REQUESTS,
+            _ => &[],
+        }
+    }
+
+    /// Whether `path` (after the package) names one of
+    /// [`Pkg::named_symbols`]: at the package's top, or in the submodule
+    /// that defines it (`boto3.session.Session`, `litellm.main.completion`).
+    fn is_named_symbol(self, path: &[String]) -> bool {
+        let home = match self {
+            Pkg::Boto3 => "session",
+            Pkg::Litellm => "main",
+            _ => return false,
+        };
+        let name = match path {
+            [name] => name,
+            [module, name] if module == home => name,
+            _ => return false,
+        };
+        self.named_symbols().contains(&name.as_str())
+    }
+
+    /// The SDK package a LangChain chat model builds its client from
+    /// (`openai`, `anthropic`); an SDK's package is its own.
+    fn base(self) -> Pkg {
+        match self.sdk() {
+            _ if !self.is_langchain() => self,
+            Sdk::Openai => Pkg::Openai,
+            Sdk::Anthropic => Pkg::Anthropic,
+            Sdk::Aws => Pkg::Boto3,
+            _ => self,
+        }
+    }
+
+    /// A LangChain OpenAI chat model that may run on the pre-1.0 `openai`
+    /// SDK: given no `base_url`, it sends its requests through the
+    /// module-level API, so the file's `openai.api_base` / `api_type`
+    /// settings apply to it. `langchain_openai` needs `openai>=1`.
+    fn reads_module_config(self) -> bool {
+        matches!(
+            self,
+            Pkg::LangchainCommunityOpenai | Pkg::LangchainLegacyOpenai
+        )
     }
 
     /// The package a dotted module path belongs to, and the rest of the
@@ -382,6 +580,11 @@ impl Pkg {
             (Some("anthropic"), _) => Pkg::Anthropic,
             (Some("google"), Some("genai")) => Pkg::GoogleGenai,
             (Some("google"), Some("generativeai")) => Pkg::GoogleGenerativeai,
+            (Some("langchain_openai"), _) => Pkg::LangchainOpenai,
+            (Some("langchain_anthropic"), _) => Pkg::LangchainAnthropic,
+            (Some("langchain_aws"), _) => Pkg::LangchainAws,
+            (Some("boto3"), _) => Pkg::Boto3,
+            (Some("litellm"), _) => Pkg::Litellm,
             _ => return None,
         };
         if matches!(pkg, Pkg::GoogleGenai | Pkg::GoogleGenerativeai) {
@@ -402,6 +605,9 @@ enum Family {
     LegacyModel,
     /// A hosted-platform client this version does not classify.
     Platform,
+    /// Amazon Bedrock's runtime, for any model: `boto3.client(
+    /// "bedrock-runtime")` and LangChain's Bedrock chat models.
+    AwsBedrock,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,10 +652,82 @@ const CLASSES: &[ClientClass] = &[
         "GenerativeModel",
         Family::LegacyModel,
     ),
+    // LangChain chat models route like the client each one builds.
+    class(Pkg::LangchainOpenai, "ChatOpenAI", Family::OpenaiDirect),
+    class(Pkg::LangchainOpenai, "AzureChatOpenAI", Family::Azure),
+    class(
+        Pkg::LangchainAnthropic,
+        "ChatAnthropic",
+        Family::AnthropicDirect,
+    ),
+    class(
+        Pkg::LangchainCommunityOpenai,
+        "ChatOpenAI",
+        Family::OpenaiDirect,
+    ),
+    class(
+        Pkg::LangchainCommunityOpenai,
+        "AzureChatOpenAI",
+        Family::Azure,
+    ),
+    class(
+        Pkg::LangchainCommunityAnthropic,
+        "ChatAnthropic",
+        Family::AnthropicDirect,
+    ),
+    class(
+        Pkg::LangchainLegacyOpenai,
+        "ChatOpenAI",
+        Family::OpenaiDirect,
+    ),
+    class(Pkg::LangchainLegacyOpenai, "AzureChatOpenAI", Family::Azure),
+    class(
+        Pkg::LangchainLegacyAnthropic,
+        "ChatAnthropic",
+        Family::AnthropicDirect,
+    ),
+    // `boto3.client(...)` builds a Bedrock client only for the service
+    // `"bedrock-runtime"` (see [`Ctx::builds_client`]).
+    class(Pkg::Boto3, "client", Family::AwsBedrock),
+    class(Pkg::LangchainAws, "ChatBedrock", Family::AwsBedrock),
+    class(Pkg::LangchainAws, "ChatBedrockConverse", Family::AwsBedrock),
 ];
+
+/// LiteLLM's functions that send a request; the first argument is the
+/// model.
+const LITELLM_REQUESTS: &[&str] = &["completion", "acompletion"];
 
 const fn class(pkg: Pkg, name: &'static str, family: Family) -> ClientClass {
     ClientClass { pkg, name, family }
+}
+
+/// The deprecated LangChain modules that re-export several providers' chat
+/// models, with the packages their OpenAI and Anthropic classes are
+/// recorded under. A name imported from one of them, or from a submodule
+/// (`langchain_community.chat_models.openai`), is tracked only when it is
+/// one of those classes; the modules themselves are not followed.
+const LANGCHAIN_REEXPORTS: &[(&str, [Pkg; 2])] = &[
+    (
+        "langchain_community.chat_models",
+        [
+            Pkg::LangchainCommunityOpenai,
+            Pkg::LangchainCommunityAnthropic,
+        ],
+    ),
+    (
+        "langchain.chat_models",
+        [Pkg::LangchainLegacyOpenai, Pkg::LangchainLegacyAnthropic],
+    ),
+];
+
+/// The packages of the [`LANGCHAIN_REEXPORTS`] module `module` is, or is a
+/// submodule of. Only its first two segments are read.
+fn langchain_reexport(module: &str) -> Option<[Pkg; 2]> {
+    let mut parts = module.split('.').map(str::trim);
+    let head = (parts.next()?, parts.next()?);
+    LANGCHAIN_REEXPORTS
+        .iter()
+        .find_map(|(prefix, pkgs)| (prefix.split_once('.') == Some(head)).then_some(*pkgs))
 }
 
 fn client_class(pkg: Pkg, name: &str) -> Option<ClientClass> {
@@ -486,6 +764,12 @@ impl ClientClass {
             {
                 Routing::Unknown
             }
+            Family::AwsBedrock if matches!(base_url, BaseUrl::Custom | BaseUrl::CustomFallback) => {
+                Routing::CustomBaseUrl
+            }
+            Family::AwsBedrock if matches!(base_url, BaseUrl::Unknown { .. }) => Routing::Unknown,
+            Family::AwsBedrock if splat && base_url == BaseUrl::Absent => Routing::Unknown,
+            Family::AwsBedrock => Routing::Bedrock,
             Family::OpenaiDirect => Routing::OpenaiDirect,
             Family::AnthropicDirect => Routing::AnthropicDirect,
             Family::Azure => Routing::AzureOpenai,
@@ -502,14 +786,249 @@ impl ClientClass {
     /// endpoint), so it is `unknown`.
     fn typed_routing(self) -> Routing {
         match self.family {
-            Family::OpenaiDirect | Family::AnthropicDirect | Family::Genai => Routing::Unknown,
+            Family::OpenaiDirect | Family::AnthropicDirect | Family::Genai | Family::AwsBedrock => {
+                Routing::Unknown
+            }
             _ => self.routing(&[], false, BaseUrl::Absent),
         }
     }
 }
 
+/// The SDK clients and resources a LangChain chat model sends its requests
+/// through. Given to its constructor or assigned after it is built, they
+/// replace the client its own options would build.
+const LANGCHAIN_CLIENT_FIELDS: &[&str] = &[
+    "client",
+    "async_client",
+    "root_client",
+    "root_async_client",
+    "_client",
+    "_async_client",
+];
+
+/// The path on the SDK client that the field `field` of a LangChain chat
+/// model of `pkg` holds: `chat.completions` for the OpenAI classes'
+/// `client` and `async_client` (`root_client.chat.completions`, or
+/// `openai.ChatCompletion` on the pre-1.0 SDK), and the client itself (`""`)
+/// for `root_client` and `root_async_client` on `langchain_openai`,
+/// `ChatAnthropic`'s `_client` and `_async_client`, and the deprecated
+/// `ChatAnthropic`'s `client` and `async_client`. `None` for a field the
+/// class does not hold an SDK client in.
+fn held_client_path(pkg: Pkg, field: &str) -> Option<&'static str> {
+    match (pkg, field) {
+        (_, "client" | "async_client") if pkg.sdk() == Sdk::Openai => Some("chat.completions"),
+        (Pkg::LangchainOpenai, "root_client" | "root_async_client")
+        | (Pkg::LangchainAnthropic, "_client" | "_async_client")
+        | (
+            Pkg::LangchainCommunityAnthropic | Pkg::LangchainLegacyAnthropic,
+            "client" | "async_client",
+        )
+        | (Pkg::LangchainAws, "client") => Some(""),
+        _ => None,
+    }
+}
+
+/// Arguments of a LangChain call that configure LangChain's run (tracing,
+/// callbacks, configurable fields) and never reach the provider's request:
+/// a `model` key inside them is not a model the request uses.
+const LANGCHAIN_RUN_OPTIONS: &[&str] = &[
+    "config",
+    "configurable",
+    "metadata",
+    "tags",
+    "callbacks",
+    "run_name",
+];
+
+/// Fields of a LangChain chat model that decide the model its requests
+/// send: the model field under either of its names, and `model_kwargs` and
+/// `extra_body`, which are sent over it.
+const LANGCHAIN_MODEL_FIELDS: &[&str] = &[
+    "model",
+    "model_name",
+    "model_id",
+    "model_kwargs",
+    "extra_body",
+];
+
+/// The dicts a LangChain chat model sends over its model field: a `model`
+/// key in one replaces it in the request.
+const LANGCHAIN_SENT_OVER: &[&str] = &["model_kwargs", "extra_body"];
+
+/// Keyword names that set a client's endpoint: the SDKs' own, and
+/// LangChain's field names for it (`base_url` is their alias).
 fn is_base_url_key(key: &str) -> bool {
-    key == "base_url" || key == "api_base"
+    matches!(
+        key,
+        "base_url" | "api_base" | "openai_api_base" | "anthropic_api_url"
+    )
+}
+
+/// Keyword names that set the endpoint of a client `pkg` builds: boto3's
+/// `endpoint_url` (which `ChatBedrockConverse` also takes as `base_url`),
+/// else [`is_base_url_key`].
+fn is_endpoint_key(pkg: Pkg, key: &str) -> bool {
+    match pkg {
+        Pkg::Boto3 => key == "endpoint_url",
+        Pkg::LangchainAws => key == "endpoint_url" || key == "base_url",
+        _ => is_base_url_key(key),
+    }
+}
+
+/// The keyword arguments a call reads values from.
+#[derive(Debug, Clone, Copy)]
+enum ValueKeys {
+    /// [`super::VALUE_KEYS`] and these.
+    Plus(&'static [&'static str]),
+    /// Only these: a boto3 request validates its parameters, so it takes
+    /// no other model argument (`model=` is rejected before it is sent).
+    Only(&'static [&'static str]),
+}
+
+impl ValueKeys {
+    const DEFAULT: ValueKeys = ValueKeys::Plus(&[]);
+
+    fn reads(self, key: &str) -> bool {
+        match self {
+            ValueKeys::Plus(extra) => is_value_key(key) || extra.contains(&key),
+            ValueKeys::Only(keys) => keys.contains(&key),
+        }
+    }
+}
+
+/// The value keys of a call of `pkg`: `modelId` alone on a Bedrock
+/// client's requests; `model_id` and its alias `model` where a LangChain
+/// Bedrock model is built (`receiver` is not a client), which has no
+/// `model_name`, `engine` or `deployment_id` field; and `model_id` or
+/// `modelId` on a call on the built model, which the Converse API sends
+/// instead of the model's own (`llm.invoke(q, model_id=...)`).
+fn value_keys(pkg: Pkg, receiver: Receiver) -> ValueKeys {
+    match pkg {
+        Pkg::Boto3 => ValueKeys::Only(&["modelId"]),
+        Pkg::LangchainAws if receiver == Receiver::Client => {
+            ValueKeys::Only(&["model_id", "modelId"])
+        }
+        Pkg::LangchainAws => ValueKeys::Only(&["model_id", "model"]),
+        // `completion(model, ...)` takes no `engine` or `model_name`; a
+        // `deployment_id` replaces the model (see the `reassigned` gap).
+        Pkg::Litellm => ValueKeys::Only(&["model", "deployment_id"]),
+        _ => ValueKeys::DEFAULT,
+    }
+}
+
+/// The two names a LangChain chat model of `pkg` takes its model under:
+/// its field, then the field's alias. On a call on a built Bedrock model
+/// (`receiver` is a client) they are the call's two spellings, which
+/// langchain-aws folds into one `modelId`.
+fn langchain_model_names(pkg: Pkg, receiver: Receiver) -> [&'static str; 2] {
+    match pkg {
+        Pkg::LangchainAws if receiver == Receiver::Client => ["model_id", "modelId"],
+        Pkg::LangchainAws => ["model_id", "model"],
+        _ => ["model", "model_name"],
+    }
+}
+
+/// Every package followed across files, for reading one back from its
+/// name (see [`Pkg::followed_across_files`]).
+const ALL_PKGS: [Pkg; 13] = [
+    Pkg::Openai,
+    Pkg::Anthropic,
+    Pkg::GoogleGenai,
+    Pkg::GoogleGenerativeai,
+    Pkg::LangchainOpenai,
+    Pkg::LangchainAnthropic,
+    Pkg::LangchainCommunityOpenai,
+    Pkg::LangchainCommunityAnthropic,
+    Pkg::LangchainLegacyOpenai,
+    Pkg::LangchainLegacyAnthropic,
+    Pkg::LangchainAws,
+    Pkg::Boto3,
+    Pkg::Litellm,
+];
+
+/// HTTP libraries whose `post` function is followed to a provider's REST
+/// API: `requests.post(url, json=...)` and `httpx.post(url, json=...)`.
+/// Nothing else of theirs is followed (sessions, clients, `request`).
+const HTTP_LIBRARIES: &[&str] = &["requests", "httpx"];
+
+/// A provider API a raw HTTP request is sent to (see [`http_endpoint`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HttpEndpoint {
+    sdk: Sdk,
+    routing: Routing,
+    /// The SDK method the endpoint is (`chat.completions.create` for
+    /// `/v1/chat/completions`), recorded as the call's member.
+    member: &'static str,
+    /// The request body names the model at its top level, so a body with
+    /// no `model` is a `missing_model` gap. A Message Batch nests its
+    /// models in its requests.
+    takes_model: bool,
+}
+
+/// The REST endpoints a raw HTTP request is recorded for, by path, with
+/// the SDK method each one is. Only endpoints whose JSON body names a
+/// model are listed.
+const OPENAI_HTTP_ENDPOINTS: &[(&str, &str)] = &[
+    ("/v1/chat/completions", "chat.completions.create"),
+    ("/v1/completions", "completions.create"),
+    ("/v1/responses", "responses.create"),
+    ("/v1/embeddings", "embeddings.create"),
+    ("/v1/images/generations", "images.generate"),
+    ("/v1/images/edits", "images.edit"),
+    ("/v1/images/variations", "images.create_variation"),
+    ("/v1/audio/speech", "audio.speech.create"),
+    ("/v1/audio/transcriptions", "audio.transcriptions.create"),
+    ("/v1/audio/translations", "audio.translations.create"),
+    ("/v1/moderations", "moderations.create"),
+    ("/v1/fine_tuning/jobs", "fine_tuning.jobs.create"),
+    ("/v1/assistants", "assistants.create"),
+];
+const ANTHROPIC_HTTP_ENDPOINTS: &[(&str, &str)] = &[
+    ("/v1/messages", "messages.create"),
+    ("/v1/messages/count_tokens", "messages.count_tokens"),
+    ("/v1/messages/batches", "messages.batches.create"),
+    ("/v1/complete", "completions.create"),
+];
+
+/// The provider endpoint `url` names: an `https://` (or `http://`) URL on
+/// `api.openai.com` or `api.anthropic.com` whose path, without its query,
+/// fragment or a trailing `/`, is one of [`OPENAI_HTTP_ENDPOINTS`] or
+/// [`ANTHROPIC_HTTP_ENDPOINTS`]. Any other URL names none: a gateway's
+/// host, Azure's or Google's REST paths, and a path this list does not
+/// hold are not recorded.
+fn http_endpoint(url: &str) -> Option<HttpEndpoint> {
+    let url = url.trim();
+    let scheme = url.split_once("://")?.0;
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let rest = &url[scheme.len() + 3..];
+    // The authority ends at the first `/`, `?` or `#`; only a `/` starts a
+    // path (`https://api.openai.com?x/v1/...` is a request to `/`).
+    let path = match rest.find(['/', '?', '#']) {
+        Some(at) if rest[at..].starts_with('/') => &rest[at..],
+        _ => "",
+    };
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let (sdk, routing, endpoints) = match url_host(url).as_str() {
+        "api.openai.com" => (Sdk::Openai, Routing::OpenaiDirect, OPENAI_HTTP_ENDPOINTS),
+        "api.anthropic.com" => (
+            Sdk::Anthropic,
+            Routing::AnthropicDirect,
+            ANTHROPIC_HTTP_ENDPOINTS,
+        ),
+        _ => return None,
+    };
+    let member = endpoints
+        .iter()
+        .find_map(|(p, member)| (*p == path).then_some(*member))?;
+    Some(HttpEndpoint {
+        sdk,
+        routing,
+        member,
+        takes_model: member != "messages.batches.create",
+    })
 }
 
 /// The provider an SDK-shaped chain on an unknown receiver most likely
@@ -551,6 +1070,14 @@ fn sdk_shape(chain: &str) -> Option<(Sdk, bool)> {
         ".messages.stream",
         ".messages.count_tokens",
     ];
+    // Bedrock's runtime requests: `converse` is a common word, so these
+    // count only where the file imports boto3.
+    const AWS: &[&str] = &[
+        ".invoke_model",
+        ".invoke_model_with_response_stream",
+        ".converse",
+        ".converse_stream",
+    ];
     let chain = strip_wrappers(chain);
     if GOOGLE.iter().any(|s| chain.ends_with(s)) {
         Some((Sdk::Google, true))
@@ -558,6 +1085,8 @@ fn sdk_shape(chain: &str) -> Option<(Sdk, bool)> {
         Some((Sdk::Openai, true))
     } else if ANTHROPIC.iter().any(|s| chain.ends_with(s)) {
         Some((Sdk::Anthropic, false))
+    } else if AWS.iter().any(|s| chain.ends_with(s)) {
+        Some((Sdk::Aws, false))
     } else {
         None
     }
@@ -633,6 +1162,13 @@ enum ClientCaveat {
     /// setup block (in a function, a branch, after a `def`...), so it may
     /// not hold when a call runs (see [`Ctx::module_openai_routing`]).
     ModuleSetup(Feature),
+    /// A LangChain OpenAI chat model that may run on the pre-1.0 SDK
+    /// ([`Pkg::reads_module_config`]) in a file that configures the
+    /// module-level API, which such a model's requests then go through.
+    LangchainModuleConfig,
+    /// A LangChain chat model given an SDK client or resource to send its
+    /// requests through (`field`, one of [`LANGCHAIN_CLIENT_FIELDS`]).
+    GivenClient { field: &'static str },
 }
 
 /// A Python feature that can change what a name, attribute, dict or the
@@ -670,13 +1206,48 @@ enum BaseUrl {
     Unknown { env: bool },
 }
 
-/// The provider's own API host, for [`BaseUrl::Provider`].
-fn provider_host(pkg: Pkg) -> &'static str {
-    match pkg {
-        Pkg::Openai => "api.openai.com",
-        Pkg::Anthropic => "api.anthropic.com",
-        Pkg::GoogleGenai | Pkg::GoogleGenerativeai => "generativelanguage.googleapis.com",
+/// Whether `host` is the provider's own API host, for
+/// [`BaseUrl::Provider`]. For Bedrock that is a runtime endpoint of a
+/// region on AWS: `bedrock-runtime.<region>.amazonaws.com` (`.com.cn`,
+/// dual-stack `.api.aws`), its `bedrock-runtime-fips` form, or a VPC
+/// endpoint's `vpce-<id>.bedrock-runtime.<region>.vpce.amazonaws.com`.
+fn is_provider_host(pkg: Pkg, host: &str) -> bool {
+    match pkg.sdk() {
+        Sdk::Openai => host == "api.openai.com",
+        Sdk::Anthropic => host == "api.anthropic.com",
+        Sdk::Google => host == "generativelanguage.googleapis.com",
+        Sdk::Aws => is_bedrock_runtime_host(host),
+        Sdk::Litellm => false,
     }
+}
+
+/// See [`is_provider_host`]. A region label has a `-` and ends in a digit
+/// (`us-east-1`, `us-gov-west-1`), so a bucket named `bedrock-runtime` on
+/// S3 (`bedrock-runtime.s3.amazonaws.com`) is another host.
+fn is_bedrock_runtime_host(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    let start = match labels.as_slice() {
+        [first, ..] if *first == "bedrock-runtime" || *first == "bedrock-runtime-fips" => 0,
+        [first, second, ..] if first.starts_with("vpce-") && *second == "bedrock-runtime" => 1,
+        _ => return false,
+    };
+    let Some(region) = labels.get(start + 1) else {
+        return false;
+    };
+    let region_like = region.contains('-') && region.ends_with(|c: char| c.is_ascii_digit());
+    let rest = &labels[start + 2..];
+    let suffix = if start == 1 {
+        matches!(
+            rest,
+            ["vpce", "amazonaws", "com"] | ["vpce", "amazonaws", "com", "cn"]
+        )
+    } else {
+        matches!(
+            rest,
+            ["amazonaws", "com"] | ["amazonaws", "com", "cn"] | ["api", "aws"]
+        )
+    };
+    region_like && suffix
 }
 
 /// The host of a URL, lowercase, without user information or port.
@@ -694,7 +1265,7 @@ fn url_host(url: &str) -> String {
 /// [`BaseUrl::Provider`] when `url` is the provider's own host, else
 /// [`BaseUrl::Custom`].
 fn host_kind(pkg: Pkg, url: &str) -> BaseUrl {
-    if url_host(url) == provider_host(pkg) {
+    if is_provider_host(pkg, &url_host(url)) {
         BaseUrl::Provider
     } else {
         BaseUrl::Custom
@@ -703,22 +1274,56 @@ fn host_kind(pkg: Pkg, url: &str) -> BaseUrl {
 
 /// Environment variables an SDK reads its endpoint from when the
 /// constructor is not given one.
-const ENDPOINT_ENV: &[(Pkg, &str)] = &[
-    (Pkg::Openai, "OPENAI_BASE_URL"),
-    (Pkg::Anthropic, "ANTHROPIC_BASE_URL"),
-    // `google.genai.Client()` reads whether to use Vertex AI, and its
-    // endpoints, from these.
-    (Pkg::GoogleGenai, "GOOGLE_GENAI_USE_VERTEXAI"),
-    (Pkg::GoogleGenai, "GOOGLE_GEMINI_BASE_URL"),
-    (Pkg::GoogleGenai, "GOOGLE_VERTEX_BASE_URL"),
-];
+fn endpoint_env_vars(pkg: Pkg) -> &'static [&'static str] {
+    match pkg {
+        Pkg::Openai => &["OPENAI_BASE_URL"],
+        Pkg::Anthropic => &["ANTHROPIC_BASE_URL"],
+        // `google.genai.Client()` reads whether to use Vertex AI, and its
+        // endpoints, from these.
+        Pkg::GoogleGenai => &[
+            "GOOGLE_GENAI_USE_VERTEXAI",
+            "GOOGLE_GEMINI_BASE_URL",
+            "GOOGLE_VERTEX_BASE_URL",
+        ],
+        Pkg::GoogleGenerativeai => &[],
+        // LangChain reads its own variable first, then the SDK it builds
+        // reads the SDK's; the partner packages also fall back to the
+        // LangSmith gateway.
+        Pkg::LangchainOpenai | Pkg::LangchainCommunityOpenai | Pkg::LangchainLegacyOpenai => {
+            &["OPENAI_API_BASE", "OPENAI_BASE_URL", "LANGSMITH_GATEWAY"]
+        }
+        Pkg::LangchainAnthropic
+        | Pkg::LangchainCommunityAnthropic
+        | Pkg::LangchainLegacyAnthropic => &[
+            "ANTHROPIC_API_URL",
+            "ANTHROPIC_BASE_URL",
+            "LANGSMITH_GATEWAY",
+        ],
+        // botocore's service-specific and global endpoint variables; a
+        // LangChain Bedrock model given no endpoint also falls back to the
+        // LangSmith gateway.
+        Pkg::Boto3 => &["AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "AWS_ENDPOINT_URL"],
+        Pkg::LangchainAws => &[
+            "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+            "AWS_ENDPOINT_URL",
+            "LANGSMITH_GATEWAY",
+        ],
+        Pkg::Litellm => &[],
+    }
+}
 
 /// Environment variables the module-level OpenAI API (v0 and the v1 module
 /// client) reads its endpoint or API type from.
 const OPENAI_MODULE_ENV: &[&str] = &["OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_TYPE"];
 
 /// Attributes that re-route a built client when assigned.
-const BASE_URL_ATTRS: &[&str] = &["base_url", "api_base", "_base_url"];
+const BASE_URL_ATTRS: &[&str] = &[
+    "base_url",
+    "api_base",
+    "_base_url",
+    "openai_api_base",
+    "anthropic_api_url",
+];
 
 /// Where an untracked value came from, for gap details.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -755,8 +1360,11 @@ enum Origin {
     /// (`AzureOpenAI if azure else build`, `try: from openai import
     /// AzureOpenAI as Maker` / `except ImportError: from mylib import
     /// FakeClient as Maker`); calling it builds an ambiguous client of the
-    /// first constructor's package.
-    MixedClasses(Pkg),
+    /// first constructor's package. A LangChain chat model among them
+    /// (`Chat = AzureChatOpenAI if azure else ChatOpenAI`) is still built
+    /// with the model its requests use: calling it records the construction
+    /// with an ambiguous route (see [`Ctx::analyze_call`]).
+    MixedClasses(Pkg, Option<ClientClass>),
     /// A dynamic feature of the file may rebind or replace the value.
     Dynamic(Feature),
     Other,
@@ -955,6 +1563,96 @@ struct NestedValue {
     path: String,
     positional: bool,
     resolved: Resolved,
+    /// The dict holding the value names a `deployment_id` next to it, which
+    /// replaces the model that dict sends: a LiteLLM fallback's own.
+    deployment: bool,
+    /// The provider arguments the dict holding the value names next to it:
+    /// a LiteLLM fallback's own, which decide where that fallback goes.
+    providers: ProviderArgs,
+}
+
+/// How a LiteLLM provider argument reads: `custom_llm_provider`, or
+/// `azure`, whose `True` makes `completion` set `custom_llm_provider` to
+/// `azure`. Given a provider, `get_llm_provider` reads the model as
+/// `<provider>/<model>` (unless it already starts with that prefix) before
+/// any rule about its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProviderPick {
+    /// `None`, `False` or an empty string: the model's name decides.
+    Absent,
+    /// A string literal or a same-file constant (`azure=True` names `azure`).
+    Named(String),
+    /// A value this file does not show (a parameter, the environment, a
+    /// call, an entry a `**` written after it may replace).
+    Unknown,
+}
+
+impl ProviderPick {
+    fn named(&self) -> Option<String> {
+        match self {
+            ProviderPick::Named(name) => Some(name.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// The provider arguments a LiteLLM call, or one of its fallback dicts,
+/// gives: `None` for one it does not give.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProviderArgs {
+    custom: Option<ProviderPick>,
+    azure: Option<ProviderPick>,
+}
+
+impl ProviderArgs {
+    /// LiteLLM's provider arguments, by name.
+    const NAMES: [&'static str; 2] = ["custom_llm_provider", "azure"];
+
+    fn given(&self) -> bool {
+        self.custom.is_some() || self.azure.is_some()
+    }
+
+    /// Records `pick` for argument `name`. Given twice (a keyword and a
+    /// same-file dict expanded with `**`, a `TypeError` when it runs), two
+    /// different readings are not known.
+    fn give(&mut self, name: &str, pick: ProviderPick) {
+        let slot = if name == "azure" {
+            &mut self.azure
+        } else {
+            &mut self.custom
+        };
+        *slot = match slot.take() {
+            Some(earlier) if earlier != pick => Some(ProviderPick::Unknown),
+            _ => Some(pick),
+        };
+    }
+
+    /// These arguments of a fallback dict over the call's: each fallback
+    /// attempt gets the call's arguments, updated with its dict.
+    fn over(&self, call: &ProviderArgs) -> ProviderArgs {
+        ProviderArgs {
+            custom: self.custom.clone().or_else(|| call.custom.clone()),
+            azure: self.azure.clone().or_else(|| call.azure.clone()),
+        }
+    }
+
+    /// The provider LiteLLM picks: `azure=True` wins over
+    /// `custom_llm_provider`.
+    fn pick(&self) -> ProviderPick {
+        let custom = self.custom.clone().unwrap_or(ProviderPick::Absent);
+        match self.azure.as_ref().unwrap_or(&ProviderPick::Absent) {
+            ProviderPick::Named(_) => ProviderPick::Named("azure".to_string()),
+            ProviderPick::Unknown if custom == ProviderPick::Named("azure".to_string()) => custom,
+            ProviderPick::Unknown => ProviderPick::Unknown,
+            ProviderPick::Absent => custom,
+        }
+    }
+}
+
+/// Whether a LiteLLM value key is a `deployment_id`, which `completion`
+/// sends to Azure whatever provider the call names.
+fn is_deployment_key(key: &str) -> bool {
+    key.rsplit('.').next() == Some("deployment_id")
 }
 
 /// A bounded read of nested model values.
@@ -1196,6 +1894,11 @@ struct OtherImport {
     /// The module as written, clipped, shared by every name one statement
     /// imports.
     module: Rc<str>,
+    /// The dotted path the local name is bound to, clipped: `requests` for
+    /// `import requests` and `import requests.adapters`, `requests.adapters`
+    /// for `import requests.adapters as ra`, `requests.post` for `from
+    /// requests import post`. A relative import's path starts with `.`.
+    target: Rc<str>,
     place: Place,
 }
 
@@ -1266,6 +1969,18 @@ struct ConfigAssign<'t> {
     plain: bool,
     /// Where the write is.
     at: usize,
+}
+
+/// A write of a dict a LangChain chat model sends over its model field
+/// ([`LANGCHAIN_SENT_OVER`]) on an object other than `self` or a same-file
+/// class (see [`Ctx::sent_over_write`]).
+#[derive(Debug, Clone, Copy)]
+struct SentOverWrite<'t> {
+    attr: &'t str,
+    /// The value written and the scope it is written in, or `None` when it
+    /// is not read here (`+=`, `del`, a write through a borrowed `self`).
+    value: Option<(Node<'t>, usize)>,
+    feature: Feature,
 }
 
 /// Calls and the scope each is in.
@@ -1583,6 +2298,15 @@ struct Ctx<'t> {
     /// function, stored, returned, or aliased by a name that is. Their
     /// literal is never read.
     escaped: HashSet<&'t str>,
+    /// The `json=` argument of each call shaped like `requests.post(...)`
+    /// or a bare `post(...)`, by its value's node id, with the callee. A
+    /// name passed there is not escaped yet (see [`Ctx::http_bodies`]).
+    http_body_args: HashMap<usize, Node<'t>>,
+    /// Names passed as such a `json=` argument, with the callee and the
+    /// scope of the call. Once imports are bound, a name whose callee is
+    /// not `requests.post` or `httpx.post` (which only serialize the dict)
+    /// is escaped like any dict passed to a function.
+    http_bodies: Vec<(&'t str, Node<'t>, usize)>,
     /// Dict parts that leave their dict, and plain-name aliases.
     exposed: Vec<Exposed<'t>>,
     def_index: HashMap<Key, DefIndex>,
@@ -1660,6 +2384,18 @@ struct Ctx<'t> {
     rerouted_any: Option<Feature>,
     /// Why the module-level OpenAI API's routing may not hold.
     openai_caveat: Option<ClientCaveat>,
+    /// A LangChain model's model made configurable at run time
+    /// (`configurable_fields(model_name=...)`,
+    /// `configurable_alternatives(...)`), anywhere in the file.
+    langchain_configurable: Option<Feature>,
+    /// The file mentions LiteLLM's `model_alias_map`, which may map the
+    /// model a LiteLLM call is given to another one.
+    litellm_aliases: Option<Feature>,
+    /// Outside writes of a dict a LangChain chat model sends over its model
+    /// field, in source order (see [`Ctx::note_langchain_sent_over`]).
+    sent_over_writes: Vec<SentOverWrite<'t>>,
+    /// [`Ctx::sent_over_write`] by field and key.
+    sent_over_found: HashMap<(&'static str, String), Option<Feature>>,
     /// Namespace builtins used as a value, by name (see
     /// [`Ctx::note_builtin_value`]).
     builtin_values: HashMap<&'t str, Feature>,
@@ -1688,6 +2424,10 @@ struct Ctx<'t> {
     /// = patched`, `openai.OpenAI = Sub`), by package: every route of that
     /// package is then a `dynamic_feature` gap.
     sdk_patched: HashMap<Pkg, Feature>,
+    /// An HTTP library patched in this file (see [`Ctx::note_http_patch`]):
+    /// every raw HTTP request is then a `dynamic_feature` gap, and a dict
+    /// given to one may be changed.
+    http_patched: Option<Feature>,
     /// Names bound by `def` and `class` statements and class-body imports,
     /// where they bind: a name also assigned there gets an assignment of no
     /// known value for each (see [`Ctx::bind_definitions`]).
@@ -1722,6 +2462,26 @@ struct Ctx<'t> {
     /// [`MAX_FILE_IMPORTS`] was reached.
     import_bindings: usize,
     import_cut: Option<Node<'t>>,
+    /// The start of the last `x.__init__(...)` call directly in each
+    /// function, computed on first use (see [`Ctx::base_init_after`]).
+    base_inits: Option<HashMap<usize, usize>>,
+    /// Wrappers in other files, by the import target that names them
+    /// (`.sampler.Sampler`), from [`Ctx::resolve_wrappers`].
+    wrappers: HashMap<Rc<str>, Rc<Wrapper>>,
+    /// What gap-worthy calls may send a model in, other than a parameter
+    /// read unchanged (see [`Ctx::note_model_read`]), for
+    /// [`Ctx::changed_elsewhere`].
+    model_reads: Vec<Node<'t>>,
+    /// The gap-worthy calls recorded, and calls through a wrapper in
+    /// another file: what may send a request.
+    sending: Vec<Node<'t>>,
+    /// Model parameters found, with the function each is a parameter of,
+    /// until [`Ctx::settle_model_params`] keeps the ones no request sends
+    /// changed.
+    param_exports: Vec<(ModelParam, usize)>,
+    /// For each gap-worthy call by node id, the parameters it sends
+    /// unchanged as a model (see [`Ctx::param_source`]), listed or not.
+    direct: HashMap<usize, Vec<ParamKey>>,
     out: FileUsages,
 }
 
@@ -1774,6 +2534,8 @@ impl<'t> Ctx<'t> {
             name_uses: HashMap::new(),
             attr_uses: HashMap::new(),
             escaped: HashSet::new(),
+            http_body_args: HashMap::new(),
+            http_bodies: Vec::new(),
             exposed: Vec::new(),
             def_index: HashMap::new(),
             loops: HashMap::new(),
@@ -1812,6 +2574,10 @@ impl<'t> Ctx<'t> {
             rerouted_pkgs: HashSet::new(),
             rerouted_any: None,
             openai_caveat: None,
+            langchain_configurable: None,
+            litellm_aliases: None,
+            sent_over_writes: Vec::new(),
+            sent_over_found: HashMap::new(),
             builtin_values: HashMap::new(),
             member_values: HashSet::new(),
             method_self_writes: Vec::new(),
@@ -1821,6 +2587,7 @@ impl<'t> Ctx<'t> {
             exported: HashSet::new(),
             exports_dynamic: false,
             sdk_patched: HashMap::new(),
+            http_patched: None,
             def_bindings: Vec::new(),
             openai_last_config: None,
             config_top: false,
@@ -1833,6 +2600,12 @@ impl<'t> Ctx<'t> {
             loop_iter: None,
             import_bindings: 0,
             import_cut: None,
+            base_inits: None,
+            wrappers: HashMap::new(),
+            model_reads: Vec::new(),
+            sending: Vec::new(),
+            param_exports: Vec::new(),
+            direct: HashMap::new(),
             out: FileUsages::new(file, "python"),
         }
     }
@@ -2117,6 +2890,7 @@ impl<'t> Ctx<'t> {
                             self.parents.insert(node.id(), parent);
                         }
                         self.note_dict_mutation(node);
+                        self.note_http_body(node);
                         self.note_env_read(node);
                         self.note_env_write(node);
                         if is_get_call(node, |n| self.text(n)) {
@@ -2886,6 +3660,10 @@ impl<'t> Ctx<'t> {
     /// A bare name: whether a dict bound to it may change or escape here.
     fn note_dict_name(&mut self, node: Node<'t>, frame: &Frame<'t>, scope: usize) {
         let name = self.text(node);
+        if let Some(function) = self.http_body_args.get(&node.id()).copied() {
+            self.http_bodies.push((name, function, scope));
+            return;
+        }
         match self.dict_use(frame, false) {
             DictUse::Safe => {}
             DictUse::Escape => {
@@ -2900,6 +3678,35 @@ impl<'t> Ctx<'t> {
                     _ => None,
                 },
             }),
+        }
+    }
+
+    /// `post(url, json=body)` or `x.post(url, json=body)`: the name passed as
+    /// `json=` is held back from escaping until imports are bound (see
+    /// [`Ctx::http_bodies`]). The callee's shape is all that is known here.
+    fn note_http_body(&mut self, call: Node<'t>) {
+        let Some(function) = call.child_by_field_name("function") else {
+            return;
+        };
+        let shaped = match function.kind() {
+            "identifier" => true,
+            "attribute" => {
+                function
+                    .child_by_field_name("attribute")
+                    .is_some_and(|a| self.text(a) == "post")
+                    && function
+                        .child_by_field_name("object")
+                        .is_some_and(|o| o.kind() == "identifier")
+            }
+            _ => false,
+        };
+        if !shaped {
+            return;
+        }
+        if let Some(value) = keyword_value(call, |n| self.text(n), |name| name == "json") {
+            if value.kind() == "identifier" {
+                self.http_body_args.insert(value.id(), function);
+            }
         }
     }
 
@@ -2999,6 +3806,23 @@ impl<'t> Ctx<'t> {
     /// and escapes too. There is no alias tracking to get wrong: a whole
     /// container assigned to another name has already escaped.
     fn settle_dict_escapes(&mut self) {
+        // `requests.post` and `httpx.post` serialize the dict they are
+        // given; anything else may keep or change it, and so may they once
+        // the file may patch the library (`note_http_patch`: any attribute
+        // written, deleted or set with `setattr` at or below `requests` or
+        // `httpx`; `post` or a run-time name written on an object the scan
+        // cannot identify; a test helper aimed at the library) or has a
+        // whole-file dynamic feature (`settle_builtin_values` may add one
+        // later, so a builtin used as a value counts here already).
+        self.note_http_patch();
+        let replaceable = self.http_patched.is_some()
+            || self.file_dynamic.is_some()
+            || !self.builtin_values.is_empty();
+        for (name, function, scope) in std::mem::take(&mut self.http_bodies) {
+            if replaceable || self.http_library(function, scope).is_none() {
+                self.escaped.insert(name);
+            }
+        }
         for exposed in std::mem::take(&mut self.exposed) {
             let (alters, names) = self.exposed_contents(&exposed);
             if alters {
@@ -3415,9 +4239,17 @@ impl<'t> Ctx<'t> {
             } else {
                 continue;
             };
-            self.outside_attr_writes
-                .entry(attr)
-                .or_insert_with(|| Self::feature(what, object));
+            let feature = Self::feature(what, object);
+            self.outside_attr_writes.entry(attr).or_insert(feature);
+            // Its value is not read here: it may hold any key (see
+            // [`Self::sent_over_write`]).
+            if LANGCHAIN_SENT_OVER.contains(&attr) {
+                self.sent_over_writes.push(SentOverWrite {
+                    attr,
+                    value: None,
+                    feature,
+                });
+            }
         }
         for (object, scope) in self.wild_attr_objects.clone() {
             if let Some(feature) = self.rebound_receiver(object, scope) {
@@ -4104,7 +4936,14 @@ impl<'t> Ctx<'t> {
         scope
     }
 
-    fn other_import(&mut self, scope: usize, local: String, module: &Rc<str>, place: Place) {
+    fn other_import(
+        &mut self,
+        scope: usize,
+        local: String,
+        module: &Rc<str>,
+        target: Rc<str>,
+        place: Place,
+    ) {
         self.class_body_import(scope, &local, place);
         let home = self.import_home(scope, &local);
         self.other_imports
@@ -4112,6 +4951,7 @@ impl<'t> Ctx<'t> {
             .or_default()
             .push(OtherImport {
                 module: Rc::clone(module),
+                target,
                 place,
             });
     }
@@ -4161,11 +5001,14 @@ impl<'t> Ctx<'t> {
             self.note_self_import(written, node);
             let module = clip(written);
             let Some((pkg, rest)) = Pkg::of_module(written) else {
-                let local = match alias {
-                    Some(alias) => self.text(alias).to_string(),
-                    None => written.split('.').next().unwrap_or("").to_string(),
+                let (local, target) = match alias {
+                    Some(alias) => (self.text(alias).to_string(), Rc::from(module.as_str())),
+                    None => {
+                        let first = written.split('.').next().unwrap_or("");
+                        (first.to_string(), Rc::from(clip(first.trim())))
+                    }
                 };
-                self.other_import(scope, local, &Rc::from(module), place);
+                self.other_import(scope, local, &Rc::from(module), target, place);
                 continue;
             };
             let (local, val) = match alias {
@@ -4223,6 +5066,11 @@ impl<'t> Ctx<'t> {
         } else {
             Pkg::of_module(written)
         };
+        let reexports = if relative {
+            None
+        } else {
+            langchain_reexport(written)
+        };
         if !relative {
             self.note_self_import(written, node);
         }
@@ -4240,7 +5088,7 @@ impl<'t> Ctx<'t> {
                 }
                 return;
             }
-            if let Some((pkg, _)) = target {
+            if let Some((pkg, rest)) = target {
                 for class in CLASSES.iter().filter(|c| c.pkg == pkg) {
                     if !self.import_budget(node) {
                         return;
@@ -4248,6 +5096,21 @@ impl<'t> Ctx<'t> {
                     let key = (self.import_home(scope, class.name), class.name.to_string());
                     self.imports.entry(key).or_default().push(ImportDef {
                         val: Val::Class(*class),
+                        place,
+                    });
+                }
+                for name in pkg.named_symbols() {
+                    let mut path = rest.clone();
+                    path.push(name.to_string());
+                    if !pkg.is_named_symbol(&path) {
+                        continue;
+                    }
+                    if !self.import_budget(node) {
+                        return;
+                    }
+                    let key = (self.import_home(scope, name), name.to_string());
+                    self.imports.entry(key).or_default().push(ImportDef {
+                        val: Val::Symbol { pkg, path },
                         place,
                     });
                 }
@@ -4284,6 +5147,10 @@ impl<'t> Ctx<'t> {
             if !relative {
                 self.note_dynamic_import(written, &name, &local, node);
             }
+            // What `local` is bound to, for an import this file does not
+            // track (`requests.post`).
+            let bound =
+                || -> Rc<str> { Rc::from(clip(&format!("{}.{}", written.trim(), name.trim()))) };
 
             // `from google import genai` / `from google import generativeai`.
             if !relative && written == "google" {
@@ -4291,7 +5158,7 @@ impl<'t> Ctx<'t> {
                     "genai" => Pkg::GoogleGenai,
                     "generativeai" => Pkg::GoogleGenerativeai,
                     _ => {
-                        self.other_import(scope, local, &shared, place);
+                        self.other_import(scope, local, &shared, bound(), place);
                         continue;
                     }
                 };
@@ -4310,17 +5177,38 @@ impl<'t> Ctx<'t> {
                 continue;
             }
 
+            // `from langchain_community.chat_models import ChatOpenAI`: the
+            // class's provider decides its package.
+            let reexport =
+                reexports.and_then(|pkgs| pkgs.iter().find_map(|pkg| client_class(*pkg, &name)));
+            if let Some(class) = reexport {
+                let binding = Binding {
+                    local: &local,
+                    pkg: class.pkg,
+                    module: &module,
+                    name: Some(name),
+                    kind: BindingKind::ClientClass,
+                };
+                self.add_import(binding, Val::Class(class), scope, item, place);
+                continue;
+            }
+
             let Some((pkg, rest)) = target.clone() else {
-                self.other_import(scope, local, &shared, place);
+                self.other_import(scope, local, &shared, bound(), place);
                 continue;
             };
+            let mut path = rest;
+            path.push(name.clone());
             let (val, kind) = match client_class(pkg, &name) {
                 Some(class) => (Val::Class(class), BindingKind::ClientClass),
-                None => {
-                    let mut path = rest;
-                    path.push(name.clone());
-                    (Val::Symbol { pkg, path }, BindingKind::Symbol)
+                // Any other name from LangChain (`OpenAIEmbeddings`,
+                // `ChatOllama`), boto3 (`resource`) or LiteLLM (`Router`) is
+                // not followed.
+                None if pkg.follows_named_only() && !pkg.is_named_symbol(&path) => {
+                    self.other_import(scope, local, &shared, bound(), place);
+                    continue;
                 }
+                None => (Val::Symbol { pkg, path }, BindingKind::Symbol),
             };
             let binding = Binding {
                 local: &local,
@@ -4355,7 +5243,10 @@ impl<'t> Ctx<'t> {
     }
 
     fn record_import(&mut self, binding: Binding<'_>, node: Node<'t>) {
-        self.sdk_imported.insert(binding.pkg.sdk());
+        // Only the SDK itself makes a bare `messages.create` its shape.
+        if !binding.pkg.is_langchain() {
+            self.sdk_imported.insert(binding.pkg.sdk());
+        }
         self.legacy_imported |= binding.pkg == Pkg::GoogleGenerativeai;
         let span = self.span(node);
         self.out.imports.push(SdkImport {
@@ -4436,7 +5327,11 @@ impl<'t> Ctx<'t> {
     fn bind_definitions(&mut self) {
         for (key, scope, place) in std::mem::take(&mut self.def_bindings) {
             let class_body = self.scopes[key.0].kind == ScopeKind::Class;
-            if !class_body && !self.assigns.contains_key(&key) {
+            // A `def` or `class` that rebinds an imported name (`from openai
+            // import OpenAI` then `def OpenAI(): ...`) replaces the import
+            // from there on, like an assignment.
+            let imported = self.imports.contains_key(&key) || self.other_imports.contains_key(&key);
+            if !class_body && !imported && !self.assigns.contains_key(&key) {
                 continue;
             }
             // `scope` is where the statement runs: a `global` def in a
@@ -5845,8 +6740,23 @@ impl<'t> Ctx<'t> {
 
     fn apply_call(&mut self, callee: Val, call: Node<'t>, scope: usize, depth: u32) -> Val {
         match callee {
-            Val::Class(class) => Val::Client {
+            Val::Class(class) if self.builds_client(call, class, scope) => Val::Client {
                 client: self.construction(call, class),
+                path: Vec::new(),
+            },
+            // `boto3.client("s3")`: not followed.
+            Val::Class(class) => Val::Result(Some(class.pkg)),
+            // `boto3.Session(...)`: its `client(...)` builds what
+            // `boto3.client(...)` does.
+            Val::Module {
+                pkg: Pkg::Boto3,
+                ref path,
+            }
+            | Val::Symbol {
+                pkg: Pkg::Boto3,
+                ref path,
+            } if Pkg::Boto3.is_named_symbol(path) && self.plain_session(call) => Val::Module {
+                pkg: Pkg::Boto3,
                 path: Vec::new(),
             },
             Val::Client { client, path } => {
@@ -5854,7 +6764,9 @@ impl<'t> Ctx<'t> {
                 let joined = path.join(".");
                 match joined.as_str() {
                     // Copies of the same client, re-routed by their options.
-                    "with_options" | "copy" => Val::Client {
+                    // A LangChain chat model's `copy(update=...)` may change
+                    // any field, so its copy is not followed.
+                    "with_options" | "copy" if !pkg.follows_named_only() => Val::Client {
                         client: self.copied_client(client, call, scope),
                         path: Vec::new(),
                     },
@@ -5869,7 +6781,7 @@ impl<'t> Ctx<'t> {
             Val::Module { pkg, .. } | Val::Symbol { pkg, .. } => Val::Result(Some(pkg)),
             Val::Result(pkg) => Val::Result(pkg),
             Val::GoogleNs => Val::untracked(Origin::Other),
-            Val::Untracked(Origin::MixedClasses(pkg)) => Val::Client {
+            Val::Untracked(Origin::MixedClasses(pkg, _)) => Val::Client {
                 client: Client {
                     pkg,
                     routing: Routing::Unknown,
@@ -5997,6 +6909,48 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// Whether every client this file builds on `line` (one, normally) was
+    /// built by `constructor` (`langchain_aws.ChatBedrockConverse`).
+    fn built_as(&self, line: Option<u32>, constructor: &str) -> bool {
+        let Some(line) = line else {
+            return false;
+        };
+        let mut built = self
+            .out
+            .clients
+            .iter()
+            .filter(|c| c.span.line == line)
+            .peekable();
+        built.peek().is_some() && built.all(|c| c.constructor == constructor)
+    }
+
+    /// Whether calling the constructor `class` builds a client: always,
+    /// except `boto3.client(...)`, which is followed only when its service
+    /// name (its first argument or `service_name=`) resolves, with no gap,
+    /// to `"bedrock-runtime"`.
+    fn builds_client(&mut self, call: Node<'t>, class: ClientClass, scope: usize) -> bool {
+        if class.pkg != Pkg::Boto3 {
+            return true;
+        }
+        let service = keyword_value(call, |n| self.text(n), |k| k == "service_name")
+            .or(self.arguments(call).first_positional);
+        service.is_some_and(|expr| {
+            matches!(
+                self.resolve_value(expr, scope, 0),
+                Ok(resolved) if resolved.caveats.is_empty() && resolved.value == "bedrock-runtime"
+            )
+        })
+    }
+
+    /// Whether `boto3.Session(...)` is given nothing that may change how its
+    /// clients are built: no `botocore_session` (which may carry its own
+    /// endpoint configuration or event handlers), by keyword or as the
+    /// fifth positional argument, and no `**` expansion.
+    fn plain_session(&self, call: Node<'t>) -> bool {
+        let args = self.arguments(call);
+        !args.splat && args.positional < 5 && !args.kwargs.iter().any(|k| k == "botocore_session")
+    }
+
     /// The SDK of a tracked client or constructor passed to a call
     /// (`instructor.from_openai(OpenAI())`).
     fn wrapped_pkg(&mut self, call: Node<'t>, scope: usize, depth: u32) -> Option<Pkg> {
@@ -6035,17 +6989,42 @@ impl<'t> Ctx<'t> {
         }
         let scope = self.call_scope.get(&call.id()).copied().unwrap_or(0);
         let args = self.arguments(call);
-        let direct = matches!(class.family, Family::OpenaiDirect | Family::AnthropicDirect);
-        let base_url = match keyword_value(call, |n| self.text(n), is_base_url_key) {
+        // Clients routed by their endpoint argument: a direct client's
+        // `base_url`, a Bedrock client's `endpoint_url`.
+        let direct = matches!(
+            class.family,
+            Family::OpenaiDirect | Family::AnthropicDirect | Family::AwsBedrock
+        );
+        let endpoint = keyword_value(call, |n| self.text(n), |k| is_endpoint_key(class.pkg, k));
+        let mut base_url = match endpoint {
             Some(expr) if direct => self.base_url_kind(class.pkg, expr, scope),
             Some(_) => BaseUrl::Custom,
             None => BaseUrl::Absent,
         };
+        // `boto3.client(service, region, api_version, use_ssl, verify,
+        // endpoint_url, ...)`: an endpoint passed by position, or through
+        // `*args`, is not read.
+        if class.pkg == Pkg::Boto3
+            && base_url == BaseUrl::Absent
+            && (args.positional >= 6 || args.list_splat)
+        {
+            base_url = BaseUrl::Unknown { env: false };
+        }
         let mut routing = class.routing(&args.kwargs, args.splat, base_url);
         let mut caveat = match self.genai_endpoint_option(call, class, &args) {
             Some(option) => Some(ClientCaveat::EndpointOption { option }),
             None => self.endpoint_env(class, base_url),
         };
+        // `ChatOpenAI(client=OpenAI(base_url=...).chat.completions)`: its
+        // requests go through the client it is given.
+        if class.pkg.is_langchain() {
+            if let Some(field) = LANGCHAIN_CLIENT_FIELDS
+                .iter()
+                .find(|field| args.kwargs.iter().any(|k| k == *field))
+            {
+                caveat = Some(ClientCaveat::GivenClient { field });
+            }
+        }
         if caveat.is_some() {
             routing = Routing::Unknown;
         }
@@ -6188,15 +7167,15 @@ impl<'t> Ctx<'t> {
     fn endpoint_env(&self, class: ClientClass, base_url: BaseUrl) -> Option<ClientCaveat> {
         if !matches!(
             class.family,
-            Family::OpenaiDirect | Family::AnthropicDirect | Family::Genai
+            Family::OpenaiDirect | Family::AnthropicDirect | Family::Genai | Family::AwsBedrock
         ) || base_url != BaseUrl::Absent
         {
             return None;
         }
-        ENDPOINT_ENV
+        endpoint_env_vars(class.pkg)
             .iter()
-            .find(|(pkg, var)| *pkg == class.pkg && self.env_writes.contains(*var))
-            .map(|(_, var)| ClientCaveat::EndpointEnv { var })
+            .find(|var| self.env_writes.contains(**var))
+            .map(|var| ClientCaveat::EndpointEnv { var })
             .or_else(|| self.env_wild.map(ClientCaveat::EnvWrite))
     }
 
@@ -6334,6 +7313,17 @@ impl<'t> Ctx<'t> {
         }
         self.note_legacy_configure();
         self.note_rerouted_clients();
+        self.note_langchain_configurable();
+        self.note_botocore_events();
+        // LiteLLM maps a model name to another one through this
+        // process-wide table; any mention of it in the file counts.
+        if let Some(at) = self.src.find("model_alias_map") {
+            self.litellm_aliases = Some(Feature {
+                what: "LiteLLM's `model_alias_map`",
+                line: self.src[..at].matches('\n').count() as u32 + 1,
+            });
+        }
+        self.note_langchain_sent_over();
         for (call, scope) in self.calls.clone() {
             if self.records() >= MAX_FILE_RECORDS {
                 return self.truncate_file(call, scope);
@@ -6663,8 +7653,18 @@ impl<'t> Ctx<'t> {
             "generate_content_async",
         ];
         let attr = assign.attr;
-        let resource =
-            RESOURCES.contains(&attr) || attr.starts_with(|c: char| c.is_ascii_uppercase());
+        let langchain = target.pkg().is_some_and(Pkg::is_langchain);
+        // A tracked constructor (`boto3.client = fake`), a Bedrock client's
+        // request (`client.converse = patched`) or LiteLLM's.
+        let named = target.pkg().is_some_and(|pkg| {
+            client_class(pkg, attr).is_some()
+                || (pkg == Pkg::Boto3 && BEDROCK_REQUESTS.contains(&attr))
+                || (pkg == Pkg::Litellm && LITELLM_REQUESTS.contains(&attr))
+        });
+        let resource = RESOURCES.contains(&attr)
+            || attr.starts_with(|c: char| c.is_ascii_uppercase())
+            || (langchain && LANGCHAIN_CLIENT_FIELDS.contains(&attr))
+            || named;
         let pkg = match target {
             Val::Module { pkg, path } if !path.is_empty() || resource => *pkg,
             Val::Class(class) => class.pkg,
@@ -6675,6 +7675,208 @@ impl<'t> Ctx<'t> {
         self.sdk_patched
             .entry(pkg)
             .or_insert_with(|| Self::feature("an SDK member replaced in this file", assign.object));
+    }
+
+    /// `llm.configurable_fields(model_name=ConfigurableField(...))` or
+    /// `llm.configurable_alternatives(...)`: which model a LangChain chat
+    /// model's requests use may then be chosen at run time. The receiver is
+    /// not resolved, so any such call in the file counts.
+    fn note_langchain_configurable(&mut self) {
+        for (call, _) in self.calls.clone() {
+            let Some(attr) = call
+                .child_by_field_name("function")
+                .filter(|f| f.kind() == "attribute")
+                .and_then(|f| f.child_by_field_name("attribute"))
+            else {
+                continue;
+            };
+            let model = match self.text(attr) {
+                "configurable_alternatives" => true,
+                "configurable_fields" => {
+                    let args = self.arguments(call);
+                    args.splat
+                        || args
+                            .kwargs
+                            .iter()
+                            .any(|k| k == "model" || k == "model_name" || k == "model_id")
+                }
+                _ => false,
+            };
+            if model {
+                self.langchain_configurable = Some(Self::feature(
+                    "a LangChain model made configurable at run time",
+                    call,
+                ));
+                return;
+            }
+        }
+    }
+
+    /// `client.meta.events.register(...)` on a Bedrock client (also the one
+    /// a LangChain Bedrock model holds), or `session.events.register(...)`
+    /// on a boto3 session: a botocore event handler may rewrite a request's
+    /// parameters or send it elsewhere. It counts as replacing an SDK member
+    /// of the package (see [`Ctx::note_sdk_patch`]).
+    ///
+    /// The handler may be registered on an object this file cannot follow
+    /// (`boto3._get_default_session().events`, a session's `_session`, a
+    /// botocore session), so a `register` call whose event name is a
+    /// botocore event (`"before-parameter-build.bedrock-runtime.Converse"`)
+    /// counts wherever it is, and so does a default session set up from a
+    /// botocore session of the file's own
+    /// (`boto3.setup_default_session(botocore_session=...)`).
+    fn note_botocore_events(&mut self) {
+        // The botocore events a handler can rewrite a request in, or
+        // answer it from.
+        const EVENTS: &[&str] = &[
+            "before-",
+            "after-",
+            "provide-client-params",
+            "request-created",
+            "needs-retry",
+            "response-received",
+            "choose-",
+            "creating-client-class",
+            "*",
+        ];
+        const BEDROCK: [Pkg; 2] = [Pkg::Boto3, Pkg::LangchainAws];
+        for (call, scope) in self.calls.clone() {
+            let Some(function) = call.child_by_field_name("function") else {
+                continue;
+            };
+            let name = match function.kind() {
+                "attribute" => function.child_by_field_name("attribute"),
+                "identifier" => Some(function),
+                _ => None,
+            }
+            .map(|n| self.text(n));
+            let hooked: &[Pkg] = match name {
+                Some("register" | "register_first" | "register_last") => {
+                    // The event name may be a same-file constant.
+                    let event = keyword_value(call, |n| self.text(n), |k| k == "event_name")
+                        .or(self.arguments(call).first_positional)
+                        .and_then(|n| self.resolve_value(n, scope, 0).ok())
+                        .map(|resolved| resolved.value);
+                    if event.is_some_and(|e| EVENTS.iter().any(|p| e.starts_with(p))) {
+                        &BEDROCK
+                    } else {
+                        match self.eval(function, scope, 0) {
+                            Val::Client { client, path }
+                                if path.len() >= 2 && path[path.len() - 2] == "events" =>
+                            {
+                                match client.pkg {
+                                    Pkg::Boto3 => &BEDROCK[..1],
+                                    Pkg::LangchainAws => &BEDROCK[1..],
+                                    _ => &[],
+                                }
+                            }
+                            Val::Module {
+                                pkg: Pkg::Boto3,
+                                path,
+                            } if path.len() >= 2 && path[path.len() - 2] == "events" => {
+                                &BEDROCK[..1]
+                            }
+                            _ => &[],
+                        }
+                    }
+                }
+                Some("setup_default_session") => {
+                    let args = self.arguments(call);
+                    if args.splat || args.kwargs.iter().any(|k| k == "botocore_session") {
+                        &BEDROCK[..1]
+                    } else {
+                        &[]
+                    }
+                }
+                _ => &[],
+            };
+            for pkg in hooked {
+                self.sdk_patched.entry(*pkg).or_insert_with(|| {
+                    Self::feature("a botocore event handler registered in this file", call)
+                });
+            }
+        }
+    }
+
+    /// `x.model_kwargs = ...` or `x.extra_body = ...` on an object other
+    /// than `self` or a same-file class: a LangChain chat model sends these
+    /// over its model field, so the write replaces the models a constructor
+    /// gives in them, and may change the others (see
+    /// [`Self::langchain_rewrite`]).
+    fn note_langchain_sent_over(&mut self) {
+        let writes: Vec<SentOverWrite<'t>> = self
+            .config_assigns
+            .iter()
+            .filter(|write| LANGCHAIN_SENT_OVER.contains(&write.attr))
+            .map(|write| SentOverWrite {
+                attr: write.attr,
+                value: write.value.map(|value| (value, write.scope)),
+                feature: Self::feature("a write of the attribute on another object", write.object),
+            })
+            .collect();
+        self.sent_over_writes.extend(writes);
+    }
+
+    /// The write, on an object other than `self` or a same-file class, that
+    /// may give a built LangChain chat model another model where it is
+    /// given the value keyed `key` (`model_name`, `extra_body.model`).
+    /// LangChain sends the model field (`model` or `model_name`), then
+    /// `model_kwargs` over its own parameters, then `extra_body` over the
+    /// request body. So a value is replaced by any write of the field it is
+    /// given in (either name, for the model field), and by a write of a
+    /// dict sent after that field whose value may hold the request key the
+    /// value is sent as (`model`, for the model field and for
+    /// `model_kwargs.model`). A write of `model` or `model_name` leaves the
+    /// values given in `model_kwargs` and `extra_body`, which are sent over
+    /// it.
+    fn langchain_rewrite(&mut self, key: &str) -> Option<Feature> {
+        let (field, rest) = key.split_once('.').unwrap_or((key, ""));
+        let next = rest.split('.').next().unwrap_or(rest);
+        // The request key the value is sent as, and the dicts sent after the
+        // field it is given in.
+        let (sent_as, after): (&str, &[&'static str]) = match field {
+            "model" | "model_name" | "model_id" => ("model", LANGCHAIN_SENT_OVER),
+            "model_kwargs" => (next, &["extra_body"]),
+            _ => (next, &[]),
+        };
+        let written = match field {
+            "model" | "model_name" | "model_id" => ["model", "model_name", "model_id"]
+                .iter()
+                .find_map(|name| self.outside_attr_writes.get(name)),
+            _ => self.outside_attr_writes.get(field),
+        }
+        .copied();
+        written.or_else(|| {
+            after
+                .iter()
+                .find_map(|over| self.sent_over_write(over, sent_as))
+        })
+    }
+
+    /// The first write of `field`, one of [`LANGCHAIN_SENT_OVER`], whose
+    /// value may hold `key` ([`Self::may_hold_keys`]). One whose value is
+    /// not read here may hold any key.
+    fn sent_over_write(&mut self, field: &'static str, key: &str) -> Option<Feature> {
+        let cache_key = (field, key.to_string());
+        if let Some(found) = self.sent_over_found.get(&cache_key) {
+            return *found;
+        }
+        let mut found = None;
+        for index in 0..self.sent_over_writes.len() {
+            let write = self.sent_over_writes[index];
+            if write.attr != field {
+                continue;
+            }
+            if write
+                .value
+                .is_none_or(|(value, scope)| self.may_hold_keys(value, scope, &[key]))
+            {
+                found = Some(write.feature);
+                break;
+            }
+        }
+        self.sent_over_found.insert(cache_key, found);
+        found
     }
 
     /// Clients given a new `base_url` after they are built
@@ -6733,6 +7935,20 @@ impl<'t> Ctx<'t> {
                 client.caveat = Some(caveat.clone());
             }
         }
+        // A deprecated LangChain OpenAI chat model on the pre-1.0 SDK sends
+        // its requests through the module-level API, which this file
+        // configures (`openai.api_type = "azure"`, `openai.api_base = ...`).
+        let module_configured =
+            self.openai_routing != Routing::OpenaiDirect || self.openai_caveat.is_some();
+        if client.pkg.reads_module_config()
+            && module_configured
+            && client.routing == Routing::OpenaiDirect
+            && client.caveat.is_none()
+            && !client.ambiguous
+        {
+            client.routing = Routing::Unknown;
+            client.caveat = Some(ClientCaveat::LangchainModuleConfig);
+        }
         let assigned = client
             .site
             .is_some_and(|site| self.rerouted.contains(&site))
@@ -6758,12 +7974,21 @@ impl<'t> Ctx<'t> {
                 client.caveat = Some(ClientCaveat::Dynamic(feature));
             }
         }
-        if let Some(feature) = self.sdk_patched.get(&client.pkg) {
+        if let Some(feature) = self.sdk_patch(client.pkg) {
             if client.caveat.is_none() && !client.ambiguous {
-                client.caveat = Some(ClientCaveat::Dynamic(*feature));
+                client.caveat = Some(ClientCaveat::Dynamic(feature));
             }
         }
         client
+    }
+
+    /// A member of `pkg` replaced in this file, or, for a LangChain chat
+    /// model, one of the SDK whose client it builds (`openai.OpenAI = ...`).
+    fn sdk_patch(&self, pkg: Pkg) -> Option<Feature> {
+        self.sdk_patched
+            .get(&pkg)
+            .or_else(|| self.sdk_patched.get(&pkg.base()))
+            .copied()
     }
 
     /// Why the module-level API of `pkg` may not route as reported.
@@ -6782,6 +8007,18 @@ impl<'t> Ctx<'t> {
             Pkg::GoogleGenai => Routing::GoogleGenai,
             Pkg::GoogleGenerativeai if self.legacy_caveat.is_some() => Routing::Unknown,
             Pkg::GoogleGenerativeai => Routing::GoogleGenerativeaiLegacy,
+            // Only LangChain's chat-model classes are followed, and each
+            // routes by its own construction.
+            Pkg::LangchainOpenai
+            | Pkg::LangchainAnthropic
+            | Pkg::LangchainCommunityOpenai
+            | Pkg::LangchainCommunityAnthropic
+            | Pkg::LangchainLegacyOpenai
+            | Pkg::LangchainLegacyAnthropic
+            | Pkg::LangchainAws
+            | Pkg::Boto3 => Routing::Unknown,
+            // `litellm.completion(...)`: LiteLLM picks the provider.
+            Pkg::Litellm => Routing::Litellm,
         }
     }
 
@@ -6886,10 +8123,39 @@ impl<'t> Ctx<'t> {
             self.check_getattr(call, scope);
             return;
         }
+        if let Some(library) = self.http_library(function, scope) {
+            self.analyze_http(call, function, scope, library);
+            return;
+        }
+        if let Some(wrapper) = self.wrapper_callee(function, scope) {
+            self.record_wrapper_call(call, function, scope, &wrapper);
+            return;
+        }
 
         let callee = self.eval(function, scope, 0);
         match callee {
-            Val::Class(class) => {
+            Val::Class(class) if class.pkg.is_langchain() => {
+                // A LangChain chat model is built with the model its
+                // requests use, and routes by the client it builds.
+                let built = self.construction(call, class);
+                let built = self.reroute(built);
+                let receiver = if function.kind() == "attribute" {
+                    Receiver::Module
+                } else {
+                    Receiver::Symbol
+                };
+                let target = CallTarget {
+                    pkg: class.pkg,
+                    member: class.name.to_string(),
+                    receiver,
+                    routing: built.routing,
+                    client_line: built.line,
+                    ambiguous: built.ambiguous,
+                    caveat: built.caveat,
+                };
+                self.record_call(call, function, scope, target);
+            }
+            Val::Class(class) if self.builds_client(call, class, scope) => {
                 self.construction(call, class);
                 if class.family == Family::LegacyModel {
                     let receiver = if function.kind() == "attribute" {
@@ -6904,15 +8170,19 @@ impl<'t> Ctx<'t> {
                         routing: self.module_routing(class.pkg),
                         client_line: None,
                         ambiguous: false,
-                        caveat: self.module_caveat(class.pkg).or_else(|| {
-                            self.sdk_patched
-                                .get(&class.pkg)
-                                .map(|f| ClientCaveat::Dynamic(*f))
-                        }),
+                        caveat: self
+                            .module_caveat(class.pkg)
+                            .or_else(|| self.sdk_patch(class.pkg).map(ClientCaveat::Dynamic)),
                     };
                     self.record_call(call, function, scope, target);
                 }
             }
+            // LangChain and boto3 are followed only through their classes
+            // (above) and the objects they build, LiteLLM only through its
+            // request functions.
+            Val::Module { pkg, ref path } | Val::Symbol { pkg, ref path }
+                if pkg.follows_named_only()
+                    && !(pkg == Pkg::Litellm && pkg.is_named_symbol(path)) => {}
             Val::Module { pkg, path } if !path.is_empty() => {
                 let (routing, caveat) = self.module_target(pkg, call, scope);
                 let target = CallTarget {
@@ -6952,6 +8222,27 @@ impl<'t> Ctx<'t> {
                 };
                 self.record_call(call, function, scope, target);
             }
+            // `Chat = AzureChatOpenAI if azure else ChatOpenAI`, or the same
+            // choice made by a `try`/`except ImportError` import: a LangChain
+            // chat model is built with the model its requests use, but which
+            // class builds it, and so its route, is decided at run time.
+            Val::Untracked(Origin::MixedClasses(_, Some(class))) => {
+                let receiver = if function.kind() == "attribute" {
+                    Receiver::Module
+                } else {
+                    Receiver::Symbol
+                };
+                let target = CallTarget {
+                    pkg: class.pkg,
+                    member: class.name.to_string(),
+                    receiver,
+                    routing: Routing::Unknown,
+                    client_line: None,
+                    ambiguous: true,
+                    caveat: None,
+                };
+                self.record_call(call, function, scope, target);
+            }
             Val::Untracked(origin) => self.check_unknown_receiver(call, function, scope, origin),
             Val::Result(pkg) => {
                 let origin = Origin::SdkResult { pkg };
@@ -6959,6 +8250,1918 @@ impl<'t> Ctx<'t> {
             }
             _ => {}
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Raw HTTP requests
+    // ------------------------------------------------------------------
+
+    /// The dotted path a name is bound to when every definition of it that
+    /// reaches `node` is an untracked import binding that same path
+    /// (`requests` after `import requests`). A name also assigned, a
+    /// parameter, a wildcard import or a write to the module namespace has
+    /// none.
+    fn import_target(&self, node: Node<'t>, scope: usize) -> Option<Rc<str>> {
+        let (key, at) = self.locate(self.text(node), scope, node.start_byte());
+        let imports = self.other_imports.get(&key)?;
+        let defs = match self.reaching(&key, at) {
+            Reach::All => self.all_defs(&key),
+            Reach::Subset(defs) => defs,
+        };
+        let mut target: Option<Rc<str>> = None;
+        for def in defs {
+            let DefRef::Other(i) = def else {
+                return None;
+            };
+            let bound = &imports.get(i)?.target;
+            match &target {
+                Some(seen) if seen != bound => return None,
+                Some(_) => {}
+                None => target = Some(Rc::clone(bound)),
+            }
+        }
+        target
+    }
+
+    /// The HTTP library ([`HTTP_LIBRARIES`]) whose `post` function
+    /// `function` is: `requests.post` after `import requests` (or `r.post`
+    /// after `import requests as r`), or `post` after `from requests import
+    /// post`, each name bound by its import alone (see
+    /// [`Ctx::import_target`]).
+    fn http_library(&self, function: Node<'t>, scope: usize) -> Option<&'static str> {
+        match function.kind() {
+            "identifier" => {
+                let target = self.import_target(function, scope)?;
+                HTTP_LIBRARIES
+                    .iter()
+                    .copied()
+                    .find(|lib| target.strip_prefix(lib) == Some(".post"))
+            }
+            "attribute" => {
+                let attr = function.child_by_field_name("attribute")?;
+                if self.text(attr) != "post" {
+                    return None;
+                }
+                self.http_module(function.child_by_field_name("object")?, scope)
+            }
+            _ => None,
+        }
+    }
+
+    /// The HTTP library `object` is the module of, bound by its import
+    /// alone.
+    fn http_module(&self, object: Node<'t>, scope: usize) -> Option<&'static str> {
+        if object.kind() != "identifier" {
+            return None;
+        }
+        let target = self.import_target(object, scope)?;
+        HTTP_LIBRARIES.iter().copied().find(|lib| *lib == &*target)
+    }
+
+    /// Whatever may make a raw HTTP request send something else, failing
+    /// closed: any attribute written (or deleted, or set with `setattr`) on
+    /// an HTTP library or anything in it (`requests.post = fake`,
+    /// `requests.Session.request = pin`, `Session.send = pin` after `from
+    /// requests import Session`), since `post` hands its arguments down to
+    /// them; `post`, or an attribute named at run time, written on an
+    /// object the scan cannot identify (`r = requests; r.post = fake`); and
+    /// a test helper aimed at one (`monkeypatch.setattr(requests, ...)`,
+    /// `mock.patch("requests.post")`).
+    fn note_http_patch(&mut self) {
+        let mut found = None;
+        for assign in &self.config_assigns {
+            if self.in_http_library(assign.object, assign.scope) {
+                found = Some(("an HTTP library patched in this file", assign.object));
+            } else if assign.attr == "post" && !self.identified(assign.object, assign.scope) {
+                found = Some((
+                    "`post` written on an object this scan cannot identify",
+                    assign.object,
+                ));
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        if found.is_none() {
+            found = self
+                .wild_attr_objects
+                .iter()
+                .find(|&&(object, scope)| {
+                    self.in_http_library(object, scope) || !self.identified(object, scope)
+                })
+                .map(|&(object, _)| {
+                    (
+                        "an attribute named at run time written on an HTTP library or an object this scan cannot identify",
+                        object,
+                    )
+                });
+        }
+        if found.is_none() {
+            found = self
+                .calls
+                .iter()
+                .find(|&&(call, scope)| self.patches_http(call, scope))
+                .map(|&(call, _)| ("an HTTP library patched by a test helper", call));
+        }
+        if let Some((what, node)) = found {
+            self.http_patched = Some(Self::feature(what, node));
+        }
+    }
+
+    /// Whether `object` is an HTTP library ([`HTTP_LIBRARIES`]) or something
+    /// in it: its root is a name bound by its import alone (see
+    /// [`Ctx::import_target`]) to the library or a path below it
+    /// (`requests.Session`, `Session` after `from requests import Session`).
+    fn in_http_library(&self, object: Node<'t>, scope: usize) -> bool {
+        let Some(target) = self
+            .object_root(object)
+            .and_then(|root| self.import_target(root, scope))
+        else {
+            return false;
+        };
+        HTTP_LIBRARIES.iter().any(|lib| {
+            target
+                .strip_prefix(lib)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+        })
+    }
+
+    /// Whether the scan knows what `object` is: its root is a name bound by
+    /// an import alone. An alias (`r = requests`), a parameter or `self`
+    /// is not known.
+    fn identified(&self, object: Node<'t>, scope: usize) -> bool {
+        self.object_root(object)
+            .is_some_and(|root| self.import_target(root, scope).is_some())
+    }
+
+    /// The name an attribute chain starts from (`requests` in
+    /// `requests.Session.request`), if it starts from one.
+    fn object_root(&self, object: Node<'t>) -> Option<Node<'t>> {
+        let mut root = object;
+        while root.kind() == "attribute" {
+            root = root.child_by_field_name("object")?;
+        }
+        (root.kind() == "identifier").then_some(root)
+    }
+
+    /// `monkeypatch.setattr(requests, "post", fake)`,
+    /// `monkeypatch.setattr("requests.post", fake)`,
+    /// `mock.patch("httpx.post")`, `patch.object(requests.Session, ...)`: a
+    /// call to a `setattr`, `patch` or `object` (of `patch`) whose first
+    /// argument is in an HTTP library or names one.
+    fn patches_http(&self, call: Node<'t>, scope: usize) -> bool {
+        let Some(function) = call.child_by_field_name("function") else {
+            return false;
+        };
+        let name = match function.kind() {
+            "identifier" => self.text(function),
+            "attribute" => function
+                .child_by_field_name("attribute")
+                .map_or("", |a| self.text(a)),
+            _ => return false,
+        };
+        let helper = match name {
+            "setattr" => function.kind() == "attribute",
+            "patch" => true,
+            "object" => function
+                .child_by_field_name("object")
+                .is_some_and(|o| self.text(o).ends_with("patch")),
+            _ => false,
+        };
+        let first = call
+            .child_by_field_name("arguments")
+            .and_then(|args| named_children(args).into_iter().next());
+        helper
+            && first.is_some_and(|arg| {
+                self.in_http_library(arg, scope)
+                    || self.literal(arg).is_ok_and(|path| {
+                        HTTP_LIBRARIES.iter().any(|lib| {
+                            path.strip_prefix(lib)
+                                .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+                        })
+                    })
+            })
+    }
+
+    /// The dict a `data=` or `content=` argument sends as JSON:
+    /// `json.dumps(body)`, with `body` its only argument.
+    fn json_dumps_argument(&self, expr: Node<'t>) -> Option<Node<'t>> {
+        if expr.kind() != "call" {
+            return None;
+        }
+        let function = expr.child_by_field_name("function")?;
+        if self.render(function) != "json.dumps" {
+            return None;
+        }
+        let args = self.arguments(expr);
+        if args.splat || args.list_splat || args.positional != 1 || !args.kwargs.is_empty() {
+            return None;
+        }
+        args.first_positional
+    }
+
+    /// `requests.post(url, json=body)` or `httpx.post(...)`: a request to a
+    /// provider's REST API when `url` resolves, with no gap, to an endpoint
+    /// [`http_endpoint`] lists. It is recorded as a request whose member is
+    /// the SDK method that endpoint is, routed direct, and its model is
+    /// read from the JSON body the way a dict expanded with `**` is read at
+    /// an SDK call. A URL that does not resolve, or names another host or
+    /// path, records nothing.
+    fn analyze_http(
+        &mut self,
+        call: Node<'t>,
+        function: Node<'t>,
+        scope: usize,
+        library: &'static str,
+    ) {
+        // The call's own arguments: none of them is a model value.
+        let args = self.arguments_with(call, ValueKeys::Only(&[]));
+        let (positional, keywords) = call_arguments(call, |n| self.text(n));
+        self.sending.push(call);
+        for arg in positional.iter().chain(keywords.iter().map(|(_, v)| v)) {
+            self.note_model_read(*arg);
+        }
+        self.model_reads.extend(splat_arguments(call));
+        let by_keyword = |name: &str| {
+            keywords
+                .iter()
+                .find_map(|(k, value)| (k == name).then_some(*value))
+        };
+        let url_keyword = by_keyword("url");
+        // A `*` argument hides the position of every argument after it: one
+        // before the URL leaves the URL unknown, one after it may hold the
+        // body.
+        let first_splat = call
+            .child_by_field_name("arguments")
+            .map(named_children)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|a| a.kind() == "list_splat")
+            .map(|a| a.start_byte());
+        let url = match (url_keyword, positional.first()) {
+            (Some(url), _) => url,
+            (None, Some(first)) if first_splat.is_none_or(|at| at > first.start_byte()) => *first,
+            _ => return,
+        };
+        let endpoint = match self.resolve_value(url, scope, 0) {
+            Ok(resolved) if resolved.is_certain() => http_endpoint(&resolved.value),
+            _ => None,
+        };
+        let Some(endpoint) = endpoint else {
+            return;
+        };
+
+        // Where the JSON body is: `json=`, or a `data=` (httpx also
+        // `content=`) that is `json.dumps(...)` of it; requests also takes
+        // `data` and `json` as its second and third positional arguments.
+        // `None` is a body this file cannot read as JSON.
+        let mut bodies: Vec<Option<Node<'t>>> = Vec::new();
+        for (name, value) in &keywords {
+            match name.as_str() {
+                "json" => bodies.push(Some(*value)),
+                "data" => bodies.push(self.json_dumps_argument(*value)),
+                "content" if library == "httpx" => {
+                    bodies.push(self.json_dumps_argument(*value));
+                }
+                "files" => bodies.push(None),
+                _ => {}
+            }
+        }
+        let skip = usize::from(url_keyword.is_none());
+        for (index, value) in positional.iter().enumerate().skip(skip) {
+            let after_splat = first_splat.is_some_and(|at| at < value.start_byte());
+            match (library, index - skip) {
+                _ if after_splat => bodies.push(None),
+                ("requests", 0) => bodies.push(self.json_dumps_argument(*value)),
+                ("requests", 1) => bodies.push(Some(*value)),
+                _ => bodies.push(None),
+            }
+        }
+        if first_splat.is_some() {
+            bodies.push(None);
+        }
+
+        let chain = self.render(function);
+        let span = self.span(call);
+        let symbol = self.symbol(scope);
+        let site = Site {
+            sdk: endpoint.sdk,
+            call,
+            chain: &chain,
+            scope,
+            gap_worthy: true,
+        };
+        let gaps_before = self.out.gaps.len();
+        let mut values = Vec::new();
+        // Why the body's model is not known, when it is not.
+        let mut unread: Option<String> = None;
+        match bodies.as_slice() {
+            [Some(body)] => match self.expand_splat(*body, scope) {
+                Some(expansion) => {
+                    let mut named = false;
+                    for (key, index, value) in expansion.summary.expansion.iter() {
+                        if key != "model" {
+                            continue;
+                        }
+                        named = true;
+                        let label = expansion.name.as_ref().map(|n| format!("{n}[\"{key}\"]"));
+                        let mut result = self
+                            .resolve_value(*value, expansion.scope, 0)
+                            .map(|mut r| {
+                                if r.origin == ValueOrigin::Literal {
+                                    r.origin = expansion.origin;
+                                    r.name = label.clone();
+                                }
+                                r
+                            })
+                            .map_err(|u| match &label {
+                                Some(label) => u.via(label),
+                                None => u,
+                            });
+                        // `{"model": "gpt-4o", **extra}`: the entry is a
+                        // candidate, not the value.
+                        if expansion.summary.overridable(*index) {
+                            let shape = expansion
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| "{...}".to_string());
+                            let candidates: Vec<Resolved> = result.ok().into_iter().collect();
+                            result =
+                                Err(Unresolved::new("splat", shape).with_candidates(candidates, false));
+                        }
+                        self.take_value(&site, key, false, result, &mut values);
+                    }
+                    // `metadata` holds the caller's own tags, which the API
+                    // stores and never reads as a model.
+                    let nested = self.dict_nested(&expansion);
+                    let sent = |path: &str| {
+                        path.split(['.', '[']).next() != Some("metadata")
+                    };
+                    let found = nested
+                        .found
+                        .iter()
+                        .filter(|v| sent(&v.path))
+                        .cloned()
+                        .collect();
+                    // Not a LiteLLM call, so no value gets a `provider`.
+                    self.take_nested(&site, found, nested.cut, None, &mut values);
+                    let mut seen: HashSet<&str> = HashSet::new();
+                    for path in nested
+                        .overridden
+                        .iter()
+                        .filter(|p| sent(p))
+                        .take(MAX_NESTED_VALUES)
+                    {
+                        if seen.insert(path.as_str()) {
+                            let unresolved = Unresolved::new("splat", "{...}".to_string());
+                            self.unresolved_gap(&site, path, &unresolved, None);
+                        }
+                    }
+                    if !named && expansion.opaque() {
+                        let shape = expansion
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| "{...}".to_string());
+                        let unresolved = Unresolved::new("splat", shape);
+                        self.unresolved_gap(&site, "model", &unresolved, None);
+                    } else if !named && endpoint.takes_model {
+                        let unresolved = Unresolved::new("missing_model", String::new());
+                        self.unresolved_gap(&site, "model", &unresolved, None);
+                    }
+                }
+                None => {
+                    let shape = self.render(*body);
+                    unread = Some(format!(
+                            "the JSON body of `{chain}` is `{shape}`, which is not a dict literal this file can read, so the model it sends is not known"
+                        ));
+                }
+            },
+            [] if !endpoint.takes_model => {}
+            [] => unread = Some(format!(
+                    "`{chain}` passes no JSON body this scan reads (`json=` or `data=json.dumps(...)`), so the model it sends is not known"
+                )),
+            _ => unread = Some(format!(
+                    "the body of `{chain}` is not one JSON value this scan reads (it is form data, a string, passed by position or passed more than once), so the model it sends is not known"
+                )),
+        }
+        if let Some(detail) = unread {
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::UnresolvedModel,
+                sdk: Some(endpoint.sdk),
+                file: self.file.clone(),
+                span: Some(span),
+                symbol: symbol.clone(),
+                chain: Some(chain.clone()),
+                key: Some("model".to_string()),
+                reason: "request_body".to_string(),
+                detail,
+                values: Vec::new(),
+                values_complete: false,
+                args: None,
+            });
+        }
+        if args.splat || args.list_splat {
+            // `**kw` may hold `data=`, which replaces a `json=` body: no
+            // value of the body is confirmed, nested ones included.
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::UnresolvedModel,
+                sdk: Some(endpoint.sdk),
+                file: self.file.clone(),
+                span: Some(span),
+                symbol: symbol.clone(),
+                chain: Some(chain.clone()),
+                key: None,
+                reason: "splat".to_string(),
+                detail: format!(
+                    "`{chain}` is given arguments through `*` or `**`, which may replace its body, so the model it sends is not confirmed"
+                ),
+                values: Vec::new(),
+                values_complete: false,
+                args: None,
+            });
+        }
+        // The request goes where its URL says unless `post` itself, or
+        // anything in the file, may be replaced at run time.
+        let replaced = match (self.http_patched, self.file_dynamic) {
+            (Some(feature), _) => Some(format!(
+                "`{chain}` may be replaced at run time ({}), so where the request goes is not confirmed",
+                feature.describe()
+            )),
+            (None, Some(feature)) => Some(format!(
+                "this file may rebind any name or attribute at run time ({}), so the routing of `{chain}` is not confirmed",
+                feature.describe()
+            )),
+            (None, None) => None,
+        };
+        if let Some(detail) = replaced {
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::AmbiguousClient,
+                sdk: Some(endpoint.sdk),
+                file: self.file.clone(),
+                span: Some(span),
+                symbol: symbol.clone(),
+                chain: Some(chain.clone()),
+                key: None,
+                reason: "dynamic_feature".to_string(),
+                detail,
+                values: Vec::new(),
+                values_complete: false,
+                args: None,
+            });
+        }
+
+        // The same value or gap reached twice is listed once.
+        let mut seen_values = HashSet::new();
+        values.retain(|v| seen_values.insert((v.key.clone(), v.span.start_byte, v.value.clone())));
+        let mut seen_gaps = HashSet::new();
+        for gap in self.out.gaps.split_off(gaps_before) {
+            if seen_gaps.insert((
+                gap.kind,
+                gap.key.clone(),
+                gap.reason.clone(),
+                gap.detail.clone(),
+            )) {
+                self.out.gaps.push(gap);
+            }
+        }
+
+        let spreads = self.spreads(&args, scope);
+        self.out.calls.push(SdkCall {
+            sdk: endpoint.sdk,
+            package: library.to_string(),
+            chain,
+            member: endpoint.member.to_string(),
+            request: true,
+            receiver: if function.kind() == "attribute" {
+                Receiver::Module
+            } else {
+                Receiver::Symbol
+            },
+            routing: endpoint.routing,
+            client_line: None,
+            file: self.file.clone(),
+            span,
+            symbol,
+            spreads,
+            kwargs: args.kwargs,
+            positional: args.positional,
+            splat: args.splat,
+            values,
+            wrapper: None,
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Calls through a wrapper in another file
+    // ------------------------------------------------------------------
+
+    /// The parameter `expr` is, unchanged: a plain name whose only
+    /// definition reaching it is a parameter of the function that binds
+    /// it, or `self.attr` read in a method of a class whose one assignment
+    /// of `attr` (in it, its same-file base and its subclasses) is
+    /// `self.attr = <parameter>` in its own `__init__`, which calls no base
+    /// class's `__init__` after it. `None` for anything else, and for an attribute
+    /// a dynamic feature of the class may change.
+    fn param_source(&mut self, expr: Node<'t>, scope: usize) -> Option<ParamSource> {
+        match expr.kind() {
+            "identifier" => {
+                let name = self.text(expr);
+                let (key, defs) = self.defs_at(name, scope, expr.start_byte());
+                // A `def` or `class` of the same name in the function rebinds
+                // it too, without counting as an assignment there.
+                let shadowed = self.functions.contains_key(&key)
+                    || self.classes_by_name.get(name).is_some_and(|classes| {
+                        classes.iter().any(|c| self.class_home(*c) == key.0)
+                    });
+                let only_param = defs.param && defs.assigns == 0 && !defs.imported && !shadowed;
+                (only_param && self.scopes[key.0].kind == ScopeKind::Function).then(|| {
+                    ParamSource {
+                        func: key.0,
+                        param: name.to_string(),
+                        attribute: None,
+                    }
+                })
+            }
+            "attribute" => {
+                let object = expr.child_by_field_name("object")?;
+                if object.kind() != "identifier" || self.text(object) != "self" {
+                    return None;
+                }
+                let attr = self.text(expr.child_by_field_name("attribute")?);
+                if is_secret_key(attr) || self.rebound_receiver(object, scope).is_some() {
+                    return None;
+                }
+                let Some((class, true)) = self.class_receiver(object, scope) else {
+                    return None;
+                };
+                let lookup = self.attr_lookup(class, attr, true);
+                let ([assign], None) = (lookup.assigns.as_ref(), lookup.dynamic) else {
+                    return None;
+                };
+                let assign = *assign;
+                // Once the class assigns the attribute, the lookup no longer
+                // lists its same-file base's assignments, but a method of the
+                // base the instance runs may still set it.
+                if let Some(base) = self.class_shape(class).base {
+                    if !self.own_attrs(base, attr).is_empty() {
+                        return None;
+                    }
+                }
+                let init = &self.scopes[assign.scope];
+                let own_init = init.kind == ScopeKind::Function
+                    && !init.lambda
+                    && init.name == "__init__"
+                    && init.parent == Some(class);
+                if assign.unknowable || !own_init {
+                    return None;
+                }
+                let value = assign.value.filter(|v| v.kind() == "identifier")?;
+                let name = self.text(value);
+                let (key, defs) = self.defs_at(name, assign.scope, value.start_byte());
+                let only_param = defs.param && defs.assigns == 0 && !defs.imported;
+                if key.0 != assign.scope || !only_param || self.base_init_after(assign) {
+                    return None;
+                }
+                Some(ParamSource {
+                    func: assign.scope,
+                    param: name.to_string(),
+                    attribute: Some(attr.to_string()),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the function `assign` is in calls an `__init__` on
+    /// something (`super().__init__(...)`, `Base.__init__(self, ...)`)
+    /// after it: a base class's constructor may set the attribute again.
+    fn base_init_after(&mut self, assign: Assign<'t>) -> bool {
+        if self.base_inits.is_none() {
+            let mut last: HashMap<usize, usize> = HashMap::new();
+            for &(call, scope) in &self.calls {
+                let init = call.child_by_field_name("function").is_some_and(|f| {
+                    f.kind() == "attribute"
+                        && f.child_by_field_name("attribute")
+                            .is_some_and(|a| self.text(a) == "__init__")
+                });
+                if init {
+                    let at = last.entry(scope).or_default();
+                    *at = (*at).max(call.start_byte());
+                }
+            }
+            self.base_inits = Some(last);
+        }
+        self.base_inits
+            .as_ref()
+            .and_then(|last| last.get(&assign.scope))
+            .is_some_and(|&at| at > assign.place.at)
+    }
+
+    /// The module-level name other files call to pass a parameter of
+    /// `func`: a function, or the class whose `__init__` it is, defined
+    /// once at module level, undecorated (a class also with no class
+    /// keyword, second base or `__new__`, nor a same-file base with one or
+    /// with a decorator), and bound by nothing else, in a module other
+    /// files may import (not a script) that no dynamic feature may rewrite.
+    fn exported_callee(&self, func: usize) -> Option<String> {
+        if self.script
+            || self.file_dynamic.is_some()
+            || self.dynamic_globals
+            || !self.module_stars.is_empty()
+        {
+            return None;
+        }
+        let scope = &self.scopes[func];
+        if scope.kind != ScopeKind::Function
+            || scope.lambda
+            || scope.comprehension
+            || scope.decorated
+            || scope.staticmethod
+        {
+            return None;
+        }
+        let parent = scope.parent?;
+        let named = match self.scopes[parent].kind {
+            ScopeKind::Module => func,
+            ScopeKind::Class if scope.name == "__init__" => parent,
+            _ => return None,
+        };
+        let def = &self.scopes[named];
+        if def.parent != Some(0) {
+            return None;
+        }
+        let name = def.name.as_str();
+        let key = (0, name.to_string());
+        let functions = self.functions.get(&key).map_or(0, Vec::len);
+        let classes = self.classes_by_name.get(name).map_or(0, Vec::len);
+        let once = if named == func {
+            functions == 1 && classes == 0
+        } else {
+            // A `def` in a class body is also an assignment of its name
+            // there (see [`Ctx::bind_definitions`]): `__init__` is bound
+            // once when that is its only one.
+            let bindings = |class: usize, m: &str| {
+                let key = (class, m.to_string());
+                self.functions.get(&key).map_or(0, Vec::len)
+                    + self.assigns.get(&key).map_or(0, Vec::len)
+                    + self.attr_assigns.get(&key).map_or(0, Vec::len)
+                    + usize::from(self.imports.contains_key(&key))
+                    + usize::from(self.other_imports.contains_key(&key))
+            };
+            // Its same-file bases: their `__new__` builds its instances too,
+            // and their decorators and class keywords apply to it.
+            let mut bases = Vec::new();
+            let mut base = self.class_shape(named).base;
+            while let Some(b) = base.filter(|b| !bases.contains(b) && *b != named) {
+                bases.push(b);
+                base = self.class_shape(b).base;
+            }
+            functions == 0
+                && classes == 1
+                && !def.decorated
+                && def.class_feature.is_none()
+                && self
+                    .functions
+                    .get(&(named, "__init__".to_string()))
+                    .map_or(0, Vec::len)
+                    == 1
+                && bindings(named, "__init__") == 2
+                && bindings(named, "__new__") == 0
+                && bases.iter().all(|&b| {
+                    let base = &self.scopes[b];
+                    !base.decorated && base.class_feature.is_none() && bindings(b, "__new__") == 0
+                })
+        };
+        let rebound = self.assigns.contains_key(&key)
+            || self.imports.contains_key(&key)
+            || self.other_imports.contains_key(&key);
+        (once && !rebound).then(|| name.to_string())
+    }
+
+    /// Lists, for calls from other files, each model key of a call whose
+    /// value is a parameter of an exported function or class (see
+    /// [`Ctx::exported_callee`]). Gaps the parameter's own reading added
+    /// (its default, what in-file callers pass, a subclass that may set the
+    /// attribute) do not hold a call that passes it; any other model gap
+    /// at the call, added from `gaps_from` on, does.
+    fn note_model_params(
+        &mut self,
+        sources: Vec<(String, ParamSource, Range<usize>)>,
+        gaps_from: usize,
+        request: &ParamRequest<'_>,
+    ) {
+        let gaps = &self.out.gaps[gaps_from..];
+        let route_confirmed = request.routing != Routing::Unknown
+            && !gaps.iter().any(|g| g.kind == GapKind::AmbiguousClient);
+        let held: Vec<bool> = sources
+            .iter()
+            .map(|(key, _, own)| {
+                gaps.iter().enumerate().any(|(i, g)| {
+                    g.kind == GapKind::UnresolvedModel
+                        && g.key.as_deref().is_none_or(|k| k == key)
+                        && !own.contains(&(gaps_from + i))
+                })
+            })
+            .collect();
+        for ((key, source, _), held) in sources.into_iter().zip(held) {
+            if held || !request.pkg.followed_across_files() {
+                continue;
+            }
+            let Some(function) = self.exported_callee(source.func) else {
+                continue;
+            };
+            let Some(slot) = self.param_slot(source.func, &source.param) else {
+                continue;
+            };
+            // LiteLLM sends a `deployment_id` to Azure whatever provider
+            // the call names (see [`is_deployment_key`]).
+            let provider = request
+                .provider
+                .clone()
+                .filter(|_| !is_deployment_key(&key));
+            let param = ModelParam {
+                function,
+                parameter: source.param,
+                position: slot.position.and_then(|p| u32::try_from(p).ok()),
+                keyword: slot.keyword,
+                attribute: source.attribute,
+                key,
+                sdk: request.sdk,
+                package: request.pkg.package().to_string(),
+                chain: request.chain.to_string(),
+                member: request.member.to_string(),
+                line: request.line,
+                receiver: request.receiver,
+                routing: request.routing,
+                route_confirmed,
+                provider,
+            };
+            self.param_exports.push((param, source.func));
+        }
+    }
+
+    /// Keeps, for [`Ctx::changed_elsewhere`], what `arg` may send a model
+    /// in: in a dict, list or tuple literal, the values under a model key
+    /// (or a key that is not a string) and its `**` entries, and any other
+    /// expression whole.
+    fn note_model_read(&mut self, arg: Node<'t>) {
+        let mut stack = vec![arg];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "dictionary" | "list" | "tuple" | "set" => stack.extend(named_children(node)),
+                "pair" => {
+                    let (Some(key), Some(value)) = (
+                        node.child_by_field_name("key"),
+                        node.child_by_field_name("value"),
+                    ) else {
+                        continue;
+                    };
+                    let other_key = self.literal(key).is_ok_and(|k| {
+                        !is_value_key(&k) && !BEDROCK_VALUE_KEYS.contains(&k.as_str())
+                    });
+                    if other_key {
+                        stack.push(value);
+                    } else {
+                        self.model_reads.push(value);
+                    }
+                }
+                _ if node.id() == arg.id() => self.model_reads.push(node),
+                "dictionary_splat" => self.model_reads.push(node),
+                _ => {}
+            }
+        }
+    }
+
+    /// Keeps the model parameters [`Ctx::note_model_params`] found that
+    /// reach their requests unchanged on every path this file shows (see
+    /// [`Ctx::changed_elsewhere`]), each once.
+    fn settle_model_params(&mut self) {
+        let exports = std::mem::take(&mut self.param_exports);
+        if exports.is_empty() {
+            return;
+        }
+        let cx = self.settle_context();
+        let mut changed: HashMap<ParamKey, bool> = HashMap::new();
+        let mut kept = HashSet::new();
+        for (param, func) in exports {
+            let key: ParamKey = (func, param.parameter.clone(), param.attribute.clone());
+            let held = match changed.get(&key) {
+                Some(held) => *held,
+                None => {
+                    let held = self.changed_elsewhere(&key, &cx);
+                    changed.insert(key, held);
+                    held
+                }
+            };
+            if !held && kept.insert(param.clone()) {
+                self.out.model_params.push(param);
+            }
+        }
+    }
+
+    /// What [`Ctx::changed_elsewhere`] reads about the whole file, computed
+    /// once: which calls send a request, the model reads in order, what
+    /// each call's callee is, and which functions, lambdas and classes may
+    /// send one (they hold a sending call, call a callee the scan cannot
+    /// see into, or call one of the file's own that may, or nest one).
+    fn settle_context(&self) -> Settle<'t> {
+        let sent: HashSet<usize> = self.sending.iter().map(|c| c.id()).collect();
+        let mut reads = self.model_reads.clone();
+        reads.sort_by_key(|n| n.start_byte());
+        let lambdas: HashMap<usize, usize> = self
+            .scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, scope)| scope.lambda)
+            .map(|(i, scope)| (scope.start, i))
+            .collect();
+        let n = self.scopes.len();
+        let mut callees = HashMap::new();
+        let mut owned: Vec<Vec<Node<'t>>> = vec![Vec::new(); n];
+        for &(call, scope) in &self.calls {
+            callees.insert(call.id(), self.callee(call, scope, &lambdas));
+            owned[self.callable_owner(scope)].push(call);
+        }
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+        // Who runs a scope's code: its callers, and the scope it is nested in.
+        let mut runs: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut may_send = vec![false; n];
+        let mut queue = Vec::new();
+        for s in 0..n {
+            if let Some(parent) = self.scopes[s].parent {
+                children[parent].push(s);
+                runs[s].push(parent);
+            }
+            let mut sends = false;
+            for call in &owned[s] {
+                if sent.contains(&call.id()) {
+                    sends = true;
+                    continue;
+                }
+                match callees.get(&call.id()) {
+                    Some(Callee::Here(scopes)) => {
+                        for &callee in scopes {
+                            runs[callee].push(s);
+                        }
+                    }
+                    Some(Callee::Inert) => {}
+                    _ => sends = true,
+                }
+            }
+            if sends {
+                may_send[s] = true;
+                queue.push(s);
+            }
+        }
+        while let Some(s) = queue.pop() {
+            for &runner in &runs[s] {
+                if !may_send[runner] {
+                    may_send[runner] = true;
+                    queue.push(runner);
+                }
+            }
+        }
+        Settle {
+            sent,
+            reads,
+            callees,
+            owned,
+            children,
+            may_send,
+        }
+    }
+
+    /// The function, lambda or class whose code `scope` runs in: itself,
+    /// or the one a comprehension is in.
+    fn callable_owner(&self, scope: usize) -> usize {
+        let mut s = scope;
+        while self.scopes[s].comprehension {
+            match self.scopes[s].parent {
+                Some(parent) => s = parent,
+                None => break,
+            }
+        }
+        s
+    }
+
+    /// What `call` (in `scope`) calls (see [`Callee`]). A name is followed
+    /// to the file's own `def`, `class` or lambda when nothing else binds
+    /// it; `self.x(...)`, `cls.x(...)` and `super().x(...)` to the method of
+    /// the class (or its same-file bases) the receiver is.
+    fn callee(&self, call: Node<'t>, scope: usize, lambdas: &HashMap<usize, usize>) -> Callee {
+        if self.constructions.contains_key(&call.id()) {
+            return Callee::Inert;
+        }
+        let Some(function) = call.child_by_field_name("function") else {
+            return Callee::Unknown;
+        };
+        match function.kind() {
+            "identifier" => {
+                let name = self.text(function);
+                let (key, kinds) = self.defs_at(name, scope, function.start_byte());
+                let mut here: Vec<usize> = self.functions.get(&key).cloned().unwrap_or_default();
+                here.extend(
+                    self.classes_by_name
+                        .get(name)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .filter(|c| self.class_home(*c) == key.0),
+                );
+                let mut unknown = kinds.param || kinds.imported;
+                for assign in self.assigns.get(&key).into_iter().flatten() {
+                    let lambda = assign
+                        .value
+                        .filter(|v| v.kind() == "lambda")
+                        .and_then(|v| lambdas.get(&v.start_byte()));
+                    match lambda {
+                        Some(&lambda) => here.push(lambda),
+                        None => unknown = true,
+                    }
+                }
+                if unknown {
+                    Callee::Unknown
+                } else if !here.is_empty() {
+                    Callee::Here(here)
+                } else if INERT_BUILTINS.contains(&name) || is_exception_name(name) {
+                    Callee::Inert
+                } else {
+                    Callee::Unknown
+                }
+            }
+            "attribute" => {
+                let (Some(object), Some(attr)) = (
+                    function.child_by_field_name("object"),
+                    function.child_by_field_name("attribute"),
+                ) else {
+                    return Callee::Unknown;
+                };
+                let attr = self.text(attr);
+                let class = match object.kind() {
+                    "identifier" => match self.text(object) {
+                        "self" => self.scopes[scope]
+                            .self_recv
+                            .map(|(class, _)| (class, false)),
+                        "cls" => self.scopes[scope].cls_recv.map(|(class, _)| (class, false)),
+                        _ => None,
+                    },
+                    "call"
+                        if object
+                            .child_by_field_name("function")
+                            .is_some_and(|f| self.text(f) == "super") =>
+                    {
+                        self.scopes[scope]
+                            .self_recv
+                            .or(self.scopes[scope].cls_recv)
+                            .map(|(class, _)| (class, true))
+                    }
+                    _ => None,
+                };
+                if let Some((class, skip_own)) = class {
+                    return match self.method_in_chain(class, attr, skip_own) {
+                        Some(method) => Callee::Here(vec![method]),
+                        None => Callee::Unknown,
+                    };
+                }
+                if INERT_LITERALS.contains(&object.kind())
+                    || INERT_METHODS.contains(&attr)
+                    || is_exception_name(attr)
+                    || INERT_FUNCTIONS.contains(&self.render(function).as_str())
+                    || (LOG_METHODS.contains(&attr)
+                        && self.render(object).to_ascii_lowercase().contains("log"))
+                {
+                    Callee::Inert
+                } else {
+                    Callee::Unknown
+                }
+            }
+            _ => Callee::Unknown,
+        }
+    }
+
+    /// The method `name` instances of `class` run: its own, else its
+    /// same-file bases' (from the base on when `skip_own`, for `super()`).
+    /// `None` when a base outside the file may define it.
+    fn method_in_chain(&self, class: usize, name: &str, skip_own: bool) -> Option<usize> {
+        let mut seen = Vec::new();
+        let mut current = if skip_own {
+            self.class_shape(class).base
+        } else {
+            Some(class)
+        };
+        while let Some(c) = current.filter(|c| !seen.contains(c)) {
+            seen.push(c);
+            if let Some(method) = self
+                .functions
+                .get(&(c, name.to_string()))
+                .and_then(|defs| defs.last())
+            {
+                return Some(*method);
+            }
+            if self.scopes[c].external_bases {
+                return None;
+            }
+            current = self.class_shape(c).base;
+        }
+        None
+    }
+
+    /// Whether the model parameter `key` (or, for a class, the attribute
+    /// its `__init__` stores it in) may reach a request as something else
+    /// on some path, so that a call passing a value may send another one.
+    /// The code that can see it is the function, or the class and its
+    /// same-file bases (their methods run on its instances). There, any of
+    /// these holds it, failing closed:
+    ///
+    /// - a value computed from it, through any chain of assignments or
+    ///   container updates (`params.update(model=...)`), sent where a model
+    ///   may be (see [`Ctx::note_model_read`]), or written to a global, a
+    ///   `nonlocal` or another object's attribute;
+    /// - it, such a value, or (for a class) `self` handed to a call other
+    ///   than a request, unless the callee sends nothing: one of the file's
+    ///   own functions, lambdas or methods that sends no request and calls
+    ///   nothing that may ([`Settle::may_send`]), a builtin, logging, an
+    ///   exception, a container or string method, or a method of the value
+    ///   itself (`model.startswith(...)`);
+    /// - a call chosen by it (`HANDLERS[model](...)`);
+    /// - a condition that reads it (`if`, `elif`, `while`, `match`, a
+    ///   conditional expression, `and`/`or`, `assert`) guarding another
+    ///   request, a call to the file's own code that may send one, or a
+    ///   `return`, `raise`, `break` or `continue` in a branch without the
+    ///   request.
+    ///
+    /// What a request returns is not counted as computed from its model.
+    fn changed_elsewhere(&self, key: &ParamKey, cx: &Settle<'t>) -> bool {
+        let Some(root) = self.root else {
+            return true;
+        };
+        let (func, param, attr) = (key.0, key.1.as_str(), key.2.as_deref());
+        let class = attr.is_some();
+        let own = (self.scopes[func].start, self.scopes[func].end);
+        let mut regions = Vec::new();
+        if class {
+            let mut current = self.scopes[func].parent;
+            while let Some(c) = current {
+                let range = (self.scopes[c].start, self.scopes[c].end);
+                if regions.contains(&range) || regions.len() > MAX_SCOPE_DEPTH as usize {
+                    break;
+                }
+                regions.push(range);
+                current = self.class_shape(c).base;
+            }
+        } else {
+            regions.push(own);
+        }
+        let direct = |call: Node<'t>| {
+            self.direct.get(&call.id()).is_some_and(|sources| {
+                sources
+                    .iter()
+                    .any(|(f, p, a)| *f == func && p == param && a.as_deref() == attr)
+            })
+        };
+
+        // The assignments (target, value), the calls and the conditions there.
+        let mut binds: Vec<(Node<'t>, Node<'t>)> = Vec::new();
+        let mut calls: Vec<Node<'t>> = Vec::new();
+        let mut guards: Vec<Guard<'t>> = Vec::new();
+        for &(start, end) in &regions {
+            let Some(top) = root.descendant_for_byte_range(start, end) else {
+                continue;
+            };
+            let mut stack = vec![top];
+            while let Some(node) = stack.pop() {
+                match node.kind() {
+                    "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
+                        if let (Some(target), Some(value)) = (
+                            node.child_by_field_name("left"),
+                            node.child_by_field_name("right"),
+                        ) {
+                            binds.push((target, value));
+                        }
+                    }
+                    "named_expression" => {
+                        if let (Some(target), Some(value)) = (
+                            node.child_by_field_name("name"),
+                            node.child_by_field_name("value"),
+                        ) {
+                            binds.push((target, value));
+                        }
+                    }
+                    "as_pattern" => {
+                        if let (Some(target), Some(value)) =
+                            (node.child_by_field_name("alias"), node.named_child(0))
+                        {
+                            binds.push((target, value));
+                        }
+                    }
+                    "call" => {
+                        calls.push(node);
+                        if let Some(update) = self.container_update(node) {
+                            binds.push(update);
+                        }
+                    }
+                    _ => {
+                        if let Some(guard) = self.guard(node) {
+                            guards.push(guard);
+                        }
+                    }
+                }
+                stack.extend(named_children(node));
+            }
+        }
+
+        let mut taint = Taint {
+            param,
+            own,
+            names: HashSet::new(),
+            attrs: attr.into_iter().collect(),
+        };
+        loop {
+            let mut grew = false;
+            for &(target, value) in &binds {
+                if self.reads(value, &taint, &cx.sent) {
+                    match self.taint_target(target, &mut taint, class, &regions) {
+                        Some(new) => grew |= new,
+                        None => return true,
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+
+        // Sent where a model may be.
+        for &(start, end) in &regions {
+            let from = cx.reads.partition_point(|n| n.start_byte() < start);
+            let sent_there = cx.reads[from..]
+                .iter()
+                .take_while(|n| n.start_byte() < end)
+                .any(|&n| n.end_byte() <= end && self.reads(n, &taint, &cx.sent));
+            if sent_there {
+                return true;
+            }
+        }
+
+        let mut changing = HashMap::new();
+        // Handed to a call that may send it, or choosing the call.
+        for &call in &calls {
+            if cx.sent.contains(&call.id()) || self.container_update(call).is_some() {
+                continue;
+            }
+            let Some(function) = call.child_by_field_name("function") else {
+                continue;
+            };
+            let of_value = function.kind() == "attribute"
+                && function
+                    .child_by_field_name("object")
+                    .is_some_and(|o| self.reads(o, &taint, &cx.sent));
+            if !of_value && self.reads(function, &taint, &cx.sent) {
+                return true;
+            }
+            let handed = call.child_by_field_name("arguments").is_some_and(|args| {
+                self.reads(args, &taint, &cx.sent) || (class && self.passes_self(args))
+            });
+            // `self.helper()` hands it `self` too; a base class's
+            // constructor runs before the assignment (see
+            // [`Ctx::base_init_after`]).
+            let on_self = class
+                && is_receiver_call(function, |n| self.text(n))
+                && function
+                    .child_by_field_name("attribute")
+                    .is_some_and(|a| self.text(a) != "__init__");
+            let held = match cx.callees.get(&call.id()) {
+                Some(Callee::Inert) => false,
+                Some(Callee::Here(scopes)) => {
+                    handed
+                        && scopes
+                            .iter()
+                            .any(|&s| self.sends_changed(s, cx, &regions, &direct, &mut changing))
+                }
+                _ => (handed && !of_value) || on_self,
+            };
+            if held {
+                return true;
+            }
+        }
+
+        // A condition on it choosing another path.
+        for guard in &guards {
+            if !guard
+                .conditions
+                .iter()
+                .any(|c| self.reads(*c, &taint, &cx.sent))
+            {
+                continue;
+            }
+            if guard.branches.is_empty() {
+                return true;
+            }
+            for &branch in &guard.branches {
+                if self.branch_strays(branch, cx, &regions, &direct, &mut changing) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether code that runs in `branch` sends something other than the
+    /// parameter's requests (`direct`): another request, or a call to the
+    /// file's own code that may, or leaves without one of them (`return`,
+    /// `raise`, `break`, `continue`).
+    fn branch_strays(
+        &self,
+        branch: Node<'t>,
+        cx: &Settle<'t>,
+        regions: &[(usize, usize)],
+        direct: &dyn Fn(Node<'t>) -> bool,
+        changing: &mut HashMap<usize, bool>,
+    ) -> bool {
+        let mut leaves = false;
+        let mut sends_it = false;
+        let mut stack = vec![branch];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "return_statement" | "raise_statement" | "break_statement"
+                | "continue_statement" => leaves = true,
+                "call" if cx.sent.contains(&node.id()) => {
+                    if direct(node) {
+                        sends_it = true;
+                    } else {
+                        return true;
+                    }
+                }
+                "call" => {
+                    if let Some(Callee::Here(scopes)) = cx.callees.get(&node.id()) {
+                        if scopes
+                            .iter()
+                            .any(|&s| self.sends_changed(s, cx, regions, direct, changing))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            stack.extend(named_children(node));
+        }
+        leaves && !sends_it
+    }
+
+    /// Whether the code of `scope` may send something other than the
+    /// parameter's own requests (`direct`). Outside the code that sees the
+    /// parameter that is [`Settle::may_send`]; inside, a request that is not
+    /// one of them, a callee the scan cannot see into, or a call to the
+    /// file's own code that may.
+    fn sends_changed(
+        &self,
+        scope: usize,
+        cx: &Settle<'t>,
+        regions: &[(usize, usize)],
+        direct: &dyn Fn(Node<'t>) -> bool,
+        changing: &mut HashMap<usize, bool>,
+    ) -> bool {
+        let range = (self.scopes[scope].start, self.scopes[scope].end);
+        if !regions.iter().any(|r| r.0 <= range.0 && range.1 <= r.1) {
+            return cx.may_send[scope];
+        }
+        if let Some(known) = changing.get(&scope) {
+            return *known;
+        }
+        changing.insert(scope, false);
+        let mut found = false;
+        for &call in &cx.owned[scope] {
+            if cx.sent.contains(&call.id()) {
+                if direct(call) {
+                    continue;
+                }
+                found = true;
+            } else {
+                found = match cx.callees.get(&call.id()) {
+                    Some(Callee::Inert) => false,
+                    Some(Callee::Here(scopes)) => scopes
+                        .iter()
+                        .any(|&s| self.sends_changed(s, cx, regions, direct, changing)),
+                    _ => true,
+                };
+            }
+            if found {
+                break;
+            }
+        }
+        if !found {
+            found = cx.children[scope]
+                .iter()
+                .any(|&s| self.sends_changed(s, cx, regions, direct, changing));
+        }
+        changing.insert(scope, found);
+        found
+    }
+
+    /// `x.update(...)`, `x.setdefault(...)`, `x.append(...)`...: the
+    /// container and the arguments it takes in, read as an assignment.
+    fn container_update(&self, call: Node<'t>) -> Option<(Node<'t>, Node<'t>)> {
+        let function = call.child_by_field_name("function")?;
+        if function.kind() != "attribute" {
+            return None;
+        }
+        let attr = self.text(function.child_by_field_name("attribute")?);
+        if !CONTAINER_UPDATES.contains(&attr) {
+            return None;
+        }
+        Some((
+            function.child_by_field_name("object")?,
+            call.child_by_field_name("arguments")?,
+        ))
+    }
+
+    /// The conditions a node tests and the branches they choose between,
+    /// for a node that makes a choice; an `assert` has no branch.
+    fn guard(&self, node: Node<'t>) -> Option<Guard<'t>> {
+        let mut conditions = Vec::new();
+        let mut branches = Vec::new();
+        match node.kind() {
+            "if_statement" => {
+                conditions.extend(node.child_by_field_name("condition"));
+                branches.extend(node.child_by_field_name("consequence"));
+                let mut cursor = node.walk();
+                for alternative in node.children_by_field_name("alternative", &mut cursor) {
+                    conditions.extend(alternative.child_by_field_name("condition"));
+                    branches.extend(
+                        alternative
+                            .child_by_field_name("consequence")
+                            .or_else(|| alternative.child_by_field_name("body")),
+                    );
+                }
+            }
+            "while_statement" => {
+                conditions.extend(node.child_by_field_name("condition"));
+                branches.extend(node.child_by_field_name("body"));
+                branches.extend(node.child_by_field_name("alternative"));
+            }
+            "match_statement" => {
+                let mut cursor = node.walk();
+                conditions.extend(node.children_by_field_name("subject", &mut cursor));
+                let cases = node
+                    .child_by_field_name("body")
+                    .map(named_children)
+                    .unwrap_or_default();
+                for case in cases.into_iter().filter(|c| c.kind() == "case_clause") {
+                    conditions.extend(
+                        named_children(case)
+                            .into_iter()
+                            .filter(|c| c.kind() == "if_clause"),
+                    );
+                    branches.push(case);
+                }
+            }
+            "conditional_expression" => {
+                let parts = named_children(node);
+                let [consequence, condition, alternative] = parts.as_slice() else {
+                    return None;
+                };
+                conditions.push(*condition);
+                branches.extend([*consequence, *alternative]);
+            }
+            "boolean_operator" => {
+                conditions.extend(node.child_by_field_name("left"));
+                branches.extend(node.child_by_field_name("right"));
+            }
+            "assert_statement" => conditions.extend(node.named_child(0)),
+            _ => return None,
+        }
+        Some(Guard {
+            conditions,
+            branches,
+        })
+    }
+
+    /// Whether `args` hands over `self` itself (`helper(self)`), not one of
+    /// its attributes.
+    fn passes_self(&self, args: Node<'t>) -> bool {
+        let mut stack = vec![args];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier" && self.text(node) == "self" {
+                let attribute_object = node.parent().is_some_and(|p| {
+                    p.kind() == "attribute" && p.child_by_field_name("object") == Some(node)
+                });
+                if !attribute_object {
+                    return true;
+                }
+            }
+            stack.extend(named_children(node));
+        }
+        false
+    }
+
+    /// Whether `node` reads a name or attribute `taint` holds: the
+    /// parameter itself in its own function, a name assigned from it, or
+    /// an attribute (of anything) assigned from it. A request's result
+    /// (`sent`) is not read into.
+    fn reads(&self, node: Node<'t>, taint: &Taint<'_>, sent: &HashSet<usize>) -> bool {
+        let mut stack = vec![node];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "identifier" => {
+                    let field = node.parent().is_some_and(|parent| {
+                        let named = |field: &str| parent.child_by_field_name(field) == Some(node);
+                        (parent.kind() == "attribute" && named("attribute"))
+                            || (parent.kind() == "keyword_argument" && named("name"))
+                    });
+                    if field {
+                        continue;
+                    }
+                    let name = self.text(node);
+                    let in_own = taint.own.0 <= node.start_byte() && node.end_byte() <= taint.own.1;
+                    if taint.names.contains(name) || (name == taint.param && in_own) {
+                        return true;
+                    }
+                }
+                "attribute" => {
+                    let attr = node.child_by_field_name("attribute");
+                    if attr.is_some_and(|a| taint.attrs.contains(self.text(a))) {
+                        return true;
+                    }
+                }
+                "call" if sent.contains(&node.id()) => continue,
+                _ => {}
+            }
+            stack.extend(named_children(node));
+        }
+        false
+    }
+
+    /// Adds the names and attributes an assignment `target` binds to
+    /// `taint`: `Some(true)` when one is new, `None` when the value leaves
+    /// the code that sees the parameter (a global or `nonlocal` name, an
+    /// attribute of anything but `self` in a class, a container that is not
+    /// local).
+    fn taint_target<'a>(
+        &self,
+        target: Node<'t>,
+        taint: &mut Taint<'a>,
+        class: bool,
+        regions: &[(usize, usize)],
+    ) -> Option<bool>
+    where
+        't: 'a,
+    {
+        let mut grew = false;
+        let mut stack = vec![target];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "identifier" => {
+                    let name = self.text(node);
+                    let home = self.binding_scope(name, self.scope_at(node.start_byte()));
+                    let scope = &self.scopes[home];
+                    let local = scope.kind == ScopeKind::Function
+                        && regions
+                            .iter()
+                            .any(|r| r.0 <= scope.start && scope.end <= r.1);
+                    if !local {
+                        return None;
+                    }
+                    grew |= taint.names.insert(name);
+                }
+                "attribute" => {
+                    let on_self = class
+                        && node
+                            .child_by_field_name("object")
+                            .is_some_and(|o| o.kind() == "identifier" && self.text(o) == "self");
+                    let attr = node.child_by_field_name("attribute")?;
+                    if !on_self {
+                        return None;
+                    }
+                    grew |= taint.attrs.insert(self.text(attr));
+                }
+                "subscript" => stack.extend(node.child_by_field_name("value")),
+                _ => stack.extend(named_children(node)),
+            }
+        }
+        Some(grew)
+    }
+
+    /// The innermost scope around byte `pos`.
+    fn scope_at(&self, pos: usize) -> usize {
+        let mut best = 0;
+        for (i, scope) in self.scopes.iter().enumerate() {
+            if scope.start <= pos && pos < scope.end && scope.start >= self.scopes[best].start {
+                best = i;
+            }
+        }
+        best
+    }
+
+    /// Asks `lookup` about every name this file imports with `from module
+    /// import name`, once per binding, and keeps the ones it resolves to
+    /// another file's model parameters.
+    fn resolve_wrappers(&mut self, lookup: &dyn WrapperLookup) {
+        let mut asked: HashSet<Rc<str>> = HashSet::new();
+        for defs in self.other_imports.values() {
+            for def in defs {
+                if !asked.insert(Rc::clone(&def.target)) {
+                    continue;
+                }
+                // `target` is `module.name` for `from module import name`
+                // (and not for `import module`), unless clipped.
+                let name = def
+                    .target
+                    .strip_prefix(def.module.trim())
+                    .and_then(|rest| rest.strip_prefix('.'))
+                    .filter(|name| !name.is_empty() && !name.contains('.'));
+                let Some(name) = name else {
+                    continue;
+                };
+                let module: String = def.module.chars().filter(|c| !c.is_whitespace()).collect();
+                let Some((file, params)) = lookup.model_params(&module, name.trim()) else {
+                    continue;
+                };
+                let Some(first) = params.first() else {
+                    continue;
+                };
+                let wrapper = Wrapper {
+                    file,
+                    function: first.function.clone(),
+                    params,
+                };
+                self.wrappers
+                    .insert(Rc::clone(&def.target), Rc::new(wrapper));
+            }
+        }
+    }
+
+    /// The wrapper in another file that `function` is: a name bound, at
+    /// the call, by `from module import name` alone (see
+    /// [`Ctx::import_target`]) to a function or class whose model
+    /// parameters [`Ctx::resolve_wrappers`] found.
+    fn wrapper_callee(&self, function: Node<'t>, scope: usize) -> Option<Rc<Wrapper>> {
+        if self.wrappers.is_empty() || function.kind() != "identifier" {
+            return None;
+        }
+        let target = self.import_target(function, scope)?;
+        self.wrappers.get(&target).map(Rc::clone)
+    }
+
+    /// `Sampler(model="o1")` where `Sampler` is a wrapper in another file:
+    /// a call that binds the model of that file's requests. Recorded only
+    /// when it passes one of the model parameters; what it passes is read
+    /// the way a model is read at an SDK call, keyed by the request's
+    /// model key. A call that leaves the parameter out uses its default,
+    /// which the defining file reports.
+    fn record_wrapper_call(
+        &mut self,
+        call: Node<'t>,
+        function: Node<'t>,
+        scope: usize,
+        wrapper: &Wrapper,
+    ) {
+        let Some(first) = wrapper.params.first() else {
+            return;
+        };
+        let chain = self.render(function);
+        let span = self.span(call);
+        let symbol = self.symbol(scope);
+        let args = self.arguments_with(call, ValueKeys::Only(&[]));
+        let site = Site {
+            sdk: first.sdk,
+            call,
+            chain: &chain,
+            scope,
+            gap_worthy: true,
+        };
+        let gaps_before = self.out.gaps.len();
+        let mut values = Vec::new();
+        let mut passed = false;
+        let mut read: HashSet<(&str, &str)> = HashSet::new();
+        for param in &wrapper.params {
+            if !read.insert((param.parameter.as_str(), param.key.as_str())) {
+                continue;
+            }
+            let position = param.position.map(|p| p as usize);
+            let keyword = param.keyword.then_some(param.parameter.as_str());
+            match argument_for(call, position, keyword, |n| self.text(n)) {
+                ArgFor::Found(expr) => {
+                    passed = true;
+                    self.model_reads.push(expr);
+                    let by_name = keyword.is_some_and(|k| args.kwargs.iter().any(|a| a == k));
+                    let result = self.resolve_value(expr, scope, 0);
+                    self.take_value(&site, &param.key, !by_name, result, &mut values);
+                }
+                ArgFor::Unknown => {
+                    passed = true;
+                    let unresolved = Unresolved::new("splat", "**kwargs".to_string());
+                    self.unresolved_gap(&site, &param.key, &unresolved, None);
+                }
+                ArgFor::Missing => {}
+            }
+        }
+        if !passed {
+            self.out.gaps.truncate(gaps_before);
+            return;
+        }
+        self.sending.push(call);
+        self.model_reads.extend(splat_arguments(call));
+
+        // LiteLLM sends the model to the provider its request names
+        // (`custom_llm_provider`, `azure=True`): each value, and each
+        // candidate of a gap next to it, gets the one its key's requests
+        // name, as at a call in their file. Requests that name different
+        // ones for a key do not agree on where it goes (below).
+        let mut providers: HashMap<&str, Option<&str>> = HashMap::new();
+        let providers_agree = wrapper.params.iter().all(|p| {
+            *providers
+                .entry(p.key.as_str())
+                .or_insert(p.provider.as_deref())
+                == p.provider.as_deref()
+        });
+        if providers_agree {
+            let candidates = self.out.gaps[gaps_before..]
+                .iter_mut()
+                .flat_map(|g| g.values.iter_mut());
+            for value in values.iter_mut().chain(candidates) {
+                value.provider = providers
+                    .get(value.key.as_str())
+                    .copied()
+                    .flatten()
+                    .map(str::to_string);
+            }
+        }
+
+        // The packages of the requests (`langchain_community` names two).
+        let pkgs: Vec<Pkg> = ALL_PKGS
+            .iter()
+            .copied()
+            .filter(|pkg| wrapper.params.iter().any(|p| p.package == pkg.package()))
+            .collect();
+
+        // The model may change once the call returns: a class keeps it in
+        // an instance attribute, and a LangChain chat model (built by the
+        // wrapper and handed back) in its model field, either of which this
+        // file may write; LiteLLM may map it to another model.
+        let mut fields: Vec<&str> = wrapper
+            .params
+            .iter()
+            .filter_map(|p| p.attribute.as_deref())
+            .collect();
+        let langchain: Vec<Pkg> = pkgs.iter().copied().filter(|p| p.is_langchain()).collect();
+        // The model's own field, as built (not a call on a built model).
+        for pkg in &langchain {
+            fields.extend(langchain_model_names(*pkg, Receiver::Symbol));
+        }
+        let written = if fields.is_empty() {
+            None
+        } else {
+            self.wild_attr_any.or_else(|| {
+                fields
+                    .iter()
+                    .find_map(|field| self.outside_attr_writes.get(field).copied())
+            })
+        };
+        let written = written.or(if langchain.is_empty() {
+            None
+        } else {
+            self.langchain_configurable
+                .or_else(|| self.langchain_sent_over())
+        });
+        let remapped = self
+            .litellm_aliases
+            .filter(|_| pkgs.contains(&Pkg::Litellm));
+        let changed = [
+            written.map(|feature| {
+                format!(
+                    "`{chain}` passes its model to something this file may give another model after it is built ({})",
+                    feature.describe()
+                )
+            }),
+            remapped.map(|feature| {
+                format!(
+                    "{} may map the models `{chain}` passes on to other ones",
+                    feature.describe()
+                )
+            }),
+        ];
+        for detail in changed.into_iter().flatten() {
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::UnresolvedModel,
+                sdk: Some(first.sdk),
+                file: self.file.clone(),
+                span: Some(span),
+                symbol: symbol.clone(),
+                chain: Some(chain.clone()),
+                key: None,
+                reason: "dynamic_feature".to_string(),
+                detail,
+                values: Vec::new(),
+                values_complete: false,
+                args: None,
+            });
+        }
+
+        // Where the model goes: the requests' route, when they agree (on
+        // LiteLLM's provider too), their file confirms it and this file's
+        // checks above know their package (one a newer scan exported, say).
+        let route = (first.sdk, first.routing);
+        let agreed = providers_agree
+            && wrapper.params.iter().all(|p| {
+                p.route_confirmed
+                    && (p.sdk, p.routing) == route
+                    && pkgs.iter().any(|pkg| pkg.package() == p.package)
+            });
+        let unconfirmed = if !agreed {
+            Some((
+                "wrapper_route",
+                format!(
+                    "`{chain}` passes its model to requests in `{}` that go to more than one route, or to one that file does not confirm, so where it is sent is not confirmed",
+                    wrapper.file
+                ),
+            ))
+        } else {
+            let module_level = wrapper
+                .params
+                .iter()
+                .any(|p| p.receiver != Receiver::Client);
+            self.configured_route(&pkgs, module_level, &chain).or_else(|| {
+                self.file_dynamic.map(|feature| {
+                    (
+                        "dynamic_feature",
+                        format!(
+                            "this file may rebind any name or attribute at run time ({}), so the routing of `{chain}` is not confirmed",
+                            feature.describe()
+                        ),
+                    )
+                })
+            })
+        };
+        let routing = if unconfirmed.is_none() {
+            first.routing
+        } else {
+            Routing::Unknown
+        };
+        if let Some((reason, detail)) = unconfirmed {
+            self.out.gaps.push(UsageGap {
+                kind: GapKind::AmbiguousClient,
+                sdk: Some(first.sdk),
+                file: self.file.clone(),
+                span: Some(span),
+                symbol: symbol.clone(),
+                chain: Some(chain.clone()),
+                key: None,
+                reason: reason.to_string(),
+                detail,
+                values: Vec::new(),
+                values_complete: false,
+                args: None,
+            });
+        }
+
+        let mut seen_values = HashSet::new();
+        values.retain(|v| seen_values.insert((v.key.clone(), v.span.start_byte, v.value.clone())));
+        let mut seen_gaps = HashSet::new();
+        for gap in self.out.gaps.split_off(gaps_before) {
+            if seen_gaps.insert((
+                gap.kind,
+                gap.key.clone(),
+                gap.reason.clone(),
+                gap.detail.clone(),
+            )) {
+                self.out.gaps.push(gap);
+            }
+        }
+
+        let requests = wrapper
+            .params
+            .iter()
+            .map(|p| WrapperRequest {
+                parameter: p.parameter.clone(),
+                chain: p.chain.clone(),
+                member: p.member.clone(),
+                line: p.line,
+            })
+            .collect();
+        let spreads = self.spreads(&args, scope);
+        self.out.calls.push(SdkCall {
+            sdk: first.sdk,
+            package: first.package.clone(),
+            chain,
+            member: wrapper.function.clone(),
+            request: false,
+            receiver: Receiver::Symbol,
+            routing,
+            client_line: None,
+            file: self.file.clone(),
+            span,
+            symbol,
+            spreads,
+            kwargs: args.kwargs,
+            positional: args.positional,
+            splat: args.splat,
+            values,
+            wrapper: Some(WrapperCall {
+                file: wrapper.file.clone(),
+                function: wrapper.function.clone(),
+                requests,
+            }),
+        });
+    }
+
+    /// An access in this file to a LangChain chat model's `model_kwargs`
+    /// or `extra_body` (`llm.model_kwargs = {...}`,
+    /// `llm.extra_body["model"] = ...`, `.update(...)`), whose entries
+    /// LangChain sends over the model it was built with. Any access counts,
+    /// since the object may be one a wrapper in another file built.
+    fn langchain_sent_over(&self) -> Option<Feature> {
+        ["model_kwargs", "extra_body"]
+            .iter()
+            .filter_map(|field| {
+                self.src
+                    .match_indices(&format!(".{field}"))
+                    .find(|(at, _)| {
+                        let end = at + field.len() + 1;
+                        !self.src[end..]
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    })
+            })
+            .map(|(at, _)| at)
+            .min()
+            .map(|at| Feature {
+                what: "an access to a LangChain chat model's `model_kwargs` or `extra_body`",
+                line: self.src[..at].matches('\n').count() as u32 + 1,
+            })
+    }
+
+    /// Why requests of `pkgs` that a wrapper call in this file reaches may
+    /// not go where the wrapper's file says, because of something this
+    /// file does to the whole process: it sets an endpoint variable those
+    /// SDKs read, writes the environment with a run-time name, configures
+    /// the module-level API (which matters only to `module_level`
+    /// requests, those not sent through a client), replaces part of the
+    /// SDK, or writes a `base_url` on an object it cannot identify.
+    fn configured_route(
+        &self,
+        pkgs: &[Pkg],
+        module_level: bool,
+        chain: &str,
+    ) -> Option<(&'static str, String)> {
+        let dynamic = |feature: Feature, what: &str| {
+            Some((
+                "dynamic_feature",
+                format!(
+                    "this file {what} ({}), so where the requests `{chain}` passes its model to go is not confirmed",
+                    feature.describe()
+                ),
+            ))
+        };
+        for pkg in pkgs {
+            let module_env = if module_level && pkg.sdk() == Sdk::Openai {
+                OPENAI_MODULE_ENV
+            } else {
+                &[]
+            };
+            let var = endpoint_env_vars(*pkg)
+                .iter()
+                .chain(module_env)
+                .find(|var| self.env_writes.contains(**var));
+            if let Some(var) = var {
+                return Some((
+                    "endpoint_env",
+                    format!(
+                        "this file sets `{var}`, which the SDK reads its endpoint from, so the requests `{chain}` passes its model to may go elsewhere"
+                    ),
+                ));
+            }
+        }
+        if let Some(feature) = self.env_wild {
+            return dynamic(feature, "may write the SDK's endpoint variables");
+        }
+        for pkg in pkgs.iter().filter(|_| module_level) {
+            let module_configured = match pkg.sdk() {
+                Sdk::Openai => {
+                    self.openai_routing != Routing::OpenaiDirect || self.openai_caveat.is_some()
+                }
+                Sdk::Google => *pkg == Pkg::GoogleGenerativeai && self.legacy_caveat.is_some(),
+                _ => false,
+            };
+            if module_configured {
+                return Some((
+                    "module_config",
+                    format!(
+                        "this file configures the SDK's module-level API, which the requests `{chain}` passes its model to go through"
+                    ),
+                ));
+            }
+        }
+        if let Some(feature) = pkgs.iter().find_map(|pkg| self.sdk_patched.get(pkg)) {
+            return dynamic(*feature, "replaces part of the SDK");
+        }
+        self.rerouted_any.and_then(|feature| {
+            dynamic(
+                feature,
+                "writes a `base_url` on an object it cannot identify",
+            )
+        })
     }
 
     fn record_call(
@@ -6971,19 +10174,61 @@ impl<'t> Ctx<'t> {
         let chain = self.render(function);
         let span = self.span(call);
         let symbol = self.symbol(scope);
-        let args = self.arguments(call);
+        let keys = value_keys(target.pkg, target.receiver);
+        let args = self.arguments_with(call, keys);
         let sdk = target.pkg.sdk();
-        let member = clip_owned(strip_wrappers(&target.member));
-        let request = is_request(&member);
-        let model_bearing = is_model_bearing(&member);
+        let mut member = clip_owned(strip_wrappers(&target.member));
+        // A LangChain call is a construction or a call on a chat model, never
+        // an SDK request, whatever its method is called (`llm.stream`). A
+        // call through the SDK client the model holds
+        // (`llm.root_client.chat.completions.create`, `llm.client.create`)
+        // is the SDK's own: it is made with the SDK's package, under the
+        // chat model's routing, and its member is the path on that client.
+        // One through a field the class does not hold an SDK client in stays
+        // a call on the chat model.
+        let held = (target.pkg.is_langchain() && target.receiver == Receiver::Client)
+            .then(|| {
+                let (field, rest) = member.split_once('.').unwrap_or((member.as_str(), ""));
+                let path = held_client_path(target.pkg, field)?;
+                let path = match (path, rest) {
+                    ("", rest) => rest.to_string(),
+                    (path, "") => path.to_string(),
+                    (path, rest) => format!("{path}.{rest}"),
+                };
+                (!path.is_empty()).then_some(path)
+            })
+            .flatten();
+        let through_client = held.is_some();
+        if let Some(path) = held {
+            member = path;
+        }
+        let langchain = target.pkg.is_langchain() && !through_client;
+        let pkg = if through_client {
+            target.pkg.base()
+        } else {
+            target.pkg
+        };
+        let request = is_request_of(pkg, &member) && !langchain;
+        // Only LiteLLM's request functions are recorded for it.
+        let model_bearing = is_model_bearing(&member) || pkg == Pkg::Litellm;
+        // Bedrock, LangChain's Bedrock models and LiteLLM need a model: none
+        // given is an error, not a default.
+        let default_model = !matches!(pkg, Pkg::Boto3 | Pkg::LangchainAws | Pkg::Litellm);
+        // `llm.copy(update=...)` and `llm.model_copy(update=...)` set fields
+        // by their own names, not LangChain's aliases, and the copy is not
+        // followed: what `update` holds is never a value of the call.
+        let langchain_copy = langchain
+            && target.receiver == Receiver::Client
+            && matches!(member.as_str(), "copy" | "model_copy");
 
         // An unresolved model matters where it reaches a request, a model
         // object, or any call on a client or SDK module; on an SDK type
         // (`ChatCompletion(model=model)`) the call still lists `model` in
-        // its kwargs, without a gap.
+        // its kwargs, without a gap. Every call recorded for LangChain
+        // builds a chat model or calls one.
         let on_sdk_object = matches!(target.receiver, Receiver::Client | Receiver::Module)
             && member.split('.').next() != Some("types");
-        let gap_worthy = request || model_bearing || on_sdk_object;
+        let gap_worthy = request || model_bearing || on_sdk_object || target.pkg.is_langchain();
         let site = Site {
             sdk,
             call,
@@ -6995,6 +10240,9 @@ impl<'t> Ctx<'t> {
         let gaps_before = self.out.gaps.len();
         let mut values = Vec::new();
         let mut keyed = false;
+        // Model keys whose value is a parameter, with the gaps reading it
+        // added, for calls from other files (see [`Ctx::note_model_params`]).
+        let mut from_params: Vec<(String, ParamSource, Range<usize>)> = Vec::new();
         // A keyword repeated with the same expression (a syntax error
         // tree-sitter accepts) is read once.
         let mut read_args: HashSet<(&str, &str)> = HashSet::new();
@@ -7003,18 +10251,43 @@ impl<'t> Ctx<'t> {
             if !read_args.insert((key.as_str(), self.text(*expr))) {
                 continue;
             }
+            let source = if gap_worthy {
+                self.param_source(*expr, scope)
+            } else {
+                None
+            };
+            if gap_worthy && source.is_none() {
+                self.model_reads.push(*expr);
+            }
             let result = self.resolve_value(*expr, scope, 0);
+            let own_gaps = self.out.gaps.len();
             self.take_value(&site, key, false, result, &mut values);
+            if let Some(source) = source {
+                from_params.push((key.clone(), source, own_gaps..self.out.gaps.len()));
+            }
+        }
+
+        if gap_worthy {
+            self.sending.push(call);
+            for (_, literal) in &args.literal_args {
+                self.note_model_read(*literal);
+            }
+            self.model_reads.extend(splat_arguments(call));
         }
 
         // `GenerativeModel("gemini-pro")`, `genai.embed_content("models/...", text)`:
         // the model is positional.
-        if !keyed {
+        // A LiteLLM call's first argument is its model even next to a
+        // `deployment_id`, which is a value key too.
+        let positional_open = !keyed
+            || (target.pkg == Pkg::Litellm && !args.value_args.iter().any(|(k, _)| k == "model"));
+        if positional_open {
             if let (Some(key), Some(first)) = (
                 positional_model_key(target.pkg, target.receiver, &member),
                 args.first_positional,
             ) {
                 keyed = true;
+                self.model_reads.push(first);
                 let result = self.resolve_value(first, scope, 0);
                 let site = Site {
                     gap_worthy: true,
@@ -7028,6 +10301,24 @@ impl<'t> Ctx<'t> {
         // call; what an expanded dict nests is read once per dict.
         let mut read = NestedRead::new();
         for (keyword, expr) in &args.literal_args {
+            // LangChain's run options and its positional input or config
+            // never reach the provider's request.
+            let run_option = keyword
+                .as_deref()
+                .is_none_or(|k| LANGCHAIN_RUN_OPTIONS.contains(&k));
+            // A Bedrock request's other fields (`inferenceConfig`,
+            // `additionalModelRequestFields`, `requestMetadata`) do not name
+            // the model it is sent to, and LiteLLM's `model_list` names
+            // deployments, not the model the call sends (a `model_list` gap
+            // below covers it).
+            let deployments = pkg == Pkg::Litellm && keyword.as_deref() == Some("model_list");
+            if langchain && run_option
+                || langchain_copy && keyword.as_deref() == Some("update")
+                || pkg == Pkg::Boto3
+                || deployments
+            {
+                continue;
+            }
             let prefix = keyword
                 .as_ref()
                 .map(|k| format!("{k}."))
@@ -7046,7 +10337,37 @@ impl<'t> Ctx<'t> {
 
         // `**PARAMS` where `PARAMS` is a same-file dict literal.
         let mut opaque_splat = false;
+        // A LiteLLM call given a `model_list`, by keyword or in an expanded
+        // same-file dict.
+        let mut model_list =
+            target.pkg == Pkg::Litellm && args.kwargs.iter().any(|k| k == "model_list");
+        // A LiteLLM call given a `deployment_id`, which replaces its `model`.
+        let mut deployment =
+            target.pkg == Pkg::Litellm && args.kwargs.iter().any(|k| k == "deployment_id");
+        // A LiteLLM call given a `prompt_id`.
+        let mut prompt = target.pkg == Pkg::Litellm && args.kwargs.iter().any(|k| k == "prompt_id");
+        // The provider a LiteLLM call names itself (`custom_llm_provider`,
+        // `azure=True`), by keyword or in an expanded same-file dict.
+        let mut providers = ProviderArgs::default();
+        if pkg == Pkg::Litellm {
+            for name in ProviderArgs::NAMES {
+                if let Some(value) = keyword_value(call, |n| self.text(n), |k| k == name) {
+                    let pick = self.provider_pick(name, value, scope);
+                    providers.give(name, pick);
+                }
+            }
+        }
         let mut expanded: Vec<usize> = Vec::new();
+        // The model keys the expanded same-file dicts give.
+        let mut expanded_keys: HashSet<&'static str> = HashSet::new();
+        // A copy's `update`, with the scope it is written in: given at the
+        // call or by a same-file dict (`llm.copy(**ARGS)`).
+        let mut updates: Vec<(Node<'t>, usize)> = Vec::new();
+        if langchain_copy {
+            if let Some(update) = keyword_value(call, |n| self.text(n), |k| k == "update") {
+                updates.push((update, scope));
+            }
+        }
         for splat in &args.splats {
             let Some(expansion) = self.expand_splat(*splat, scope) else {
                 opaque_splat = true;
@@ -7058,11 +10379,24 @@ impl<'t> Ctx<'t> {
                 continue;
             }
             expanded.push(expansion.node.id());
+            // An `update` that a `**` or computed key after it may replace
+            // is the opaque expansion's, which has its `splat` gap.
+            if langchain_copy {
+                if let Lookup::Found(update) = self.dict_lookup(expansion.node, "update") {
+                    updates.push((update, expansion.scope));
+                }
+            }
             for (key, index, value) in expansion.summary.expansion.iter() {
-                if !is_value_key(key) {
+                if !keys.reads(key) {
                     continue;
                 }
                 keyed = true;
+                if let Some(known) = langchain_model_names(target.pkg, target.receiver)
+                    .into_iter()
+                    .find(|k| *k == key.as_str())
+                {
+                    expanded_keys.insert(known);
+                }
                 let label = expansion.name.as_ref().map(|n| format!("{n}[\"{key}\"]"));
                 let mut result = self
                     .resolve_value(*value, expansion.scope, 0)
@@ -7091,12 +10425,83 @@ impl<'t> Ctx<'t> {
                 }
                 self.take_value(&site, key, false, result, &mut values);
             }
-            let list = self.dict_nested(&expansion);
-            nested.extend(list.found.iter().cloned());
-            nested_overridden.extend(list.overridden.iter().cloned());
-            nested_cut |= list.cut;
+            if pkg == Pkg::Litellm && expansion.summary.last.contains_key("model_list") {
+                model_list = true;
+            }
+            if pkg == Pkg::Litellm && expansion.summary.last.contains_key("deployment_id") {
+                deployment = true;
+            }
+            if pkg == Pkg::Litellm && expansion.summary.last.contains_key("prompt_id") {
+                prompt = true;
+            }
+            if pkg == Pkg::Litellm {
+                for name in ProviderArgs::NAMES {
+                    if let Some(pick) =
+                        self.dict_provider(&expansion.summary, name, expansion.scope)
+                    {
+                        providers.give(name, pick);
+                    }
+                }
+            }
+            if pkg != Pkg::Boto3 {
+                let list = self.dict_nested(&expansion);
+                // The dict is read once for every call that expands it: the
+                // run options (and a copy's `update`) it holds are dropped
+                // here, for a LangChain call, and a LiteLLM `model_list`.
+                let reaches_request = |path: &str| {
+                    let option = path.split('.').next().unwrap_or(path);
+                    !(langchain && LANGCHAIN_RUN_OPTIONS.contains(&option)
+                        || langchain_copy && option == "update"
+                        || pkg == Pkg::Litellm && option == "model_list")
+                };
+                nested.extend(
+                    list.found
+                        .iter()
+                        .filter(|v| reaches_request(&v.path))
+                        .cloned(),
+                );
+                nested_overridden.extend(
+                    list.overridden
+                        .iter()
+                        .filter(|path| reaches_request(path))
+                        .cloned(),
+                );
+                nested_cut |= list.cut;
+            }
         }
-        self.take_nested(&site, nested, nested_cut, &mut values);
+        // A LiteLLM call sends each value to the provider it names: the
+        // call's own values and its candidates to the call's, and a
+        // fallback's to the one its dict names, else the call's. A provider
+        // the file does not show leaves the call's routing unknown.
+        let litellm = (pkg == Pkg::Litellm).then_some(&providers);
+        let call_provider = providers.pick();
+        if let Some(name) = call_provider.named() {
+            let candidates = self.out.gaps[gaps_before..]
+                .iter_mut()
+                .filter(|g| !g.key.as_deref().is_some_and(is_deployment_key))
+                .flat_map(|g| g.values.iter_mut());
+            for value in values
+                .iter_mut()
+                .filter(|v| !is_deployment_key(&v.key))
+                .chain(candidates)
+            {
+                value.provider = Some(name.clone());
+            }
+        }
+        // A LiteLLM fallback that names its own `deployment_id`, or a
+        // provider of its own this file does not show.
+        let mut fallback_deployments: Vec<String> = Vec::new();
+        let mut fallback_provider_unknown = false;
+        if let Some(call) = litellm {
+            for value in &nested {
+                if value.deployment {
+                    fallback_deployments.push(value.path.clone());
+                }
+                fallback_provider_unknown |= value.providers.given()
+                    && value.providers.over(call).pick() == ProviderPick::Unknown;
+            }
+        }
+        self.take_nested(&site, nested, nested_cut, litellm, &mut values);
         if site.gap_worthy && !nested_overridden.is_empty() {
             // One gap per key path, at most [`MAX_NESTED_VALUES`]; past
             // that, one `truncated` gap stands for the rest.
@@ -7134,22 +10539,295 @@ impl<'t> Ctx<'t> {
             }
         }
 
-        let model_key = if member == "GenerativeModel" {
-            "model_name"
-        } else {
-            "model"
+        let model_key = match target.pkg {
+            _ if member == "GenerativeModel" => "model_name",
+            Pkg::Boto3 => "modelId",
+            Pkg::LangchainAws => "model_id",
+            _ => "model",
         };
-        if !keyed && opaque_splat && (request || model_bearing) {
+        // A call on a built LangChain chat model (`invoke`, `bind`, `batch`,
+        // `stream`...) sends its kwargs over the model's own parameters, so
+        // a `model` there replaces the field.
+        let on_chat_model = langchain && target.receiver == Receiver::Client;
+        // On a Bedrock one, through the Converse API (see the `conditional`
+        // gap below).
+        let bedrock_model_call = on_chat_model && target.pkg == Pkg::LangchainAws;
+        // A LangChain chat model takes its model under its field's name or
+        // its alias (`model` or `model_name`; `model_id` or `model` on
+        // Bedrock, and `model_id` or `modelId` on a call on a built Bedrock
+        // model).
+        let [field, alias] = langchain_model_names(target.pkg, target.receiver);
+        if !keyed && opaque_splat && (request || model_bearing || on_chat_model) {
             let unresolved = Unresolved::new("splat", "**kwargs".to_string());
             self.unresolved_gap(&site, model_key, &unresolved, None);
-        } else if !keyed && model_bearing && !args.list_splat {
-            // No model at all: the SDK's or the server's default applies,
-            // and it may be one that retires.
-            let unresolved = Unresolved::new("missing_model", String::new());
+        } else if !keyed && model_bearing && default_model && !args.list_splat {
+            // No model at all: the SDK's, the server's or LangChain's
+            // default applies, and it may be one that retires.
+            let default = if langchain {
+                "LangChain's default model"
+            } else {
+                ""
+            };
+            let unresolved = Unresolved::new("missing_model", default.to_string());
             self.unresolved_gap(&site, model_key, &unresolved, None);
         }
+        // A copy whose `update` may set the model (by either name, since
+        // which one is the field depends on the class, or through a `model`
+        // in `model_kwargs` or `extra_body`) may have another model, or its
+        // own: either way it is not confirmed.
+        if langchain_copy {
+            let changes_model = updates
+                .into_iter()
+                .any(|(update, scope)| self.update_may_set_model(update, scope));
+            if changes_model {
+                self.out.gaps.push(UsageGap {
+                    kind: GapKind::UnresolvedModel,
+                    sdk: Some(sdk),
+                    file: self.file.clone(),
+                    span: Some(span),
+                    symbol: symbol.clone(),
+                    chain: Some(chain.clone()),
+                    key: Some(field.to_string()),
+                    reason: "langchain_copy".to_string(),
+                    detail: format!(
+                        "`{chain}` copies a LangChain chat model with an `update` that may set its model, by name or through a `model` in the `model_kwargs` or `extra_body` sent over it; the copy sets fields by their own names (`model_name` on the OpenAI classes, `model` on `ChatAnthropic`), not by alias, and calls on it are not followed"
+                    ),
+                    values: Vec::new(),
+                    values_complete: false,
+                    args: None,
+                });
+            }
+        }
+        // Given both of its names, which one LangChain keeps is not
+        // confirmed; given one, an opaque `**` expansion may hold the other,
+        // which (unlike a second `model=` in an SDK call) is no `TypeError`.
+        let given = |key: &str| args.kwargs.iter().any(|k| k == key) || expanded_keys.contains(key);
+        let names = (given(field), given(alias));
+        // The key a gap about the model as a whole holds: the name the call
+        // passes, or none (every key) when it passes both.
+        let model_key = match names {
+            (true, true) => None,
+            (false, true) => Some(alias.to_string()),
+            _ => Some(field.to_string()),
+        };
+        let aliased = match names {
+            (true, true) => Some((
+                "reassigned",
+                format!("is given its model twice, as `{field}` and as `{alias}`, so which one LangChain uses is not confirmed"),
+            )),
+            (true, false) | (false, true) if opaque_splat => Some((
+                "splat",
+                format!("is given its model and a `**` expansion that may hold it under its other name (`{field}` or `{alias}`), so which one LangChain uses is not confirmed"),
+            )),
+            _ => None,
+        };
+        let mut model_gaps: Vec<(&str, String, Option<String>)> = aliased
+            .into_iter()
+            .map(|(reason, what)| (reason, what, model_key.clone()))
+            .collect();
+        // Its requests read the model field, `model_kwargs` and
+        // `extra_body` when they are sent, so a write of one after it is
+        // built, on an object other than `self` or a same-file class, may
+        // replace a value it is given (see [`Self::langchain_rewrite`]), and
+        // a write with a run-time name or a model made configurable may
+        // replace any. A constructor given no model field already has its
+        // own gap.
+        if langchain && target.receiver != Receiver::Client {
+            let mut keys: Vec<String> = [(field, names.0), (alias, names.1)]
+                .into_iter()
+                .filter(|(_, given)| *given)
+                .map(|(name, _)| name.to_string())
+                .collect();
+            for value in &values {
+                let field = value.key.split('.').next().unwrap_or_default();
+                if LANGCHAIN_SENT_OVER.contains(&field) && !keys.contains(&value.key) {
+                    keys.push(value.key.clone());
+                }
+            }
+            let any = self.wild_attr_any.or(self.langchain_configurable);
+            for key in keys {
+                let Some(feature) = any.or_else(|| self.langchain_rewrite(&key)) else {
+                    continue;
+                };
+                let what = format!(
+                    "may be given another model after it is built ({})",
+                    feature.describe()
+                );
+                model_gaps.push(("dynamic_feature", what, Some(key)));
+            }
+        }
+        if langchain {
+            for (reason, what, key) in model_gaps {
+                self.out.gaps.push(UsageGap {
+                    kind: GapKind::UnresolvedModel,
+                    sdk: Some(sdk),
+                    file: self.file.clone(),
+                    span: Some(span),
+                    symbol: symbol.clone(),
+                    chain: Some(chain.clone()),
+                    key,
+                    reason: reason.to_string(),
+                    detail: format!("the LangChain chat model `{chain}` {what}"),
+                    values: Vec::new(),
+                    values_complete: false,
+                    args: None,
+                });
+            }
+        }
 
+        // `ChatBedrockConverse` sends a model given to a call on it instead
+        // of its own; `ChatBedrock` does only when it runs on the Converse
+        // API (`beta_use_converse_api`, decided where it is built), and
+        // otherwise sends its own.
+        if bedrock_model_call
+            && !values.is_empty()
+            && !self.built_as(target.client_line, "langchain_aws.ChatBedrockConverse")
+        {
+            let mut keys: Vec<String> = values.iter().map(|v| v.key.clone()).collect();
+            keys.dedup();
+            for key in keys {
+                self.out.gaps.push(UsageGap {
+                    kind: GapKind::UnresolvedModel,
+                    sdk: Some(sdk),
+                    file: self.file.clone(),
+                    span: Some(span),
+                    symbol: symbol.clone(),
+                    chain: Some(chain.clone()),
+                    detail: format!(
+                        "`{key}` for `{chain}` replaces the model only when `ChatBedrock` runs on the Converse API (`beta_use_converse_api`), so which model this call sends is not confirmed"
+                    ),
+                    key: Some(key),
+                    reason: "conditional".to_string(),
+                    values: Vec::new(),
+                    values_complete: false,
+                    args: None,
+                });
+            }
+        }
+
+        // LiteLLM may send the models a call names to others: through its
+        // process-wide `model_alias_map`, a `model_list` passed to the call
+        // (or held by a `**` expansion), which maps a model name to the
+        // deployment it calls, a `deployment_id`, which it sends to Azure in
+        // place of the model and of every fallback's, or a `prompt_id`, whose
+        // template may name the model. These gaps hold no key, so they cover
+        // every model value of the call, nested fallbacks included; the
+        // `deployment_id` itself is the value sent.
+        if target.pkg == Pkg::Litellm {
+            let mut remapped: Vec<(Option<String>, &str, String)> = Vec::new();
+            if let Some(feature) = self.litellm_aliases {
+                remapped.push((
+                    None,
+                    "dynamic_feature",
+                    format!(
+                        "{} may map the models `{chain}` names to other ones",
+                        feature.describe()
+                    ),
+                ));
+            }
+            if model_list {
+                remapped.push((
+                    None,
+                    "model_list",
+                    format!("`{chain}` is given a `model_list`, which maps the model names it is given to the deployments LiteLLM calls"),
+                ));
+            }
+            // With no value to cover, the `splat` gap on the model above
+            // says it.
+            if opaque_splat && !values.is_empty() {
+                remapped.push((
+                    None,
+                    "splat",
+                    format!("`{chain}` is given a `**` expansion that may hold a `model_list`, a `deployment_id` or a `prompt_id`, which may send other models in place of those it names"),
+                ));
+            }
+            if deployment {
+                let mut keys: Vec<String> = values
+                    .iter()
+                    .map(|v| v.key.clone())
+                    .filter(|key| key != "deployment_id")
+                    .collect();
+                keys.sort();
+                keys.dedup();
+                for key in keys {
+                    let detail = format!("`{key}` for `{chain}` is not sent: LiteLLM sends the `deployment_id` it is given to Azure in its place, for the model and for every fallback");
+                    remapped.push((Some(key), "deployment_id", detail));
+                }
+            }
+            if prompt {
+                remapped.push((
+                    None,
+                    "prompt_id",
+                    format!("`{chain}` is given a `prompt_id`: with a prompt-management integration registered, the prompt's template may name the model LiteLLM sends"),
+                ));
+            }
+            for key in fallback_deployments {
+                let detail = format!("`{key}` for `{chain}` is not sent: its fallback names a `deployment_id`, which LiteLLM sends to Azure in its place");
+                remapped.push((Some(key), "deployment_id", detail));
+            }
+            for (key, reason, detail) in remapped {
+                self.out.gaps.push(UsageGap {
+                    kind: GapKind::UnresolvedModel,
+                    sdk: Some(sdk),
+                    file: self.file.clone(),
+                    span: Some(span),
+                    symbol: symbol.clone(),
+                    chain: Some(chain.clone()),
+                    key,
+                    reason: reason.to_string(),
+                    detail,
+                    values: Vec::new(),
+                    values_complete: false,
+                    args: None,
+                });
+            }
+            // `custom_llm_provider` (or `azure`) picks the provider before
+            // the model's name does: a literal one is the value's
+            // `provider`, and one this file does not show leaves the call's
+            // route unknown.
+            let unknown_provider = if call_provider == ProviderPick::Unknown {
+                Some(format!("`{chain}` is given a `custom_llm_provider` or `azure` this file does not show, which picks the provider LiteLLM sends the request to in place of the model's name"))
+            } else if fallback_provider_unknown {
+                Some(format!("a fallback of `{chain}` names a `custom_llm_provider` or `azure` of its own that this file does not show, which picks the provider LiteLLM sends that fallback to in place of its model's name"))
+            } else {
+                None
+            };
+            if let Some(detail) = unknown_provider {
+                self.out.gaps.push(UsageGap {
+                    kind: GapKind::AmbiguousClient,
+                    sdk: Some(sdk),
+                    file: self.file.clone(),
+                    span: Some(span),
+                    symbol: symbol.clone(),
+                    chain: Some(chain.clone()),
+                    key: None,
+                    reason: "litellm_provider".to_string(),
+                    detail,
+                    values: Vec::new(),
+                    values_complete: false,
+                    args: None,
+                });
+            }
+        }
+
+        // The argument that sets the client's endpoint, as gaps name it.
+        let endpoint = match target.pkg {
+            Pkg::Boto3 | Pkg::LangchainAws => "endpoint_url",
+            _ => "base_url",
+        };
         if target.ambiguous {
+            // A chat model built by a class chosen at run time (see
+            // [`Origin::MixedClasses`]), or a call on a receiver assigned
+            // more than one way.
+            let detail = if target.receiver == Receiver::Client {
+                format!(
+                    "the receiver of `{chain}` is assigned more than one kind of client or a non-client value, so its routing depends on a runtime branch"
+                )
+            } else {
+                format!(
+                    "`{chain}` is bound to more than one class, or to a class and another value, so which chat model it builds, and its routing, depend on a runtime branch"
+                )
+            };
             self.out.gaps.push(UsageGap {
                 kind: GapKind::AmbiguousClient,
                 sdk: Some(sdk),
@@ -7159,9 +10837,7 @@ impl<'t> Ctx<'t> {
                 chain: Some(chain.clone()),
                 key: None,
                 reason: "multiple_assignments".to_string(),
-                detail: format!(
-                    "the receiver of `{chain}` is assigned more than one kind of client or a non-client value, so its routing depends on a runtime branch"
-                ),
+                detail,
                 values: Vec::new(),
                 values_complete: false,
                 args: None,
@@ -7211,7 +10887,7 @@ impl<'t> Ctx<'t> {
                 } => (
                     "base_url_env",
                     format!(
-                        "the `base_url` of the client behind `{chain}` is read from the environment and falls back to another host, so the deployment may point it anywhere"
+                        "the `{endpoint}` of the client behind `{chain}` is read from the environment and falls back to another host, so the deployment may point it anywhere"
                     ),
                 ),
                 ClientCaveat::EndpointOption { option } => (
@@ -7223,19 +10899,19 @@ impl<'t> Ctx<'t> {
                 ClientCaveat::BaseUrl { env: true, .. } => (
                     "base_url_env",
                     format!(
-                        "the `base_url` of the client behind `{chain}` is read from the environment with no fallback, so its endpoint is not known"
+                        "the `{endpoint}` of the client behind `{chain}` is read from the environment with no fallback, so its endpoint is not known"
                     ),
                 ),
                 ClientCaveat::BaseUrl { fallback: true, .. } => (
                     "base_url_env",
                     format!(
-                        "the `base_url` of the client behind `{chain}` falls back to the provider's own host, but the environment may set another"
+                        "the `{endpoint}` of the client behind `{chain}` falls back to the provider's own host, but the environment may set another"
                     ),
                 ),
                 ClientCaveat::BaseUrl { .. } => (
                     "base_url_unresolved",
                     format!(
-                        "the `base_url` of the client behind `{chain}` does not resolve to a string in this file, so its endpoint is not known"
+                        "the `{endpoint}` of the client behind `{chain}` does not resolve to a string in this file, so its endpoint is not known"
                     ),
                 ),
                 ClientCaveat::Dynamic(feature) => (
@@ -7256,6 +10932,18 @@ impl<'t> Ctx<'t> {
                     "module_config",
                     format!(
                         "`{chain}` passes `engine` or `deployment_id`, which Azure deployments take, but this file does not configure the module-level API, so another module may route it to Azure"
+                    ),
+                ),
+                ClientCaveat::LangchainModuleConfig => (
+                    "langchain_module_config",
+                    format!(
+                        "this file configures the module-level OpenAI API, which the LangChain chat model behind `{chain}` sends its requests through when it runs on the pre-1.0 `openai` SDK, so its routing is not confirmed"
+                    ),
+                ),
+                ClientCaveat::GivenClient { field } => (
+                    "given_client",
+                    format!(
+                        "the LangChain chat model behind `{chain}` is given `{field}=`, an SDK client it sends its requests through, so where they go is decided by that client"
                     ),
                 ),
             };
@@ -7299,6 +10987,25 @@ impl<'t> Ctx<'t> {
         // fallback behind two names) is listed once.
         let mut seen_values = HashSet::new();
         values.retain(|v| seen_values.insert((v.key.clone(), v.span.start_byte, v.value.clone())));
+        if !from_params.is_empty() {
+            let sources = from_params
+                .iter()
+                .map(|(_, source, _)| (source.func, source.param.clone(), source.attribute.clone()))
+                .collect();
+            self.direct.insert(call.id(), sources);
+            let request = ParamRequest {
+                sdk,
+                pkg: target.pkg,
+                chain: &chain,
+                member: &member,
+                line: span.line,
+                receiver: target.receiver,
+                routing: target.routing,
+                provider: call_provider.named(),
+            };
+            self.note_model_params(from_params, gaps_before, &request);
+        }
+
         let mut seen_gaps = HashSet::new();
         for gap in self.out.gaps.split_off(gaps_before) {
             if seen_gaps.insert((
@@ -7314,7 +11021,7 @@ impl<'t> Ctx<'t> {
         let spreads = self.spreads(&args, scope);
         self.out.calls.push(SdkCall {
             sdk,
-            package: target.pkg.package().to_string(),
+            package: pkg.package().to_string(),
             chain,
             request,
             member,
@@ -7329,6 +11036,7 @@ impl<'t> Ctx<'t> {
             positional: args.positional,
             splat: args.splat,
             values,
+            wrapper: None,
         });
     }
 
@@ -7382,11 +11090,14 @@ impl<'t> Ctx<'t> {
     /// and [`MAX_FILE_NESTED_VALUES`] per file. Values cut by either limit,
     /// or a read cut short after model values were found, leave a
     /// `truncated` gap: the call may carry values the report does not list.
+    /// On a LiteLLM call (`litellm`, the call's provider arguments), each
+    /// value gets the provider its dict names, else the call's.
     fn take_nested(
         &mut self,
         site: &Site<'_, 't>,
         nested: Vec<NestedValue>,
         read_cut: bool,
+        litellm: Option<&ProviderArgs>,
         values: &mut Vec<CapturedValue>,
     ) {
         if nested.is_empty() {
@@ -7405,7 +11116,18 @@ impl<'t> Ctx<'t> {
             }
             listed += 1;
             self.nested_left -= 1;
+            let provider = litellm
+                .filter(|_| !is_deployment_key(&item.path))
+                .and_then(|call| item.providers.over(call).pick().named());
+            let (values_before, gaps_before) = (values.len(), self.out.gaps.len());
             self.take_value(site, &item.path, item.positional, Ok(item.resolved), values);
+            // The value, and the candidates of the gaps next to it.
+            let candidates = self.out.gaps[gaps_before..]
+                .iter_mut()
+                .flat_map(|g| g.values.iter_mut());
+            for value in values[values_before..].iter_mut().chain(candidates) {
+                value.provider = provider.clone();
+            }
         }
         if (dropped || read_cut) && site.gap_worthy {
             let chain = site.chain;
@@ -7447,6 +11169,9 @@ impl<'t> Ctx<'t> {
             ),
             _ if unresolved.reason == "splat" => {
                 format!("`{key}` for `{chain}` is not passed by name and may come from `**kwargs`")
+            }
+            _ if unresolved.reason == "missing_model" && !shape.is_empty() => {
+                format!("`{key}` for `{chain}` is not passed, so {shape} applies")
             }
             _ if unresolved.reason == "missing_model" => {
                 format!("`{key}` for `{chain}` is not passed, so the SDK or server default applies")
@@ -7664,7 +11389,12 @@ impl<'t> Ctx<'t> {
             ),
         };
 
-        let args = self.arguments(call);
+        let keys = if shape_sdk == Sdk::Aws {
+            value_keys(Pkg::Boto3, Receiver::Client)
+        } else {
+            ValueKeys::DEFAULT
+        };
+        let args = self.arguments_with(call, keys);
         let mut values = Vec::new();
         for (key, expr) in &args.value_args {
             if let Ok(resolved) = self.resolve_value(*expr, scope, 0) {
@@ -7703,7 +11433,11 @@ impl<'t> Ctx<'t> {
         let Some(last) = val.path().last() else {
             return;
         };
-        if !REQUEST_METHODS.contains(&last.as_str()) {
+        let request = match val.pkg() {
+            Some(pkg) => is_request_of(pkg, last),
+            None => is_request(last),
+        };
+        if !request {
             return;
         }
         let rendered = self.render(reference);
@@ -7730,6 +11464,12 @@ impl<'t> Ctx<'t> {
     // ------------------------------------------------------------------
 
     fn arguments(&self, call: Node<'t>) -> Args<'t> {
+        self.arguments_with(call, ValueKeys::DEFAULT)
+    }
+
+    /// [`Ctx::arguments`], reading the keyword arguments `keys` names as
+    /// values (see [`value_keys`]).
+    fn arguments_with(&self, call: Node<'t>, keys: ValueKeys) -> Args<'t> {
         let mut args = Args::default();
         let Some(list) = call.child_by_field_name("arguments") else {
             return args;
@@ -7747,7 +11487,7 @@ impl<'t> Ctx<'t> {
                     };
                     let name = self.text(name).to_string();
                     if let Some(value) = arg.child_by_field_name("value") {
-                        if is_value_key(&name) {
+                        if keys.reads(&name) {
                             args.value_args.push((name.clone(), value));
                         } else if is_container(value) && !is_secret_key(&name) {
                             args.literal_args.push((Some(name.clone()), value));
@@ -7831,6 +11571,9 @@ impl<'t> Ctx<'t> {
             "dictionary" => {
                 // Read once per literal (memoized), like any dict lookup.
                 let summary = self.dict_summary(node);
+                // The provider arguments the dict names, read for its first
+                // model value.
+                let mut providers: Option<ProviderArgs> = None;
                 // Indexes as `dict_entries` counts them: every named child
                 // but comments.
                 let mut index = 0;
@@ -7873,10 +11616,28 @@ impl<'t> Ctx<'t> {
                         if overridden {
                             read.overridden.push(path);
                         } else if let Ok(resolved) = self.resolve_value(value, place.scope, 0) {
+                            let deployment = key != "deployment_id"
+                                && summary.last.contains_key("deployment_id");
+                            let providers = match &providers {
+                                Some(providers) => providers.clone(),
+                                None => {
+                                    let mut args = ProviderArgs::default();
+                                    for name in ProviderArgs::NAMES {
+                                        if let Some(pick) =
+                                            self.dict_provider(&summary, name, place.scope)
+                                        {
+                                            args.give(name, pick);
+                                        }
+                                    }
+                                    providers.insert(args).clone()
+                                }
+                            };
                             read.found.push(NestedValue {
                                 path,
                                 positional: place.positional,
                                 resolved,
+                                deployment,
+                                providers,
                             });
                         }
                     } else if is_container(value) {
@@ -9028,6 +12789,114 @@ impl<'t> Ctx<'t> {
         }
     }
 
+    /// Whether `value`, a dict a LangChain chat model takes its model from
+    /// (a copy's `update`, or `model_kwargs` or `extra_body` written after
+    /// it is built), may hold one of `keys`. `None`, written there or bound
+    /// to a name assigned once, does not, nor does a dict literal
+    /// [`Self::dict_node`] reads that has none of them; anything else may.
+    fn may_hold_keys(&mut self, value: Node<'t>, scope: usize, keys: &[&str]) -> bool {
+        if self.is_none_value(value, scope) {
+            return false;
+        }
+        match self.dict_node(value, scope, 0) {
+            Some(dict) => keys
+                .iter()
+                .any(|key| !matches!(self.dict_lookup(dict.node, key), Lookup::Absent)),
+            None => true,
+        }
+    }
+
+    /// Whether a copy's `update` may set the model the copy sends: it may
+    /// name the model field (by either name), or give `model_kwargs` or
+    /// `extra_body` a value that may hold a `model`, which is sent over it
+    /// (the rule of a write of those fields, [`Self::sent_over_write`]).
+    fn update_may_set_model(&mut self, update: Node<'t>, scope: usize) -> bool {
+        if self.is_none_value(update, scope) {
+            return false;
+        }
+        let Some(dict) = self.dict_node(update, scope, 0) else {
+            return true;
+        };
+        LANGCHAIN_MODEL_FIELDS
+            .iter()
+            .any(|field| match self.dict_lookup(dict.node, field) {
+                Lookup::Absent => false,
+                Lookup::Found(value) if LANGCHAIN_SENT_OVER.contains(field) => {
+                    self.may_hold_keys(value, dict.scope, &["model"])
+                }
+                _ => true,
+            })
+    }
+
+    /// `None`, written there or through a name assigned once, to `None`.
+    fn is_none_value(&mut self, value: Node<'t>, scope: usize) -> bool {
+        match value.kind() {
+            "none" => true,
+            "identifier" => {
+                let (key, defs) = self.defs_at(self.text(value), scope, value.start_byte());
+                let only = defs
+                    .only_assign
+                    .filter(|_| !defs.param && !defs.imported && defs.assigns == 1)
+                    .and_then(|i| self.assigns.get(&key)?.get(i).copied());
+                only.is_some_and(|a| !a.unknowable && a.value.is_some_and(|v| v.kind() == "none"))
+            }
+            _ => false,
+        }
+    }
+
+    /// How LiteLLM provider argument `name` (one of [`ProviderArgs::NAMES`])
+    /// reads with `value`. A provider is read under the value rules, and only
+    /// one that is the sole value its source gives (a literal or a same-file
+    /// constant) is named. `azure` names Azure only when it is `True`.
+    fn provider_pick(&mut self, name: &str, value: Node<'t>, scope: usize) -> ProviderPick {
+        if self.is_none_value(value, scope) {
+            return ProviderPick::Absent;
+        }
+        if name == "azure" {
+            return match value.kind() {
+                "true" => ProviderPick::Named("azure".to_string()),
+                "false" => ProviderPick::Absent,
+                _ => ProviderPick::Unknown,
+            };
+        }
+        match self.resolve_value(value, scope, 0) {
+            Ok(resolved)
+                if resolved.is_certain()
+                    && matches!(
+                        resolved.origin,
+                        ValueOrigin::Literal
+                            | ValueOrigin::ModuleConstant
+                            | ValueOrigin::ClassConstant
+                            | ValueOrigin::LocalConstant
+                    ) =>
+            {
+                if resolved.value.is_empty() {
+                    ProviderPick::Absent
+                } else {
+                    ProviderPick::Named(resolved.value)
+                }
+            }
+            _ => ProviderPick::Unknown,
+        }
+    }
+
+    /// How LiteLLM provider argument `name` reads in a dict literal, or
+    /// `None` when the dict has no such key. An entry that a `**` or a
+    /// computed key written after it may replace is not known.
+    fn dict_provider(
+        &mut self,
+        summary: &DictSummary<'t>,
+        name: &str,
+        scope: usize,
+    ) -> Option<ProviderPick> {
+        let (index, value) = *summary.last.get(name)?;
+        Some(if summary.overridable(index) {
+            ProviderPick::Unknown
+        } else {
+            self.provider_pick(name, value, scope)
+        })
+    }
+
     fn dict_summary(&mut self, dict: Node<'t>) -> Rc<DictSummary<'t>> {
         if let Some(summary) = self.dict_cache.get(&dict.id()) {
             return Rc::clone(summary);
@@ -9050,7 +12919,10 @@ impl<'t> Ctx<'t> {
             // A credential-named or non-identifier key cannot be a model
             // argument; it is never read through an expansion.
             let relevant = is_identifier_key(&key)
-                && (is_value_key(&key) || is_base_url_key(&key) || is_container(value));
+                && (is_value_key(&key)
+                    || BEDROCK_VALUE_KEYS.contains(&key.as_str())
+                    || is_base_url_key(&key)
+                    || is_container(value));
             if relevant {
                 if let Some(slot) = summary.expansion.iter_mut().find(|(k, _, _)| *k == key) {
                     slot.1 = index;
@@ -9231,6 +13103,243 @@ struct CallTarget {
     caveat: Option<ClientCaveat>,
 }
 
+/// The parameter a model value is, unchanged (see [`Ctx::param_source`]).
+struct ParamSource {
+    /// The function that takes it.
+    func: usize,
+    param: String,
+    /// The instance attribute it reaches the call through (`self.model`).
+    attribute: Option<String>,
+}
+
+/// A model parameter: the function that takes it, its name, and the
+/// attribute a class keeps it in.
+type ParamKey = (usize, String, Option<String>);
+
+/// What a call calls, for [`Ctx::changed_elsewhere`].
+enum Callee {
+    /// Something that sends no request: a builtin ([`INERT_BUILTINS`]), an
+    /// exception, logging, a method of a literal, a container or string
+    /// method ([`INERT_METHODS`]), a few standard functions
+    /// ([`INERT_FUNCTIONS`]), a client construction.
+    Inert,
+    /// The file's own functions, lambdas, methods or classes it may be.
+    Here(Vec<usize>),
+    /// Anything else: an import, a parameter, another object's method.
+    Unknown,
+}
+
+/// The file-wide facts [`Ctx::changed_elsewhere`] reads, from
+/// [`Ctx::settle_context`].
+struct Settle<'t> {
+    /// The calls that send a request ([`Ctx::sending`]), by node id.
+    sent: HashSet<usize>,
+    /// [`Ctx::model_reads`], by start byte.
+    reads: Vec<Node<'t>>,
+    /// What each call calls, by node id.
+    callees: HashMap<usize, Callee>,
+    /// The calls whose code each scope runs (see [`Ctx::callable_owner`]),
+    /// and the scopes nested in each.
+    owned: Vec<Vec<Node<'t>>>,
+    children: Vec<Vec<usize>>,
+    /// Whether each scope may send a request: it holds a sending call or a
+    /// call to a callee the scan cannot see into, or runs one of the
+    /// file's own scopes that may (a call, or nesting).
+    may_send: Vec<bool>,
+}
+
+/// A choice: what it tests and the code each outcome runs.
+struct Guard<'t> {
+    conditions: Vec<Node<'t>>,
+    /// Empty for an `assert`, which raises.
+    branches: Vec<Node<'t>>,
+}
+
+/// Builtins that send nothing, whatever they are given. `getattr`, `map`,
+/// `filter`, `next` and `iter` may run other code and are not listed.
+const INERT_BUILTINS: &[&str] = &[
+    "print",
+    "len",
+    "str",
+    "repr",
+    "int",
+    "float",
+    "bool",
+    "bytes",
+    "isinstance",
+    "issubclass",
+    "type",
+    "hash",
+    "id",
+    "sorted",
+    "reversed",
+    "min",
+    "max",
+    "sum",
+    "any",
+    "all",
+    "format",
+    "abs",
+    "round",
+    "list",
+    "tuple",
+    "set",
+    "frozenset",
+    "dict",
+    "enumerate",
+    "zip",
+    "range",
+    "hasattr",
+    "callable",
+    "ord",
+    "chr",
+    "divmod",
+];
+
+/// Methods of containers and strings, which send nothing, on whatever
+/// object they are called.
+const INERT_METHODS: &[&str] = &[
+    "append",
+    "extend",
+    "insert",
+    "update",
+    "setdefault",
+    "add",
+    "pop",
+    "remove",
+    "discard",
+    "clear",
+    "copy",
+    "get",
+    "keys",
+    "values",
+    "items",
+    "index",
+    "count",
+    "join",
+    "split",
+    "rsplit",
+    "splitlines",
+    "strip",
+    "lstrip",
+    "rstrip",
+    "lower",
+    "upper",
+    "casefold",
+    "title",
+    "startswith",
+    "endswith",
+    "replace",
+    "format",
+    "encode",
+    "decode",
+    "partition",
+    "rpartition",
+    "removeprefix",
+    "removesuffix",
+];
+
+/// The container methods that put their arguments into the container
+/// (see [`Ctx::container_update`]).
+const CONTAINER_UPDATES: &[&str] = &["append", "extend", "insert", "update", "setdefault", "add"];
+
+/// Standard functions that send nothing.
+const INERT_FUNCTIONS: &[&str] = &[
+    "json.dumps",
+    "json.loads",
+    "copy.copy",
+    "copy.deepcopy",
+    "re.match",
+    "re.search",
+    "re.fullmatch",
+    "re.sub",
+    "re.split",
+    "re.compile",
+    "time.sleep",
+    "time.time",
+    "time.monotonic",
+    "time.perf_counter",
+    "warnings.warn",
+];
+
+/// Logging methods: on an object whose name mentions `log`.
+const LOG_METHODS: &[&str] = &[
+    "debug",
+    "info",
+    "warning",
+    "warn",
+    "error",
+    "exception",
+    "critical",
+    "fatal",
+    "log",
+];
+
+/// Nodes whose methods send nothing.
+const INERT_LITERALS: &[&str] = &[
+    "string",
+    "concatenated_string",
+    "integer",
+    "float",
+    "list",
+    "dictionary",
+    "tuple",
+    "set",
+];
+
+/// An exception class's name, by convention.
+fn is_exception_name(name: &str) -> bool {
+    name.ends_with("Error") || name.ends_with("Exception") || name.ends_with("Warning")
+}
+
+/// `self.x`, `cls.x` or `super().x`: a method of the receiver's class.
+fn is_receiver_call<'t>(function: Node<'t>, text: impl Fn(Node<'t>) -> &'t str) -> bool {
+    function.kind() == "attribute"
+        && function
+            .child_by_field_name("object")
+            .is_some_and(|object| match object.kind() {
+                "identifier" => matches!(text(object), "self" | "cls"),
+                "call" => object
+                    .child_by_field_name("function")
+                    .is_some_and(|f| text(f) == "super"),
+                _ => false,
+            })
+}
+
+/// What holds a value computed from a model parameter (see
+/// [`Ctx::changed_elsewhere`]).
+struct Taint<'a> {
+    /// The parameter, read under its name in its own function (`own`).
+    param: &'a str,
+    own: (usize, usize),
+    /// Names and attributes assigned such a value where it can be seen.
+    names: HashSet<&'a str>,
+    attrs: HashSet<&'a str>,
+}
+
+/// The request a [`ModelParam`] is the model of.
+struct ParamRequest<'a> {
+    sdk: Sdk,
+    pkg: Pkg,
+    chain: &'a str,
+    member: &'a str,
+    line: u32,
+    receiver: Receiver,
+    routing: Routing,
+    /// The provider a LiteLLM request names (`custom_llm_provider`,
+    /// `azure=True`) as a string the file shows.
+    provider: Option<String>,
+}
+
+/// A function or class of another file whose parameters are the model of
+/// requests there, as [`WrapperLookup`] resolved an import of it.
+struct Wrapper {
+    file: String,
+    function: String,
+    /// Never empty.
+    params: Vec<ModelParam>,
+}
+
 /// The call a value or gap is reported for.
 #[derive(Clone, Copy)]
 struct Site<'a, 't> {
@@ -9288,6 +13397,7 @@ fn captured(key: &str, resolved: Resolved, positional: bool) -> CapturedValue {
         positional,
         span: resolved.span,
         model_family: family,
+        provider: None,
     }
 }
 
@@ -9306,10 +13416,13 @@ fn positional_model_key(pkg: Pkg, receiver: Receiver, member: &str) -> Option<&'
         return Some("model_name");
     }
     let last = member.rsplit('.').next().unwrap_or(member);
-    (pkg == Pkg::GoogleGenerativeai
-        && receiver != Receiver::Client
-        && LEGACY_POSITIONAL_MODEL.contains(&last))
-    .then_some("model")
+    let positional = match pkg {
+        Pkg::GoogleGenerativeai => LEGACY_POSITIONAL_MODEL.contains(&last),
+        // `litellm.completion("gpt-4o", messages)`.
+        Pkg::Litellm => LITELLM_REQUESTS.contains(&last),
+        _ => false,
+    };
+    (positional && receiver != Receiver::Client).then_some("model")
 }
 
 /// A dict, list, tuple or set literal.
@@ -9711,6 +13824,19 @@ fn children(node: Node<'_>) -> Vec<Node<'_>> {
 
 /// Every named child, in order, in time linear in their number
 /// (`Node::named_child(i)` walks from the first child on every call).
+/// The `*` and `**` arguments of a call.
+fn splat_arguments(call: Node<'_>) -> Vec<Node<'_>> {
+    call.child_by_field_name("arguments")
+        .filter(|a| a.kind() == "argument_list")
+        .map(|a| {
+            named_children(a)
+                .into_iter()
+                .filter(|n| matches!(n.kind(), "list_splat" | "dictionary_splat"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).collect()
@@ -9823,12 +13949,40 @@ fn combine(vals: Vec<Val>) -> Val {
         })
         .collect();
     if let Some(first) = classes.first() {
+        // `try: from langchain_openai import ChatOpenAI` / `except
+        // ImportError: from langchain_community.chat_models import
+        // ChatOpenAI`: one LangChain chat model, whichever package gives it.
+        // A deprecated copy that reads the module-level OpenAI configuration
+        // ([`Pkg::reads_module_config`]) stands for them all: it routes like
+        // the others unless the file configures that API, where its gap is
+        // the conservative result.
+        let one_chat_model = classes.len() == real.len()
+            && classes.iter().all(|c| {
+                c.pkg.is_langchain()
+                    && c.pkg.sdk() == first.pkg.sdk()
+                    && c.name == first.name
+                    && c.family == first.family
+            });
+        if one_chat_model {
+            let class = classes
+                .iter()
+                .find(|c| c.pkg.reads_module_config())
+                .unwrap_or(first);
+            return Val::Class(*class);
+        }
         if classes.len() < real.len()
             || classes
                 .iter()
                 .any(|c| c.pkg != first.pkg || c.family != first.family)
         {
-            return Val::untracked(Origin::MixedClasses(first.pkg));
+            // A chat model that takes a model first, so one built with none
+            // keeps its `missing_model` gap.
+            let chat_model = classes
+                .iter()
+                .filter(|c| c.pkg.is_langchain())
+                .min_by_key(|c| !is_model_bearing(c.name))
+                .copied();
+            return Val::untracked(Origin::MixedClasses(first.pkg, chat_model));
         }
     }
 
