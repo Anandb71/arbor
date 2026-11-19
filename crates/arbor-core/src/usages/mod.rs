@@ -406,6 +406,15 @@ pub struct CapturedValue {
     pub span: Span,
     /// Which provider's model-ID shape the value matches, if any.
     pub model_family: Option<Sdk>,
+    /// For a LiteLLM call: the provider the call names apart from the model,
+    /// a string literal or same-file constant given as `custom_llm_provider`
+    /// (or `azure=True`, which is `azure`), at the call or in the fallback
+    /// dict that holds the value. LiteLLM then sends the model as
+    /// `<provider>/<model>`. `None` (omitted from JSON) when none is named;
+    /// one the file does not show is an `ambiguous_client` gap
+    /// (`litellm_provider`) instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 /// A call whose member chain is rooted at a tracked binding.

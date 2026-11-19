@@ -911,7 +911,8 @@ fn call_routing(
         Routing::GoogleGenerativeaiLegacy => {
             (RoutingClass::Direct, Schedule::One(Table::GeminiApi))
         }
-        // LiteLLM picks the provider from the model string.
+        // LiteLLM picks the provider from the model string, or from the
+        // provider the call names (each value's `provider`).
         Routing::AzureOpenai
         | Routing::CustomBaseUrl
         | Routing::AnthropicBedrock
@@ -1175,11 +1176,14 @@ fn fine_tuning_job_hit<'d>(data: &'d Retirements, mut hit: Hit<'d>) -> Hit<'d> {
     hit
 }
 
-/// Resolves a value for a call, deciding which schedule applies.
+/// Resolves a value for a call, deciding which schedule applies. `provider`
+/// is the provider a LiteLLM call names apart from the model
+/// ([`CapturedValue::provider`]).
 fn resolve<'d>(
     data: &'d Retirements,
     routing: &CallRouting,
     value: &str,
+    provider: Option<&str>,
 ) -> Option<(Hit<'d>, RoutingClass)> {
     match routing.schedule {
         // A direct client follows its provider's schedule only.
@@ -1201,19 +1205,46 @@ fn resolve<'d>(
     } else {
         RoutingClass::Routed
     };
+    // LiteLLM reads a model the call names a provider for
+    // (`custom_llm_provider`, `azure=True`) as `<provider>/<model>`, unless
+    // it already starts with that prefix (`get_llm_provider`), before any
+    // rule about its name: it is looked up as that router prefix is.
+    let sent;
+    let value = match provider {
+        Some(provider) if value.split('/').next() != Some(provider) => {
+            sent = format!("{provider}/{value}");
+            sent.as_str()
+        }
+        _ => value,
+    };
+    let provider_note = |hit: &mut Hit<'_>| {
+        if let Some(provider) = provider {
+            let given = match provider {
+                "azure" => "`custom_llm_provider=\"azure\"` or `azure=True`".to_string(),
+                _ => format!("`custom_llm_provider=\"{provider}\"`"),
+            };
+            hit.notes.push(format!(
+                "LiteLLM is given {given}, so it sends this model as `{value}`."
+            ));
+        }
+    };
     for (prefix, table) in ROUTER_PREFIXES {
         if let Some(id) = value.strip_prefix(prefix) {
             let mut hit = lookup(data, *table, id)?;
             hit.match_kind = MatchKind::RouterPrefix;
+            provider_note(&mut hit);
             return Some((hit, routed));
         }
     }
-    // LiteLLM sends a Gemini model named with no provider prefix to Vertex
-    // AI (`get_llm_provider`); only `gemini/<model>`, above, reaches the
-    // Gemini API. A call whose provider is chosen otherwise
-    // (`custom_llm_provider`, a routing gap) may reach either: neither is
-    // looked up.
-    if routing.sdk == Some(Sdk::Litellm) && model_family(value) == Some(Sdk::Google) {
+    // LiteLLM sends a Gemini model named with no provider prefix, when the
+    // call names no provider, to Vertex AI (`get_llm_provider`); only
+    // `gemini/<model>`, above, reaches the Gemini API. A call whose provider
+    // the usage scan could not read (a routing gap) may reach either:
+    // neither is looked up.
+    if provider.is_none()
+        && routing.sdk == Some(Sdk::Litellm)
+        && model_family(value) == Some(Sdk::Google)
+    {
         if routing.gap.is_some() {
             return None;
         }
@@ -1227,7 +1258,7 @@ fn resolve<'d>(
     let table = model_family(value)
         .and_then(sdk_table)
         .or(routing.sdk.and_then(sdk_table))?;
-    let hit = match lookup(data, table, value) {
+    let mut hit = match lookup(data, table, value) {
         Some(hit) => hit,
         // A Google client whose endpoint is not known may be on Vertex AI,
         // which keeps its own schedule (`text-bison` is listed only there).
@@ -1236,6 +1267,7 @@ fn resolve<'d>(
         }
         None => return None,
     };
+    provider_note(&mut hit);
     let table = hit.table;
     // An SDK sending another provider's model is talking to a proxy.
     let crosses = routing.sdk.is_some_and(|sdk| sdk_table(sdk) != Some(table))
@@ -1416,7 +1448,7 @@ fn finding_for(
     value: &CapturedValue,
     confidence: Confidence,
 ) -> Option<Finding> {
-    let (hit, class) = resolve(data, routing, &value.value)?;
+    let (hit, class) = resolve(data, routing, &value.value, value.provider.as_deref())?;
 
     // `args`: the call's argument names and whether some are spread with
     // `**`, or `None` when the usage scan did not record them.
@@ -2747,6 +2779,7 @@ mod tests {
             positional: false,
             span: span(line),
             model_family: model_family(model),
+            provider: None,
         }
     }
 
@@ -3766,12 +3799,8 @@ env.converse(modelId="claude-3-5-sonnet-20240620", messages=[])
         let report = check_source(source, &opts);
         assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
         assert_eq!(report.findings[0].routing_class, RoutingClass::Unknown);
-        // A provider the call picks itself: a bare Gemini model is looked up
-        // on neither Google schedule.
-        let source = "import litellm\nlitellm.completion(model=\"gemini-3.7-flash\", custom_llm_provider=\"gemini\", messages=[])\n";
-        let report = check_source(source, &opts);
-        assert!(report.findings.is_empty(), "{:#?}", report.findings);
-        assert!(report.routed.is_empty(), "{:#?}", report.routed);
+        // A provider the call names itself: see
+        // a_litellm_provider_picks_the_schedule_its_router_prefix_would.
         // A Bedrock call is neither listed nor counted as not checked.
         let source = "import os\nimport boto3\nfrom langchain_aws import ChatBedrockConverse\nbrt = boto3.client(\"bedrock-runtime\")\nbrt.converse(modelId=os.environ[\"MODEL_ID\"], messages=[])\nllm = ChatBedrockConverse(model=\"amazon.nova-pro-v1:0\")\nllm.invoke(\"hi\", model_id=\"amazon.nova-lite-v1:0\", modelId=\"amazon.nova-micro-v1:0\")\n";
         let report = check_source(source, &opts);
@@ -3812,6 +3841,268 @@ def ask(brt):
             }
             assert_eq!(report.exit_code, 0, "{remap}{list}");
         }
+    }
+
+    #[test]
+    fn a_litellm_provider_picks_the_schedule_its_router_prefix_would() {
+        // `custom_llm_provider` (or `azure=True`) picks LiteLLM's provider
+        // before any rule about the model's name (`get_llm_provider` makes
+        // the model `<provider>/<model>`), so the model is looked up as that
+        // router prefix is. With `--include-routed --fail-within 90`.
+        let mut opts = options("2026-11-18");
+        opts.include_routed = true;
+        opts.fail_within = Some(90);
+        let report = |source: &str, opts: &CheckOptions| {
+            check_source(&format!("import os\nimport litellm\n{source}\n"), opts)
+        };
+        let all = |report: &RetirementReport| -> Vec<Finding> {
+            report
+                .findings
+                .iter()
+                .chain(&report.routed)
+                .cloned()
+                .collect()
+        };
+        let bare_note = |f: &Finding| {
+            f.notes
+                .iter()
+                .any(|n| n.contains("LiteLLM sends a Gemini model named with no provider"))
+        };
+        let provider_note = |f: &Finding, provider: &str| {
+            f.notes
+                .iter()
+                .any(|n| n.contains(&format!("is given `custom_llm_provider=\"{provider}\"`")))
+        };
+
+        // With no provider, a bare Gemini model is Vertex AI's: retiring on
+        // 28 Jan 2027, 71 days out, so it fails.
+        let bare = report(
+            "litellm.completion(model=\"gemini-3.7-flash\", messages=[])",
+            &opts,
+        );
+        let found = all(&bare);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].provider, Table::Vertex);
+        assert!(bare_note(&found[0]) && found[0].fails);
+        assert_eq!(bare.exit_code, 1);
+
+        // The review's call: `custom_llm_provider="gemini"` reaches the
+        // Gemini API, which lists gemini-3.7-flash as auto-routed with no
+        // date. Given by keyword, through a same-file constant or in a
+        // same-file dict expanded with `**`, it is confirmed and routed.
+        for call in [
+            "litellm.completion(model=\"gemini-3.7-flash\", custom_llm_provider=\"gemini\", messages=[])",
+            "PROVIDER = \"gemini\"\nlitellm.completion(model=\"gemini-3.7-flash\", custom_llm_provider=PROVIDER, messages=[])",
+            "CFG = {\"custom_llm_provider\": \"gemini\"}\nlitellm.completion(model=\"gemini-3.7-flash\", messages=[], **CFG)",
+        ] {
+            let report = report(call, &opts);
+            let found = all(&report);
+            assert_eq!(found.len(), 1, "{call}: {found:#?}");
+            let finding = &found[0];
+            assert_eq!(finding.provider, Table::GeminiApi, "{call}");
+            assert_eq!(finding.status, State::AutoRouted, "{call}");
+            assert_eq!(finding.date, None, "{call}");
+            assert_eq!(finding.match_kind, MatchKind::RouterPrefix, "{call}");
+            assert_eq!(finding.routing_class, RoutingClass::Routed, "{call}");
+            assert_eq!(finding.confidence, Confidence::Confirmed, "{call}");
+            assert!(!bare_note(finding), "{call}: {:#?}", finding.notes);
+            assert!(provider_note(finding, "gemini"), "{call}: {:#?}", finding.notes);
+            assert!(!finding.fails, "{call}");
+            assert_eq!(report.exit_code, 0, "{call}");
+        }
+        // gemini-2.5-flash is listed only on Vertex AI's schedule: given the
+        // Gemini API, or another provider, it is looked up nowhere.
+        for provider in ["gemini", "bedrock", "azure", "openrouter"] {
+            let call = format!("litellm.completion(model=\"gemini-2.5-flash\", custom_llm_provider=\"{provider}\", messages=[])");
+            let report = report(&call, &opts);
+            assert!(all(&report).is_empty(), "{call}: {:#?}", all(&report));
+            assert_eq!(report.exit_code, 0, "{call}");
+        }
+
+        // `vertex_ai` is Vertex AI's schedule, as `vertex_ai/` is.
+        let vertex = report(
+            "litellm.completion(model=\"gemini-3.7-flash\", custom_llm_provider=\"vertex_ai\", messages=[])",
+            &opts,
+        );
+        let found = all(&vertex);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].provider, Table::Vertex);
+        assert_eq!(found[0].match_kind, MatchKind::RouterPrefix);
+        assert!(!bare_note(&found[0]), "{:#?}", found[0].notes);
+        assert!(provider_note(&found[0], "vertex_ai"));
+        assert!(found[0].fails);
+        assert_eq!(vertex.exit_code, 1);
+
+        // `openai` and `anthropic` name their provider's schedule; `bedrock`
+        // and `azure` (or `azure=True`, which wins over
+        // `custom_llm_provider`) name none in the data, as `bedrock/` and
+        // `azure/` do, nor does a provider the data does not know.
+        let openai = report(
+            "litellm.completion(model=\"gpt-3.5-turbo-0613\", custom_llm_provider=\"openai\", messages=[])",
+            &opts,
+        );
+        let found = all(&openai);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].provider, Table::Openai);
+        assert_eq!(found[0].status, State::Retired);
+        assert!(found[0].fails);
+        let anthropic = report(
+            "litellm.completion(model=\"claude-3-5-sonnet-20241022\", custom_llm_provider=\"anthropic\", messages=[])",
+            &opts,
+        );
+        assert_eq!(all(&anthropic)[0].provider, Table::Anthropic);
+        for call in [
+            "litellm.completion(model=\"claude-3-5-sonnet-20241022\", custom_llm_provider=\"bedrock\", messages=[])",
+            "litellm.completion(model=\"gpt-3.5-turbo-0613\", custom_llm_provider=\"azure\", messages=[])",
+            "litellm.completion(model=\"gpt-3.5-turbo-0613\", azure=True, messages=[])",
+            "litellm.completion(model=\"gpt-3.5-turbo-0613\", azure=True, custom_llm_provider=\"openai\", messages=[])",
+            "litellm.completion(model=\"gpt-3.5-turbo-0613\", custom_llm_provider=\"openrouter\", messages=[])",
+        ] {
+            let report = report(call, &opts);
+            assert!(all(&report).is_empty(), "{call}: {:#?}", all(&report));
+            assert_eq!(report.exit_code, 0, "{call}");
+        }
+        // `None`, `False` or an empty string names no provider.
+        for call in [
+            "litellm.completion(model=\"gemini-3.7-flash\", custom_llm_provider=None, messages=[])",
+            "litellm.completion(model=\"gemini-3.7-flash\", azure=False, messages=[])",
+            "litellm.completion(model=\"gemini-3.7-flash\", custom_llm_provider=\"\", messages=[])",
+        ] {
+            let found = all(&report(call, &opts));
+            assert_eq!(found.len(), 1, "{call}: {found:#?}");
+            assert!(bare_note(&found[0]), "{call}");
+        }
+
+        // A provider the file does not show (the environment, a parameter,
+        // a call, an entry a later `**` may replace): a bare Gemini model is
+        // looked up on neither Google schedule, and another model is listed
+        // with its routing not confirmed. Nothing fails.
+        for provider in [
+            "custom_llm_provider=os.environ[\"LLM_PROVIDER\"]",
+            "custom_llm_provider=provider",
+            "custom_llm_provider=pick()",
+            "azure=use_azure",
+            "**{\"custom_llm_provider\": \"gemini\", **extra}",
+        ] {
+            let gemini = report(
+                &format!("def ask(provider, use_azure, extra):\n    return litellm.completion(model=\"gemini-3.7-flash\", {provider}, messages=[])"),
+                &opts,
+            );
+            assert!(all(&gemini).is_empty(), "{provider}: {:#?}", all(&gemini));
+            let openai = report(
+                &format!("def ask(provider, use_azure, extra):\n    return litellm.completion(model=\"gpt-3.5-turbo-0613\", {provider}, messages=[])"),
+                &opts,
+            );
+            assert!(openai.routed.is_empty(), "{provider}: {:#?}", openai.routed);
+            assert_eq!(
+                openai.findings.len(),
+                1,
+                "{provider}: {:#?}",
+                openai.findings
+            );
+            let finding = &openai.findings[0];
+            assert_eq!(finding.routing_class, RoutingClass::Unknown, "{provider}");
+            assert_eq!(finding.routing_gap.as_deref(), Some("litellm_provider"));
+            assert!(!finding.fails, "{provider}");
+            assert_eq!(openai.exit_code, 0, "{provider}");
+        }
+
+        // A fallback's own provider governs that fallback; one that names
+        // none goes where the call's does. A fallback that names `gemini`,
+        // with `--count-unconfirmed` too: the Gemini API's result, no Vertex
+        // date. (The call's own model is one the data does not list.)
+        let mut unconfirmed = opts;
+        unconfirmed.count_unconfirmed = true;
+        let fallback = report(
+            "litellm.completion(model=\"gpt-6-luna\", fallbacks=[{\"model\": \"gemini-3.7-flash\", \"custom_llm_provider\": \"gemini\"}], messages=[])",
+            &unconfirmed,
+        );
+        let found: Vec<Finding> = all(&fallback)
+            .into_iter()
+            .filter(|f| f.key == "fallbacks.model")
+            .collect();
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].provider, Table::GeminiApi);
+        assert_eq!(found[0].confidence, Confidence::Confirmed);
+        assert!(!bare_note(&found[0]) && !found[0].fails);
+        assert_eq!(fallback.exit_code, 0);
+        let mixed = report(
+            "litellm.completion(model=\"gemini-3.7-flash\", custom_llm_provider=\"gemini\", fallbacks=[{\"model\": \"gemini-3.7-flash\", \"custom_llm_provider\": \"vertex_ai\"}, {\"model\": \"gemini-2.5-flash\"}], messages=[])",
+            &opts,
+        );
+        let mut tables: Vec<(String, Table)> = all(&mixed)
+            .into_iter()
+            .map(|f| (f.key.clone(), f.provider))
+            .collect();
+        tables.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            tables,
+            vec![
+                ("fallbacks.model".to_string(), Table::Vertex),
+                ("model".to_string(), Table::GeminiApi),
+            ]
+        );
+        // A fallback's own provider that the file does not show leaves the
+        // call's routing unknown: its bare Gemini model is looked up on
+        // neither Google schedule, and nothing fails.
+        let unread = report(
+            "litellm.completion(model=\"gpt-3.5-turbo-0613\", fallbacks=[{\"model\": \"gemini-3.7-flash\", \"custom_llm_provider\": os.environ[\"P\"]}], messages=[])",
+            &opts,
+        );
+        let found = all(&unread);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].key, "model");
+        assert_eq!(found[0].routing_class, RoutingClass::Unknown);
+        assert!(!found[0].fails);
+        assert_eq!(unread.exit_code, 0);
+    }
+
+    #[test]
+    fn the_vertex_rule_never_runs_for_a_litellm_value_with_a_provider() {
+        // Whatever provider is named, the bare-Gemini rule (Vertex AI's
+        // schedule, with its note) is not applied: only `vertex_ai` reaches
+        // Vertex AI, through its router prefix. `models` keeps the value
+        // Gemini-shaped after the prefix, so the rule itself is tested.
+        let data = bundled().unwrap();
+        let routing = CallRouting {
+            class: RoutingClass::Routed,
+            routing: "litellm".to_string(),
+            sdk: Some(Sdk::Litellm),
+            schedule: Schedule::Guess,
+            base_url: None,
+            gap: None,
+        };
+        let vertex_note = |hit: &Hit<'_>| hit.notes.iter().any(|n| n.contains("to Vertex AI"));
+        let (bare, _) = resolve(data, &routing, "gemini-2.5-flash", None).unwrap();
+        assert_eq!(bare.table, Table::Vertex);
+        assert!(vertex_note(&bare));
+        for provider in [
+            "gemini",
+            "bedrock",
+            "azure",
+            "openrouter",
+            "models",
+            "Gemini",
+        ] {
+            assert!(
+                resolve(data, &routing, "gemini-2.5-flash", Some(provider)).is_none(),
+                "{provider}"
+            );
+        }
+        let (hit, class) = resolve(data, &routing, "gemini-2.5-flash", Some("vertex_ai")).unwrap();
+        assert_eq!(hit.table, Table::Vertex);
+        assert_eq!(class, RoutingClass::Routed);
+        assert!(!vertex_note(&hit), "{:#?}", hit.notes);
+        // A model already written with the provider's prefix is not
+        // prefixed again.
+        let (hit, _) = resolve(
+            data,
+            &routing,
+            "vertex_ai/gemini-2.5-flash",
+            Some("vertex_ai"),
+        )
+        .unwrap();
+        assert_eq!(hit.table, Table::Vertex);
     }
 
     #[test]

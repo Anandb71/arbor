@@ -941,6 +941,11 @@ fn human_report_reads_plainly_and_offers_a_review_once() {
         "Retirement data from the providers' deprecation pages: OpenAI, Anthropic, Google and Google Cloud as of 28 Oct 2026."
     ));
     assert!(text.contains("Days are counted in UTC."));
+    // The data line states the raw HTTP scope as the clean line does, and
+    // the one-hop wrapper clause after it.
+    assert!(text.contains(
+        "requests.post and httpx.post to a listed OpenAI or Anthropic endpoint whose URL is a literal or a same-file constant, models passed one hop to the project's own wrappers of them, LangChain's"
+    ));
     assert!(text.contains("Runs locally: no code leaves this machine."));
     // No line ends in a space.
     assert!(text.lines().all(|l| !l.ends_with(' ')), "{text}");

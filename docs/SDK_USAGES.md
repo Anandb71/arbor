@@ -5,12 +5,13 @@ calls the OpenAI, Anthropic and Gemini SDKs, directly or through LangChain's
 OpenAI and Anthropic chat models ([LangChain chat
 models](#langchain-chat-models)), and where it calls models on Amazon Bedrock
 or through LiteLLM ([Amazon Bedrock and LiteLLM](#amazon-bedrock-and-litellm)),
-and where it posts JSON to OpenAI's or Anthropic's REST API with `requests` or
-`httpx` ([Raw HTTP requests](#raw-http-requests)), with each call's routing
-and model values. A directory scan also follows a call to a function or class
-in another file of the project that passes the model on to one of these
-([Calls through a wrapper in another file](#calls-through-a-wrapper-in-another-file)). A consumer (a codemod, a reviewer)
-should treat the report this way:
+and where it sends `requests.post` or `httpx.post` to a listed OpenAI or
+Anthropic endpoint whose URL is a literal or a same-file constant ([Raw HTTP
+requests](#raw-http-requests)), with each call's routing and model values. A
+directory scan also follows a call to a function or class in another file of
+the project that passes the model on to one of these ([Calls through a wrapper
+in another file](#calls-through-a-wrapper-in-another-file)). A consumer (a
+codemod, a reviewer) should treat the report this way:
 
 - **A value or route with no gap at its call is confirmed.** It comes from one
   of the shapes in the supported grammar below, and nothing in the file can
@@ -495,10 +496,19 @@ not a gap.
 - **The route** is `litellm`. LiteLLM picks the provider and endpoint from
   the model string (`anthropic/...`, `azure/...`, `bedrock/...`) and its
   arguments and configuration (`custom_llm_provider=`, `api_base=`, the
-  environment, `litellm.api_base`), so the report does not say which
-  provider's API the call reaches. A call given `custom_llm_provider` or
-  `azure=True`, by keyword or in a same-file dict expanded with `**`, picks
-  its provider before the model's name does: an `ambiguous_client` gap,
+  environment, `litellm.api_base`), so the route does not say which
+  provider's API the call reaches. `custom_llm_provider`, or `azure=True`
+  (which names `azure` and wins over it), by keyword or in a same-file dict
+  expanded with `**`, picks the provider before the model's name does:
+  LiteLLM sends the model as `<provider>/<model>`. A string literal or a
+  same-file constant is recorded on each value the call sends there as its
+  `provider` (`"provider": "gemini"` in `--json`), with no gap, since the
+  route is then known. A fallback dict's own provider is recorded on that
+  fallback's model, and a fallback that names none gets the call's; a
+  `deployment_id` gets none, since LiteLLM sends it to Azure whatever the
+  call names. A provider the file does not show (a parameter, the
+  environment, a function call, an entry a later `**` may replace), at the
+  call or in a fallback dict, is an `ambiguous_client` gap,
   `litellm_provider`. Replacing `litellm.completion` is a `dynamic_feature`
   gap on the route; a setting (`litellm.drop_params = True`) changes
   nothing.
@@ -521,8 +531,7 @@ not a gap.
   (`completion` sets `model = deployment_id`, and each fallback attempt gets
   the call's arguments): each of those values keeps a `deployment_id` gap,
   and the deployment is the value sent. A fallback dict that names its own
-  `deployment_id` gives that fallback's model the same gap, and one that
-  names its own `custom_llm_provider` a `litellm_provider` gap.
+  `deployment_id` gives that fallback's model the same gap.
 
 `arbor retirements` does not check Bedrock calls: AWS keeps Bedrock's model
 schedule, which the bundled data does not hold, so nothing is looked up for a
@@ -531,11 +540,14 @@ schedule, which the bundled data does not hold, so nothing is looked up for a
 none is listed or counted. LiteLLM calls are routed: counted, and listed with
 `--include-routed`, or with their routing not confirmed when the call has a
 routing gap. A LiteLLM model is looked up on the schedule its router prefix
-names (`openai/`, `anthropic/`, `gemini/`, `vertex_ai/`), else by its shape,
-except that a Gemini model with no prefix (`gemini-2.5-flash`) is looked up on
-Vertex AI's schedule, where LiteLLM sends it (only `gemini/<model>` reaches
-the Gemini API), and on neither Google schedule when the call picks its
-provider itself (`custom_llm_provider`) or has another routing gap. As for
+names (`openai/`, `anthropic/`, `gemini/`, `vertex_ai/`), else by its shape.
+A value with a `provider` is looked up as `<provider>/<model>`, so
+`custom_llm_provider="gemini"` is the Gemini API's schedule and a provider
+with none in the data (`bedrock`, `azure`) looks nothing up. A Gemini model
+with no prefix (`gemini-2.5-flash`) and no provider is looked up on Vertex
+AI's schedule, where LiteLLM sends it (only `gemini/<model>` reaches the
+Gemini API), and on neither Google schedule when the call has a routing gap,
+such as a provider the file does not show. As for
 LangChain, only the checks about the model apply (see
 [RETIREMENTS.md](RETIREMENTS.md)).
 
@@ -627,11 +639,10 @@ requests; r.post = fake`, a parameter, `self.http`), and a test helper aimed at
 the library (`monkeypatch.setattr(requests, "post", ...)`,
 `mock.patch("requests.post")`, `patch.object(...)`) is a `dynamic_feature` gap
 on every raw HTTP request in the file, as is any dynamic feature of the whole
-file. A replaced
-`post` may also change the dict it is given, so in such a file a dict passed
-as `json=` counts as passed elsewhere again, for SDK calls that expand it
-too. A `def` or `class` that rebinds the imported `post` (or any other
-imported name) is a definition of that name from there on.
+file. A patched library may also change the dict `post` is given, so in such
+a file a dict passed as `json=` counts as passed elsewhere again, for SDK
+calls that expand it too. A `def` or `class` that rebinds the imported `post`
+(or any other imported name) is a definition of that name from there on.
 
 `arbor retirements` treats these as direct calls on the provider's schedule.
 Their argument names are the library's, and the scan reads only the model in
