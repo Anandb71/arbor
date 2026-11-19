@@ -356,13 +356,13 @@ enum Commands {
         path: PathBuf,
     },
 
-    /// Find OpenAI, Anthropic and Gemini SDK calls (Python today): routing, model IDs and gaps. Never prints credential values
+    /// Find OpenAI, Anthropic and Gemini SDK calls and LangChain's OpenAI and Anthropic chat models (Python today): routing, model IDs and gaps. Never prints credential values
     Usages {
         /// Directory or file to scan (defaults to current directory)
         #[arg(default_value = ".")]
         path: String,
 
-        /// Only this provider's SDK: openai, anthropic or google (alias: gemini)
+        /// Only this provider's SDK: openai, anthropic, google (alias: gemini), aws (alias: bedrock; boto3 and LangChain's Bedrock models) or litellm
         #[arg(long)]
         sdk: Option<String>,
 
@@ -371,7 +371,7 @@ enum Commands {
         json: bool,
     },
 
-    /// Find direct SDK calls to AI models their provider has retired or is retiring, with the replacement, the argument changes and the choices it needs (Python today). Runs locally. Exit 0: nothing failing, 1: a confirmed call uses a retired model (or one retiring within --fail-within days), 2: error
+    /// Find direct SDK calls and LangChain's OpenAI and Anthropic chat models that use AI models their provider has retired or is retiring, with the replacement, the argument changes and the choices it needs (Python today). Runs locally. Exit 0: nothing failing, 1: a confirmed call uses a retired model (or one retiring within --fail-within days), 2: error
     Retirements {
         /// Directory or file to scan (defaults to current directory)
         #[arg(default_value = ".")]
@@ -401,7 +401,7 @@ enum Commands {
         #[arg(long, value_name = "DAYS", value_parser = clap::value_parser!(i64).range(0..=36500))]
         fail_within: Option<i64>,
 
-        /// List calls that go through Azure, another host in base_url or another cloud (the provider's dates may not apply) and let them fail the check
+        /// List calls that go through Azure, another host in base_url, another cloud or LiteLLM (the provider's dates may not apply) and let them fail the check
         #[arg(long)]
         include_routed: bool,
 
