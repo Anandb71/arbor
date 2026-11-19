@@ -818,6 +818,14 @@ change it too, and then the route is `unknown` with a gap:
   replaces part of the SDK, writes a `base_url` on an object it cannot
   identify, or may rebind any name.
 
+A LiteLLM request may name the provider LiteLLM sends the model to
+(`custom_llm_provider`, or `azure=True`, given as a string its file shows).
+Each value the call passes, and each candidate of its gaps, then carries that
+`provider`, as a value written at the request would, and `arbor retirements`
+looks it up as `<provider>/<model>`. Requests that name different providers
+for the model do not agree, and route `unknown` with `wrapper_route`, as does a
+request whose provider its file does not show.
+
 The model can change after the call returns, which gives a `dynamic_feature`
 gap with no key:
 

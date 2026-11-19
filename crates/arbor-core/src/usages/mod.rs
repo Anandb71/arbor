@@ -545,6 +545,10 @@ pub struct ModelParam {
     pub routing: Routing,
     /// The request's routing has no client gap.
     pub route_confirmed: bool,
+    /// For a LiteLLM request: the provider it names apart from the model,
+    /// which LiteLLM sends the parameter's value to, as in
+    /// [`CapturedValue::provider`].
+    pub provider: Option<String>,
 }
 
 /// The functions and classes of other files that an import names, as the

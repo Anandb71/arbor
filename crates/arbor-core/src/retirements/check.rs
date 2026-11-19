@@ -4238,6 +4238,99 @@ SAMPLERS = {
     }
 
     #[test]
+    fn a_wrapper_call_is_looked_up_with_the_provider_its_litellm_request_names() {
+        // The wrapper's LiteLLM request names `custom_llm_provider="gemini"`:
+        // a model passed to it from another file reaches the Gemini API, as
+        // one written at the request would, not Vertex AI's schedule that a
+        // bare Gemini model with no provider is looked up on. With
+        // `--include-routed --fail-within 90`.
+        use crate::usages::{ModelParam, WrapperLookup};
+        struct Llm(Vec<ModelParam>);
+        impl WrapperLookup for Llm {
+            fn model_params(&self, module: &str, name: &str) -> Option<(String, Vec<ModelParam>)> {
+                (module == ".llm" && name == "ask")
+                    .then(|| ("app/llm.py".to_string(), self.0.clone()))
+            }
+        }
+        let mut opts = options("2026-11-18");
+        opts.include_routed = true;
+        opts.fail_within = Some(90);
+        let report = |given: &str| {
+            let wrapper = format!(
+                "import litellm\n\ndef ask(prompt, model):\n    return litellm.completion(model=model, messages=[prompt]{given})\n"
+            );
+            let caller = "from .llm import ask\n\nask(\"hi\", model=\"gemini-3.7-flash\")\n";
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_python::language())
+                .unwrap();
+            let tree = parser.parse(&wrapper, None).unwrap();
+            let defined = crate::usages::python::extract(&tree, &wrapper, "app/llm.py");
+            let lookup = Llm(defined.model_params.clone());
+            let tree = parser.parse(caller, None).unwrap();
+            let found =
+                crate::usages::python::extract_with(&tree, caller, "app/run.py", Some(&lookup));
+            let calls: Vec<SdkCall> = defined.calls.into_iter().chain(found.calls).collect();
+            let gaps: Vec<UsageGap> = defined.gaps.into_iter().chain(found.gaps).collect();
+            let clients: Vec<ClientConstruction> =
+                defined.clients.into_iter().chain(found.clients).collect();
+            let input = ScanInput {
+                calls: &calls,
+                gaps: &gaps,
+                clients: &clients,
+            };
+            check(input, bundled().unwrap(), &opts)
+        };
+        let at_caller = |report: &RetirementReport| -> Vec<Finding> {
+            report
+                .findings
+                .iter()
+                .chain(&report.routed)
+                .filter(|f| f.file == "app/run.py")
+                .cloned()
+                .collect()
+        };
+        let bare_note = |f: &Finding| {
+            f.notes
+                .iter()
+                .any(|n| n.contains("LiteLLM sends a Gemini model named with no provider"))
+        };
+
+        // The Gemini API lists gemini-3.7-flash as auto-routed with no date.
+        let gemini = report(", custom_llm_provider=\"gemini\"");
+        let found = at_caller(&gemini);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        let finding = &found[0];
+        assert_eq!(finding.provider, Table::GeminiApi);
+        assert_eq!(finding.status, State::AutoRouted);
+        assert_eq!(finding.date, None);
+        assert_eq!(finding.match_kind, MatchKind::RouterPrefix);
+        assert_eq!(finding.routing_class, RoutingClass::Routed);
+        assert_eq!(finding.confidence, Confidence::Confirmed);
+        assert_eq!(finding.call_kind, CallKind::ModelBinding);
+        assert!(!bare_note(finding), "{:#?}", finding.notes);
+        assert!(
+            finding
+                .notes
+                .iter()
+                .any(|n| n.contains("is given `custom_llm_provider=\"gemini\"`")),
+            "{:#?}",
+            finding.notes
+        );
+        assert!(!finding.fails);
+        assert_eq!(gemini.exit_code, 0);
+
+        // With no provider, the bare Gemini model is Vertex AI's: retiring
+        // on 28 Jan 2027, 71 days out, so it fails.
+        let bare = report("");
+        let found = at_caller(&bare);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].provider, Table::Vertex);
+        assert!(bare_note(&found[0]) && found[0].fails);
+        assert_eq!(bare.exit_code, 1);
+    }
+
+    #[test]
     fn langchain_chat_models_get_only_the_rules_about_the_model() {
         // `ChatOpenAI(max_tokens=...)` is LangChain's argument, which it
         // maps to the request itself: the SDK's argument changes and

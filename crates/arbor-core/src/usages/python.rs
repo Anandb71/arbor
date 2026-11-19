@@ -8973,6 +8973,12 @@ impl<'t> Ctx<'t> {
             let Some(slot) = self.param_slot(source.func, &source.param) else {
                 continue;
             };
+            // LiteLLM sends a `deployment_id` to Azure whatever provider
+            // the call names (see [`is_deployment_key`]).
+            let provider = request
+                .provider
+                .clone()
+                .filter(|_| !is_deployment_key(&key));
             let param = ModelParam {
                 function,
                 parameter: source.param,
@@ -8988,6 +8994,7 @@ impl<'t> Ctx<'t> {
                 receiver: request.receiver,
                 routing: request.routing,
                 route_confirmed,
+                provider,
             };
             self.param_exports.push((param, source.func));
         }
@@ -9856,6 +9863,31 @@ impl<'t> Ctx<'t> {
         self.sending.push(call);
         self.model_reads.extend(splat_arguments(call));
 
+        // LiteLLM sends the model to the provider its request names
+        // (`custom_llm_provider`, `azure=True`): each value, and each
+        // candidate of a gap next to it, gets the one its key's requests
+        // name, as at a call in their file. Requests that name different
+        // ones for a key do not agree on where it goes (below).
+        let mut providers: HashMap<&str, Option<&str>> = HashMap::new();
+        let providers_agree = wrapper.params.iter().all(|p| {
+            *providers
+                .entry(p.key.as_str())
+                .or_insert(p.provider.as_deref())
+                == p.provider.as_deref()
+        });
+        if providers_agree {
+            let candidates = self.out.gaps[gaps_before..]
+                .iter_mut()
+                .flat_map(|g| g.values.iter_mut());
+            for value in values.iter_mut().chain(candidates) {
+                value.provider = providers
+                    .get(value.key.as_str())
+                    .copied()
+                    .flatten()
+                    .map(str::to_string);
+            }
+        }
+
         // The packages of the requests (`langchain_community` names two).
         let pkgs: Vec<Pkg> = ALL_PKGS
             .iter()
@@ -9926,15 +9958,16 @@ impl<'t> Ctx<'t> {
             });
         }
 
-        // Where the model goes: the requests' route, when they agree, their
-        // file confirms it and this file's checks above know their package
-        // (one a newer scan exported, say).
+        // Where the model goes: the requests' route, when they agree (on
+        // LiteLLM's provider too), their file confirms it and this file's
+        // checks above know their package (one a newer scan exported, say).
         let route = (first.sdk, first.routing);
-        let agreed = wrapper.params.iter().all(|p| {
-            p.route_confirmed
-                && (p.sdk, p.routing) == route
-                && pkgs.iter().any(|pkg| pkg.package() == p.package)
-        });
+        let agreed = providers_agree
+            && wrapper.params.iter().all(|p| {
+                p.route_confirmed
+                    && (p.sdk, p.routing) == route
+                    && pkgs.iter().any(|pkg| pkg.package() == p.package)
+            });
         let unconfirmed = if !agreed {
             Some((
                 "wrapper_route",
@@ -10968,6 +11001,7 @@ impl<'t> Ctx<'t> {
                 line: span.line,
                 receiver: target.receiver,
                 routing: target.routing,
+                provider: call_provider.named(),
             };
             self.note_model_params(from_params, gaps_before, &request);
         }
@@ -13292,6 +13326,9 @@ struct ParamRequest<'a> {
     line: u32,
     receiver: Receiver,
     routing: Routing,
+    /// The provider a LiteLLM request names (`custom_llm_provider`,
+    /// `azure=True`) as a string the file shows.
+    provider: Option<String>,
 }
 
 /// A function or class of another file whose parameters are the model of

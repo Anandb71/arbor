@@ -134,7 +134,8 @@ parameter is the model of one of these requests (`Sampler(model="o1")` after `fr
 .sampler import Sampler`), is found where it is passed, in the calling file: one hop
 only, and only for the shapes
 [SDK_USAGES.md](SDK_USAGES.md#calls-through-a-wrapper-in-another-file) lists. It follows
-the schedule of the requests the wrapper sends it in. The call's arguments are the
+the schedule of the requests the wrapper sends it in, and the provider a LiteLLM request
+there names. The call's arguments are the
 wrapper's, so only the checks about the model apply, with a check naming the wrapper and
 the line of its request, where the other parameters are set.
 Wrappers the scan does not follow (a model passed on through a second wrapper or

@@ -9585,6 +9585,88 @@ ask(\"hi\", model=\"o1\")
 }
 
 #[test]
+fn a_wrapper_call_sends_its_model_to_the_provider_the_litellm_request_names() {
+    // LiteLLM sends the model to the provider its request names
+    // (`custom_llm_provider`, `azure=True`) as `<provider>/<model>`: what a
+    // call from another file passes gets that provider, as a value at the
+    // request would.
+    let caller = "from .llm import ask\n\ndef run(model=\"gemini-2.5-flash\"):\n    return ask(\"hi\", model=model)\n\nask(\"hi\", model=\"gemini-3.7-flash\")\n";
+    for (given, provider) in [
+        ("custom_llm_provider=\"gemini\"", "gemini"),
+        ("custom_llm_provider=PROVIDER", "vertex_ai"),
+        ("azure=True", "azure"),
+        ("**CFG", "gemini"),
+    ] {
+        let wrapper = format!(
+            "import litellm\nPROVIDER = \"vertex_ai\"\nCFG = {{\"custom_llm_provider\": \"gemini\"}}\n\ndef ask(prompt, model):\n    return litellm.completion(model=model, messages=[prompt], {given})\n"
+        );
+        let params = model_params(&wrapper, "sampler.py");
+        assert_eq!(params.len(), 1, "{given}");
+        assert_eq!(params[0].provider.as_deref(), Some(provider), "{given}");
+        assert!(params[0].route_confirmed, "{given}");
+        let found = through(&wrapper, ".llm", caller);
+        let call = call_on(&found, 6);
+        assert_eq!(call.routing, Routing::Litellm, "{given}");
+        assert_eq!(value(call, "model"), Some("gemini-3.7-flash"), "{given}");
+        assert_eq!(
+            call.values[0].provider.as_deref(),
+            Some(provider),
+            "{given}"
+        );
+        assert!(
+            gaps_on(&found, 6).is_empty(),
+            "{given}: {:?}",
+            gaps_on(&found, 6)
+        );
+        // A parameter default in the calling file, and the candidates of
+        // its gap, go to the same provider.
+        let defaulted = call_on(&found, 4);
+        assert_eq!(
+            value(defaulted, "model"),
+            Some("gemini-2.5-flash"),
+            "{given}"
+        );
+        let candidates = found
+            .gaps
+            .iter()
+            .filter(|g| g.span.is_some_and(|s| s.line == 4))
+            .flat_map(|g| &g.values);
+        for v in defaulted.values.iter().chain(candidates) {
+            assert_eq!(v.provider.as_deref(), Some(provider), "{given}: {v:?}");
+        }
+    }
+
+    // No provider named: the model's name decides, as before.
+    let plain = "import litellm\n\ndef ask(prompt, model):\n    return litellm.completion(model=model, messages=[prompt])\n";
+    assert_eq!(model_params(plain, "sampler.py")[0].provider, None);
+    let found = through(plain, ".llm", caller);
+    let call = call_on(&found, 6);
+    assert_eq!(call.routing, Routing::Litellm);
+    assert_eq!(call.values[0].provider, None);
+    assert!(gaps_on(&found, 6).is_empty(), "{:?}", gaps_on(&found, 6));
+
+    // Requests that name different providers for the model, or one the
+    // file does not show, leave the route unknown and name none.
+    for wrapper in [
+        "import litellm\n\ndef ask(prompt, model, fast=False):\n    if fast:\n        return litellm.completion(model=model, messages=[prompt], custom_llm_provider=\"gemini\")\n    return litellm.completion(model=model, messages=[prompt], custom_llm_provider=\"vertex_ai\")\n",
+        "import litellm\n\ndef ask(prompt, model, fast=False):\n    if fast:\n        return litellm.completion(model=model, messages=[prompt], custom_llm_provider=\"gemini\")\n    return litellm.completion(model=model, messages=[prompt])\n",
+        "import litellm\n\ndef ask(prompt, model, provider=\"gemini\"):\n    return litellm.completion(model=model, messages=[prompt], custom_llm_provider=provider)\n",
+    ] {
+        assert!(!model_params(wrapper, "sampler.py").is_empty(), "{wrapper}");
+        let found = through(wrapper, ".llm", caller);
+        let call = call_on(&found, 6);
+        assert_eq!(value(call, "model"), Some("gemini-3.7-flash"), "{wrapper}");
+        assert_eq!(call.routing, Routing::Unknown, "{wrapper}");
+        assert_eq!(call.values[0].provider, None, "{wrapper}");
+        assert_eq!(
+            gaps_on(&found, 6),
+            ["ambiguous_client/wrapper_route"],
+            "{wrapper}"
+        );
+    }
+}
+
+#[test]
 fn a_wrapper_call_keeps_what_the_calling_file_changes() {
     // A LangChain chat model the wrapper builds and hands back, given
     // another model or made configurable where it is called.
