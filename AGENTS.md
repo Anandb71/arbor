@@ -73,7 +73,7 @@ arbor-core  →  arbor-graph  →  arbor-watcher
 
 **`arbor-mcp`** — MCP bridge for AI agents (stdio by default, stateless HTTP via `arbor bridge --http --port 3333`). Speaks MCP `2026-07-28` with fallback for `2025-03-26` clients. Seventeen tools:
 - **Orientation**: `get_map` — ranked, token-budgeted skeleton of the codebase (recommended first call), `get_architecture_overview`
-- **Surgical**: `list_entry_points`, `get_callers`, `get_callees`, `search_symbols`, `get_file_graph`, `get_node_detail`, `explain_symbol`, `find_api_usages` (OpenAI/Anthropic/Gemini SDK call sites with routing and model IDs; reads files, no graph needed)
+- **Surgical**: `list_entry_points`, `get_callers`, `get_callees`, `search_symbols`, `get_file_graph`, `get_node_detail`, `explain_symbol`, `find_api_usages` (OpenAI/Anthropic/Gemini SDK call sites, and LangChain's OpenAI and Anthropic chat models, with routing and model IDs; reads files, no graph needed)
 - **Broad**: `get_logic_path`, `get_knowledge_path`, `find_path`, `analyze_impact`, `get_blast_radius` (git-diff based), `audit_security`, `batch_query`
 
 Module layout: `lib.rs` (tool dispatch + `tools/list`), `protocol.rs` (version negotiation, caching metadata), `tasks.rs` (Tasks extension — background indexing returns task handles agents can poll during cold start), `apps.rs` (MCP Apps — interactive blast-radius and architecture-map UIs via `ui://arbor/*` resources), `http.rs` (HTTP transport with `Mcp-Method`/`Mcp-Name` header routing), `git.rs`.
@@ -90,8 +90,8 @@ Key features:
 - `summary .`: auto-generates structured Pull Request descriptions based on graph diff analysis.
 - `agent review`/`agent onboard`/`agent guard`: built-in autonomous workflows (PR risk review, contributor onboarding guide, architecture violation check with `--max-blast-radius`).
 - `audit "sink"`: traces call paths to sensitive sinks (e.g. `db_query`, `exec`).
-- `usages [--sdk openai|anthropic|google] [path] [--json]`: OpenAI, Anthropic and Gemini SDK call sites in Python with client routing (direct, Azure, custom `base_url`, Bedrock, Vertex...), model IDs from literals, same-file constants, dict literals and parameter defaults (env/config fallbacks flagged `env_default`), and typed gaps for everything unresolved (`src/usages.rs`; never prints credential values, refusing secret-named bindings and credential-shaped values).
-- `retirements [path]`: direct SDK calls to models their provider has retired or is retiring, with the listed replacement, the argument changes and the per-repo decisions it needs (`src/retirements.rs`). Exit 0 clean, 1 a confirmed direct call is retired (or retiring within `--fail-within` days; the shutdown day counts as retired, UTC), 2 error; `--count-unconfirmed` and `--include-routed` count more. `--annotations` caps at GitHub's 10 warnings per step; `--markdown-out` writes the summary from the same scan. The closing fix-PR line's URL lives only in `FIX_PRS_URL`.
+- `usages [--sdk openai|anthropic|google] [path] [--json]`: OpenAI, Anthropic and Gemini SDK call sites in Python (LangChain's `ChatOpenAI`, `AzureChatOpenAI` and `ChatAnthropic` included) with client routing (direct, Azure, custom `base_url`, Bedrock, Vertex...), model IDs from literals, same-file constants, dict literals and parameter defaults (env/config fallbacks flagged `env_default`), and typed gaps for everything unresolved (`src/usages.rs`; never prints credential values, refusing secret-named bindings and credential-shaped values).
+- `retirements [path]`: direct SDK calls, and LangChain's `ChatOpenAI`, `AzureChatOpenAI` and `ChatAnthropic`, that use models their provider has retired or is retiring, with the listed replacement, the argument changes and the per-repo decisions it needs (`src/retirements.rs`); a LangChain chat model gets only the rules about the model, and a check to review its parameters by hand. Exit 0 clean, 1 a confirmed call routed to the provider's own API uses a retired model (or one retiring within `--fail-within` days; the shutdown day counts as retired, UTC), 2 error; `--count-unconfirmed` and `--include-routed` count more. `--annotations` caps at GitHub's 10 warnings per step; `--markdown-out` writes the summary from the same scan. The closing fix-PR line's URL lives only in `FIX_PRS_URL`.
 - `explain "question"`: graph-backed context slicing for a question (`--tokens`, `--why`).
 - `hook Codex [--global]`: installs Arbor directives + hooks into Codex settings.
 
@@ -143,7 +143,7 @@ Local cache created by `arbor init`/`arbor setup`. Contains `config.json` with d
 | `summary .` | Auto-generate PR description |
 | `audit "sink" .` | Trace call paths to a sensitive sink |
 | `usages .` | OpenAI/Anthropic/Gemini SDK call sites, routing, model IDs and gaps (`--sdk`, `--json`) |
-| `retirements .` | Direct SDK calls to retired or retiring AI models: date, replacement, argument changes, per-repo decisions (`--fail-within`, `--count-unconfirmed`, `--include-routed`, `--json`, `--markdown`, `--markdown-out`, `--annotations`) |
+| `retirements .` | Direct SDK calls and LangChain's OpenAI and Anthropic chat models that use retired or retiring AI models: date, replacement, argument changes, per-repo decisions (`--fail-within`, `--count-unconfirmed`, `--include-routed`, `--json`, `--markdown`, `--markdown-out`, `--annotations`) |
 | `explain "question" .` | Graph-backed context for a question |
 | `agent review .` | Autonomous PR risk review |
 | `agent onboard .` | Generate contributor onboarding guide |
